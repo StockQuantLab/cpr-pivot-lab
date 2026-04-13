@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import logging
 from collections.abc import Callable
@@ -121,7 +122,9 @@ async def process_closed_bar_group(
     normalized_strategy = str(strategy or "").upper()
 
     # Step 1: exits/position advances first.
-    for candle in bar_candles_sorted:
+    # Yield to the event loop every 64 symbols so alert consumer can send Telegram messages
+    # between symbol batches — otherwise 600+ synchronous evaluations starve the consumer.
+    for _i, candle in enumerate(bar_candles_sorted):
         state = runtime_state.symbols.get(candle.symbol)
         if state is not None and state.candles:
             last_seen = state.candles[-1].get("bar_end")
@@ -155,10 +158,15 @@ async def process_closed_bar_group(
             )
         elif advance.get("action") == "PARTIAL":
             tracker.credit_cash(float(advance.get("exit_value") or 0.0))
+        if _i % 64 == 63:
+            await asyncio.sleep(0)
+
+    # Yield after exit loop so any CLOSE alerts fire before we scan entries.
+    await asyncio.sleep(0)
 
     # Step 2: evaluate entry candidates for this bar.
     entry_candidates: list[dict[str, Any]] = []
-    for candle in bar_candles_sorted:
+    for _i, candle in enumerate(bar_candles_sorted):
         if tracker.has_open_position(candle.symbol):
             continue
         setup_status = _runtime_setup_status(runtime_state, candle.symbol)
@@ -180,6 +188,8 @@ async def process_closed_bar_group(
         )
         if evaluation.get("action") == "ENTRY_CANDIDATE":
             entry_candidates.append(evaluation)
+        if _i % 64 == 63:
+            await asyncio.sleep(0)
 
     # Step 3: select + execute entries.
     selected_entries = select_entries_for_bar(entry_candidates, tracker)

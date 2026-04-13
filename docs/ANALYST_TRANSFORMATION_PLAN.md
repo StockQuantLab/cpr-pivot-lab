@@ -1,5 +1,8 @@
 # CPR Pivot Lab — Analyst-Ready Transformation Plan
 
+> Product/backlog doc, not live operator guidance. The live runbook is
+> `docs/PAPER_TRADING_RUNBOOK.md`.
+
 Last updated: 2026-03-25
 
 ---

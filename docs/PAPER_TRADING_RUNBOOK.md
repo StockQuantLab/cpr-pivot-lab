@@ -26,6 +26,9 @@ execution rules; none of them is exempt from parity.
 - Paper does **not** inject extra paper-only strategy defaults.
 - If you want a paper run to match a specific backtest run, pass the same explicit flags or JSON overrides.
 - Prefer named presets such as `CPR_LEVELS_RISK_LONG` and `CPR_LEVELS_RISK_SHORT` instead of hand-spelling the full flag bundle.
+- Live finalization is defensive: final flush is guarded, abnormal exits auto-flatten, and a
+  `SESSION_ERROR` alert is emitted if terminal cleanup fails. A clean shutdown still requires
+  the DB terminal status stamp to land successfully.
 - When multiple symbols qualify on the same bar, the current shared selector uses a
   deterministic symbol-order tie-break via `select_entries_for_bar()`. That keeps replay,
   live, and backtest reproducible. It is not a profitability optimizer. If you want to rank
@@ -227,10 +230,10 @@ doppler run -- uv run pivot-build --refresh-since 2026-03-30 --batch-size 64
 
 ```bash
 # Step 1 — Build today's setup rows from yesterday's close data (8:30–8:45 AM)
-# Replace <prev_trading_date> with the last NSE trading day (e.g. 2026-04-07)
+# Replace <prev_trading_date> with the last NSE trading day (e.g. 2026-04-10)
 doppler run -- uv run pivot-refresh --since <prev_trading_date>
 
-# Step 2 — Verify runtime table coverage for today (must pass before starting live)
+# Step 2 — Verify runtime table coverage for prior trading date (must pass before starting live)
 doppler run -- uv run pivot-paper-trading daily-prepare --trade-date today --all-symbols
 
 # Step 3 — Scan for today's narrow-CPR candidates (informational — 8:45–9:10 AM)
@@ -239,6 +242,12 @@ doppler run -- uv run pivot-signal-alert --universe gold_51 --condition narrow-c
 doppler run -- uv run pivot-signal-alert --all-symbols --condition narrow-cpr
 ```
 
+**Pre-market build (fixed Apr 2026)**: `market_day_state` is now buildable pre-market.
+`pivot-refresh` uses an ASOF JOIN for ATR (finds the most recent prior-day ATR when today's
+bars don't yet exist) so today's CPR rows appear in `market_day_state` pre-market.
+`--allow-late-start-fallback` is no longer required; direction is resolved from the live
+9:15 candle when the DB row has `or_close_5 = NULL`.
+
 **Dashboard note**: The dashboard can remain open during live sessions — the `paper.duckdb` replica avoids
 file-lock conflicts.
 
@@ -246,13 +255,50 @@ file-lock conflicts.
 - Re-run `pivot-refresh --since <prev_trading_date>` and check for errors
 - Do NOT start `daily-live` until `daily-prepare` reports coverage ready
 
-**Late start / restart note (after market open):**
-- Strict setup parity is enforced for invalid setup rows. Missing same-day `market_day_state`
-  rows are tolerated and skipped, so a small gap does not trigger another build cycle.
-- If you intentionally want candle-derived recovery for a late start, use:
-  `--allow-late-start-fallback`
-- For normal parity runs, keep the fallback off and use `--no-alerts` only when you are
-  comparing paper paths and do not want Telegram/email noise.
+**Kite WebSocket STALE recovery**: Current sessions emit `FEED_STALE` when the session-wide feed
+stops progressing and `FEED_RECOVERED` when data resumes. A single quiet symbol is normal and does
+not count as stale by itself. Connected WebSocket sessions allow a longer quiet period before stale
+is raised; disconnected sessions still use the shorter session timeout. The session stays alive
+for up to 10 minutes so KiteConnect can reconnect automatically before terminating.
+If you still see the old `SESSION_ERROR market_data_stale` wording, that session was started
+before this rollout and must be restarted to pick up the new alert contract. Only terminate
+manually if you see stale for > 10 min past entry window with no active positions.
+
+**How to tell real feed trouble from normal quiet symbols**:
+- A few symbols being quiet is normal in low-liquidity names.
+- Treat stale as a **session-wide** transport problem, not a per-symbol trading signal.
+- If bars keep closing and `LIVE_BAR`/trade alerts keep flowing, the session is healthy even if
+  some symbols are silent.
+- Use highly liquid symbols such as `SBIN` and `RELIANCE` as canaries only if they are already
+  part of that day’s tradable universe. If they are not in the session symbol list, use a separate
+  health-check probe and do not force them into the trading list.
+- Do not let a single quiet symbol force a session restart.
+
+**Failure drills for no-surprises live ops**:
+- `market_data_stale`: use `daily-live --feed-source local` and inject a gap in the feeder, or
+  monkeypatch the ticker adapter in `tests/test_live_market_data.py` so `last_tick_ts` stops
+  advancing. Expect `FEED_STALE` / `FEED_RECOVERED` on new sessions.
+- `bar_processing_error`: monkeypatch `paper_session_driver.process_closed_bar_group()` to raise.
+  The session should emit `SESSION_ERROR reason=bar_processing_error` and fail closed.
+- `session_finalize_failed`: monkeypatch the terminal `complete_session()` update path to raise.
+  The session should emit `SESSION_ERROR reason=session_finalize_failed` and stamp a fallback
+  terminal status.
+- `auto_flatten_failed`: force a stale/failed exit with open positions, then monkeypatch
+  `flatten_session_positions()` to raise. The session should emit
+  `SESSION_ERROR reason=auto_flatten_failed`.
+- `prefetch missing setup`: run `daily-live` before `pivot-refresh` / `daily-prepare`, or stub
+  `load_setup_row()` to return `None` in a test. The session should fail fast before trading.
+
+**Auto-restart scope**: current live code can auto-flatten abnormal exits, stamp terminal
+status, and alert on feed/session failures. It does **not** auto-spawn a replacement
+`daily-live` process. If you want zero-manual-intervention day trading, add an external
+supervisor/launcher that notices a failed/stopped session and restarts it only after
+reconciliation.
+
+**Session identity**: for the same trading day, the safest recovery path is usually to resume the
+same `session_id` after reconciling DB state so open positions keep the same history. Use a new
+`session_id` only when you are intentionally starting a fresh day or after the old session has
+been fully closed and archived.
 
 **What the signal scan tells you:**
 - Which symbols have narrow CPR today (eligible for CPR_LEVELS entry)
@@ -280,6 +326,10 @@ doppler run -- uv run pivot-paper-trading daily-live \
   --trade-date today --all-symbols
 ```
 
+`--allow-late-start-fallback` is no longer required. `pivot-refresh` now builds
+`market_day_state` pre-market using prev-day ATR (ASOF JOIN). Direction is resolved from
+the live 9:15 candle automatically when `or_close_5` is NULL in the DB row.
+
 Add `--no-alerts` only for silent validation runs. Add explicit CPR flags only when you are
 intentionally overriding the canonical preset.
 
@@ -299,6 +349,31 @@ doppler run -- uv run pivot-paper-trading daily-live \
 Each variant gets its own session, pre-filtered symbol list, and RVOL policy. The alert dispatcher uses
 reference counting — it only shuts down when all sessions complete. Stale sessions from previous crashes
 are auto-cleaned on startup.
+
+### 2a-resume. Mid-day session recovery (STALE or FAILED with open positions)
+
+If a live session goes STALE or FAILED mid-day and positions are still open, resume it:
+
+```bash
+doppler run -- uv run pivot-paper-trading daily-live \
+  --resume --session-id CPR_LEVELS_SHORT-2026-04-15 \
+  >> .tmp_logs/live_resume_2026-04-15.log 2>&1 &
+```
+
+Behavior:
+- Reads open positions from `paper.duckdb` and calls `run_live_session()` directly.
+- Only `FAILED`, `STALE`, `STOPPING`, or `CANCELLED` sessions can be resumed (avoids hijacking a running session).
+- Sessions with no open positions are rejected — nothing to manage.
+- No new entry signals are evaluated; the resume path only manages existing open positions through to EOD.
+- Do **not** use `--multi` with `--resume`; the resume path targets a single named session.
+
+**DB status mapping**: `STALE` maps to `FAILED` in the DB (CHECK constraint does not include STALE).
+Internally the logic still uses STALE to decide auto-flatten behavior. The DB always gets `FAILED`
+with notes `"stale_exit: ..."` so the constraint is never violated.
+
+**FLATTEN_EOD dedup**: `flatten_session_positions()` checks `alert_log` before sending the EOD
+Telegram alert. If the session already sent a `FLATTEN_EOD` (from the original process before stale),
+the resumed process skips it — only one EOD alert per session.
 
 ### 2b. Historical replay — exact live parity with alerts (any past date)
 

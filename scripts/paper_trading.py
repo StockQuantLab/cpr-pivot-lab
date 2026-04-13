@@ -839,9 +839,67 @@ async def _cmd_daily_replay(args: argparse.Namespace) -> None:
                 set_alerts_suppressed(False)
 
 
+async def _cmd_daily_live_resume(args: argparse.Namespace) -> None:
+    """Resume a stale/stopped live session by session_id.
+
+    Loads open positions directly from DB — no pre-filter, no fresh session.
+    run_live_session() seeds open + closed positions and updates status to ACTIVE.
+    """
+    session_id = args.session_id
+    if not session_id:
+        raise SystemExit("--resume requires --session-id <session_id>")
+
+    session = await get_session(session_id)
+    if session is None:
+        raise SystemExit(f"Session {session_id!r} not found in DB")
+
+    resumable = {"FAILED", "STALE", "STOPPING", "CANCELLED"}
+    if session.status not in resumable:
+        raise SystemExit(
+            f"Session {session_id!r} has status {session.status!r}. "
+            f"Only {resumable} sessions can be resumed."
+        )
+
+    open_positions = await get_session_positions(session_id, statuses=["OPEN"])
+    symbols = [p.symbol for p in open_positions]
+    if not symbols:
+        raise SystemExit(
+            f"No OPEN positions in session {session_id!r} — nothing to resume. "
+            f"(Use daily-live without --resume to start a fresh session.)"
+        )
+
+    print(
+        f"Resuming {session_id!r}: {len(symbols)} open position(s): {symbols}",
+        flush=True,
+    )
+
+    suppress_alerts = bool(getattr(args, "no_alerts", False))
+    if suppress_alerts:
+        set_alerts_suppressed(True)
+
+    try:
+        payload = await run_live_session(
+            session_id=session_id,
+            symbols=symbols,
+            poll_interval_sec=getattr(args, "poll_interval_sec", None),
+            candle_interval_minutes=getattr(args, "candle_interval_minutes", None),
+            max_cycles=getattr(args, "max_cycles", None),
+            complete_on_exit=getattr(args, "complete_on_exit", False),
+        )
+    finally:
+        if suppress_alerts:
+            set_alerts_suppressed(False)
+
+    print(json.dumps(payload, default=str, indent=2))
+
+
 async def _cmd_daily_live(args: argparse.Namespace) -> None:
     if getattr(args, "multi", False):
         await _cmd_daily_live_multi(args)
+        return
+
+    if getattr(args, "resume", False):
+        await _cmd_daily_live_resume(args)
         return
 
     trade_date = resolve_trade_date(args.trade_date)
@@ -2614,6 +2672,15 @@ def build_parser() -> argparse.ArgumentParser:
     _add_symbol_args(daily_live)
     _add_strategy_args(daily_live)
     daily_live.add_argument("--session-id", default=None, help="Custom session ID")
+    daily_live.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "Resume a stale/stopped session by --session-id. "
+            "Loads open positions from DB and monitors them to EOD. "
+            "No new entries. Skips pre-filter and session creation."
+        ),
+    )
     _add_live_args(daily_live)
     daily_live.add_argument(
         "--skip-coverage",

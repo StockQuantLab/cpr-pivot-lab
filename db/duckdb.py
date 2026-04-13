@@ -1484,14 +1484,21 @@ class MarketDB:
                     o.h0935, o.l0935, o.c0935,
                     o.h0940, o.l0940, o.c0940
                 FROM cpr_daily c
-                JOIN atr_intraday a
-                  ON a.symbol = c.symbol AND a.trade_date = c.trade_date
+                -- ASOF JOIN: finds the most recent ATR row with trade_date <= c.trade_date.
+                -- For historical dates this resolves to same-day ATR.
+                -- For today (pre-market, when today's bars don't yet exist) it resolves to
+                -- the prior trading day's ATR, allowing market_day_state to be built
+                -- pre-market by pivot-refresh without requiring the day's 5-min bars.
+                ASOF JOIN atr_intraday a
+                  ON a.symbol = c.symbol AND a.trade_date <= c.trade_date
                 LEFT JOIN cpr_thresholds t
                   ON t.symbol = c.symbol AND t.trade_date = c.trade_date
                 LEFT JOIN or_daily o
                   ON o.symbol = c.symbol AND o.trade_date = c.trade_date
                 {"LEFT JOIN virgin_cpr_flags v ON v.symbol = c.symbol AND v.trade_date = c.prev_date" if virgin_exists else ""}
-                WHERE o.c0915 IS NOT NULL
+                -- Keep rows where 9:15 data exists (historical) OR where or_daily has no
+                -- match at all (today pre-market: LEFT JOIN returns NULL for o.symbol).
+                WHERE (o.c0915 IS NOT NULL OR o.symbol IS NULL)
                 {symbol_filter}
                 {date_filter}
             ),

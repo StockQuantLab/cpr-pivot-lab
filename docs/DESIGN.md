@@ -1,5 +1,8 @@
 # Design Notes — CPR Pivot Lab
 
+> Design/history doc, not live operator guidance. The live runbook is
+> `docs/PAPER_TRADING_RUNBOOK.md`.
+
 > **Migration Note (Apr 2026)**: Paper trading state has migrated from PostgreSQL to DuckDB
 > (`paper.duckdb`). Backtest results are now in `backtest.duckdb` (separated from `market.duckdb`).
 > PostgreSQL is used only for agent sessions and walk-forward validation. The workstream

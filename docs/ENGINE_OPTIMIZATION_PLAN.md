@@ -1,5 +1,8 @@
 # CPR Pivot Lab — Engine Optimization Plan
 
+> Planning doc, not operator guidance. The live runbook is `docs/PAPER_TRADING_RUNBOOK.md`.
+> Use this file for strategy and engine backlog context only.
+
 Last updated: 2026-03-27
 
 ---

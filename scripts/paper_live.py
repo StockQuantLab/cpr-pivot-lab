@@ -33,8 +33,11 @@ from engine.live_market_data import (
 from engine.paper_runtime import (
     PaperRuntimeState,
     SymbolRuntimeState,
+    _start_alert_dispatcher,
     build_backtest_params,
     build_summary_feed_state,
+    dispatch_feed_recovered_alert,
+    dispatch_feed_stale_alert,
     dispatch_session_error_alert,
     enforce_session_risk_controls,
     evaluate_candle,
@@ -55,6 +58,7 @@ _PARITY_TRACE_ENABLED = str(os.getenv("PIVOT_LIVE_PARITY_TRACE", "0")).strip().l
 _SETUP_PARITY_CHECK_ENABLED = (
     str(os.getenv("PIVOT_LIVE_SETUP_PARITY_CHECK", "0")).strip().lower() in _BOOL_TRUE
 )
+_ORIGINAL_LOAD_SETUP_ROW = load_setup_row
 
 
 @dataclass(slots=True)
@@ -150,7 +154,6 @@ def _floor_bucket_start(ts: datetime, interval_minutes: int) -> datetime:
         second=0,
         microsecond=0,
     )
-
 
 
 def _session_now(deps: LiveSessionDeps | None = None) -> datetime:
@@ -249,32 +252,160 @@ def _prefetch_setup_rows(
 ) -> None:
     missing_symbols: list[str] = []
     invalid_symbols: list[tuple[str, float, float, float]] = []
-    for symbol in symbols:
-        state = runtime_state.symbols.setdefault(symbol, SymbolRuntimeState())
-        if state.setup_row is not None:
-            continue
-        setup_row = load_setup_row(
-            symbol,
-            trade_date,
-            live_candles=state.candles,
-            or_minutes=candle_interval_minutes,
-            allow_live_fallback=runtime_state.allow_live_setup_fallback,
-        )
-        if setup_row is None:
-            missing_symbols.append(symbol)
-            continue
-        tc = float(setup_row.get("tc") or 0.0)
-        bc = float(setup_row.get("bc") or 0.0)
-        atr = float(setup_row.get("atr") or 0.0)
-        # Guard against caching incomplete fast-path setup rows.
-        # If these fields are unusable, keep the symbol unresolved so strict mode
-        # fails fast (or permissive mode can attempt late fallback reads).
+    unique_symbols = list(dict.fromkeys(symbols))
+
+    def _hydrate_setup_row(
+        *,
+        symbol: str,
+        row: tuple[Any, ...],
+        live_candles: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any] | None:
+        from engine.paper_runtime import resolve_cpr_direction
+
+        tc = float(row[3] or 0.0)
+        bc = float(row[4] or 0.0)
+        atr = float(row[10] or 0.0)
         if tc <= 0.0 or bc <= 0.0 or atr <= 0.0:
             invalid_symbols.append((symbol, tc, bc, atr))
-            continue
-        setup_row.setdefault("setup_source", "market_day_state")
-        state.setup_row = setup_row
-        _log_setup_row_parity(symbol, trade_date, setup_row)
+            return None
+        or_close_5 = float(row[16]) if row[16] is not None else None
+        direction = resolve_cpr_direction(or_close_5, tc, bc, fallback="NONE")
+        if direction == "NONE" and or_close_5 is None:
+            direction = str(row[21] or "NONE")
+        if direction == "NONE" and live_candles:
+            from engine.paper_runtime import _build_intraday_summary
+
+            intraday = _build_intraday_summary(live_candles, or_minutes=candle_interval_minutes)
+            live_or_close_5 = intraday.get("or_close_5")
+            if live_or_close_5 is not None:
+                direction = resolve_cpr_direction(
+                    live_or_close_5, tc, bc, fallback="NONE"
+                )
+                or_close_5 = live_or_close_5
+        rvol_baseline: list[float | None] | None = None
+        if row[24]:
+            rvol_baseline = [float(v) if v is not None else None for v in row[24]]
+        setup_row = {
+            "trade_date": str(row[1] or trade_date),
+            "prev_day_close": float(row[2]) if row[2] is not None else None,
+            "tc": tc,
+            "bc": bc,
+            "pivot": float(row[5] or 0.0),
+            "r1": float(row[6] or 0.0),
+            "s1": float(row[7] or 0.0),
+            "r2": float(row[8] or 0.0),
+            "s2": float(row[9] or 0.0),
+            "atr": atr,
+            "cpr_width_pct": float(row[11] or 0.0),
+            "cpr_threshold": float(row[12] or 0.0),
+            "or_high_5": float(row[13] or 0.0),
+            "or_low_5": float(row[14] or 0.0),
+            "open_915": float(row[15] or 0.0),
+            "or_close_5": or_close_5,
+            "open_side": str(row[17] or ""),
+            "open_to_cpr_atr": float(row[18]) if row[18] is not None else None,
+            "gap_abs_pct": float(row[19]) if row[19] is not None else None,
+            "or_atr_5": float(row[20]) if row[20] is not None else None,
+            "direction": direction,
+            "is_narrowing": bool(row[22]),
+            "cpr_shift": str(row[23] or "OVERLAP"),
+            "rvol_baseline": rvol_baseline,
+            "setup_source": "market_day_state",
+        }
+        return setup_row
+
+    batch_rows: dict[str, tuple[Any, ...]] | None = None
+    use_batch_prefetch = load_setup_row is _ORIGINAL_LOAD_SETUP_ROW and bool(unique_symbols)
+    if use_batch_prefetch:
+        try:
+            from engine.paper_runtime import _MARKET_DB_READ_LOCK
+
+            db = get_dashboard_db()
+            placeholders = ", ".join(["?"] * len(unique_symbols))
+            query = f"""
+                SELECT
+                    m.symbol,
+                    m.trade_date::VARCHAR,
+                    m.prev_close,
+                    m.tc,
+                    m.bc,
+                    m."pivot",
+                    m.r1,
+                    m.s1,
+                    m.r2,
+                    m.s2,
+                    m.atr,
+                    m.cpr_width_pct,
+                    m.cpr_threshold_pct,
+                    m.or_high_5,
+                    m.or_low_5,
+                    m.open_915,
+                    m.or_close_5,
+                    s.open_side,
+                    s.open_to_cpr_atr,
+                    s.gap_abs_pct,
+                    s.or_atr_5,
+                    s.direction_5,
+                    m.is_narrowing,
+                    m.cpr_shift,
+                    p.rvol_baseline_arr
+                FROM market_day_state m
+                LEFT JOIN strategy_day_state s
+                  ON s.symbol = m.symbol
+                 AND s.trade_date = m.trade_date
+                LEFT JOIN intraday_day_pack p
+                  ON p.symbol = m.symbol
+                 AND p.trade_date = m.trade_date
+                WHERE m.trade_date = ?::DATE
+                  AND m.symbol IN ({placeholders})
+            """
+            with _MARKET_DB_READ_LOCK:
+                rows = db.con.execute(query, [trade_date, *unique_symbols]).fetchall()
+            batch_rows = {str(row[0]): row for row in rows}
+        except Exception:
+            logger.exception("Batch setup prefetch failed; falling back to serial loading")
+
+    if batch_rows is not None:
+        for symbol in unique_symbols:
+            state = runtime_state.symbols.setdefault(symbol, SymbolRuntimeState())
+            if state.setup_row is not None:
+                continue
+            row = batch_rows.get(symbol)
+            if row is None:
+                missing_symbols.append(symbol)
+                continue
+            setup_row = _hydrate_setup_row(symbol=symbol, row=row, live_candles=state.candles)
+            if setup_row is None:
+                continue
+            state.setup_row = setup_row
+            _log_setup_row_parity(symbol, trade_date, setup_row)
+    else:
+        for symbol in unique_symbols:
+            state = runtime_state.symbols.setdefault(symbol, SymbolRuntimeState())
+            if state.setup_row is not None:
+                continue
+            setup_row = load_setup_row(
+                symbol,
+                trade_date,
+                live_candles=state.candles,
+                or_minutes=candle_interval_minutes,
+                allow_live_fallback=runtime_state.allow_live_setup_fallback,
+            )
+            if setup_row is None:
+                missing_symbols.append(symbol)
+                continue
+            tc = float(setup_row.get("tc") or 0.0)
+            bc = float(setup_row.get("bc") or 0.0)
+            atr = float(setup_row.get("atr") or 0.0)
+            # Guard against caching incomplete fast-path setup rows.
+            # If these fields are unusable, keep the symbol unresolved so strict mode
+            # fails fast (or permissive mode can attempt late fallback reads).
+            if tc <= 0.0 or bc <= 0.0 or atr <= 0.0:
+                invalid_symbols.append((symbol, tc, bc, atr))
+                continue
+            setup_row.setdefault("setup_source", "market_day_state")
+            state.setup_row = setup_row
+            _log_setup_row_parity(symbol, trade_date, setup_row)
     if invalid_symbols:
         sample = ", ".join(
             f"{symbol}(tc={tc:.4f},bc={bc:.4f},atr={atr:.4f})"
@@ -296,15 +427,12 @@ def _prefetch_setup_rows(
     runtime_state.invalid_setup_rows += len(invalid_symbols)
 
 
-
-
 def _runtime_setup_status(runtime_state: PaperRuntimeState, symbol: str) -> str:
     state = runtime_state.symbols.get(symbol)
     if state is None or state.setup_row is None:
         return "pending"
     direction = str(state.setup_row.get("direction") or "").upper()
     return "candidate" if direction in {"LONG", "SHORT"} else "rejected"
-
 
 
 def _log_parity_trace(
@@ -535,6 +663,7 @@ async def run_live_session(
         }
 
     register_session_start()
+    _start_alert_dispatcher()  # start consumer eagerly so first alerts are not delayed
     if session.status != "ACTIVE":
         session = await _update_session(session_id, deps, status="ACTIVE", notes=notes)
 
@@ -562,6 +691,14 @@ async def run_live_session(
     )
     if deps is None:
         tracker.seed_open_positions(await get_session_positions(session_id, statuses=["OPEN"]))
+        # R2: on session resume, seed closed/flattened symbols so they cannot re-enter today.
+        # Two guards exist: tracker._closed_today (bar_orchestrator) and
+        # state.position_closed_today (paper_runtime). Both start empty; both need seeding.
+        for _closed_pos in await get_session_positions(
+            session_id, statuses=["CLOSED", "FLATTENED"]
+        ):
+            tracker.mark_traded(_closed_pos.symbol)
+            runtime_state.for_symbol(_closed_pos.symbol).position_closed_today = True
 
     use_websocket = ticker_adapter is not None or adapter is None
     local_ticker_created = False
@@ -593,7 +730,9 @@ async def run_live_session(
     last_ticker_tick_count = ticker_adapter.tick_count if ticker_adapter is not None else 0
     reconnect_alerted = False
     stale_alerted = False
+    last_stale_alert_ts: datetime | None = None
     alerts_enabled = deps is None
+    _stale_alert_cooldown_sec = 300  # 5 min between repeated FEED_STALE alerts
 
     try:
         print(
@@ -635,7 +774,11 @@ async def run_live_session(
             cycle_closed: list[ClosedCandle] = []
             latest_raw_state: dict[str, Any] | None = None
             last_price: float | None = None
-            local_feed = bool(use_websocket and ticker_adapter is not None and getattr(ticker_adapter, "_local_feed", False))
+            local_feed = bool(
+                use_websocket
+                and ticker_adapter is not None
+                and getattr(ticker_adapter, "_local_feed", False)
+            )
             local_feed_exhausted = False
 
             if use_websocket and ticker_adapter is not None:
@@ -724,29 +867,45 @@ async def run_live_session(
                             },
                         }
 
-                    driver_result = await paper_session_driver.process_closed_bar_group(
-                        session_id=session_id,
-                        session=current_session,
-                        bar_candles=bar_candles,
-                        runtime_state=runtime_state,
-                        tracker=tracker,
-                        params=params,
-                        active_symbols=active_symbols,
-                        strategy=strategy,
-                        direction_filter=direction_filter,
-                        stage_b_applied=stage_b_applied,
-                        symbol_last_prices=symbol_last_prices,
-                        last_price=last_price,
-                        evaluate_candle_fn=evaluate_candle,
-                        execute_entry_fn=execute_entry,
-                        enforce_risk_controls=enforce_session_risk_controls,
-                        build_feed_state=build_summary_feed_state,
-                        update_symbols_cb=(
-                            (lambda symbols: ticker_adapter.update_symbols(session_id, symbols))
-                            if use_websocket and ticker_adapter is not None
-                            else None
-                        ),
-                    )
+                    try:
+                        driver_result = await paper_session_driver.process_closed_bar_group(
+                            session_id=session_id,
+                            session=current_session,
+                            bar_candles=bar_candles,
+                            runtime_state=runtime_state,
+                            tracker=tracker,
+                            params=params,
+                            active_symbols=active_symbols,
+                            strategy=strategy,
+                            direction_filter=direction_filter,
+                            stage_b_applied=stage_b_applied,
+                            symbol_last_prices=symbol_last_prices,
+                            last_price=last_price,
+                            evaluate_candle_fn=evaluate_candle,
+                            execute_entry_fn=execute_entry,
+                            enforce_risk_controls=enforce_session_risk_controls,
+                            build_feed_state=build_summary_feed_state,
+                            update_symbols_cb=(
+                                (lambda symbols: ticker_adapter.update_symbols(session_id, symbols))
+                                if use_websocket and ticker_adapter is not None
+                                else None
+                            ),
+                        )
+                    except Exception:
+                        logger.exception(
+                            "[%s] Bar group processing failed bar_end=%s — halting session",
+                            session_id,
+                            bar_end,
+                        )
+                        if alerts_enabled:
+                            dispatch_session_error_alert(
+                                session_id=session_id,
+                                reason="bar_processing_error",
+                                details=f"bar_end={bar_end.isoformat()} symbols={len(bar_candles)}",
+                            )
+                        final_status = "FAILED"
+                        stop_requested = True
+                        break
                     active_symbols = list(driver_result["active_symbols"])
                     last_price = driver_result["last_price"]
                     stage_b_applied = bool(driver_result["stage_b_applied"])
@@ -774,7 +933,18 @@ async def run_live_session(
 
             stale = False
             if not local_feed and stale_timeout > 0 and last_snapshot_ts is not None:
-                stale = (now - last_snapshot_ts).total_seconds() > stale_timeout
+                elapsed = (now - last_snapshot_ts).total_seconds()
+                if elapsed > stale_timeout:
+                    # For WebSocket mode: if the connection is alive, symbols may just be quiet.
+                    # Low-liquidity stocks can go 30–90 s without a trade tick; that is not a
+                    # broken feed.  Only declare stale after 4× the base timeout (≥120 s) when
+                    # the WebSocket reports it is connected.  A genuinely broken connection will
+                    # be detected faster because is_connected flips to False when the handshake
+                    # drops, at which point we apply the normal (shorter) stale_timeout.
+                    if use_websocket and ticker_adapter is not None and ticker_adapter.is_connected:
+                        stale = elapsed > max(stale_timeout * 4, 120)
+                    else:
+                        stale = True
             if stale:
                 no_snapshot_streak += 1
                 await _write_feed_state(
@@ -801,6 +971,21 @@ async def run_live_session(
                 await _update_session(session_id, deps, stale_feed_at=now)
             else:
                 if use_websocket and ticker_adapter is not None and ticker_adapter.is_connected:
+                    if stale_alerted and no_snapshot_streak > 0:
+                        logger.warning(
+                            "[%s] market data feed recovered after %d stale cycles",
+                            session_id,
+                            no_snapshot_streak,
+                        )
+                        if alerts_enabled:
+                            dispatch_feed_recovered_alert(
+                                session_id=session_id,
+                                details=(
+                                    f"Recovered after {no_snapshot_streak} stale cycles."
+                                    f" Monitoring {len(tracker._open)} position(s)."
+                                ),
+                            )
+                        stale_alerted = False  # allow re-alert if it goes stale again
                     no_snapshot_streak = 0
                 if latest_raw_state is not None:
                     await _write_feed_state(
@@ -814,83 +999,204 @@ async def run_live_session(
                         raw_state=latest_raw_state,
                     )
 
+            # Alert once at streak=3, but stay alive to allow KiteConnect protocol-level
+            # reconnect to recover.  Only exit after 600s (10 min) of no data.
+            stale_exit_sec = 600
             if not local_feed and no_snapshot_streak >= 3:
-                if alerts_enabled and not stale_alerted:
+                _stale_cooldown_ok = last_stale_alert_ts is None or (
+                    now - last_stale_alert_ts
+                ).total_seconds() > _stale_alert_cooldown_sec
+                if alerts_enabled and not stale_alerted and _stale_cooldown_ok:
                     stale_alerted = True
+                    last_stale_alert_ts = now
                     last_snapshot = last_snapshot_ts.isoformat() if last_snapshot_ts else "none"
-                    dispatch_session_error_alert(
+                    # Build open-position details so the alert can serve as a manual-order guide.
+                    open_pos_lines: list[str] = []
+                    for sym, pos in tracker._open.items():
+                        open_pos_lines.append(
+                            f"{sym} {pos.direction} entry={pos.entry_price:.2f}"
+                            f" SL={pos.stop_loss:.2f} tgt={pos.target_price:.2f}"
+                            f" qty={int(pos.current_qty)}"
+                        )
+                    pos_detail = (
+                        ("\nOPEN POSITIONS — place manual SL orders:\n" + "\n".join(open_pos_lines))
+                        if open_pos_lines
+                        else "\nNo open positions."
+                    )
+                    dispatch_feed_stale_alert(
                         session_id=session_id,
-                        reason="market_data_stale",
                         details=(
                             f"transport={'websocket' if use_websocket else 'rest'}"
-                            f" no_snapshot_streak={no_snapshot_streak}"
-                            f" last_snapshot_ts={last_snapshot}"
+                            f" streak={no_snapshot_streak}"
+                            f" last_tick={last_snapshot}"
+                            + pos_detail
                         ),
                     )
-                final_status = "STALE"
-                break
+                stale_duration_sec = (
+                    (now - last_snapshot_ts).total_seconds() if last_snapshot_ts else 0
+                )
+                if stale_duration_sec > stale_exit_sec:
+                    logger.warning(
+                        "[%s] market data stale for %.0fs (limit %ds) — terminating",
+                        session_id,
+                        stale_duration_sec,
+                        stale_exit_sec,
+                    )
+                    final_status = "STALE"
+                    break
 
             await _sleep(deps, supervision_sleep)
     finally:
-        flush_candles: list[ClosedCandle] = []
-        if use_websocket and ticker_adapter is not None:
-            ticker_adapter.synthesize_quiet_symbols(session_id, active_symbols, _session_now(deps))
-            flush_candles.extend(ticker_adapter.drain_closed(session_id))
-        flush_candles.extend(builder.flush())
-        if flush_candles:
-            flush_bars_by_end: dict[datetime, list[ClosedCandle]] = {}
-            for candle in flush_candles:
-                flush_bars_by_end.setdefault(candle.bar_end, []).append(candle)
-            for bar_end in sorted(flush_bars_by_end):
-                bar_candles = sorted(flush_bars_by_end[bar_end], key=lambda c: c.symbol)
-                for candle in bar_candles:
-                    closed_bars += 1
-                    last_bar_ts = candle.bar_end
-                    symbol_last_prices[candle.symbol] = candle.close
-                    state = runtime_state.symbols.get(candle.symbol)
-                    setup_row = state.setup_row if state is not None else None
-                    _log_parity_trace(session_id=session_id, candle=candle, setup_row=setup_row)
-                driver_result = await paper_session_driver.process_closed_bar_group(
-                    session_id=session_id,
-                    session=session,
-                    bar_candles=bar_candles,
-                    runtime_state=runtime_state,
-                    tracker=tracker,
-                    params=params,
-                    active_symbols=active_symbols,
-                    strategy=strategy,
-                    direction_filter=direction_filter,
-                    stage_b_applied=stage_b_applied,
-                    symbol_last_prices=symbol_last_prices,
-                    last_price=last_price,
-                    evaluate_candle_fn=evaluate_candle,
-                    execute_entry_fn=execute_entry,
-                    enforce_risk_controls=enforce_session_risk_controls,
-                    build_feed_state=build_summary_feed_state,
+        # Fix 1: guard the flush so a candle-processing error cannot skip the mandatory
+        # cleanup steps (adapter teardown, position flatten, alert dispatcher shutdown).
+        try:
+            flush_candles: list[ClosedCandle] = []
+            if use_websocket and ticker_adapter is not None:
+                ticker_adapter.synthesize_quiet_symbols(
+                    session_id, active_symbols, _session_now(deps)
                 )
-                active_symbols = list(driver_result["active_symbols"])
-                last_price = driver_result["last_price"]
-                stage_b_applied = bool(driver_result["stage_b_applied"])
+                flush_candles.extend(ticker_adapter.drain_closed(session_id))
+            flush_candles.extend(builder.flush())
+            if flush_candles:
+                flush_bars_by_end: dict[datetime, list[ClosedCandle]] = {}
+                for candle in flush_candles:
+                    flush_bars_by_end.setdefault(candle.bar_end, []).append(candle)
+                for bar_end in sorted(flush_bars_by_end):
+                    bar_candles = sorted(flush_bars_by_end[bar_end], key=lambda c: c.symbol)
+                    for candle in bar_candles:
+                        closed_bars += 1
+                        last_bar_ts = candle.bar_end
+                        symbol_last_prices[candle.symbol] = candle.close
+                        state = runtime_state.symbols.get(candle.symbol)
+                        setup_row = state.setup_row if state is not None else None
+                        _log_parity_trace(
+                            session_id=session_id, candle=candle, setup_row=setup_row
+                        )
+                    driver_result = await paper_session_driver.process_closed_bar_group(
+                        session_id=session_id,
+                        session=session,
+                        bar_candles=bar_candles,
+                        runtime_state=runtime_state,
+                        tracker=tracker,
+                        params=params,
+                        active_symbols=active_symbols,
+                        strategy=strategy,
+                        direction_filter=direction_filter,
+                        stage_b_applied=stage_b_applied,
+                        symbol_last_prices=symbol_last_prices,
+                        last_price=last_price,
+                        evaluate_candle_fn=evaluate_candle,
+                        execute_entry_fn=execute_entry,
+                        enforce_risk_controls=enforce_session_risk_controls,
+                        build_feed_state=build_summary_feed_state,
+                    )
+                    active_symbols = list(driver_result["active_symbols"])
+                    last_price = driver_result["last_price"]
+                    stage_b_applied = bool(driver_result["stage_b_applied"])
+        except Exception:
+            logger.exception("[%s] Final flush failed — some candles may be dropped", session_id)
+            final_status = "FAILED"
+            if alerts_enabled:
+                dispatch_session_error_alert(
+                    session_id=session_id,
+                    reason="session_finalize_failed",
+                    details=(
+                        "final_flush failed while draining remaining candles; "
+                        "session will fail closed and may need reconciliation."
+                    ),
+                )
+
+        # Adapter teardown — always runs even if flush raised.
         if use_websocket and ticker_adapter is not None:
             ticker_adapter.unregister_session(session_id)
             if local_ticker_created:
                 ticker_adapter.close()
+
+        # Position flatten — always runs.
         if final_status in {"COMPLETED", "NO_ACTIVE_SYMBOLS", "NO_TRADES_ENTRY_WINDOW_CLOSED"}:
             try:
                 await flatten_session_positions(session_id, notes=notes or "session flatten")
             except Exception:
                 logger.debug("Final EOD flatten/summary failed (best-effort)", exc_info=True)
+        elif final_status in {"STALE", "FAILED"} and tracker.open_count > 0:
+            # Auto-flatten on abnormal exit so positions don't linger overnight.
+            try:
+                logger.warning(
+                    "[%s] %s exit with %d open position(s) — auto-flattening",
+                    session_id,
+                    final_status,
+                    tracker.open_count,
+                )
+                await flatten_session_positions(
+                    session_id, notes=f"{final_status}_AUTO_FLATTEN"
+                )
+            except Exception:
+                # Fix 2: alert operator when auto-flatten itself fails — orphaned positions.
+                logger.exception(
+                    "[%s] %s auto-flatten failed — positions may be orphaned",
+                    session_id,
+                    final_status,
+                )
+                if alerts_enabled:
+                    dispatch_session_error_alert(
+                        session_id=session_id,
+                        reason="auto_flatten_failed",
+                        details=(
+                            f"{final_status} exit; {tracker.open_count} position(s) may be orphaned."
+                            " Check paper.duckdb and close manually in Kite."
+                        ),
+                    )
+
         await maybe_shutdown_alert_dispatcher()
 
-    await paper_session_driver.complete_session(
-        session_id=session_id,
-        complete_on_exit=complete_on_exit
-        or final_status in {"NO_ACTIVE_SYMBOLS", "NO_TRADES_ENTRY_WINDOW_CLOSED", "COMPLETED"},
-        last_bar_ts=last_bar_ts,
-        stale_timeout=stale_timeout,
-        notes=notes,
-        update_session_state=lambda sid, **kwargs: _update_session(sid, deps, **kwargs),
-    )
+    # Fix 3: stamp STALE/FAILED into the DB now so the session is never left looking
+    # "ACTIVE" after the loop exits.  complete_session() below only writes COMPLETED
+    # when complete_on_exit=True; for other statuses it only updates timestamps.
+    if final_status in {"STALE", "FAILED"}:
+        try:
+            # STALE is not a valid DB status (CHECK constraint). Map it to FAILED
+            # with a note so the resume path can detect it. The internal final_status
+            # variable stays "STALE" for flow-control below (auto-flatten, etc.).
+            db_status = "FAILED" if final_status == "STALE" else final_status
+            db_notes = f"stale_exit: {notes}" if final_status == "STALE" else notes
+            await _update_session(session_id, deps, status=db_status, notes=db_notes)
+        except Exception:
+            logger.debug(
+                "[%s] Failed to stamp terminal status %s", session_id, final_status, exc_info=True
+            )
+
+    try:
+        await paper_session_driver.complete_session(
+            session_id=session_id,
+            complete_on_exit=complete_on_exit
+            or final_status in {"NO_ACTIVE_SYMBOLS", "NO_TRADES_ENTRY_WINDOW_CLOSED", "COMPLETED"},
+            last_bar_ts=last_bar_ts,
+            stale_timeout=stale_timeout,
+            notes=notes,
+            update_session_state=lambda sid, **kwargs: _update_session(sid, deps, **kwargs),
+        )
+    except Exception:
+        logger.exception("[%s] Final session completion failed", session_id)
+        final_status = "FAILED"
+        if alerts_enabled:
+            dispatch_session_error_alert(
+                session_id=session_id,
+                reason="session_finalize_failed",
+                details=(
+                    f"final_status={final_status} last_bar_ts="
+                    f"{last_bar_ts.isoformat() if last_bar_ts else 'none'}"
+                    f" complete_on_exit={complete_on_exit}"
+                ),
+            )
+        try:
+            await _update_session(session_id, deps, status=final_status)
+        except Exception:
+            logger.debug(
+                "[%s] Failed to stamp fallback terminal status %s",
+                session_id,
+                final_status,
+                exc_info=True,
+            )
     if complete_on_exit or final_status in {
         "NO_ACTIVE_SYMBOLS",
         "NO_TRADES_ENTRY_WINDOW_CLOSED",

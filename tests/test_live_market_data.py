@@ -14,6 +14,30 @@ from engine.live_market_data import FiveMinuteCandleBuilder, MarketSnapshot
 from scripts.paper_live import LiveSessionDeps, run_live_session
 
 
+@pytest.fixture(autouse=True)
+def _disable_live_alert_dispatcher(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def _noop_async() -> None:
+        return None
+
+    monkeypatch.setattr("scripts.paper_live._start_alert_dispatcher", lambda: None)
+    monkeypatch.setattr("scripts.paper_live.maybe_shutdown_alert_dispatcher", _noop_async)
+    monkeypatch.setattr(
+        "scripts.paper_live.get_paper_db",
+        lambda: SimpleNamespace(
+            get_feed_state=lambda session_id: FeedState(
+                session_id=session_id,
+                status="OK",
+                stale_reason=None,
+                last_price=None,
+                last_event_ts=None,
+                last_bar_ts=None,
+                raw_state={},
+                updated_at=datetime(2024, 1, 1, 9, 15),
+            )
+        ),
+    )
+
+
 def test_five_minute_candle_builder_emits_closed_bars() -> None:
     builder = FiveMinuteCandleBuilder(interval_minutes=5)
 
@@ -242,6 +266,112 @@ async def test_run_live_session_marks_stale_then_recovers(monkeypatch: pytest.Mo
 
 
 @pytest.mark.asyncio
+async def test_run_live_session_fails_closed_when_finalization_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = SimpleNamespace(
+        session_id="sess-finalize",
+        status="ACTIVE",
+        symbols=["SBIN"],
+        strategy="CPR_LEVELS",
+        strategy_params={},
+        stale_feed_timeout_sec=30,
+    )
+    updates: list[dict[str, object]] = []
+    feed_states: list[dict[str, object]] = []
+
+    async def fake_session_loader(session_id: str):
+        assert session_id == "sess-finalize"
+        return session
+
+    async def fake_session_updater(session_id: str, **kwargs):
+        assert session_id == "sess-finalize"
+        updates.append(dict(kwargs))
+        if "status" in kwargs:
+            session.status = str(kwargs["status"])
+        return session
+
+    async def fake_feed_writer(**kwargs):
+        feed_states.append(kwargs)
+        return SimpleNamespace(**kwargs)
+
+    async def fake_feed_reader(session_id: str):
+        return FeedState(
+            session_id=session_id,
+            status="OK",
+            last_event_ts=None,
+            last_bar_ts=None,
+            last_price=None,
+            stale_reason=None,
+            raw_state={},
+            updated_at=datetime(2024, 1, 1, 9, 15),
+        )
+
+    class OneShotAdapter:
+        def __init__(self):
+            self.calls = 0
+
+        def poll(self, symbols):
+            self.calls += 1
+            if self.calls == 1:
+                return [
+                    MarketSnapshot(
+                        symbol="SBIN",
+                        ts=datetime(2024, 1, 1, 9, 15),
+                        last_price=100.0,
+                        volume=10.0,
+                    )
+                ]
+            return []
+
+    async def fake_sleep(_: float) -> None:
+        return None
+
+    async def fake_risk_enforcer(**kwargs):
+        return {"triggered": False, "daily_pnl_used": 0.0, "reasons": []}
+
+    async def fake_evaluate_candle(**kwargs):
+        return {
+            "symbol": kwargs["candle"].symbol,
+            "action": "SKIP",
+            "reason": "setup_ready",
+            "setup_status": "pending",
+            "candidate": None,
+            "advance_result": None,
+            "setup_row": None,
+        }
+
+    async def fake_complete_session(**kwargs):
+        raise RuntimeError("finalize failed")
+
+    monkeypatch.setattr("scripts.paper_live.enforce_session_risk_controls", fake_risk_enforcer)
+    monkeypatch.setattr("scripts.paper_live.evaluate_candle", fake_evaluate_candle)
+    monkeypatch.setattr(
+        "scripts.paper_live.paper_session_driver.complete_session", fake_complete_session
+    )
+
+    result = await run_live_session(
+        session_id="sess-finalize",
+        adapter=OneShotAdapter(),
+        poll_interval_sec=0,
+        candle_interval_minutes=5,
+        max_cycles=2,
+        deps=LiveSessionDeps(
+            session_loader=fake_session_loader,
+            session_updater=fake_session_updater,
+            feed_writer=fake_feed_writer,
+            feed_reader=fake_feed_reader,
+            sleep_fn=fake_sleep,
+            now_fn=lambda: datetime(2024, 1, 1, 9, 15, 10),
+        ),
+    )
+
+    assert result["final_status"] == "FAILED"
+    assert any(update.get("status") == "FAILED" for update in updates)
+    assert feed_states
+
+
+@pytest.mark.asyncio
 async def test_run_live_session_uses_websocket_path_when_ticker_adapter_is_provided() -> None:
     session = SimpleNamespace(
         session_id="sess-ws",
@@ -331,6 +461,110 @@ async def test_run_live_session_uses_websocket_path_when_ticker_adapter_is_provi
     assert ticker_adapter.unregister_calls == ["sess-ws"]
     assert ticker_adapter.close_called is False
     assert result["poll_interval_sec"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_run_live_session_fails_closed_when_bar_processing_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = SimpleNamespace(
+        session_id="sess-bar-fail",
+        status="ACTIVE",
+        symbols=["SBIN"],
+        strategy="CPR_LEVELS",
+        strategy_params={},
+        stale_feed_timeout_sec=30,
+    )
+    updates: list[dict[str, object]] = []
+
+    async def fake_session_loader(session_id: str):
+        assert session_id == "sess-bar-fail"
+        return session
+
+    async def fake_session_updater(session_id: str, **kwargs):
+        assert session_id == "sess-bar-fail"
+        updates.append(dict(kwargs))
+        if "status" in kwargs:
+            session.status = str(kwargs["status"])
+        return session
+
+    async def fake_feed_writer(**kwargs):
+        return SimpleNamespace(**kwargs)
+
+    async def fake_feed_reader(session_id: str):
+        return FeedState(
+            session_id=session_id,
+            status="OK",
+            last_event_ts=None,
+            last_bar_ts=None,
+            last_price=None,
+            stale_reason=None,
+            raw_state={},
+            updated_at=datetime(2024, 1, 1, 9, 15),
+        )
+
+    class OneShotAdapter:
+        def __init__(self):
+            self.calls = 0
+
+        def poll(self, symbols):
+            self.calls += 1
+            if self.calls == 1:
+                return [
+                    MarketSnapshot(
+                        symbol="SBIN",
+                        ts=datetime(2024, 1, 1, 9, 15),
+                        last_price=100.0,
+                        volume=10.0,
+                    )
+                ]
+            return []
+
+    async def fake_sleep(_: float) -> None:
+        return None
+
+    async def fake_risk_enforcer(**kwargs):
+        return {"triggered": False, "daily_pnl_used": 0.0, "reasons": []}
+
+    async def fake_evaluate_candle(**kwargs):
+        return {
+            "symbol": kwargs["candle"].symbol,
+            "action": "SKIP",
+            "reason": "setup_ready",
+            "setup_status": "pending",
+            "candidate": None,
+            "advance_result": None,
+            "setup_row": None,
+        }
+
+    async def fake_process_closed_bar_group(**kwargs):
+        raise RuntimeError("bar processing failed")
+
+    monkeypatch.setattr("scripts.paper_live.enforce_session_risk_controls", fake_risk_enforcer)
+    monkeypatch.setattr("scripts.paper_live.evaluate_candle", fake_evaluate_candle)
+    monkeypatch.setattr(
+        "scripts.paper_live.paper_session_driver.process_closed_bar_group",
+        fake_process_closed_bar_group,
+    )
+
+    result = await run_live_session(
+        session_id="sess-bar-fail",
+        adapter=OneShotAdapter(),
+        poll_interval_sec=0,
+        candle_interval_minutes=5,
+        max_cycles=2,
+        deps=LiveSessionDeps(
+            session_loader=fake_session_loader,
+            session_updater=fake_session_updater,
+            feed_writer=fake_feed_writer,
+            feed_reader=fake_feed_reader,
+            sleep_fn=fake_sleep,
+            now_fn=lambda: datetime(2024, 1, 1, 9, 15, 10),
+        ),
+    )
+
+    assert result["final_status"] == "FAILED"
+    assert any(update.get("status") == "FAILED" for update in updates)
 @pytest.mark.asyncio
 async def test_run_live_session_applies_stage_b_direction_filter(
     monkeypatch: pytest.MonkeyPatch,
@@ -467,6 +701,7 @@ async def test_run_live_session_breaks_after_repeated_empty_polls(
         status="ACTIVE",
         symbols=["SBIN"],
         strategy="CPR_LEVELS",
+        strategy_params={},
         stale_feed_timeout_sec=60,
     )
 
@@ -492,7 +727,21 @@ async def test_run_live_session_breaks_after_repeated_empty_polls(
         )
 
     class EmptyAdapter:
+        def __init__(self):
+            self.calls = 0
+
         def poll(self, symbols):
+            del symbols
+            self.calls += 1
+            if self.calls == 1:
+                return [
+                    MarketSnapshot(
+                        symbol="SBIN",
+                        ts=datetime(2024, 1, 1, 9, 15),
+                        last_price=100.0,
+                        volume=10.0,
+                    )
+                ]
             return []
 
     async def fake_sleep(_: float) -> None:
@@ -503,9 +752,11 @@ async def test_run_live_session_breaks_after_repeated_empty_polls(
 
     monkeypatch.setattr("scripts.paper_live.enforce_session_risk_controls", fake_risk_enforcer)
 
+    adapter = EmptyAdapter()
+
     result = await run_live_session(
         session_id="sess-2",
-        adapter=EmptyAdapter(),
+        adapter=adapter,
         poll_interval_sec=0,
         candle_interval_minutes=5,
         deps=LiveSessionDeps(
@@ -514,7 +765,15 @@ async def test_run_live_session_breaks_after_repeated_empty_polls(
             feed_writer=fake_feed_writer,
             feed_reader=fake_feed_reader,
             sleep_fn=fake_sleep,
-            now_fn=lambda: datetime(2024, 1, 1, 9, 18),
+            now_fn=lambda: (
+                datetime(2024, 1, 1, 9, 15, 10)
+                if adapter.calls <= 1
+                else (
+                    datetime(2024, 1, 1, 9, 25, 10)
+                    if adapter.calls == 2
+                    else datetime(2024, 1, 1, 9, 26, 10)
+                )
+            ),
         ),
     )
 

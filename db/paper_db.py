@@ -66,7 +66,7 @@ class PaperSession:
     direction: str = "BOTH"
     name: str | None = None
     created_by: str | None = None
-    stale_feed_timeout_sec: int = 120
+    stale_feed_timeout_sec: int = 30
     portfolio_value: float = 1_000_000.0
     max_daily_loss_pct: float = 0.03
     max_drawdown_pct: float = 0.10
@@ -322,7 +322,7 @@ class PaperDB:
         execution_mode: str = "LIVE",
         strategy_params: dict | None = None,
         created_by: str | None = None,
-        stale_feed_timeout_sec: int = 120,
+        stale_feed_timeout_sec: int = 30,
         portfolio_value: float = 1_000_000.0,
         max_daily_loss_pct: float = 0.03,
         max_drawdown_pct: float = 0.10,

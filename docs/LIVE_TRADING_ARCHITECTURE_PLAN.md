@@ -1,5 +1,9 @@
 # Live Trading Architecture Plan
 
+> Historical planning doc. The current operator source of truth is `docs/PAPER_TRADING_RUNBOOK.md`.
+> This file is kept for design history and remaining backlog context; when it conflicts with the
+> runbook, the runbook wins.
+
 ## Goals
 
 1. **Full parity**: Backtest, paper-replay, and paper-live must produce identical
@@ -1586,8 +1590,9 @@ The `--portfolio-value` flag allows changing the base capital (e.g., ₹500K on 
   - `load_setup_row()` fallback from live candles is disabled in replay and disabled in live by default.
   - Missing same-day `market_day_state` rows are tolerated and skipped so small gaps do not
     force a rebuild.
-  - If you intentionally need candle-derived recovery for a late start, use the explicit CLI flag:
-    - `--allow-late-start-fallback`
+  - Historical note: early drafts allowed candle-derived recovery for a late start via
+    `--allow-late-start-fallback`. That path is no longer the default operator flow and is kept
+    here only as design history.
 
 5. CPR-only policy enforced in paper workflows
 - `pivot-paper-trading` strategy and preset surface now enforce CPR-only execution.
@@ -1708,7 +1713,8 @@ The `--portfolio-value` flag allows changing the base capital (e.g., ₹500K on 
 - Previous temporary continuity fallback was kept to unblock intraday testing.
 - Final operational default is now strict for invalid setup rows, while missing same-day
   `market_day_state` rows are skipped instead of forcing another build.
-- Late-start fallback, when needed, is explicit and CLI-driven (`--allow-late-start-fallback`).
+- Historical note: late-start fallback was once CLI-driven (`--allow-late-start-fallback`).
+  The current operator flow no longer relies on that path.
 
 ### Pending / Open (Post Phase 0–5)
 

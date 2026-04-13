@@ -1023,3 +1023,114 @@ async def test_enforce_session_risk_controls_flattens_on_max_drawdown(
     assert result["reasons"] == ["max_drawdown:5000.00"]
     assert session_updates[0]["daily_pnl_used"] == pytest.approx(-5500.0)
     assert "max_drawdown:5000.00" in str(flatten_calls[0]["notes"])
+
+
+@pytest.mark.asyncio
+async def test_flatten_session_positions_uses_ist_closed_at_and_dispatches_per_trade_alert(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    flatten_session_positions must:
+    1. Pass a timezone-aware IST closed_at to update_position (not UTC naive).
+       Bug: omitting closed_at caused datetime.utcnow() fallback → 15:10 IST stored as 09:40 UTC.
+    2. Dispatch a TRADE_CLOSED alert for each force-closed position.
+       Bug: only FLATTEN_EOD was dispatched; per-position alerts were missing.
+    3. Still dispatch exactly one FLATTEN_EOD at the end.
+    """
+    from engine.alert_dispatcher import AlertType
+    from engine.paper_runtime import (
+        flatten_session_positions,
+        set_alert_sink,
+        set_alerts_suppressed,
+    )
+
+    session = SimpleNamespace(
+        session_id="test-flatten-1",
+        strategy="CPR_LEVELS",
+        strategy_params={},
+        max_positions=10,
+        max_daily_loss_pct=0.0,
+        max_position_pct=0.1,
+        portfolio_value=1_000_000.0,
+        trade_date="2026-04-13",
+    )
+
+    open_position = SimpleNamespace(
+        position_id="pos-1",
+        session_id="test-flatten-1",
+        symbol="SUKHJITS",
+        direction="SHORT",
+        status="OPEN",
+        entry_price=175.90,
+        current_qty=568.0,
+        quantity=568.0,
+        stop_loss=180.0,
+        target_price=165.0,
+        last_price=176.34,
+        trail_state={},
+        realized_pnl=None,
+        opened_by="CPR_LEVELS",
+    )
+
+    update_position_calls: list[dict] = []
+
+    async def fake_get_session(session_id: str):
+        return session
+
+    async def fake_get_session_positions(session_id: str, *, symbol=None, statuses=None):
+        if statuses == ["OPEN"]:
+            return [open_position]
+        return []  # all_closed for EOD summary count
+
+    async def fake_append_order_event(**kwargs):
+        pass
+
+    async def fake_update_position(position_id: str, **kwargs):
+        update_position_calls.append({"position_id": position_id, **kwargs})
+
+    async def fake_update_session_state(session_id: str, **kwargs):
+        pass
+
+    class _FakeCon:
+        def execute(self, sql: str, params: list):
+            # FLATTEN_EOD dedup check — report "not yet sent"
+            return SimpleNamespace(fetchone=lambda: (0,))
+
+    class _FakeDB:
+        con = _FakeCon()
+
+    monkeypatch.setattr("engine.paper_runtime.get_session", fake_get_session)
+    monkeypatch.setattr("engine.paper_runtime.get_session_positions", fake_get_session_positions)
+    monkeypatch.setattr("engine.paper_runtime.append_order_event", fake_append_order_event)
+    monkeypatch.setattr("engine.paper_runtime.update_position", fake_update_position)
+    monkeypatch.setattr("engine.paper_runtime.update_session_state", fake_update_session_state)
+    monkeypatch.setattr("engine.paper_runtime._db", lambda: _FakeDB())
+
+    dispatched: list[tuple] = []
+    set_alerts_suppressed(False)
+    set_alert_sink(lambda t, s, b: dispatched.append((t, s, b)))
+    try:
+        feed_state = SimpleNamespace(raw_state={"symbol_last_prices": {"SUKHJITS": 176.34}})
+        result = await flatten_session_positions("test-flatten-1", notes="eod", feed_state=feed_state)
+    finally:
+        set_alert_sink(None)
+        set_alerts_suppressed(False)
+
+    # closed_at must be IST-aware — not UTC naive (the pre-fix bug)
+    assert len(update_position_calls) == 1
+    closed_at = update_position_calls[0].get("closed_at")
+    assert closed_at is not None, "closed_at must be passed to update_position when status=CLOSED"
+    assert closed_at.tzinfo is not None, "closed_at must be timezone-aware (was UTC-naive before fix)"
+    assert str(closed_at.tzinfo) == "Asia/Kolkata", f"expected IST tz, got {closed_at.tzinfo}"
+
+    # per-position TRADE_CLOSED must fire for every force-flattened symbol
+    trade_closed = [d for d in dispatched if d[0] == AlertType.TRADE_CLOSED]
+    assert len(trade_closed) == 1, f"expected 1 TRADE_CLOSED alert, got {len(trade_closed)}"
+    assert "SUKHJITS" in trade_closed[0][1], "TRADE_CLOSED subject must contain the symbol"
+    assert "AUTO_FLATTEN" in trade_closed[0][1], "TRADE_CLOSED subject must say AUTO_FLATTEN"
+
+    # exactly one FLATTEN_EOD summary at the end
+    eod = [d for d in dispatched if d[0] == AlertType.FLATTEN_EOD]
+    assert len(eod) == 1, f"expected 1 FLATTEN_EOD alert, got {len(eod)}"
+
+    assert result["closed_positions"] == 1

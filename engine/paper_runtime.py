@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from datetime import time as dt_time
 from typing import Any, cast
+from zoneinfo import ZoneInfo
 
 from db.duckdb import get_dashboard_db
 from db.paper_db import FeedState, PaperPosition, PaperSession, get_paper_db
@@ -37,6 +38,8 @@ from engine.strategy_presets import (
 )
 
 logger = logging.getLogger(__name__)
+
+_IST = ZoneInfo("Asia/Kolkata")
 
 BacktestParams = StrategyConfig
 
@@ -319,6 +322,38 @@ def dispatch_session_error_alert(
     if details:
         body += f"\nDetails: {details}"
     _dispatch_alert(AlertType.SESSION_ERROR, subject, body)
+
+
+def dispatch_feed_stale_alert(
+    *,
+    session_id: str,
+    details: str | None = None,
+) -> None:
+    """Emit a FEED_STALE alert distinct from SESSION_ERROR.
+
+    Use this for market-data gaps (quiet symbols, WebSocket timeout) so operators
+    can filter feed events separately from genuine session failures.
+    """
+    session_tag = str(session_id or "")[:16]
+    subject = f"FEED_STALE {session_tag}"
+    body = f"Session: <code>{session_tag}</code>\nMarket data feed is stale."
+    if details:
+        body += f"\n{details}"
+    _dispatch_alert(AlertType.FEED_STALE, subject, body)
+
+
+def dispatch_feed_recovered_alert(
+    *,
+    session_id: str,
+    details: str | None = None,
+) -> None:
+    """Emit a FEED_RECOVERED alert when market data resumes after a stale period."""
+    session_tag = str(session_id or "")[:16]
+    subject = f"FEED_RECOVERED {session_tag}"
+    body = f"Session: <code>{session_tag}</code>\nMarket data feed recovered."
+    if details:
+        body += f"\n{details}"
+    _dispatch_alert(AlertType.FEED_RECOVERED, subject, body)
 
 
 def _hhmm(value: datetime | None) -> str | None:
@@ -785,6 +820,17 @@ def load_setup_row(
     )
     if direction == "NONE" and or_close_5 is None:
         direction = str(row[20] or "NONE")
+    # market_day_state row exists (pre-market ASOF ATR build) but 9:15 data not yet
+    # available (or_close_5 NULL, strategy_day_state not yet built).  If live candles
+    # have arrived, derive direction from them instead of falling back to _load_live_setup_row.
+    if direction == "NONE" and live_candles:
+        intraday = _build_intraday_summary(live_candles, or_minutes=or_minutes)
+        live_or_close_5 = intraday.get("or_close_5")
+        if live_or_close_5 is not None:
+            direction = resolve_cpr_direction(
+                live_or_close_5, float(row[2] or 0.0), float(row[3] or 0.0), fallback="NONE"
+            )
+            or_close_5 = live_or_close_5  # use live close for is_narrowing/entry checks
 
     # Load rvol_baseline_arr from intraday_day_pack so RVOL filtering matches backtest.
     rvol_baseline: list[float | None] | None = None
@@ -993,6 +1039,7 @@ async def flatten_session_positions(
 
     closed: list[dict[str, Any]] = []
     total_realized = 0.0
+    now_ist = datetime.now(tz=_IST)
     for position in positions:
         close_price = _close_price_for_position(position, price_map)
         realized = _realized_pnl_for_close(position, close_price, params=params)
@@ -1019,8 +1066,30 @@ async def flatten_session_positions(
             close_price=close_price,
             realized_pnl=realized,
             closed_by="MANUAL_FLATTEN",
+            closed_at=now_ist,
             trail_state={**(position.trail_state or {}), "close_reason": "MANUAL_FLATTEN"},
         )
+        # Dispatch individual TRADE_CLOSED alert so the user sees the position close
+        # in Telegram immediately — not just in the EOD summary.
+        try:
+            subject, body = _format_close_alert(
+                symbol=position.symbol,
+                direction=str(position.direction),
+                entry_price=float(position.entry_price or 0),
+                close_price=close_price,
+                reason="AUTO_FLATTEN",
+                realized_pnl=realized,
+                strategy=str(getattr(position, "opened_by", "")),
+                session_id=str(position.session_id),
+                event_time=now_ist,
+            )
+            _dispatch_alert(AlertType.TRADE_CLOSED, subject, body)
+        except Exception:
+            logger.debug(
+                "Alert dispatch for flatten trade %s failed (best-effort)",
+                position.symbol,
+                exc_info=True,
+            )
         closed.append(
             {
                 "position_id": position.position_id,
@@ -1031,22 +1100,35 @@ async def flatten_session_positions(
 
     await update_session_state(session_id, status="STOPPING", notes=notes)
     # Always send EOD summary — even if no positions needed force-closing
-    # (they may have exited earlier via SL/target)
+    # (they may have exited earlier via SL/target).
+    # Guard: only fire once per session_id (multiple processes / resume runs can
+    # each call flatten_session_positions — only the first should send the alert).
     all_closed = await get_session_positions(session_id, statuses=["CLOSED"])
     total_trades = len(all_closed) + len(closed)
     # Sum P&L from all closed positions when no force-closes happened
     if not closed and all_closed:
         total_realized = sum(float(p.realized_pnl or 0) for p in all_closed)
     try:
-        subject, body = _format_risk_alert(
-            reason=notes or "session flatten",
-            net_pnl=total_realized,
-            session_id=session_id,
-            positions_closed=len(closed),
-            total_trades=total_trades,
-            trade_date=getattr(session, "trade_date", None),
+        already_sent = (
+            _db()
+            .con.execute(
+                "SELECT COUNT(*) FROM alert_log WHERE alert_type = 'FLATTEN_EOD' AND subject LIKE ?",
+                [f"%{str(session_id)[:16]}%"],
+            )
+            .fetchone()[0]
         )
-        _dispatch_alert(AlertType.FLATTEN_EOD, subject, body)
+        if already_sent:
+            logger.debug("FLATTEN_EOD already sent for session %s — skipping duplicate", session_id)
+        else:
+            subject, body = _format_risk_alert(
+                reason=notes or "session flatten",
+                net_pnl=total_realized,
+                session_id=session_id,
+                positions_closed=len(closed),
+                total_trades=total_trades,
+                trade_date=getattr(session, "trade_date", None),
+            )
+            _dispatch_alert(AlertType.FLATTEN_EOD, subject, body)
     except Exception:
         logger.debug("Alert dispatch for flatten failed (best-effort)", exc_info=True)
     return {"session_id": session_id, "closed_positions": len(closed), "positions": closed}
@@ -1156,8 +1238,8 @@ def _entry_candidate(
     if direction == "SHORT" and target_for_rr >= fill_price:
         return None
 
-    capital_for_sizing = float(capital_base) if capital_base is not None else float(
-        params.portfolio_value or 0.0
+    capital_for_sizing = (
+        float(capital_base) if capital_base is not None else float(params.portfolio_value or 0.0)
     )
     risk_capital = (
         float(capital_base)
