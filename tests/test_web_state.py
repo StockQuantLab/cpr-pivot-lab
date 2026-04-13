@@ -1,0 +1,402 @@
+"""Tests for dashboard state helpers."""
+
+from __future__ import annotations
+
+from pathlib import Path
+from types import SimpleNamespace
+
+import polars as pl
+import pytest
+
+import web.state as web_state
+from db.backtest_db import BacktestDB
+from db.duckdb import MarketDB
+
+
+@pytest.mark.asyncio
+async def test_aget_paper_session_snapshot_uses_postgres_live_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, str]] = []
+
+    async def fake_get_session(session_id: str):
+        calls.append(("session", session_id))
+        return SimpleNamespace(session_id=session_id, strategy="CPR_LEVELS", status="ACTIVE")
+
+    async def fake_get_session_positions(session_id: str, symbol: str | None = None, statuses=None):
+        calls.append(("positions", session_id))
+        return [
+            SimpleNamespace(position_id=1, symbol="SBIN"),
+            SimpleNamespace(position_id=2, symbol="TCS"),
+        ]
+
+    async def fake_get_session_orders(
+        session_id: str,
+        symbol: str | None = None,
+        status: str | None = None,
+        limit: int = 25,
+    ):
+        calls.append(("orders", session_id))
+        return [SimpleNamespace(order_id=11), SimpleNamespace(order_id=12)]
+
+    async def fake_get_feed_state(session_id: str):
+        calls.append(("feed", session_id))
+        return SimpleNamespace(status="OK", stale_reason=None, last_price=101.5)
+
+    monkeypatch.setattr(web_state, "get_session", fake_get_session)
+    monkeypatch.setattr(web_state, "get_session_positions", fake_get_session_positions)
+    monkeypatch.setattr(web_state, "get_session_orders", fake_get_session_orders)
+    monkeypatch.setattr(web_state, "get_feed_state", fake_get_feed_state)
+    monkeypatch.setattr(
+        web_state,
+        "summarize_paper_positions",
+        lambda session, positions, feed_state: {
+            "session_id": session.session_id,
+            "feed_status": feed_state.status,
+            "open_positions": len(positions),
+        },
+    )
+
+    snapshot = await web_state.aget_paper_session_snapshot("paper-1")
+
+    assert calls == [
+        ("session", "paper-1"),
+        ("positions", "paper-1"),
+        ("orders", "paper-1"),
+        ("feed", "paper-1"),
+    ]
+    assert snapshot["session"].session_id == "paper-1"
+    assert len(snapshot["positions"]) == 2
+    assert len(snapshot["orders"]) == 2
+    assert snapshot["summary"]["feed_status"] == "OK"
+    assert snapshot["summary"]["orders"] == 2
+    assert snapshot["summary"]["open_positions"] == 2
+
+
+@pytest.mark.asyncio
+async def test_aget_paper_active_sessions_aggregates_snapshots(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_get_active_sessions():
+        return [
+            SimpleNamespace(session_id="paper-1"),
+            SimpleNamespace(session_id="paper-2"),
+        ]
+
+    async def fake_snapshot(session_id: str):
+        return {
+            "session": SimpleNamespace(session_id=session_id, strategy="CPR_LEVELS"),
+            "summary": {"session_id": session_id, "orders": 1},
+            "positions": [],
+            "orders": [],
+            "feed_state": None,
+        }
+
+    monkeypatch.setattr(web_state, "get_active_sessions", fake_get_active_sessions)
+    monkeypatch.setattr(web_state, "aget_paper_session_snapshot", fake_snapshot)
+
+    active_sessions = await web_state.aget_paper_active_sessions()
+
+    assert [payload["session"].session_id for payload in active_sessions] == ["paper-1", "paper-2"]
+    assert all(payload["summary"]["orders"] == 1 for payload in active_sessions)
+
+
+@pytest.mark.asyncio
+async def test_aget_runs_refreshes_cold_cache(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[str] = []
+
+    class _FakeDB:
+        def get_runs_with_metrics(self, execution_mode: str = "BACKTEST") -> list[dict]:
+            calls.append(execution_mode)
+            return [
+                {
+                    "run_id": "run-1",
+                    "strategy": "CPR_LEVELS",
+                    "direction_filter": "long",
+                }
+            ]
+
+    monkeypatch.setattr(web_state, "get_dashboard_backtest_db", lambda: _FakeDB())
+    monkeypatch.setattr(web_state, "_runs_cache", None, raising=False)
+    monkeypatch.setattr(web_state, "_runs_cache_time", 0.0, raising=False)
+
+    runs = await web_state.aget_runs(force=False, execution_mode="BACKTEST")
+
+    assert calls == ["BACKTEST"]
+    assert len(runs) == 1
+    assert runs[0]["direction_filter"] == "LONG"
+
+
+@pytest.mark.asyncio
+async def test_aget_trades_falls_back_to_paper_execution_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str | None] = []
+
+    class _FakeDB:
+        def get_backtest_trades(
+            self, run_id: str, symbols=None, execution_mode: str | None = "BACKTEST"
+        ):
+            calls.append(execution_mode)
+            if execution_mode == "BACKTEST":
+                return pl.DataFrame()
+            return pl.DataFrame([{"run_id": run_id, "execution_mode": "PAPER", "symbol": "SBIN"}])
+
+    monkeypatch.setattr(web_state, "get_dashboard_backtest_db", lambda: _FakeDB())
+
+    trades = await web_state.aget_trades("paper-1")
+
+    assert calls == ["BACKTEST", "PAPER"]
+    assert trades.height == 1
+    assert trades["execution_mode"][0] == "PAPER"
+
+
+def test_invalidate_run_cache_can_drop_a_single_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        web_state,
+        "_runs_cache",
+        [
+            {"run_id": "run-1", "strategy": "CPR_LEVELS"},
+            {"run_id": "run-2", "strategy": "FBR"},
+        ],
+        raising=False,
+    )
+    monkeypatch.setattr(web_state, "_runs_cache_time", 42.0, raising=False)
+
+    web_state.invalidate_run_cache("run-1")
+
+    assert web_state._runs_cache == [{"run_id": "run-2", "strategy": "FBR"}]
+    assert web_state._runs_cache_time == 0
+
+
+def test_build_run_options_includes_rvol_state() -> None:
+    options = web_state.build_run_options(
+        [
+            {
+                "run_id": "run-1",
+                "strategy": "CPR_LEVELS",
+                "direction_filter": "LONG",
+                "updated_at": "2026-04-12 20:50:00",
+                "start_date": "2025-01-01",
+                "end_date": "2026-03-27",
+                "annual_return_pct": 45.0,
+                "total_return_pct": 58.3,
+                "total_pnl": 582592,
+                "trade_count": 2060,
+                "rvol_threshold": 1.0,
+                "cpr_min_close_atr": 0.35,
+                "skip_rvol_check": False,
+            },
+            {
+                "run_id": "run-2",
+                "strategy": "CPR_LEVELS",
+                "direction_filter": "SHORT",
+                "updated_at": "2026-04-11 18:15:00",
+                "start_date": "2025-01-01",
+                "end_date": "2026-03-27",
+                "annual_return_pct": 41.5,
+                "total_return_pct": 51.2,
+                "total_pnl": 511200,
+                "trade_count": 1800,
+                "rvol_threshold": 1.0,
+                "cpr_min_close_atr": 0.0,
+                "skip_rvol_check": True,
+            },
+            {
+                "run_id": "run-3",
+                "strategy": "FBR",
+                "direction_filter": "LONG",
+                "updated_at": "2026-04-10 09:00:00",
+                "start_date": "2025-01-01",
+                "end_date": "2026-03-27",
+                "annual_return_pct": 12.5,
+                "total_return_pct": 18.2,
+                "total_pnl": 182000,
+                "trade_count": 900,
+                "rvol_threshold": 1.1,
+                "failure_window": 10,
+                "skip_rvol_check": False,
+            },
+        ]
+    )
+
+    labels = list(options)
+    assert labels[0].startswith(
+        "run-1 | 2026-04-12 20:50 | cpr-levels-long-daily-reset-rvol1-atr0.35 | 2025-01-01→2026-03-27 | "
+        "TotRet 58.3% | P/L ₹582,592 | Trades 2,060"
+    )
+    assert labels[1].startswith(
+        "run-2 | 2026-04-11 18:15 | cpr-levels-short-daily-reset-rvoloff | 2025-01-01→2026-03-27 | "
+        "TotRet 51.2% | P/L ₹511,200 | Trades 1,800"
+    )
+    assert labels[2].startswith(
+        "run-3 | 2026-04-10 09:00 | fbr-long-daily-reset-rvol1.1-fw10 | 2025-01-01→2026-03-27 | "
+        "TotRet 18.2% | P/L ₹182,000 | Trades 900"
+    )
+    assert all("Calmar" not in label for label in labels)
+
+
+@pytest.mark.asyncio
+async def test_aget_trade_inspection_combines_backtest_and_market_context(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bt = BacktestDB(db_path=tmp_path / "backtest.duckdb")
+    market = MarketDB(db_path=tmp_path / "market.duckdb")
+    try:
+        bt.con.execute(
+            """
+            CREATE TABLE backtest_results (
+                run_id VARCHAR,
+                symbol VARCHAR,
+                trade_date DATE,
+                direction VARCHAR,
+                entry_time VARCHAR,
+                exit_time VARCHAR,
+                entry_price DOUBLE,
+                exit_price DOUBLE,
+                sl_price DOUBLE,
+                target_price DOUBLE,
+                profit_loss DOUBLE,
+                profit_loss_pct DOUBLE,
+                exit_reason VARCHAR,
+                atr DOUBLE,
+                position_size INTEGER,
+                position_value DOUBLE
+            )
+            """
+        )
+        bt.con.execute(
+            """
+            CREATE TABLE run_metadata (
+                run_id VARCHAR,
+                params_json VARCHAR
+            )
+            """
+        )
+        bt.con.execute(
+            """
+            INSERT INTO backtest_results VALUES
+            ('run123', 'TEST', DATE '2026-02-11', 'LONG', '09:20', '09:55',
+             11.57, 12.0958333333, 11.4119891667, 12.0333333333,
+             7294.36, 4.5448, 'TRAILING_SL', 0.1441666667, 17200, 198964.0)
+            """
+        )
+        bt.con.execute(
+            """
+            INSERT INTO run_metadata VALUES
+            ('run123', '{"buffer_pct":0.0005,"cpr_levels":{"cpr_min_close_atr":0.35}}')
+            """
+        )
+
+        market.con.execute(
+            """
+            CREATE TABLE market_day_state (
+                symbol VARCHAR,
+                trade_date DATE,
+                prev_date DATE,
+                prev_close DOUBLE,
+                "pivot" DOUBLE,
+                bc DOUBLE,
+                tc DOUBLE,
+                cpr_width_pct DOUBLE,
+                r1 DOUBLE,
+                s1 DOUBLE,
+                cpr_shift VARCHAR,
+                is_narrowing INTEGER,
+                cpr_threshold_pct DOUBLE,
+                atr DOUBLE,
+                open_915 DOUBLE,
+                or_close_5 DOUBLE,
+                gap_pct_open DOUBLE
+            )
+            """
+        )
+        market.con.execute(
+            """
+            CREATE TABLE cpr_daily (
+                symbol VARCHAR,
+                trade_date DATE,
+                prev_high DOUBLE,
+                prev_low DOUBLE,
+                prev_close DOUBLE
+            )
+            """
+        )
+        market.con.execute(
+            """
+            CREATE TABLE strategy_day_state (
+                symbol VARCHAR,
+                trade_date DATE,
+                open_side VARCHAR,
+                open_to_cpr_atr DOUBLE,
+                gap_abs_pct DOUBLE,
+                or_atr_5 DOUBLE,
+                direction_5 VARCHAR
+            )
+            """
+        )
+        market.con.execute(
+            """
+            CREATE TABLE candles_5min (
+                symbol VARCHAR,
+                date DATE,
+                candle_time TIMESTAMP,
+                open DOUBLE,
+                high DOUBLE,
+                low DOUBLE,
+                close DOUBLE,
+                volume DOUBLE
+            )
+            """
+        )
+        market.con.execute("CREATE OR REPLACE VIEW v_5min AS SELECT * FROM candles_5min")
+        market._has_5min = True
+        market.con.execute(
+            """
+            INSERT INTO market_day_state VALUES
+            ('TEST', DATE '2026-02-11', DATE '2026-02-10', 11.50,
+             11.4566666667, 11.435, 11.4783333333, 0.3782368344,
+             12.0333333333, 10.9233333333, 'HIGHER', 1, 0.6160345170,
+             0.1441666667, 11.50, 11.57, 0.0)
+            """
+        )
+        market.con.execute(
+            """
+            INSERT INTO cpr_daily VALUES
+            ('TEST', DATE '2026-02-11', 11.99, 10.88, 11.50)
+            """
+        )
+        market.con.execute(
+            """
+            INSERT INTO strategy_day_state VALUES
+            ('TEST', DATE '2026-02-11', 'ABOVE', 0.1502890173, 0.0, 1.8728323699, 'LONG')
+            """
+        )
+        market.con.execute(
+            """
+            INSERT INTO candles_5min VALUES
+            ('TEST', DATE '2026-02-11', TIMESTAMP '2026-02-11 09:15:00', 11.50, 11.73, 11.46, 11.57, 1000),
+            ('TEST', DATE '2026-02-11', TIMESTAMP '2026-02-11 09:20:00', 11.57, 11.57, 11.45, 11.56, 1200),
+            ('TEST', DATE '2026-02-11', TIMESTAMP '2026-02-11 09:55:00', 11.84, 12.34, 11.84, 12.24, 2000)
+            """
+        )
+
+        monkeypatch.setattr(web_state, "get_dashboard_backtest_db", lambda: bt)
+        monkeypatch.setattr(web_state, "get_dashboard_db", lambda: market)
+
+        details = await web_state.aget_trade_inspection(
+            "run123", "TEST", "2026-02-11", "09:20", "09:55"
+        )
+
+        assert details["trade"]["direction"] == "LONG"
+        assert details["daily_cpr"]["prev_date"] == "2026-02-10"
+        assert details["daily_cpr"]["tc"] == pytest.approx(11.4783333333)
+        assert details["daily_cpr"]["r1"] == pytest.approx(12.0333333333)
+        assert details["derived"]["trigger_price"] == pytest.approx(11.4840725)
+        assert details["derived"]["min_signal_close"] == pytest.approx(11.528791666645)
+        assert details["candles"]["09:15"]["close"] == pytest.approx(11.57)
+        assert details["candles"]["09:20"]["open"] == pytest.approx(11.57)
+        assert details["candles"]["09:55"]["high"] == pytest.approx(12.34)
+    finally:
+        bt.close()
+        market.close()

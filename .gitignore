@@ -1,0 +1,64 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+*.egg-info/
+dist/
+build/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# Data files — all runtime/market data lives outside git (too large)
+data/
+*.parquet
+*.csv
+*.xlsx
+*.zip
+
+# DuckDB database files
+*.duckdb
+*.duckdb.wal
+*.duckdb.tmp/
+*.writelock
+
+# Logs
+logs/
+.tmp_logs/
+*.log
+
+# Secrets — never commit (use Doppler)
+.env
+*.env
+secrets/
+
+# Output
+output/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Session / planning artifacts (not for repo)
+plan.md
+memory.md
+AGENTS.md
+CLAUDE.md
+RESULTS.md
+STATUS.md
+code-review.md
+docs/UI_REDESIGN_PROPOSAL.md
+docs/superpowers/
+.tmp_pytest/
+pytest-cache-files-*/
+nul
+.mcp.json
+.precommit-home/
+.codex/
+.claude/

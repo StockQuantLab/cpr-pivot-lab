@@ -1,0 +1,363 @@
+# Kite Ingestion Runbook
+
+Use this workflow to keep `cpr-pivot-lab` self-contained after March 9, 2026 without copying parquet or DuckDB files from `nse-momentum-lab`.
+
+## Source-of-truth rules
+
+- `pivot-backtest`, `pivot-paper-trading daily-replay`, and `pivot-paper-trading walk-forward` must read only local parquet and DuckDB runtime tables.
+- Kite API is used only for:
+  - request-token exchange / token refresh
+  - instrument master refresh
+  - daily historical ingestion
+  - 5-minute historical ingestion
+  - `pivot-paper-trading daily-live`
+
+## Files written
+
+- Instrument cache: `data/raw/kite/instruments/NSE.csv`
+- NSE equity allowlist: `data/NSE_EQUITY_SYMBOLS.csv` (**not in git** — copy from `nse-momentum-lab/data/` or download from NSE website; required for correct tradeable symbol count ~2,105)
+- Optional raw snapshots: `data/raw/kite/daily/...` and `data/raw/kite/5min/...`
+- Resume checkpoints: `data/raw/kite/checkpoints/*.json`
+- Daily baseline parquet: `data/parquet/daily/<SYMBOL>/all.parquet`
+- Daily Kite overlay parquet: `data/parquet/daily/<SYMBOL>/kite.parquet`
+- 5-minute parquet: `data/parquet/5min/<SYMBOL>/<YEAR>.parquet`
+
+The parquet schema matches the existing repo contract:
+
+- Daily: `symbol,date,open,high,low,close,volume`
+- 5-minute: `candle_time,open,high,low,close,volume,true_range,date,symbol`
+
+## Daily parquet storage contract
+
+`5min` is already partitioned by symbol and year:
+
+- `data/parquet/5min/<SYMBOL>/<YEAR>.parquet`
+
+`daily` now uses a two-file per-symbol layout:
+
+- `data/parquet/daily/<SYMBOL>/all.parquet`
+  - historical baseline
+  - typically populated by CSV conversion or `copy_from_nse`
+- `data/parquet/daily/<SYMBOL>/kite.parquet`
+  - incremental overlay written by `pivot-kite-ingest`
+  - safe append/replace target for recent Kite catch-up windows
+
+DuckDB `v_daily` reads both files and dedupes on `(symbol, date)`, preferring
+`kite.parquet` when the same date exists in both places. Processing code should
+query `v_daily` or materialized runtime tables, not individual daily parquet files.
+
+Compaction is a separate maintenance step:
+
+```bash
+doppler run -- uv run pivot-kite-ingest --compact-daily
+```
+
+That command merges `kite.parquet` back into `all.parquet` for the resolved symbols
+and deletes the overlay file. Use it only when no repo readers are active.
+
+## Windows reader/writer rule
+
+On Windows, even read-only DuckDB/parquet readers can block atomic parquet file
+replacement at the filesystem level. Do not overlap these with ingestion or rebuilds:
+
+- `pivot-dashboard`
+- `pivot-paper-trading`
+- `pivot-backtest`
+- `pivot-agent`
+- `pivot-build`
+
+`pivot-kite-ingest` and `pivot-build` now fail fast with a preflight error if they
+detect conflicting repo processes.
+
+## Step 1: Refresh the Kite token in Doppler
+
+Before any ingestion run, make sure these secrets already exist in Doppler:
+
+- `KITE_API_KEY`
+- `KITE_API_SECRET`
+
+If `KITE_ACCESS_TOKEN` has expired or is missing, refresh it with the CLI entry point
+that exchanges a `request_token` for a new access token:
+
+```bash
+doppler run -- uv run pivot-kite-token --apply-doppler
+```
+
+Alias:
+
+```bash
+doppler run -- uv run pivot-kite-get-token --apply-doppler
+```
+
+Flow:
+
+1. The command prints the Kite login URL.
+2. Sign in to Kite in the browser.
+3. Copy either the full redirected callback URL or just the `request_token`.
+4. Paste it back into the terminal prompt.
+5. The command exchanges the token and writes `KITE_ACCESS_TOKEN` to Doppler.
+
+If you prefer a manual update, run the command without `--apply-doppler`, then persist the
+token yourself:
+
+```bash
+doppler secrets set KITE_ACCESS_TOKEN '<access-token>'
+```
+
+If you already have a valid `KITE_ACCESS_TOKEN`, you can skip this step.
+
+## Step 2: Refresh the instrument master
+
+Refresh the local instrument master before the first ingestion run or whenever Zerodha changes the symbol map:
+
+```bash
+doppler run -- uv run pivot-kite-ingest --refresh-instruments --exchange NSE
+```
+
+## Step 3: Ingest the missing date window
+
+Always start from the day after the last loaded date. For example, if the repo is already
+loaded through `2026-03-20`, resume at `2026-03-21`.
+
+### Daily bars
+
+```bash
+doppler run -- uv run pivot-kite-ingest \
+  --from 2026-03-21 \
+  --to 2026-03-23
+```
+
+If an earlier daily run was interrupted, rerun the same command with `--resume`.
+The checkpoint lets the ingester recover only the unfinished symbol tail.
+
+### 5-minute bars
+
+`--resume` keeps a checkpoint under `data/raw/kite/checkpoints/` and skips already completed
+symbols on rerun.
+
+```bash
+doppler run -- uv run pivot-kite-ingest \
+  --from 2026-03-21 \
+  --to 2026-03-23 \
+  --5min \
+  --resume
+```
+
+Optional raw CSV snapshots:
+
+```bash
+doppler run -- uv run pivot-kite-ingest \
+  --from 2026-03-21 \
+  --to 2026-03-23 \
+  --5min \
+  --resume \
+  --save-raw
+```
+
+## Backfilling missing symbols (current-master mode)
+
+The default `local-first` universe only updates symbols that already have local parquet.
+New symbols listed on NSE — or symbols that were never ingested historically — are
+invisible to the default ingester.
+
+Use `--universe current-master` to resolve symbols directly from the Kite instrument
+master instead of local parquet directories. This is required to backfill symbols that
+have zero or incomplete local history.
+
+```bash
+# Check what's missing first (dashboard → /data_quality, Short History section)
+doppler run -- uv run pivot-hygiene --check-stale
+
+# Backfill daily bars for ALL tradeable NSE symbols
+doppler run -- uv run pivot-kite-ingest \
+  --universe current-master \
+  --from 2015-01-01 \
+  --to 2025-12-01 \
+  --resume \
+  --skip-existing
+
+# Backfill 5-minute bars (takes several hours — use --resume for safe restart)
+doppler run -- uv run pivot-kite-ingest \
+  --universe current-master \
+  --5min \
+  --from 2015-01-01 \
+  --to 2025-12-01 \
+  --resume \
+  --skip-existing
+```
+
+**How it works:**
+- `--universe current-master` resolves symbols by cross-referencing two sources:
+  1. `data/raw/kite/instruments/NSE.csv` (Kite instrument master, segment=NSE)
+  2. `data/NSE_EQUITY_SYMBOLS.csv` (NSE equity allowlist, SERIES=EQ)
+  The intersection gives ~2,105 true NSE equity stocks, excluding ETFs, REITs, bonds, and
+  restricted instruments. Without the allowlist, `segment=NSE` alone returns ~9,356 rows.
+- `--skip-existing` skips symbols whose parquet already covers the target date, making
+  the run safe to re-execute incrementally
+- `--resume` writes a checkpoint under `data/raw/kite/checkpoints/current-master_*.json`
+  (namespaced separately from local-first checkpoints to prevent resume conflicts)
+
+**Refreshing the NSE equity allowlist:**
+
+`data/NSE_EQUITY_SYMBOLS.csv` is downloaded from NSE's official equity listing page
+(`nseindia.com → Market Data → Equity → Securities in F&O → fo_mktlot.csv`, or the
+equity bhavcopy). Refresh it when new companies list or you see coverage gaps:
+
+1. Download the latest CSV from NSE's website.
+2. Replace `data/NSE_EQUITY_SYMBOLS.csv` with the new file (must have `SYMBOL` and `SERIES` columns).
+3. Run `pivot-kite-ingest --universe current-master --refresh-instruments` to pick up new symbols.
+
+**After backfill, rebuild runtime tables:**
+
+```bash
+doppler run -- uv run pivot-build --force
+```
+
+**Impact on backtesting and paper trading:**
+
+| Scenario | Impact |
+|---|---|
+| `--universe-name gold_51` | None — saved symbol list unchanged |
+| `--symbols RELIANCE,...` | None — explicit list |
+| `--all --universe-size N` | Minimal — new liquid symbols could enter top-N, but NSE top-51 by traded value are stable large-caps already in the system |
+| `--all --universe-size 0` | More symbols available; all existing cached run_ids are unaffected (keyed by parameter hash) |
+| Paper trading replay/walk-forward | None unless new symbols added to `--symbols` explicitly |
+| Short-history symbols (< 1yr data) | Handled correctly — no entries in `market_day_state` for pre-ingestion dates, so backtest/paper trading simply skip those dates |
+
+## Step 4: Rebuild local runtime tables
+
+After daily and 5-minute parquet are updated, rebuild local DuckDB runtime tables:
+
+These rebuild commands operate on the parquet history already present in this repo. They do not
+call Kite and they do not assume a fixed start year like 2015; the effective date range is
+whatever local parquet exists at the time you run them.
+
+```bash
+doppler run -- uv run pivot-build --table pack --refresh-since 2026-03-21 --batch-size 64
+```
+
+Only use a full-history rebuild when runtime state is inconsistent. That rebuild scans all local
+parquet history already in this repo, not just the newly ingested Kite window:
+
+```bash
+doppler run -- uv run pivot-build \
+  --force \
+  --full-history \
+  --staged-full-rebuild \
+  --duckdb-threads 4 \
+  --duckdb-max-memory 24GB \
+  --batch-size 64
+```
+
+If you are running the daily ingestion wrapper (`pivot-refresh`) for paper/live prep, it now
+checks `daily-prepare` first and skips `pivot-build` when the runtime tables are already current
+for the target trade date. Only run the rebuild when that readiness check reports missing
+coverage or stale runtime tables.
+
+## Step 5: Validate the loaded data
+
+Run the coverage check before backtests or paper trading:
+
+`pivot-data-validate` reports the min/max dates that exist in the local runtime tables. It is a
+coverage check over loaded data, not a command that re-ingests history from a specific year.
+
+```bash
+doppler run -- uv run pivot-data-validate
+```
+
+## Step 6: Refresh data quality issues
+
+Run the full DQ scan after every ingestion + build cycle to keep the dashboard `/data_quality`
+page current and to surface any OHLC violations, timestamp anomalies, or extreme candles
+introduced by the new data:
+
+```bash
+doppler run -- uv run pivot-data-quality --refresh --full
+```
+
+This takes 1–5 minutes and writes results to `data_quality_issues` in `market.duckdb`.
+The dashboard reads from this table on the `/data_quality` page.
+
+For a quick parquet-presence-only check (faster, no OHLC scan):
+
+```bash
+doppler run -- uv run pivot-data-quality --refresh
+```
+
+## Step 7: Pre-filter symbols for next trading day
+
+After ingestion and validation, pre-filter symbols so the next day's `daily-live` session
+only polls ~200 candidates instead of ~2100:
+
+```bash
+doppler run -- uv run pivot-paper-trading daily-prepare \
+  --trade-date <next_trading_date> --all-symbols
+```
+
+This uses today's CPR/ATR setup data from `market_day_state` to determine which symbols
+are eligible for trading. Run it after step 6 so runtime tables are current.
+
+## Background execution on Windows
+
+For long `pivot-build` runs, start the command in the background and poll the log instead of
+keeping the terminal blocked for the entire rebuild:
+
+```powershell
+$logDir = Join-Path (Get-Location) '.tmp_logs'
+New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+$out = Join-Path $logDir 'pack_rebuild.out.log'
+$err = Join-Path $logDir 'pack_rebuild.err.log'
+Start-Process -FilePath 'C:\Program Files\PowerShell\7\pwsh.exe' `
+  -ArgumentList '-Command', 'Set-Location ''C:\Users\kanna\github\cpr-pivot-lab''; uv run pivot-build --table pack --refresh-since 2026-03-21 --batch-size 64' `
+  -RedirectStandardOutput $out `
+  -RedirectStandardError $err
+```
+
+Poll with:
+
+```powershell
+Get-Content .tmp_logs\pack_rebuild.out.log -Tail 40
+Get-Content .tmp_logs\pack_rebuild.err.log -Tail 40
+```
+
+## First validation sequence
+
+1. Refresh the Kite token in Doppler if needed.
+2. Refresh the instrument master.
+3. Ingest daily bars for the missing date window.
+4. Ingest 5-minute bars for the same window.
+5. Optionally compact finished daily overlays back into `all.parquet` once no repo readers are active:
+
+```bash
+doppler run -- uv run pivot-kite-ingest --compact-daily
+```
+
+6. Refresh local runtime tables with `pivot-build --refresh-since <window-start> --batch-size 64`.
+7. Run `pivot-data-validate`.
+8. Run `pivot-data-quality --refresh --full` to update the DQ issue table.
+9. Pre-filter symbols for the next trading day's live paper session:
+
+```bash
+doppler run -- uv run pivot-paper-trading daily-prepare \
+  --trade-date <next_trading_date> --all-symbols
+```
+
+10. If validation looks acceptable, run walk-forward validation:
+
+```bash
+doppler run -- uv run pivot-paper-trading walk-forward \
+  --start-date 2026-03-21 \
+  --end-date 2026-03-23 \
+  --symbols SBIN,RELIANCE \
+  --strategy CPR_LEVELS
+```
+
+11. If validation looks acceptable, start the live paper session:
+
+```bash
+doppler run -- uv run pivot-paper-trading daily-live \
+  --trade-date today \
+  --all-symbols \
+  --strategy CPR_LEVELS --direction LONG \
+  --min-price 50 --cpr-min-close-atr 0.5 --narrowing-filter
+```

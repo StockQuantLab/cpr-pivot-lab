@@ -1,0 +1,1991 @@
+"""Shared helpers for paper-trading runtime state and summaries."""
+
+from __future__ import annotations
+
+import asyncio
+import inspect
+import json
+import logging
+import threading
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from datetime import time as dt_time
+from typing import Any, cast
+
+from db.duckdb import get_dashboard_db
+from db.paper_db import FeedState, PaperPosition, PaperSession, get_paper_db
+from engine.alert_dispatcher import AlertDispatcher, AlertType, get_alert_config
+from engine.bar_orchestrator import SessionPositionTracker
+from engine.constants import SL_PHASE_TO_EXIT_REASON
+from engine.cpr_atr_shared import (
+    normalize_stop_loss,
+    scan_cpr_levels_entry,
+    split_scale_out_quantity,
+)
+from engine.cpr_atr_strategy import DayPack, StrategyConfig
+from engine.cpr_atr_utils import (
+    TrailingStop,
+    calculate_gap_pct,
+    calculate_or_atr_ratio,
+    calculate_position_size,
+    normalize_cpr_bounds,
+    resolve_cpr_direction,
+)
+from engine.strategy_presets import (
+    build_strategy_config_from_overrides as shared_build_strategy_config_from_overrides,
+)
+
+logger = logging.getLogger(__name__)
+
+BacktestParams = StrategyConfig
+
+# ---------------------------------------------------------------------------
+# Alert dispatcher (lazy singleton — best-effort, never blocks trading)
+# ---------------------------------------------------------------------------
+
+_alert_dispatcher: AlertDispatcher | None = None
+_background_tasks: set[asyncio.Task] = set()
+_active_session_count = 0
+_suppress_alerts = False
+_alert_sink: Callable[[AlertType, str, str], Any] | None = None
+
+
+def set_alerts_suppressed(suppress: bool) -> None:
+    """Control whether alerts are dispatched (True = suppress, False = enable)."""
+    global _suppress_alerts
+    _suppress_alerts = suppress
+
+
+def set_alert_sink(sink: Callable[[AlertType, str, str], Any] | None) -> None:
+    """Override alert dispatch for tests or alternate sinks."""
+    global _alert_sink
+    _alert_sink = sink
+
+
+def register_session_start() -> None:
+    global _active_session_count
+    _active_session_count += 1
+
+
+async def maybe_shutdown_alert_dispatcher() -> None:
+    global _active_session_count
+    _active_session_count -= 1
+    if _active_session_count <= 0:
+        await shutdown_alert_dispatcher()
+        _active_session_count = 0
+
+
+def _get_alert_dispatcher() -> AlertDispatcher:
+    global _alert_dispatcher
+    if _alert_dispatcher is None:
+        config = get_alert_config()
+        _alert_dispatcher = AlertDispatcher(_db(), config)
+    return _alert_dispatcher
+
+
+def _start_alert_dispatcher() -> None:
+    """Start the alert consumer task. Safe to call multiple times."""
+    dispatcher = _get_alert_dispatcher()
+    try:
+        loop = asyncio.get_running_loop()
+        if not dispatcher._running:
+            loop.create_task(dispatcher.start())  # noqa: RUF006
+    except RuntimeError:
+        pass  # No event loop — dispatcher will be started lazily on first dispatch
+
+
+async def shutdown_alert_dispatcher() -> None:
+    """Drain queued alerts and stop the consumer. Call on session exit."""
+    dispatcher = _get_alert_dispatcher()
+    if dispatcher._running:
+        await dispatcher.shutdown()
+    # Wait for any background fire-and-forget tasks
+    for task in list(_background_tasks):
+        if not task.done():
+            task.cancel()
+    if _background_tasks:
+        await asyncio.gather(*_background_tasks, return_exceptions=True)
+        _background_tasks.clear()
+
+
+SL_PHASE_EXIT_REASON_MAP = cast(dict[str, str], SL_PHASE_TO_EXIT_REASON)
+_PAPER_DB_IO_LOCK = threading.RLock()
+_MARKET_DB_READ_LOCK = (
+    threading.RLock()
+)  # serializes market.duckdb reads across threads (reentrant)
+
+
+def _db():
+    return get_paper_db()
+
+
+async def get_session(session_id: str) -> PaperSession | None:
+    with _PAPER_DB_IO_LOCK:
+        return _db().get_session(session_id)
+
+
+async def get_session_positions(
+    session_id: str, symbol: str | None = None, statuses: list[str] | None = None
+) -> list[PaperPosition]:
+    with _PAPER_DB_IO_LOCK:
+        return _db().get_session_positions(session_id, symbol=symbol, statuses=statuses)
+
+
+async def get_feed_state(session_id: str) -> FeedState | None:
+    with _PAPER_DB_IO_LOCK:
+        return _db().get_feed_state(session_id)
+
+
+async def update_session_state(session_id: str, **kwargs: Any) -> PaperSession | None:
+    with _PAPER_DB_IO_LOCK:
+        return _db().update_session(session_id, **kwargs)
+
+
+async def open_position(**kwargs: Any) -> PaperPosition:
+    with _PAPER_DB_IO_LOCK:
+        return _db().open_position(**kwargs)
+
+
+async def append_order_event(**kwargs: Any) -> Any:
+    with _PAPER_DB_IO_LOCK:
+        return _db().append_order_event(**kwargs)
+
+
+async def update_position(position_id: str, **kwargs: Any) -> PaperPosition | None:
+    with _PAPER_DB_IO_LOCK:
+        return _db().update_position(position_id, **kwargs)
+
+
+def force_paper_db_sync(paper_db: Any | None = None) -> None:
+    """Force a replica sync while serializing access to the shared writer DB."""
+    with _PAPER_DB_IO_LOCK:
+        pdb = paper_db or _db()
+        sync = getattr(pdb, "_sync", None)
+        if sync is not None:
+            sync.force_sync(source_conn=getattr(pdb, "con", None))
+
+
+def _format_event_time(event_time: datetime | None) -> str:
+    """Format trade event time as 'HH:MM DD-Mon' for alerts."""
+    if event_time is None:
+        return ""
+    return event_time.strftime("%H:%M %d-%b")
+
+
+def _format_open_alert(
+    *,
+    symbol: str,
+    direction: str,
+    entry_price: float,
+    sl_price: float,
+    target_price: float,
+    sl_distance: float,
+    position_size: int,
+    rr_ratio: float,
+    strategy: str,
+    session_id: str,
+    event_time: datetime | None = None,
+) -> tuple[str, str]:
+    """Format TRADE_OPENED alert subject and body (HTML for Telegram)."""
+    icon = "🟢" if direction == "LONG" else "🔴"
+    subject = f"{icon} {direction} OPENED: {symbol}"
+    time_str = _format_event_time(event_time)
+    risk_rupees = sl_distance * position_size
+    chart_link = f"📊 <a href='https://www.tradingview.com/chart/?symbol=NSE:{symbol}'>Chart</a>"
+    body = (
+        f"📥 Entry: <code>₹{entry_price:.2f}</code> | 🛡️ SL: <code>₹{sl_price:.2f}</code>\n"
+        f"🎯 Target: <code>₹{target_price:.2f}</code> | 📏 Qty: <code>{position_size}</code>\n"
+        f"💰 Risk: ₹{risk_rupees:,.0f} ({rr_ratio:.1f}R)"
+        + (f" | 🕒 {time_str}" if time_str else "")
+        + f"\n{chart_link}"
+        + f"\n<i>{strategy} · {session_id[:16]}</i>"
+    )
+    return subject, body
+
+
+def _format_close_alert(
+    *,
+    symbol: str,
+    direction: str,
+    entry_price: float,
+    close_price: float,
+    reason: str,
+    realized_pnl: float,
+    duration_bars: int | None = None,
+    strategy: str = "",
+    session_id: str = "",
+    event_time: datetime | None = None,
+) -> tuple[str, str]:
+    """Format TRADE_CLOSED alert subject and body (HTML for Telegram)."""
+    pnl_pct = (
+        ((close_price - entry_price) / entry_price * 100)
+        if direction == "LONG"
+        else ((entry_price - close_price) / entry_price * 100)
+    )
+    is_win = realized_pnl >= 0
+    result_tag = "WIN" if is_win else "LOSS"
+    icon = "✅" if is_win else "❌"
+    trend_icon = "📈" if is_win else "📉"
+    subject = f"{icon} [{result_tag}] {symbol} {direction} {reason}"
+    time_str = _format_event_time(event_time)
+    pnl_display = f"{'+' if is_win else '-'}₹{abs(realized_pnl):,.0f}"
+    chart_link = f"📊 <a href='https://www.tradingview.com/chart/?symbol=NSE:{symbol}'>Chart</a>"
+    body = (
+        f"💰 P&L: <code>{pnl_display}</code> ({pnl_pct:+.2f}%)\n"
+        f"🏁 Reason: {reason}\n"
+        f"{trend_icon} Exit: <code>{entry_price:.2f}</code> → <code>{close_price:.2f}</code>"
+        + (f"\n🕒 {time_str}" if time_str else "")
+        + (f"\n{chart_link}" if chart_link else "")
+        + (f"\n<i>{strategy} · {session_id[:16]}</i>" if strategy else "")
+    )
+    return subject, body
+
+
+def _format_risk_alert(
+    *,
+    reason: str,
+    net_pnl: float,
+    session_id: str,
+    positions_closed: int = 0,
+    total_trades: int | None = None,
+    trade_date: str | None = None,
+) -> tuple[str, str]:
+    """Format risk limit alert (HTML for Telegram — daily summary card style).
+
+    Args:
+        positions_closed: Positions force-closed by this risk event (flatten/loss limit).
+        total_trades: Total trades closed in the session (including earlier SL/target exits).
+            When provided, both lines are shown.
+        trade_date: Trade date string for the summary header.
+    """
+    pnl_emoji = "📈" if net_pnl >= 0 else "📉"
+    date_str = trade_date if trade_date else ""
+    if date_str and len(date_str) == 10:
+        # Format "2026-04-01" → "01-Apr-2026"
+        from datetime import datetime as _dt
+
+        date_str = _dt.strptime(date_str, "%Y-%m-%d").strftime("%d-%b-%Y")
+    if date_str:
+        subject = f"📊 EOD Summary — {date_str}"
+    else:
+        subject = "📊 EOD Summary"
+    body = (
+        f"Session: <code>{session_id[:16]}</code>\n"
+        f"Net P&L: <code>{net_pnl:+,.2f}</code> {pnl_emoji}\n"
+        f"Trades closed: {total_trades if total_trades is not None else positions_closed}"
+    )
+    return subject, body
+
+
+def _dispatch_alert(alert_type: AlertType, subject: str, body: str) -> None:
+    """Fire-and-forget alert dispatch. Best-effort, never blocks trading."""
+    if _suppress_alerts:
+        return
+    try:
+        if _alert_sink is not None:
+            result = _alert_sink(alert_type, subject, body)
+            if inspect.isawaitable(result):
+                try:
+                    loop = asyncio.get_running_loop()
+                    loop.create_task(result)  # noqa: RUF006
+                except RuntimeError:
+                    asyncio.run(result)
+            return
+        dispatcher = _get_alert_dispatcher()
+        try:
+            loop = asyncio.get_running_loop()
+            task = loop.create_task(dispatcher.dispatch(alert_type, subject, body))
+            _background_tasks.add(task)
+            task.add_done_callback(_background_tasks.discard)
+        except RuntimeError:
+            # No event loop running -- log to PaperDB directly
+            _db().log_alert(str(alert_type.value), subject, body, status="skipped_no_loop")
+    except Exception as exc:
+        logger.warning("Alert dispatch failed (best-effort, non-blocking): %s", exc)
+
+
+def dispatch_session_error_alert(
+    *,
+    session_id: str,
+    reason: str,
+    details: str | None = None,
+) -> None:
+    """Emit a non-blocking SESSION_ERROR alert for live/replay operators."""
+    session_tag = str(session_id or "")[:16]
+    normalized_reason = str(reason or "session_error").strip() or "session_error"
+    subject = f"SESSION_ERROR {session_tag} {normalized_reason}"
+    body = f"Session: <code>{session_tag}</code>\nReason: {normalized_reason}"
+    if details:
+        body += f"\nDetails: {details}"
+    _dispatch_alert(AlertType.SESSION_ERROR, subject, body)
+
+
+def _hhmm(value: datetime | None) -> str | None:
+    if value is None:
+        return None
+    return value.strftime("%H:%M")
+
+
+def _exit_value_for_position(position: PaperPosition, qty: float, close_price: float) -> float:
+    """Compute exit_value matching backtest's portfolio constraint model.
+
+    Backtest: exit_value = position_value + gross_pnl
+    For SHORT: gross_pnl = qty * (entry - exit) → exit_value = qty * (2*entry - exit)
+    For LONG:  gross_pnl = qty * (exit - entry) → exit_value = qty * exit  (= qty * close)
+    Using the unified formula ensures SHORT exits credit the correct cash amount.
+    """
+    entry = float(position.entry_price or 0.0)
+    direction = str(getattr(position, "direction", "")).upper()
+    if direction == "SHORT":
+        return round(float(qty) * (2.0 * entry - float(close_price)), 2)
+    return round(float(qty) * float(close_price), 2)
+
+
+def _float_or_none(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _symbol_price_from_raw_state(raw_state: Any, symbol: str) -> float | None:
+    if isinstance(raw_state, str):
+        try:
+            raw_state = json.loads(raw_state)
+        except json.JSONDecodeError:
+            return None
+    if not isinstance(raw_state, dict):
+        return None
+    symbol_prices = raw_state.get("symbol_last_prices")
+    if isinstance(symbol_prices, dict) and symbol in symbol_prices:
+        return _float_or_none(symbol_prices[symbol])
+    legacy_prices = raw_state.get("prices")
+    if isinstance(legacy_prices, dict) and symbol in legacy_prices:
+        return _float_or_none(legacy_prices[symbol])
+    if raw_state.get("symbol") == symbol:
+        return _float_or_none(raw_state.get("last_price"))
+    return None
+
+
+def mark_price_for_position(position: PaperPosition, feed_state: FeedState | None) -> float | None:
+    direct = _float_or_none(getattr(position, "last_price", None))
+    if direct is not None:
+        return direct
+    if feed_state is None:
+        return None
+    raw_state = getattr(feed_state, "raw_state", None)
+    symbol = str(getattr(position, "symbol", "") or "")
+    symbol_price = _symbol_price_from_raw_state(raw_state, symbol)
+    if symbol_price is not None:
+        return symbol_price
+    return _float_or_none(getattr(feed_state, "last_price", None))
+
+
+def summarize_paper_positions(
+    session: PaperSession, positions: list[PaperPosition], feed_state: FeedState | None
+) -> dict[str, object]:
+    open_positions = [p for p in positions if str(getattr(p, "status", "")).upper() == "OPEN"]
+    closed_positions = [p for p in positions if str(getattr(p, "status", "")).upper() == "CLOSED"]
+
+    def _mtm(position: PaperPosition) -> float:
+        qty = float(
+            getattr(position, "current_qty", None) or getattr(position, "quantity", 0.0) or 0.0
+        )
+        entry = float(getattr(position, "entry_price", 0.0) or 0.0)
+        mark = mark_price_for_position(position, feed_state)
+        if mark is None:
+            mark = entry
+        direction = str(getattr(position, "direction", "")).upper()
+        return (entry - mark) * qty if direction == "SHORT" else (mark - entry) * qty
+
+    realized = sum(
+        float(getattr(position, "realized_pnl", 0.0) or 0.0) for position in closed_positions
+    )
+    unrealized = sum(_mtm(position) for position in open_positions)
+    return {
+        "session_id": getattr(session, "session_id", ""),
+        "name": getattr(session, "name", None),
+        "strategy": getattr(session, "strategy", ""),
+        "status": getattr(session, "status", ""),
+        "feed_status": getattr(feed_state, "status", None),
+        "feed_reason": getattr(feed_state, "stale_reason", None),
+        "open_positions": len(open_positions),
+        "closed_positions": len(closed_positions),
+        "orders": 0,
+        "realized_pnl": round(realized, 2),
+        "unrealized_pnl": round(unrealized, 2),
+        "net_pnl": round(realized + unrealized, 2),
+        "gross_exposure": round(
+            sum(
+                float(getattr(position, "entry_price", 0.0) or 0.0)
+                * float(
+                    getattr(position, "current_qty", None)
+                    or getattr(position, "quantity", 0.0)
+                    or 0.0
+                )
+                for position in open_positions
+            ),
+            2,
+        ),
+        "last_price": getattr(feed_state, "last_price", None) if feed_state else None,
+        "latest_candle_ts": getattr(session, "latest_candle_ts", None),
+        "stale_feed_at": getattr(session, "stale_feed_at", None),
+    }
+
+
+def build_summary_feed_state(
+    *,
+    session_id: str,
+    symbol_last_prices: dict[str, float],
+    last_price: float | None,
+) -> Any:
+    """Create a lightweight feed-state object for risk control checks.
+
+    Used by both replay and live runners to pass current price state
+    into enforce_session_risk_controls without a real PostgreSQL feed row.
+    """
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        session_id=session_id,
+        status="OK",
+        last_event_ts=None,
+        last_bar_ts=None,
+        last_price=last_price,
+        stale_reason=None,
+        raw_state={"symbol_last_prices": dict(symbol_last_prices)},
+        updated_at=None,
+    )
+
+
+@dataclass(slots=True)
+class SymbolRuntimeState:
+    trade_date: str | None = None
+    candles: list[dict[str, Any]] = field(default_factory=list)
+    time_str: list[str] = field(default_factory=list)
+    opens: list[float] = field(default_factory=list)
+    highs: list[float] = field(default_factory=list)
+    lows: list[float] = field(default_factory=list)
+    closes: list[float] = field(default_factory=list)
+    volumes: list[float] = field(default_factory=list)
+    setup_row: dict[str, Any] | None = None
+    position_closed_today: bool = False
+    entry_window_closed_without_trade: bool = False
+
+
+@dataclass(slots=True)
+class PaperRuntimeState:
+    symbols: dict[str, SymbolRuntimeState] = field(default_factory=dict)
+    session_params_key: str | None = None
+    session_params: BacktestParams | None = None
+    allow_live_setup_fallback: bool = True
+    skipped_setup_rows: int = 0
+    invalid_setup_rows: int = 0
+
+    def for_symbol(self, symbol: str) -> SymbolRuntimeState:
+        state = self.symbols.get(symbol)
+        if state is None:
+            state = SymbolRuntimeState()
+            self.symbols[symbol] = state
+        return state
+
+    def get_session_params(self, session: PaperSession) -> BacktestParams:
+        raw_key = json.dumps(
+            {
+                "strategy": getattr(session, "strategy", None),
+                "strategy_params": getattr(session, "strategy_params", {}) or {},
+            },
+            sort_keys=True,
+            default=str,
+            separators=(",", ":"),
+        )
+        if self.session_params is None or self.session_params_key != raw_key:
+            self.session_params = build_backtest_params(session)
+            self.session_params_key = raw_key
+        return self.session_params
+
+
+def build_backtest_params_from_overrides(
+    strategy: str,
+    overrides: Mapping[str, Any] | None = None,
+) -> BacktestParams:
+    return shared_build_strategy_config_from_overrides(strategy, overrides)
+
+
+def apply_paper_strategy_defaults(
+    strategy: str,
+    overrides: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Normalize explicit paper overrides without injecting paper-only defaults.
+
+    Paper replay/live/sim should resolve to the same strategy parameters as
+    backtest. This helper only preserves caller-provided overrides and keeps the
+    direction filter canonical for session naming and downstream routing.
+    """
+    _ = str(strategy or "CPR_LEVELS").upper()
+    resolved = dict(overrides or {})
+    resolved["direction_filter"] = str(resolved.get("direction_filter", "BOTH") or "BOTH").upper()
+    return resolved
+
+
+def build_backtest_params(session: PaperSession) -> BacktestParams:
+    strategy = getattr(session, "strategy", None)
+    strategy_params = session.strategy_params or {}
+    if not strategy and isinstance(strategy_params, Mapping):
+        strategy = strategy_params.get("strategy")
+    return build_backtest_params_from_overrides(str(strategy or "CPR_LEVELS"), strategy_params)
+
+
+build_strategy_config_from_overrides = build_backtest_params_from_overrides
+build_strategy_config = build_backtest_params
+
+
+def _build_intraday_summary(
+    candles: list[dict[str, Any]],
+    *,
+    or_minutes: int,
+) -> dict[str, float | bool | None]:
+    if not candles:
+        return {
+            "open_915": None,
+            "or_high_5": None,
+            "or_low_5": None,
+            "or_close_5": None,
+            "or_proxy": False,
+        }
+    first = candles[0]
+    first_bar_end = first["bar_end"]
+    range_end = datetime.combine(
+        first_bar_end.date(),
+        dt_time(9, 15, tzinfo=getattr(first_bar_end, "tzinfo", None)),
+    ) + timedelta(minutes=max(1, int(or_minutes or 5)))
+    window = [candle for candle in candles if candle["bar_end"] <= range_end]
+    if not window:
+        # Late-start continuity mode: when the process starts after OR completion
+        # and early bars are unavailable in-memory, synthesize OR from first seen bar.
+        return {
+            "open_915": _float_or_none(first.get("open")),
+            "or_high_5": _float_or_none(first.get("high")),
+            "or_low_5": _float_or_none(first.get("low")),
+            "or_close_5": _float_or_none(first.get("close")),
+            "or_proxy": True,
+        }
+    if candles[-1]["bar_end"] < range_end:
+        return {
+            "open_915": _float_or_none(first.get("open")),
+            "or_high_5": None,
+            "or_low_5": None,
+            "or_close_5": None,
+            "or_proxy": False,
+        }
+    last = window[-1]
+    return {
+        "open_915": _float_or_none(first.get("open")),
+        "or_high_5": max(float(candle["high"]) for candle in window),
+        "or_low_5": min(float(candle["low"]) for candle in window),
+        "or_close_5": _float_or_none(last.get("close")),
+        "or_proxy": False,
+    }
+
+
+def _load_live_setup_row(
+    symbol: str,
+    trade_date: str,
+    live_candles: list[dict[str, Any]],
+    *,
+    or_minutes: int,
+) -> dict[str, Any] | None:
+    if not live_candles:
+        return None
+
+    db = get_dashboard_db()
+    with _MARKET_DB_READ_LOCK:
+        prev_daily = db.con.execute(
+            """
+            SELECT
+                date::VARCHAR,
+                high,
+                low,
+                close
+            FROM v_daily
+            WHERE symbol = ? AND date < ?::DATE
+            ORDER BY date DESC
+            LIMIT 1
+            """,
+            [symbol, trade_date],
+        ).fetchone()
+    if not prev_daily:
+        return None
+
+    prev_date = str(prev_daily[0])
+    prev_high = float(prev_daily[1] or 0.0)
+    prev_low = float(prev_daily[2] or 0.0)
+    prev_close = float(prev_daily[3] or 0.0)
+    pivot = (prev_high + prev_low + prev_close) / 3.0
+    bc = (prev_high + prev_low) / 2.0
+    tc = 2.0 * pivot - bc
+    cpr_lower, cpr_upper = normalize_cpr_bounds(tc, bc)
+    cpr_width_pct = abs(tc - bc) / pivot * 100 if pivot else 0.0
+    r1 = 2.0 * pivot - prev_low
+    s1 = 2.0 * pivot - prev_high
+    r2 = pivot + (prev_high - prev_low)
+    s2 = pivot - (prev_high - prev_low)
+
+    # Use pre-materialized atr_intraday instead of v_5min to avoid scanning all Parquet files.
+    # v_5min is a glob over 2100+ directories — per-symbol queries at bar close cause OOM.
+    with _MARKET_DB_READ_LOCK:
+        atr_row = db.con.execute(
+            """
+            SELECT trade_date::VARCHAR, atr
+            FROM atr_intraday
+            WHERE symbol = ? AND trade_date < ?::DATE
+            ORDER BY trade_date DESC
+            LIMIT 1
+            """,
+            [symbol, trade_date],
+        ).fetchone()
+    if not atr_row or atr_row[0] is None or atr_row[1] is None:
+        return None
+    atr_prev_date = str(atr_row[0])
+    if atr_prev_date != prev_date:
+        logger.warning(
+            "Live setup row for %s on %s: daily prev_date=%s != atr prev_date=%s — skipping",
+            symbol,
+            trade_date,
+            prev_date,
+            atr_prev_date,
+        )
+        return None
+    atr = float(atr_row[1] or 0.0)
+    if atr <= 0:
+        return None
+
+    with _MARKET_DB_READ_LOCK:
+        threshold_row = db.con.execute(
+            """
+            SELECT cpr_threshold_pct
+            FROM cpr_thresholds
+            WHERE symbol = ? AND trade_date < ?::DATE
+            ORDER BY trade_date DESC
+            LIMIT 1
+            """,
+            [symbol, trade_date],
+        ).fetchone()
+    cpr_threshold = (
+        float(threshold_row[0]) if threshold_row and threshold_row[0] is not None else 2.0
+    )
+
+    intraday = _build_intraday_summary(live_candles, or_minutes=or_minutes)
+    open_915 = intraday["open_915"]
+    or_high_5 = intraday["or_high_5"]
+    or_low_5 = intraday["or_low_5"]
+    or_close_5 = intraday["or_close_5"]
+    if open_915 is None or or_high_5 is None or or_low_5 is None:
+        return None
+
+    if open_915 < cpr_lower:
+        open_side = "BELOW"
+    elif open_915 > cpr_upper:
+        open_side = "ABOVE"
+    else:
+        open_side = "INSIDE"
+    direction = resolve_cpr_direction(or_close_5, tc, bc, fallback="NONE")
+    setup_source = "live_fallback_late_start" if bool(intraday.get("or_proxy")) else "live_fallback"
+    return {
+        "trade_date": trade_date,
+        "prev_day_close": prev_close,
+        "tc": tc,
+        "bc": bc,
+        "pivot": pivot,
+        "r1": r1,
+        "s1": s1,
+        "r2": r2,
+        "s2": s2,
+        "atr": atr,
+        "cpr_width_pct": cpr_width_pct,
+        "cpr_threshold": cpr_threshold,
+        "or_high_5": or_high_5,
+        "or_low_5": or_low_5,
+        "open_915": open_915,
+        "or_close_5": or_close_5,
+        "open_side": open_side,
+        "open_to_cpr_atr": abs(open_915 - (cpr_lower if open_side == "BELOW" else cpr_upper)) / atr
+        if open_side in {"BELOW", "ABOVE"}
+        else 0.0,
+        "gap_abs_pct": abs(calculate_gap_pct(open_915, prev_close)),
+        "or_atr_5": calculate_or_atr_ratio(or_high_5, or_low_5, atr),
+        "direction": direction,
+        "is_narrowing": int(cpr_width_pct < cpr_threshold),
+        "setup_source": setup_source,
+    }
+
+
+def load_setup_row(
+    symbol: str,
+    trade_date: str,
+    live_candles: list[dict[str, Any]] | None = None,
+    *,
+    or_minutes: int = 5,
+    allow_live_fallback: bool = True,
+) -> dict[str, Any] | None:
+    db = get_dashboard_db()
+    with _MARKET_DB_READ_LOCK:
+        row = db.con.execute(
+            """
+            SELECT
+                m.trade_date::VARCHAR,
+                m.prev_close,
+                m.tc,
+                m.bc,
+                m."pivot",
+                m.r1,
+                m.s1,
+                m.r2,
+                m.s2,
+                m.atr,
+                m.cpr_width_pct,
+                m.cpr_threshold_pct,
+                m.or_high_5,
+                m.or_low_5,
+                m.open_915,
+                m.or_close_5,
+                s.open_side,
+                s.open_to_cpr_atr,
+                s.gap_abs_pct,
+                s.or_atr_5,
+                s.direction_5,
+                m.is_narrowing,
+                m.cpr_shift
+            FROM market_day_state m
+            LEFT JOIN strategy_day_state s
+              ON s.symbol = m.symbol
+             AND s.trade_date = m.trade_date
+            WHERE m.symbol = ? AND m.trade_date = ?::DATE
+            LIMIT 1
+            """,
+            [symbol, trade_date],
+        ).fetchone()
+    if not row:
+        if not allow_live_fallback:
+            return None
+        return _load_live_setup_row(
+            symbol,
+            trade_date,
+            live_candles or [],
+            or_minutes=or_minutes,
+        )
+
+    open_side = str(row[16] or "")
+    or_close_5 = _float_or_none(row[15])
+    direction = resolve_cpr_direction(
+        or_close_5, float(row[2] or 0.0), float(row[3] or 0.0), fallback="NONE"
+    )
+    if direction == "NONE" and or_close_5 is None:
+        direction = str(row[20] or "NONE")
+
+    # Load rvol_baseline_arr from intraday_day_pack so RVOL filtering matches backtest.
+    rvol_baseline: list[float | None] | None = None
+    try:
+        with _MARKET_DB_READ_LOCK:
+            pack_row = db.con.execute(
+                "SELECT rvol_baseline_arr FROM intraday_day_pack"
+                " WHERE symbol = ? AND trade_date = ?::DATE LIMIT 1",
+                [symbol, trade_date],
+            ).fetchone()
+        if pack_row and pack_row[0]:
+            rvol_baseline = [float(v) if v is not None else None for v in pack_row[0]]
+    except Exception:
+        pass
+
+    return {
+        "trade_date": str(row[0] or trade_date),
+        "prev_day_close": _float_or_none(row[1]),
+        "tc": float(row[2] or 0.0),
+        "bc": float(row[3] or 0.0),
+        "pivot": float(row[4] or 0.0),
+        "r1": float(row[5] or 0.0),
+        "s1": float(row[6] or 0.0),
+        "r2": float(row[7] or 0.0),
+        "s2": float(row[8] or 0.0),
+        "atr": float(row[9] or 0.0),
+        "cpr_width_pct": float(row[10] or 0.0),
+        "cpr_threshold": float(row[11] or 0.0),
+        "or_high_5": float(row[12] or 0.0),
+        "or_low_5": float(row[13] or 0.0),
+        "open_915": float(row[14] or 0.0),
+        "or_close_5": or_close_5,
+        "open_side": open_side,
+        "open_to_cpr_atr": _float_or_none(row[17]),
+        "gap_abs_pct": _float_or_none(row[18]),
+        "or_atr_5": _float_or_none(row[19]),
+        "direction": direction,
+        "is_narrowing": bool(row[21]),
+        "cpr_shift": str(row[22] or "OVERLAP"),
+        "rvol_baseline": rvol_baseline,
+        "setup_source": "market_day_state",
+    }
+
+
+def _live_setup_status(setup_row: dict[str, Any] | None) -> str:
+    if setup_row is None:
+        return "pending"
+    direction = str(setup_row.get("direction") or "").upper()
+    if direction in {"LONG", "SHORT"}:
+        return "candidate"
+    return "rejected"
+
+
+def _reset_symbol_state_for_trade_date(
+    state: SymbolRuntimeState,
+    *,
+    trade_date: str,
+) -> None:
+    if state.trade_date == trade_date:
+        return
+    state.trade_date = trade_date
+    state.candles = []
+    state.time_str = []
+    state.opens = []
+    state.highs = []
+    state.lows = []
+    state.closes = []
+    state.volumes = []
+    state.setup_row = None
+    state.position_closed_today = False
+    state.entry_window_closed_without_trade = False
+
+
+def _append_candle_to_symbol_state(state: SymbolRuntimeState, candle: Any) -> str:
+    time_str = _hhmm(candle.bar_end)
+    open_price = float(candle.open)
+    high_price = float(candle.high)
+    low_price = float(candle.low)
+    close_price = float(candle.close)
+    volume = float(candle.volume)
+
+    if state.candles:
+        last = state.candles[-1]
+        last_time = str(last.get("time_str") or "")
+        last_bar_end = last.get("bar_end")
+        if last_time == str(time_str or "") and last_bar_end == candle.bar_end:
+            last.update(
+                {
+                    "open": open_price,
+                    "high": high_price,
+                    "low": low_price,
+                    "close": close_price,
+                    "volume": volume,
+                }
+            )
+            state.opens[-1] = open_price
+            state.highs[-1] = high_price
+            state.lows[-1] = low_price
+            state.closes[-1] = close_price
+            state.volumes[-1] = volume
+            return str(time_str or "")
+
+    state.candles.append(
+        {
+            "time_str": time_str,
+            "bar_end": candle.bar_end,
+            "open": open_price,
+            "high": high_price,
+            "low": low_price,
+            "close": close_price,
+            "volume": volume,
+        }
+    )
+    if time_str is not None:
+        state.time_str.append(time_str)
+    state.opens.append(open_price)
+    state.highs.append(high_price)
+    state.lows.append(low_price)
+    state.closes.append(close_price)
+    state.volumes.append(volume)
+    return str(time_str or "")
+
+
+def _build_day_pack(state: SymbolRuntimeState) -> DayPack:
+    rvol_baseline = state.setup_row.get("rvol_baseline") if state.setup_row else None
+    return DayPack(
+        time_str=state.time_str,
+        opens=state.opens,
+        highs=state.highs,
+        lows=state.lows,
+        closes=state.closes,
+        volumes=state.volumes,
+        rvol_baseline=rvol_baseline,
+    )
+
+
+def _build_symbol_price_map(feed_state: FeedState | None) -> dict[str, float]:
+    raw_state = getattr(feed_state, "raw_state", None)
+    if isinstance(raw_state, str):
+        try:
+            raw_state = json.loads(raw_state)
+        except json.JSONDecodeError:
+            return {}
+    if not isinstance(raw_state, dict):
+        return {}
+    symbol_prices = raw_state.get("symbol_last_prices")
+    if not isinstance(symbol_prices, dict):
+        return {}
+    return {
+        str(symbol): price
+        for symbol, value in symbol_prices.items()
+        if (price := _float_or_none(value)) is not None
+    }
+
+
+def _close_price_for_position(position: PaperPosition, price_map: dict[str, float]) -> float:
+    return (
+        price_map.get(position.symbol)
+        or _float_or_none(getattr(position, "last_price", None))
+        or float(position.entry_price)
+    )
+
+
+def _realized_pnl_for_close(
+    position: PaperPosition,
+    close_price: float,
+    *,
+    params: BacktestParams | None = None,
+    qty: float | None = None,
+) -> float:
+    entry_price = float(position.entry_price)
+    quantity = float(qty if qty is not None else position.quantity)
+    direction = str(position.direction).upper()
+    if direction == "LONG":
+        gross_pnl = (close_price - entry_price) * quantity
+    else:
+        gross_pnl = (entry_price - close_price) * quantity
+    cost = (
+        (params or BacktestParams())
+        .get_cost_model()
+        .round_trip_cost(
+            entry_price=entry_price,
+            exit_price=close_price,
+            qty=quantity,
+            direction=direction,
+        )
+    )
+    return round(gross_pnl - cost, 2)
+
+
+async def flatten_session_positions(
+    session_id: str,
+    *,
+    notes: str | None = None,
+    feed_state: FeedState | None = None,
+) -> dict[str, Any]:
+    session = await get_session(session_id)
+    if session is None:
+        return {"session_id": session_id, "missing": True}
+
+    positions = await get_session_positions(session_id, statuses=["OPEN"])
+    if feed_state is None:
+        feed_state = await get_feed_state(session_id)
+    price_map = _build_symbol_price_map(feed_state)
+    params = build_backtest_params(session)
+
+    closed: list[dict[str, Any]] = []
+    total_realized = 0.0
+    for position in positions:
+        close_price = _close_price_for_position(position, price_map)
+        realized = _realized_pnl_for_close(position, close_price, params=params)
+        total_realized += realized
+        side = "SELL" if str(position.direction).upper() == "LONG" else "BUY"
+        await append_order_event(
+            session_id=session_id,
+            symbol=position.symbol,
+            side=side,
+            requested_qty=float(position.quantity),
+            position_id=position.position_id,
+            order_type="MARKET",
+            request_price=close_price,
+            fill_qty=float(position.quantity),
+            fill_price=close_price,
+            status="FILLED",
+            notes=notes or "paper flatten",
+        )
+        await update_position(
+            position.position_id,
+            status="CLOSED",
+            current_qty=0.0,
+            last_price=close_price,
+            close_price=close_price,
+            realized_pnl=realized,
+            closed_by="MANUAL_FLATTEN",
+            trail_state={**(position.trail_state or {}), "close_reason": "MANUAL_FLATTEN"},
+        )
+        closed.append(
+            {
+                "position_id": position.position_id,
+                "symbol": position.symbol,
+                "close_price": close_price,
+            }
+        )
+
+    await update_session_state(session_id, status="STOPPING", notes=notes)
+    # Always send EOD summary — even if no positions needed force-closing
+    # (they may have exited earlier via SL/target)
+    all_closed = await get_session_positions(session_id, statuses=["CLOSED"])
+    total_trades = len(all_closed) + len(closed)
+    # Sum P&L from all closed positions when no force-closes happened
+    if not closed and all_closed:
+        total_realized = sum(float(p.realized_pnl or 0) for p in all_closed)
+    try:
+        subject, body = _format_risk_alert(
+            reason=notes or "session flatten",
+            net_pnl=total_realized,
+            session_id=session_id,
+            positions_closed=len(closed),
+            total_trades=total_trades,
+            trade_date=getattr(session, "trade_date", None),
+        )
+        _dispatch_alert(AlertType.FLATTEN_EOD, subject, body)
+    except Exception:
+        logger.debug("Alert dispatch for flatten failed (best-effort)", exc_info=True)
+    return {"session_id": session_id, "closed_positions": len(closed), "positions": closed}
+
+
+def _current_session_time(as_of: datetime) -> dt_time:
+    return dt_time(as_of.hour, as_of.minute, as_of.second)
+
+
+def _risk_limit_reasons(
+    session: PaperSession,
+    as_of: datetime,
+    net_pnl: float,
+) -> list[str]:
+    reasons: list[str] = []
+    flatten_time = getattr(session, "flatten_time", None)
+    if flatten_time is not None:
+        if isinstance(flatten_time, str):
+            from datetime import time as _time
+
+            parts = flatten_time.split(":")
+            if len(parts) < 2:
+                return reasons
+            h, m = int(parts[0]), int(parts[1])
+            s = int(parts[2]) if len(parts) > 2 else 0
+            flatten_time = _time(h, m, s)
+        if _current_session_time(as_of) >= flatten_time:
+            reasons.append(f"flatten_time:{flatten_time.isoformat()}")
+
+    portfolio_value = float(build_backtest_params(session).portfolio_value)
+
+    max_daily_loss_pct = float(getattr(session, "max_daily_loss_pct", 0.0) or 0.0)
+    if max_daily_loss_pct > 0:
+        loss_limit_amount = portfolio_value * max_daily_loss_pct
+        if net_pnl <= (-loss_limit_amount):
+            reasons.append(f"daily_loss_limit:{loss_limit_amount:.2f}")
+
+    max_drawdown_pct = float(getattr(session, "max_drawdown_pct", 0.0) or 0.0)
+    if max_drawdown_pct > 0:
+        drawdown_limit_amount = portfolio_value * max_drawdown_pct
+        if net_pnl <= (-drawdown_limit_amount):
+            reasons.append(f"max_drawdown:{drawdown_limit_amount:.2f}")
+
+    return reasons
+
+
+async def enforce_session_risk_controls(
+    *,
+    session: Any,
+    as_of: datetime,
+    feed_state: FeedState | None = None,
+    notes_prefix: str = "paper risk",
+) -> dict[str, Any]:
+    positions = await get_session_positions(session.session_id)
+    summary = summarize_paper_positions(session, positions, feed_state)
+    net_pnl = float(summary["net_pnl"])
+    await update_session_state(session.session_id, daily_pnl_used=net_pnl)
+
+    reasons = _risk_limit_reasons(session, as_of, net_pnl)
+    if not reasons:
+        return {"triggered": False, "daily_pnl_used": net_pnl, "reasons": []}
+
+    flatten_result = await flatten_session_positions(
+        session.session_id,
+        notes=f"{notes_prefix}: {', '.join(reasons)}",
+        feed_state=feed_state,
+    )
+    # flatten_session_positions already dispatches the EOD summary alert.
+    # No need to send a second DAILY_LOSS_LIMIT alert here.
+    return {
+        "triggered": True,
+        "daily_pnl_used": net_pnl,
+        "reasons": reasons,
+        "flatten": flatten_result,
+    }
+
+
+def _entry_candidate(
+    *,
+    direction: str,
+    candle: dict[str, Any],
+    sl_price: float,
+    target_price: float,
+    first_target_price: float | None = None,
+    scale_out_pct: float = 0.0,
+    atr: float,
+    params: BacktestParams,
+    entry_price: float | None = None,
+    capital_base: float | None = None,
+) -> dict[str, Any] | None:
+    # Use caller-supplied fill price (e.g. stop-order simulation) or fall back to close.
+    fill_price = entry_price if entry_price is not None else float(candle["close"])
+    target_for_rr = float(first_target_price or target_price)
+    normalized = normalize_stop_loss(
+        entry_price=fill_price,
+        sl_price=sl_price,
+        direction=direction,
+        atr=atr,
+        min_sl_atr_ratio=params.min_sl_atr_ratio,
+        max_sl_atr_ratio=params.max_sl_atr_ratio,
+    )
+    if normalized is None:
+        return None
+    sl_price, sl_distance = normalized
+    if direction == "LONG" and target_for_rr <= fill_price:
+        return None
+    if direction == "SHORT" and target_for_rr >= fill_price:
+        return None
+
+    capital_for_sizing = float(capital_base) if capital_base is not None else float(
+        params.portfolio_value or 0.0
+    )
+    risk_capital = (
+        float(capital_base)
+        if capital_base is not None and bool(params.risk_based_sizing)
+        else float(params.capital or 0.0)
+    )
+    position_size = calculate_position_size(risk_capital, params.risk_pct, sl_distance)
+    if not params.risk_based_sizing:
+        notional_cap = max(
+            1,
+            int((capital_for_sizing * params.max_position_pct) / max(1.0, fill_price)),
+        )
+        position_size = max(1, min(position_size, notional_cap))
+    rr_ratio = abs(target_for_rr - fill_price) / sl_distance if sl_distance > 0 else params.rr_ratio
+    return {
+        "direction": direction,
+        "entry_price": fill_price,
+        "entry_time": candle["time_str"],
+        "event_time": candle.get("bar_end"),
+        "sl_price": float(sl_price),
+        "target_price": float(target_price),
+        "first_target_price": float(first_target_price or target_price),
+        "scale_out_pct": float(scale_out_pct),
+        "sl_distance": float(sl_distance),
+        "position_size": int(position_size),
+        "rr_ratio": float(rr_ratio),
+    }
+
+
+def _target_hit_price(position: PaperPosition, candle: dict[str, Any]) -> float | None:
+    if position.target_price is None:
+        return None
+    target_price = float(position.target_price)
+    direction = position.direction.upper()
+    if direction == "LONG" and float(candle["high"]) >= target_price:
+        return target_price
+    if direction == "SHORT" and float(candle["low"]) <= target_price:
+        return target_price
+    return None
+
+
+def _updated_trail_state(
+    ts: TrailingStop, trail_state: dict[str, Any], candle: dict[str, Any]
+) -> dict[str, Any]:
+    return {
+        **trail_state,
+        "current_sl": float(ts.current_sl),
+        "phase": ts.phase,
+        "highest_since_entry": float(ts.highest_since_entry),
+        "lowest_since_entry": float(ts.lowest_since_entry),
+        "last_candle_ts": _hhmm(candle["bar_end"]),
+    }
+
+
+def _resolve_exit_decision(
+    position: PaperPosition,
+    candle: dict[str, Any],
+    params: BacktestParams,
+    ts: TrailingStop,
+) -> tuple[str | None, float]:
+    close_price = float(candle["close"])
+    if ts.is_hit(float(candle["low"]), float(candle["high"])):
+        exit_reason = SL_PHASE_EXIT_REASON_MAP.get(str(ts.phase), "INITIAL_SL")
+        return exit_reason, float(ts.current_sl)
+    bar_time = _hhmm(candle["bar_end"])
+    target_hit_price = _target_hit_price(position, candle)
+    if target_hit_price is not None:
+        return "TARGET", target_hit_price
+    if bar_time is not None and bar_time >= params.time_exit:
+        return "TIME", close_price
+    return None, close_price
+
+
+async def _open_position_from_candidate(
+    *,
+    session: PaperSession,
+    symbol: str,
+    candidate: dict[str, Any],
+    setup_row: dict[str, Any],
+    params: BacktestParams,
+    now: datetime,
+) -> dict[str, Any]:
+    position = await open_position(
+        session_id=session.session_id,
+        symbol=symbol,
+        direction=candidate["direction"],
+        quantity=float(candidate["position_size"]),
+        entry_price=float(candidate["entry_price"]),
+        stop_loss=float(candidate["sl_price"]),
+        target_price=float(candidate["target_price"]),
+        trail_state={
+            "entry_price": float(candidate["entry_price"]),
+            "direction": candidate["direction"],
+            "initial_sl": float(candidate["sl_price"]),
+            "current_sl": float(candidate["sl_price"]),
+            "atr": float(setup_row["atr"]),
+            "rr_ratio": float(candidate["rr_ratio"]),
+            "breakeven_r": float(params.breakeven_r),
+            "phase": "PROTECT",
+            "highest_since_entry": float(candidate["entry_price"]),
+            "lowest_since_entry": float(candidate["entry_price"]),
+            "entry_time": candidate["entry_time"],
+            "first_target_price": float(
+                candidate.get("first_target_price") or candidate["target_price"]
+            ),
+            "scale_out_pct": float(candidate.get("scale_out_pct") or 0.0),
+            "scaled_out": False,
+            "initial_qty": float(candidate["position_size"]),
+            "candle_count": 0,
+        },
+        opened_by=str(getattr(session, "strategy", "") or "paper_runtime"),
+        opened_at=now,
+    )
+    await append_order_event(
+        session_id=session.session_id,
+        symbol=symbol,
+        side="BUY" if candidate["direction"] == "LONG" else "SELL",
+        requested_qty=float(candidate["position_size"]),
+        position_id=position.position_id,
+        order_type="MARKET",
+        request_price=float(candidate["entry_price"]),
+        fill_qty=float(candidate["position_size"]),
+        fill_price=float(candidate["entry_price"]),
+        status="FILLED",
+        notes="paper entry",
+    )
+    logger.info(
+        "Paper trade open session_id=%s symbol=%s direction=%s time=%s entry=%.2f sl=%.2f target=%.2f rr=%.2f qty=%s",
+        session.session_id,
+        symbol,
+        candidate["direction"],
+        _format_event_time(candidate.get("event_time")),
+        float(candidate["entry_price"]),
+        float(candidate["sl_price"]),
+        float(candidate["target_price"]),
+        float(candidate["rr_ratio"]),
+        float(candidate["position_size"]),
+    )
+    try:
+        subject, body = _format_open_alert(
+            symbol=symbol,
+            direction=candidate["direction"],
+            entry_price=candidate["entry_price"],
+            sl_price=candidate["sl_price"],
+            target_price=candidate["target_price"],
+            sl_distance=candidate["sl_distance"],
+            position_size=candidate["position_size"],
+            rr_ratio=candidate["rr_ratio"],
+            strategy=str(getattr(session, "strategy", "")),
+            session_id=session.session_id,
+            event_time=candidate.get("event_time"),
+        )
+        _dispatch_alert(AlertType.TRADE_OPENED, subject, body)
+    except Exception:
+        logger.debug("Alert dispatch for trade open failed (best-effort)", exc_info=True)
+    return {
+        "action": "OPEN",
+        "position_id": position.position_id,
+        "symbol": symbol,
+        "entry_price": candidate["entry_price"],
+        "executed_qty": float(candidate["position_size"]),
+        "position": position,
+    }
+
+
+async def _advance_open_position(
+    *,
+    position: PaperPosition,
+    candle: dict[str, Any],
+    params: BacktestParams,
+) -> dict[str, Any]:
+    trail_state = dict(position.trail_state or {})
+    current_qty = float(position.current_qty or position.quantity or 0.0)
+    realized_so_far = float(position.realized_pnl or 0.0)
+    scale_out_pct = float(trail_state.get("scale_out_pct") or 0.0)
+    scaled_out = bool(trail_state.get("scaled_out") or False)
+    first_target_price = float(
+        trail_state.get("first_target_price") or position.target_price or position.entry_price
+    )
+    final_target_price = float(
+        position.target_price or trail_state.get("target_price") or first_target_price
+    )
+    scale_split = (
+        split_scale_out_quantity(
+            round(float(trail_state.get("initial_qty") or position.quantity or 0.0)), scale_out_pct
+        )
+        if scale_out_pct > 0 and not scaled_out
+        else None
+    )
+    initial_sl = _float_or_none(trail_state.get("initial_sl"))
+    if initial_sl is None:
+        initial_sl = _float_or_none(position.stop_loss)
+    if initial_sl is None:
+        initial_sl = float(position.entry_price)
+    current_sl = _float_or_none(trail_state.get("current_sl"))
+    ts = TrailingStop(
+        entry_price=float(trail_state.get("entry_price") or position.entry_price),
+        direction=str(trail_state.get("direction") or position.direction),
+        # Preserve lifecycle geometry from the original risk leg. Using current_sl here
+        # collapses sl_distance after breakeven and causes premature TRAIL transitions.
+        sl_price=float(initial_sl),
+        atr=float(trail_state.get("atr") or 0.0),
+        rr_ratio=float(trail_state.get("rr_ratio") or params.rr_ratio),
+        breakeven_r=float(trail_state.get("breakeven_r") or params.breakeven_r),
+    )
+    if current_sl is not None:
+        ts.current_sl = float(current_sl)
+    ts.phase = str(trail_state.get("phase") or ts.phase)
+    ts.highest_since_entry = float(trail_state.get("highest_since_entry") or ts.highest_since_entry)
+    ts.lowest_since_entry = float(trail_state.get("lowest_since_entry") or ts.lowest_since_entry)
+    candle_count = int(trail_state.get("candle_count") or 0) + 1
+
+    mark_price = float(candle["close"])
+    ts.update(mark_price)
+    next_trail_state = _updated_trail_state(ts, trail_state, candle)
+    next_trail_state["candle_count"] = candle_count
+    direction = position.direction.upper()
+
+    async def _record_exit_fill(qty: float, price: float, *, notes: str) -> float:
+        realized = _realized_pnl_for_close(position, price, params=params, qty=qty)
+        await append_order_event(
+            session_id=position.session_id,
+            symbol=position.symbol,
+            side="SELL" if direction == "LONG" else "BUY",
+            requested_qty=qty,
+            position_id=position.position_id,
+            order_type="MARKET",
+            request_price=price,
+            fill_qty=qty,
+            fill_price=price,
+            status="FILLED",
+            notes=notes,
+        )
+        return realized
+
+    if ts.is_hit(float(candle["low"]), float(candle["high"])):
+        exit_reason = SL_PHASE_EXIT_REASON_MAP.get(str(ts.phase), "INITIAL_SL")
+        close_price = float(ts.current_sl)
+        realized = realized_so_far + await _record_exit_fill(
+            current_qty,
+            close_price,
+            notes=f"paper exit:{exit_reason}",
+        )
+        await update_position(
+            position.position_id,
+            status="CLOSED",
+            stop_loss=float(ts.current_sl),
+            trail_state={**next_trail_state, "exit_reason": exit_reason},
+            current_qty=0.0,
+            last_price=close_price,
+            close_price=close_price,
+            realized_pnl=realized,
+            closed_by=exit_reason,
+            closed_at=candle.get("bar_end") if isinstance(candle, dict) else None,
+        )
+        logger.info(
+            "Paper trade close session_id=%s symbol=%s direction=%s time=%s reason=%s exit=%.2f pnl=%.2f bars=%d",
+            position.session_id,
+            position.symbol,
+            position.direction,
+            _format_event_time(candle.get("bar_end") if isinstance(candle, dict) else None),
+            exit_reason,
+            close_price,
+            realized,
+            candle_count,
+        )
+        try:
+            subject, body = _format_close_alert(
+                symbol=position.symbol,
+                direction=position.direction,
+                entry_price=float(position.entry_price),
+                close_price=close_price,
+                reason=exit_reason,
+                realized_pnl=realized,
+                duration_bars=candle_count,
+                strategy=str(getattr(position, "opened_by", "")),
+                session_id=position.session_id,
+                event_time=candle.get("bar_end") if isinstance(candle, dict) else None,
+            )
+            _dispatch_alert(
+                AlertType.SL_HIT if "SL" in exit_reason else AlertType.TRADE_CLOSED,
+                subject,
+                body,
+            )
+        except Exception:
+            logger.debug("Alert dispatch for SL hit failed (best-effort)", exc_info=True)
+        return {
+            "action": "CLOSE",
+            "position_id": position.position_id,
+            "symbol": position.symbol,
+            "reason": exit_reason,
+            "close_price": close_price,
+            "closed_qty": current_qty,
+            "exit_value": _exit_value_for_position(position, current_qty, close_price),
+        }
+
+    if scale_out_pct > 0 and not scaled_out and scale_split is not None:
+        scale_qty = float(scale_split[0])
+        runner_qty = float(scale_split[1])
+        first_hit = (direction == "LONG" and float(candle["high"]) >= first_target_price) or (
+            direction == "SHORT" and float(candle["low"]) <= first_target_price
+        )
+        final_hit = (direction == "LONG" and float(candle["high"]) >= final_target_price) or (
+            direction == "SHORT" and float(candle["low"]) <= final_target_price
+        )
+        if first_hit:
+            if final_hit:
+                partial_realized = await _record_exit_fill(
+                    scale_qty,
+                    first_target_price,
+                    notes="paper exit:scale_out",
+                )
+                runner_realized = await _record_exit_fill(
+                    runner_qty,
+                    final_target_price,
+                    notes="paper exit:runner_target",
+                )
+                realized = realized_so_far + partial_realized + runner_realized
+                await update_position(
+                    position.position_id,
+                    status="CLOSED",
+                    stop_loss=float(ts.current_sl),
+                    target_price=final_target_price,
+                    trail_state={**next_trail_state, "exit_reason": "TARGET", "scaled_out": True},
+                    current_qty=0.0,
+                    last_price=final_target_price,
+                    close_price=final_target_price,
+                    realized_pnl=realized,
+                    closed_by="TARGET",
+                    closed_at=candle.get("bar_end") if isinstance(candle, dict) else None,
+                )
+                logger.info(
+                    "Paper trade close session_id=%s symbol=%s direction=%s time=%s reason=%s exit=%.2f pnl=%.2f bars=%d",
+                    position.session_id,
+                    position.symbol,
+                    position.direction,
+                    _format_event_time(candle.get("bar_end") if isinstance(candle, dict) else None),
+                    "TARGET",
+                    final_target_price,
+                    realized,
+                    candle_count,
+                )
+                try:
+                    subject, body = _format_close_alert(
+                        symbol=position.symbol,
+                        direction=position.direction,
+                        entry_price=float(position.entry_price),
+                        close_price=final_target_price,
+                        reason="TARGET (scaled out + runner)",
+                        realized_pnl=realized,
+                        duration_bars=candle_count,
+                        strategy=str(getattr(position, "opened_by", "")),
+                        session_id=position.session_id,
+                        event_time=candle.get("bar_end") if isinstance(candle, dict) else None,
+                    )
+                    _dispatch_alert(AlertType.TARGET_HIT, subject, body)
+                except Exception:
+                    logger.debug(
+                        "Alert dispatch for target hit failed (best-effort)", exc_info=True
+                    )
+                return {
+                    "action": "CLOSE",
+                    "position_id": position.position_id,
+                    "symbol": position.symbol,
+                    "reason": "TARGET",
+                    "close_price": final_target_price,
+                    "closed_qty": current_qty,
+                    "exit_value": _exit_value_for_position(
+                        position, current_qty, final_target_price
+                    ),
+                }
+
+            partial_realized = await _record_exit_fill(
+                scale_qty,
+                first_target_price,
+                notes="paper exit:scale_out",
+            )
+            remaining_qty = max(current_qty - scale_qty, 0.0)
+            realized = realized_so_far + partial_realized
+            runner_sl = float(position.entry_price)
+            if direction == "LONG":
+                ts.current_sl = max(float(ts.current_sl), runner_sl)
+            else:
+                ts.current_sl = min(float(ts.current_sl), runner_sl)
+            ts.phase = "BREAKEVEN"
+            next_trail_state = {
+                **next_trail_state,
+                "current_sl": float(ts.current_sl),
+                "phase": ts.phase,
+                "scaled_out": True,
+            }
+            await update_position(
+                position.position_id,
+                stop_loss=float(ts.current_sl),
+                target_price=final_target_price,
+                trail_state=next_trail_state,
+                current_qty=remaining_qty,
+                last_price=float(candle["close"]),
+                realized_pnl=realized,
+            )
+            logger.info(
+                "Paper trade partial session_id=%s symbol=%s direction=%s first_exit=%.2f runner_exit=%.2f pnl=%.2f bars=%d",
+                position.session_id,
+                position.symbol,
+                position.direction,
+                first_target_price,
+                final_target_price,
+                realized,
+                candle_count,
+            )
+            return {
+                "action": "PARTIAL",
+                "position_id": position.position_id,
+                "mark": float(candle["close"]),
+                "symbol": position.symbol,
+                "partial_qty": scale_qty,
+                "partial_exit_price": first_target_price,
+                "exit_value": float(scale_qty) * float(first_target_price),
+                "next_trail_state": next_trail_state,
+            }
+
+    resolved_exit_reason, close_price = _resolve_exit_decision(position, candle, params, ts)
+    if resolved_exit_reason is None:
+        await update_position(
+            position.position_id,
+            stop_loss=float(ts.current_sl),
+            trail_state=next_trail_state,
+            current_qty=current_qty,
+            last_price=float(candle["close"]),
+        )
+        return {
+            "action": "HOLD",
+            "position_id": position.position_id,
+            "mark": float(candle["close"]),
+            "next_trail_state": next_trail_state,
+        }
+
+    realized = realized_so_far + _realized_pnl_for_close(
+        position,
+        close_price,
+        params=params,
+        qty=current_qty,
+    )
+    await append_order_event(
+        session_id=position.session_id,
+        symbol=position.symbol,
+        side="SELL" if position.direction.upper() == "LONG" else "BUY",
+        requested_qty=current_qty,
+        position_id=position.position_id,
+        order_type="MARKET",
+        request_price=close_price,
+        fill_qty=current_qty,
+        fill_price=close_price,
+        status="FILLED",
+        notes=f"paper exit:{resolved_exit_reason}",
+    )
+    await update_position(
+        position.position_id,
+        status="CLOSED",
+        stop_loss=float(ts.current_sl),
+        trail_state={**next_trail_state, "exit_reason": resolved_exit_reason},
+        current_qty=0.0,
+        last_price=close_price,
+        close_price=close_price,
+        realized_pnl=realized,
+        closed_by=resolved_exit_reason,
+        closed_at=candle.get("bar_end") if isinstance(candle, dict) else None,
+    )
+    logger.info(
+        "Paper trade close session_id=%s symbol=%s direction=%s time=%s reason=%s exit=%.2f pnl=%.2f bars=%d",
+        position.session_id,
+        position.symbol,
+        position.direction,
+        _format_event_time(candle.get("bar_end") if isinstance(candle, dict) else None),
+        resolved_exit_reason,
+        close_price,
+        realized,
+        candle_count,
+    )
+    try:
+        subject, body = _format_close_alert(
+            symbol=position.symbol,
+            direction=position.direction,
+            entry_price=float(position.entry_price),
+            close_price=close_price,
+            reason=resolved_exit_reason,
+            realized_pnl=realized,
+            duration_bars=candle_count,
+            strategy=str(getattr(position, "opened_by", "")),
+            session_id=position.session_id,
+            event_time=candle.get("bar_end") if isinstance(candle, dict) else None,
+        )
+        _dispatch_alert(AlertType.TRADE_CLOSED, subject, body)
+    except Exception:
+        logger.debug("Alert dispatch for resolved exit failed (best-effort)", exc_info=True)
+    return {
+        "action": "CLOSE",
+        "position_id": position.position_id,
+        "symbol": position.symbol,
+        "reason": resolved_exit_reason,
+        "close_price": close_price,
+        "closed_qty": current_qty,
+        "exit_value": _exit_value_for_position(position, current_qty, close_price),
+    }
+
+
+async def evaluate_candle(
+    *,
+    session: Any,
+    candle: Any,
+    runtime_state: PaperRuntimeState,
+    now: datetime,
+    position_tracker: SessionPositionTracker,
+    allow_entry_evaluation: bool = True,
+) -> dict[str, Any]:
+    state = runtime_state.for_symbol(candle.symbol)
+    params = runtime_state.get_session_params(session)
+    trade_date = candle.bar_end.date().isoformat()
+    _reset_symbol_state_for_trade_date(state, trade_date=trade_date)
+    candle_time = _append_candle_to_symbol_state(state, candle)
+
+    if state.setup_row is None:
+        # Keep setup-row reads synchronous in the event loop. This avoids
+        # thread contention/crashes on shared DuckDB connections.
+        state.setup_row = load_setup_row(
+            candle.symbol,
+            trade_date,
+            live_candles=state.candles,
+            or_minutes=params.or_minutes,
+            allow_live_fallback=runtime_state.allow_live_setup_fallback,
+        )
+    setup_status = _live_setup_status(state.setup_row)
+    if state.setup_row is None:
+        return {
+            "symbol": candle.symbol,
+            "action": "SKIP",
+            "reason": "no_setup",
+            "setup_status": setup_status,
+            "candidate": None,
+            "advance_result": None,
+            "setup_row": None,
+        }
+
+    tracked_position = position_tracker.get_open_position(candle.symbol)
+    if tracked_position is not None:
+        result = await _advance_open_position(
+            position=tracked_position,
+            candle=state.candles[-1],
+            params=params,
+        )
+        if result["action"] == "CLOSE":
+            state.position_closed_today = True
+        elif result["action"] in ("HOLD", "PARTIAL"):
+            # Keep in-memory trail_state in sync with the DB update inside
+            # _advance_open_position so subsequent candles see accumulated state.
+            nts = result.get("next_trail_state")
+            if nts:
+                position_tracker.update_trail_state(candle.symbol, nts)
+        return {
+            "symbol": candle.symbol,
+            "action": "ADVANCE",
+            "setup_status": setup_status,
+            "candidate": None,
+            "advance_result": result,
+            "setup_row": state.setup_row,
+        }
+
+    if state.position_closed_today:
+        return {
+            "symbol": candle.symbol,
+            "action": "SKIP",
+            "reason": "already_traded_today",
+            "setup_status": setup_status,
+            "candidate": None,
+            "advance_result": None,
+            "setup_row": state.setup_row,
+        }
+
+    entry_end = str(params.entry_window_end)
+    if candle_time and candle_time > entry_end:
+        state.entry_window_closed_without_trade = True
+        return {
+            "symbol": candle.symbol,
+            "action": "SKIP",
+            "reason": "entry_window_closed",
+            "setup_status": setup_status,
+            "candidate": None,
+            "advance_result": None,
+            "setup_row": state.setup_row,
+        }
+    if state.entry_window_closed_without_trade:
+        return {
+            "symbol": candle.symbol,
+            "action": "SKIP",
+            "reason": "entry_window_closed",
+            "setup_status": setup_status,
+            "candidate": None,
+            "advance_result": None,
+            "setup_row": state.setup_row,
+        }
+
+    if not allow_entry_evaluation:
+        return {
+            "symbol": candle.symbol,
+            "action": "SKIP",
+            "reason": "entry_evaluation_deferred",
+            "setup_status": setup_status,
+            "candidate": None,
+            "advance_result": None,
+            "setup_row": state.setup_row,
+        }
+
+    strategy = str(session.strategy or "").upper()
+    if strategy != "CPR_LEVELS":
+        return {
+            "symbol": candle.symbol,
+            "action": "SKIP",
+            "reason": f"unsupported_strategy:{strategy or 'UNKNOWN'}",
+            "setup_status": setup_status,
+            "candidate": None,
+            "advance_result": None,
+            "setup_row": state.setup_row,
+        }
+
+    candidate = _maybe_open_cpr_levels(
+        candle=state.candles[-1],
+        day_pack=_build_day_pack(state),
+        setup_row=state.setup_row,
+        params=params,
+        capital_base=(
+            float(
+                position_tracker.current_equity()
+                if hasattr(position_tracker, "current_equity")
+                else getattr(position_tracker, "initial_capital", position_tracker.cash_available)
+            )
+            if params.compound_equity
+            else None
+        ),
+    )
+    if candidate is None:
+        return {
+            "symbol": candle.symbol,
+            "action": "SKIP",
+            "reason": "setup_ready",
+            "setup_status": setup_status,
+            "candidate": None,
+            "advance_result": None,
+            "setup_row": state.setup_row,
+        }
+
+    candidate_with_symbol = {**candidate, "symbol": candle.symbol}
+    return {
+        "symbol": candle.symbol,
+        "action": "ENTRY_CANDIDATE",
+        "setup_status": setup_status,
+        "candidate": candidate_with_symbol,
+        "advance_result": None,
+        "setup_row": state.setup_row,
+    }
+
+
+async def execute_entry(
+    *,
+    session: Any,
+    candidate: dict[str, Any],
+    setup_row: dict[str, Any],
+    params: BacktestParams,
+    now: datetime,
+    position_tracker: SessionPositionTracker,
+) -> dict[str, Any]:
+    symbol = str(candidate.get("symbol") or "")
+    if not symbol:
+        return {"action": "SKIP", "reason": "missing_symbol"}
+
+    candidate_to_open = dict(candidate)
+    entry_price = float(candidate_to_open.get("entry_price") or 0.0)
+    executable_qty = position_tracker.compute_position_qty(
+        entry_price=entry_price,
+        risk_based_sizing=bool(params.risk_based_sizing),
+        candidate_size=int(candidate_to_open.get("position_size") or 0),
+        capital_base=(
+            float(
+                position_tracker.current_equity()
+                if hasattr(position_tracker, "current_equity")
+                else getattr(position_tracker, "initial_capital", position_tracker.cash_available)
+            )
+            if params.compound_equity
+            else None
+        ),
+    )
+    if executable_qty < 1:
+        return {"action": "SKIP", "reason": "no_cash", "symbol": symbol}
+    candidate_to_open["position_size"] = executable_qty
+
+    result = await _open_position_from_candidate(
+        session=session,
+        symbol=symbol,
+        candidate=candidate_to_open,
+        setup_row=setup_row,
+        params=params,
+        now=now,
+    )
+    if result.get("action") == "OPEN":
+        position = result.get("position")
+        if position is not None:
+            qty = float(candidate_to_open.get("position_size") or 0.0)
+            position_tracker.record_open(position, qty * entry_price)
+    return result
+
+
+async def process_closed_candle(
+    *,
+    session: Any,
+    candle: Any,
+    runtime_state: PaperRuntimeState,
+    now: datetime,
+    position_tracker: SessionPositionTracker,
+) -> dict[str, Any]:
+    evaluation = await evaluate_candle(
+        session=session,
+        candle=candle,
+        runtime_state=runtime_state,
+        now=now,
+        position_tracker=position_tracker,
+        allow_entry_evaluation=True,
+    )
+    setup_status = str(evaluation.get("setup_status") or "pending")
+    action = str(evaluation.get("action") or "SKIP")
+
+    if action == "ADVANCE":
+        advance = evaluation.get("advance_result") or {}
+        if advance.get("action") == "CLOSE":
+            position_tracker.record_close(
+                str(candle.symbol),
+                float(advance.get("exit_value") or 0.0),
+            )
+        elif advance.get("action") == "PARTIAL":
+            position_tracker.credit_cash(float(advance.get("exit_value") or 0.0))
+        return {
+            "symbol": candle.symbol,
+            "opened": 0,
+            "closed": 1 if advance.get("action") == "CLOSE" else 0,
+            "setup_status": setup_status,
+            "result": advance,
+        }
+
+    if action == "ENTRY_CANDIDATE":
+        params = runtime_state.get_session_params(session)
+        if not position_tracker.can_open_new():
+            return {
+                "symbol": candle.symbol,
+                "opened": 0,
+                "closed": 0,
+                "reason": "max_positions",
+                "setup_status": setup_status,
+            }
+
+        execute_result = await execute_entry(
+            session=session,
+            candidate=dict(evaluation.get("candidate") or {}),
+            setup_row=dict(evaluation.get("setup_row") or {}),
+            params=params,
+            now=now,
+            position_tracker=position_tracker,
+        )
+        opened = 1 if execute_result.get("action") == "OPEN" else 0
+        payload = {
+            "symbol": candle.symbol,
+            "opened": opened,
+            "closed": 0,
+            "setup_status": setup_status,
+            "result": execute_result,
+        }
+        if opened == 0 and execute_result.get("reason"):
+            payload["reason"] = str(execute_result.get("reason"))
+        return payload
+
+    return {
+        "symbol": candle.symbol,
+        "opened": 0,
+        "closed": 0,
+        "reason": str(evaluation.get("reason") or "skip"),
+        "setup_status": setup_status,
+    }
+
+
+def _maybe_open_cpr_levels(
+    *,
+    candle: dict[str, Any],
+    day_pack: DayPack,
+    setup_row: dict[str, Any],
+    params: BacktestParams,
+    capital_base: float | None = None,
+) -> dict[str, Any] | None:
+    del candle
+    current_idx = len(day_pack.time_str) - 1
+    if current_idx < 0:
+        return None
+    # Evaluate only the current bar. Historical bars are not re-scanned after
+    # rejection, matching backtest's "signal exists only on its triggering bar".
+    return scan_cpr_levels_entry(
+        day_pack=day_pack,
+        setup_row=setup_row,
+        params=params,
+        scan_start_idx=current_idx,
+        scan_end_idx=current_idx,
+        capital_base=capital_base,
+    )
+
+
+__all__ = [
+    "PaperRuntimeState",
+    "SymbolRuntimeState",
+    "apply_paper_strategy_defaults",
+    "build_backtest_params",
+    "build_backtest_params_from_overrides",
+    "build_summary_feed_state",
+    "dispatch_session_error_alert",
+    "enforce_session_risk_controls",
+    "evaluate_candle",
+    "execute_entry",
+    "flatten_session_positions",
+    "load_setup_row",
+    "mark_price_for_position",
+    "maybe_shutdown_alert_dispatcher",
+    "process_closed_candle",
+    "register_session_start",
+    "set_alert_sink",
+    "set_alerts_suppressed",
+    "summarize_paper_positions",
+]

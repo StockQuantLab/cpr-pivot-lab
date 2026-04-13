@@ -1,0 +1,17 @@
+# CPR width + RVOL sweep (example)
+# Tests: cpr_percentile × rvol interaction on gold_51 × 10yr
+name: cpr-width-rvol-sweep
+strategy: CPR_LEVELS
+base_params:
+  universe_name: gold_51
+  start: "2015-01-01"
+  end: "2024-12-31"
+sweep:
+  - param: cpr_percentile
+    values: [25, 33, 50]
+  - param: rvol
+    values: [1.0, 1.2, 1.5]
+compare:
+  metric: calmar
+  sort: desc
+  top_n: 5
