@@ -17,7 +17,6 @@ from config.settings import get_settings
 from db.duckdb import get_dashboard_db, get_db
 from engine.command_lock import acquire_command_lock
 from engine.constants import normalize_symbol
-from engine.walk_forward_validator import iter_session_calendar_trade_dates
 
 IST = ZoneInfo("Asia/Kolkata")
 
@@ -98,8 +97,8 @@ def _parse_symbols_csv(value: str | None) -> list[str]:
 def _resolve_all_local_symbols(*, read_only: bool = True) -> list[str]:
     """Resolve the local executable symbol universe for paper workflows.
 
-    Prefer the actual 5-minute symbol universe because paper/live/walk-forward
-    execution depends on intraday data. Falling back to `get_available_symbols`
+    Prefer the actual 5-minute symbol universe because paper/live execution
+    depends on intraday data. Falling back to `get_available_symbols`
     keeps older tests and legacy setups working if the 5-minute view is not
     available yet.
 
@@ -237,82 +236,6 @@ def validate_live_runtime_coverage(*, trade_date: str, symbols: list[str]) -> di
     }
 
 
-def validate_walk_forward_runtime_coverage(
-    *,
-    start_date: str,
-    end_date: str,
-    symbols: list[str],
-    gap_tolerance_pct: float = 5.0,
-) -> dict[str, Any]:
-    """Return per-date runtime coverage gaps for a walk-forward date range.
-
-    Only checks symbols that have actual parquet data for the requested dates.
-    Symbols without 5-min data in the date range (e.g. delisted, not traded in 2026)
-    are excluded from the coverage requirement.
-
-    A small per-date gap in market_day_state / strategy_day_state is tolerated
-    (default 5%) because some symbols lack prerequisite data (e.g. no prev_close
-    from the prior trading day). The engine correctly skips these symbols.
-    """
-    db = _open_runtime_db(read_only=False)
-    trade_dates = iter_session_calendar_trade_dates(start_date, end_date)
-    requested_symbols = sorted(set(symbols))
-
-    # Scope to symbols that actually have parquet data for these dates
-    symbols_with_data = db.get_symbols_with_parquet_data(trade_dates)
-    effective_symbols = sorted(set(requested_symbols) & symbols_with_data)
-
-    blocking_by_date: list[dict[str, Any]] = []
-    info_by_date: list[dict[str, Any]] = []
-    n_effective = len(effective_symbols)
-    for trade_date in trade_dates:
-        coverage = db.get_runtime_trade_date_coverage(effective_symbols, trade_date)
-        missing_counts = {table: len(values) for table, values in coverage.items()}
-        missing_total = sum(missing_counts.values())
-        if missing_total == 0:
-            continue
-        entry = {
-            "trade_date": trade_date,
-            "coverage": coverage,
-            "missing_counts": missing_counts,
-            "missing_total": missing_total,
-        }
-        # Determine if any table exceeds the tolerance
-        is_blocking = False
-        for _table, count in missing_counts.items():
-            if n_effective > 0 and (count / n_effective) * 100 > gap_tolerance_pct:
-                is_blocking = True
-                break
-        if is_blocking:
-            blocking_by_date.append(entry)
-        else:
-            info_by_date.append(entry)
-
-    runtime_tables = [
-        "cpr_daily",
-        "atr_intraday",
-        "cpr_thresholds",
-        "or_daily",
-        "virgin_cpr_flags",
-        "market_day_state",
-        "strategy_day_state",
-        "intraday_day_pack",
-    ]
-    table_max_dates = db.get_table_max_trade_dates(runtime_tables)
-    ready = bool(trade_dates) and bool(effective_symbols) and not blocking_by_date
-    return {
-        "start_date": start_date,
-        "end_date": end_date,
-        "requested_symbols": requested_symbols,
-        "effective_symbols": effective_symbols,
-        "trade_dates": trade_dates,
-        "coverage_ready": ready,
-        "missing_by_date": blocking_by_date,
-        "tolerated_gaps": info_by_date,
-        "table_max_trade_dates": table_max_dates,
-    }
-
-
 def prepare_runtime_for_daily_paper(
     *,
     trade_date: str,
@@ -431,5 +354,4 @@ __all__ = [
     "resolve_trade_date",
     "validate_daily_runtime_coverage",
     "validate_live_runtime_coverage",
-    "validate_walk_forward_runtime_coverage",
 ]

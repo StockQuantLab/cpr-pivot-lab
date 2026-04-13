@@ -5,7 +5,7 @@ Handles both daily-sim and daily-live paper trading state.
 Tables: paper_sessions, paper_positions, paper_orders, paper_feed_state, alert_log.
 
 This replaces the PostgreSQL paper_trading_sessions/positions/orders/feed_state tables.
-PostgreSQL is retained only for agent_sessions, signals, and walk-forward validation.
+PostgreSQL is retained only for agent_sessions and signals.
 """
 
 from __future__ import annotations
@@ -83,7 +83,6 @@ class PaperSession:
     updated_at: datetime = field(default_factory=datetime.utcnow)
     notes: str | None = None
     mode: str = "replay"
-    wf_run_id: str | None = None
 
 
 @dataclass(slots=True)
@@ -207,7 +206,6 @@ class PaperDB:
                 ended_at       TIMESTAMPTZ,
                 notes          VARCHAR(500),
                 mode           VARCHAR(20) DEFAULT 'replay',
-                wf_run_id      VARCHAR(80),
                 created_at     TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
                 updated_at     TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
             )
@@ -330,7 +328,6 @@ class PaperDB:
         max_position_pct: float = 0.10,
         flatten_time: str = "15:15",
         mode: str = "replay",
-        wf_run_id: str | None = None,
         notes: str | None = None,
     ) -> PaperSession:
         sid = session_id or f"paper-{uuid.uuid4().hex[:8]}"
@@ -344,9 +341,9 @@ class PaperDB:
                 status, trade_date, execution_mode, created_by,
                 stale_feed_timeout_sec, portfolio_value,
                 max_daily_loss_pct, max_drawdown_pct, max_positions,
-                max_position_pct, flatten_time, mode, wf_run_id,
+                max_position_pct, flatten_time, mode,
                 notes, created_at, updated_at, started_at, ended_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 sid,
@@ -367,7 +364,6 @@ class PaperDB:
                 max_position_pct,
                 flatten_time,
                 mode,
-                wf_run_id,
                 notes,
                 now,
                 now,
@@ -385,7 +381,7 @@ class PaperDB:
             "portfolio_value, max_daily_loss_pct, max_drawdown_pct, max_positions, "
             "max_position_pct, flatten_time, daily_pnl_used, total_pnl, "
             "latest_candle_ts, stale_feed_at, started_at, ended_at, notes, mode, "
-            "wf_run_id, created_at, updated_at "
+            "created_at, updated_at "
             "FROM paper_sessions WHERE session_id = ?",
             [session_id],
         ).fetchone()
@@ -400,7 +396,7 @@ class PaperDB:
             "portfolio_value, max_daily_loss_pct, max_drawdown_pct, max_positions, "
             "max_position_pct, flatten_time, daily_pnl_used, total_pnl, "
             "latest_candle_ts, stale_feed_at, started_at, ended_at, notes, mode, "
-            "wf_run_id, created_at, updated_at "
+            "created_at, updated_at "
             "FROM paper_sessions WHERE status IN ('ACTIVE', 'PAUSED', 'STOPPING') "
             "ORDER BY created_at DESC"
         ).fetchall()
@@ -486,7 +482,6 @@ class PaperDB:
             "ended_at",
             "notes",
             "mode",
-            "wf_run_id",
             "created_at",
             "updated_at",
         ]
@@ -519,7 +514,6 @@ class PaperDB:
             ended_at=d.get("ended_at"),
             notes=d.get("notes"),
             mode=d.get("mode", "replay"),
-            wf_run_id=d.get("wf_run_id"),
         )
 
     # ------------------------------------------------------------------

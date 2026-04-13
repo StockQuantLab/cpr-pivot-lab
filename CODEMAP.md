@@ -22,7 +22,7 @@ raw CSV (NSE) -> pivot-convert -> parquet -> duckdb runtime tables -> backtest e
   - `paper_db.py` paper trading state (`paper.duckdb`)
   - `replica.py` engine-side versioned file replication
   - `replica_consumer.py` dashboard-side replica reader
-  - `postgres.py` agent sessions and walk-forward metadata (PostgreSQL)
+  - `postgres.py` agent sessions and signal metadata (PostgreSQL)
 - `agent/`
   - `llm_agent.py`, `tools/backtest_tools.py` for query tooling
 - `web/`

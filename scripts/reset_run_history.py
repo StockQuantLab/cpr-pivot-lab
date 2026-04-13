@@ -1,4 +1,4 @@
-"""Reset backtest, walk-forward, and paper-trading run history."""
+"""Reset backtest and paper-trading run history."""
 
 from __future__ import annotations
 
@@ -21,8 +21,6 @@ BACKTEST_TABLES: tuple[str, ...] = (
 )
 
 POSTGRES_TABLES: tuple[str, ...] = (
-    "walk_forward_runs",
-    "walk_forward_folds",
     "paper_trading_sessions",
     "paper_positions",
     "paper_orders",
@@ -113,7 +111,7 @@ def _delete_duckdb_run(run_id: str) -> dict[str, int]:
 async def _wipe_postgres() -> dict[str, int]:
     counts = await _collect_postgres_counts()
     async with get_db_session() as session:
-        for table in ("walk_forward_runs", "paper_trading_sessions"):
+        for table in ("paper_trading_sessions",):
             try:
                 await session.execute(text(f"DELETE FROM {table}"))
             except Exception:
@@ -130,7 +128,7 @@ def _print_counts(title: str, counts: dict[str, int]) -> None:
 @command_lock("runtime-writer", detail="runtime writer")
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Reset DuckDB run history and PostgreSQL paper/walk-forward state."
+        description="Reset DuckDB run history and PostgreSQL paper-trading state."
     )
     group = parser.add_mutually_exclusive_group()
     group.add_argument(
@@ -141,7 +139,7 @@ def main() -> None:
     group.add_argument(
         "--postgres-only",
         action="store_true",
-        help="Only wipe PostgreSQL paper/walk-forward state.",
+        help="Only wipe PostgreSQL paper-trading state.",
     )
     parser.add_argument(
         "--apply",

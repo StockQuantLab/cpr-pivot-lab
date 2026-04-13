@@ -19,16 +19,6 @@ from config.settings import get_settings
 from db.backtest_db import get_backtest_db
 from db.duckdb import get_dashboard_db, get_db
 from db.paper_db import PaperSession, get_paper_db
-from db.postgres import (
-    create_walk_forward_run,
-    delete_walk_forward_run,
-    get_walk_forward_run,
-    get_walk_forward_run_schema,
-    list_walk_forward_folds,
-    reset_walk_forward_folds,
-    update_walk_forward_run,
-    upsert_walk_forward_fold,
-)
 from engine.cli_setup import configure_windows_asyncio, configure_windows_stdio, run_asyncio
 from engine.command_lock import acquire_command_lock
 from engine.cpr_atr_strategy import BacktestResult, CPRATRBacktest
@@ -42,17 +32,6 @@ from engine.paper_runtime import (
     set_alerts_suppressed,
 )
 from engine.strategy_presets import ALL_STRATEGY_PRESETS, list_strategy_preset_names
-from engine.walk_forward_validator import (
-    GateConfig,
-    evaluate_walk_forward_gate,
-    iter_session_calendar_trade_dates,
-    make_gate_key,
-    make_scope_key,
-    normalize_strategy_params,
-    run_fast_walk_forward_validation,
-    summarize_calendar_folds,
-    validate_walk_forward_runtime_preflight,
-)
 from scripts import data_quality as _data_quality
 from scripts.paper_archive import archive_completed_session
 from scripts.paper_live import run_live_session
@@ -61,11 +40,16 @@ from scripts.paper_prepare import (
     prepare_runtime_for_daily_paper,
     resolve_prepare_symbols,
     resolve_trade_date,
-    validate_walk_forward_runtime_coverage,
 )
 from scripts.paper_replay import ReplayDayPack, load_replay_day_packs, replay_session
 
 logger = logging.getLogger(__name__)
+
+
+def normalize_strategy_params(strategy_params: dict[str, Any] | None) -> dict[str, Any]:
+    """Canonicalize strategy params via JSON round-trip for stable dict comparison."""
+    parsed = strategy_params or {}
+    return json.loads(json.dumps(parsed, sort_keys=True, separators=(",", ":")))
 
 
 def _pdb():
@@ -194,7 +178,7 @@ def _assert_cpr_only_strategy(strategy: str | None, *, source: str) -> str:
     return resolved
 
 
-WALK_FORWARD_STANDARD_MATRIX: tuple[tuple[str, str, dict[str, Any]], ...] = (
+PAPER_STANDARD_MATRIX: tuple[tuple[str, str, dict[str, Any]], ...] = (
     # CPR LONG: match the canonical backtest recipe.
     (
         "CPR_LEVELS_LONG",
@@ -349,69 +333,6 @@ def _count_duckdb_rows_for_run_ids(run_ids: list[str]) -> dict[str, int]:
     return counts
 
 
-def _format_walk_forward_runtime_coverage_error(preflight: dict[str, Any]) -> str:
-    trade_dates = preflight.get("trade_dates") or []
-    missing_by_date = preflight.get("missing_by_date") or []
-    table_max_trade_dates = preflight.get("table_max_trade_dates") or {}
-    lines = [
-        (
-            "Walk-forward runtime coverage is incomplete for "
-            f"{preflight.get('start_date')} -> {preflight.get('end_date')}."
-        ),
-        f"Requested symbols: {len(preflight.get('requested_symbols') or [])}.",
-        f"Weekday trade dates in range: {len(trade_dates)}.",
-    ]
-    if not trade_dates:
-        lines.append("No weekday trade dates fall inside the requested range.")
-    if missing_by_date:
-        lines.append("Missing coverage by trade date:")
-        for entry in missing_by_date[:10]:
-            counts = entry.get("missing_counts") or {}
-            lines.append(
-                "- "
-                f"{entry.get('trade_date')}: "
-                f"market_day_state={counts.get('market_day_state', 0)}, "
-                f"strategy_day_state={counts.get('strategy_day_state', 0)}, "
-                f"intraday_day_pack={counts.get('intraday_day_pack', 0)}"
-            )
-        if len(missing_by_date) > 10:
-            lines.append(f"- ... and {len(missing_by_date) - 10} more date(s)")
-    lines.append("Current runtime table max trade dates:")
-    for table in (
-        "cpr_daily",
-        "atr_intraday",
-        "cpr_thresholds",
-        "or_daily",
-        "virgin_cpr_flags",
-        "market_day_state",
-        "strategy_day_state",
-        "intraday_day_pack",
-    ):
-        lines.append(f"- {table}: {table_max_trade_dates.get(table) or 'missing'}")
-    lines.append("Refresh the stale setup tables before rerunning walk-forward:")
-    lines.append("  doppler run -- uv run pivot-build --table cpr --force")
-    lines.append("  doppler run -- uv run pivot-build --table atr --force --batch-size 64")
-    lines.append("  doppler run -- uv run pivot-build --table thresholds --force")
-    lines.append("  doppler run -- uv run pivot-build --table or --force")
-    lines.append("  doppler run -- uv run pivot-build --table virgin --force")
-    lines.append("  doppler run -- uv run pivot-build --table state --force")
-    lines.append("  doppler run -- uv run pivot-build --table strategy --force")
-    lines.append("  doppler run -- uv run pivot-data-validate --strict")
-    return "\n".join(lines)
-
-
-def _format_walk_forward_runtime_preflight_error(preflight: dict[str, Any]) -> str:
-    lines = [_format_walk_forward_runtime_coverage_error(preflight["coverage"])]
-    schema_reasons = preflight.get("schema_reasons") or []
-    if schema_reasons:
-        lines.append("")
-        lines.append("PostgreSQL schema preflight failed:")
-        for reason in schema_reasons:
-            lines.append(f"- {reason}")
-        lines.append("Run `doppler run -- uv run pivot-db-init` to apply the schema migration.")
-    return "\n".join(lines)
-
-
 def _build_runtime_coverage_fix_lines(missing_counts: dict[str, Any]) -> list[str]:
     lines: list[str] = []
     if int(missing_counts.get("market_day_state") or 0) > 0:
@@ -421,95 +342,6 @@ def _build_runtime_coverage_fix_lines(missing_counts: dict[str, Any]) -> list[st
     if int(missing_counts.get("intraday_day_pack") or 0) > 0:
         lines.append("doppler run -- uv run pivot-build --table pack --force --batch-size 64")
     return lines or ["doppler run -- uv run pivot-data-quality --date <trade-date>"]
-
-
-async def _validate_walk_forward_runtime_preflight(
-    *,
-    start_date: str,
-    end_date: str,
-    symbols: list[str],
-) -> dict[str, Any]:
-    try:
-        coverage = validate_walk_forward_runtime_coverage(
-            start_date=start_date,
-            end_date=end_date,
-            symbols=symbols,
-        )
-    except Exception as exc:
-        raise SystemExit(
-            "Walk-forward runtime preflight failed while checking runtime coverage: "
-            f"{type(exc).__name__}: {exc}"
-        ) from exc
-
-    try:
-        schema = await get_walk_forward_run_schema()
-    except Exception as exc:
-        raise SystemExit(
-            "Walk-forward runtime preflight failed while checking PostgreSQL schema: "
-            f"{type(exc).__name__}: {exc}"
-        ) from exc
-
-    preflight = validate_walk_forward_runtime_preflight(coverage=coverage, schema=schema)
-    if not preflight.get("ready", False):
-        raise SystemExit(_format_walk_forward_runtime_preflight_error(preflight))
-    return preflight
-
-
-async def _build_walk_forward_cleanup_plan(
-    *,
-    wf_run_ids: list[str],
-    explicit_run_ids: list[str],
-) -> dict[str, Any]:
-    from db.backtest_db import get_backtest_db
-    from db.duckdb import get_db
-
-    normalized_wf_run_ids = sorted(
-        {str(wf_run_id).strip() for wf_run_id in wf_run_ids if wf_run_id}
-    )
-    normalized_run_ids = sorted({str(run_id).strip() for run_id in explicit_run_ids if run_id})
-
-    wf_runs: list[dict[str, Any]] = []
-    fold_reference_run_ids: set[str] = set()
-    for wf_run_id in normalized_wf_run_ids:
-        run = await get_walk_forward_run(wf_run_id)
-        folds = await list_walk_forward_folds(wf_run_id)
-        fold_ids = sorted(
-            {
-                str(fold.reference_run_id).strip()
-                for fold in folds
-                if getattr(fold, "reference_run_id", None)
-            }
-        )
-        fold_reference_run_ids.update(fold_ids)
-        wf_runs.append(
-            {
-                "wf_run_id": wf_run_id,
-                "exists": run is not None,
-                "status": getattr(run, "status", None),
-                "decision": getattr(run, "decision", None),
-                "strategy": getattr(run, "strategy", None),
-                "start_date": getattr(run, "start_date", None),
-                "end_date": getattr(run, "end_date", None),
-                "fold_count": len(folds),
-                "fold_reference_run_ids": fold_ids,
-            }
-        )
-
-    tagged_run_ids = sorted(
-        {
-            *get_db().get_run_ids_for_wf_run_ids(normalized_wf_run_ids),
-            *get_backtest_db().get_run_ids_for_wf_run_ids(normalized_wf_run_ids),
-        }
-    )
-    all_run_ids = sorted(set(normalized_run_ids) | set(tagged_run_ids) | fold_reference_run_ids)
-
-    return {
-        "wf_runs": wf_runs,
-        "explicit_run_ids": normalized_run_ids,
-        "tagged_run_ids": tagged_run_ids,
-        "run_ids_to_delete": all_run_ids,
-        "duckdb_counts": _count_duckdb_rows_for_run_ids(all_run_ids),
-    }
 
 
 def _session_direction_suffix(strategy: str, strategy_params: dict[str, Any] | None) -> str:
@@ -541,7 +373,6 @@ async def _ensure_daily_session(
     strategy_params: dict,
     notes: str | None,
     mode: str = "replay",
-    wf_run_id: str | None = None,
 ) -> PaperSession:
     requested_session_id = session_id or _default_session_id(
         "paper",
@@ -566,7 +397,6 @@ async def _ensure_daily_session(
             strategy_params=strategy_params,
             trade_date=trade_date,
             mode=mode,
-            wf_run_id=wf_run_id,
             notes=notes,
         )
 
@@ -586,7 +416,6 @@ async def _ensure_daily_session(
         strategy_params=strategy_params,
         trade_date=trade_date,
         mode=mode,
-        wf_run_id=wf_run_id,
         notes=notes,
     )
 
@@ -677,7 +506,6 @@ async def _run_daily_workflow(
     notes: str | None,
     replay_kwargs: dict[str, Any] | None = None,
     live_kwargs: dict[str, Any] | None = None,
-    wf_run_id: str | None = None,
     skip_preparation: bool = False,
 ) -> dict[str, Any]:
     _warn_non_tradeable(symbols)
@@ -706,10 +534,9 @@ async def _run_daily_workflow(
         strategy_params=strategy_params,
         notes=notes,
         mode=mode,
-        wf_run_id=wf_run_id,
     )
 
-    if mode == "replay" or mode == "walk_forward":
+    if mode == "replay":
         payload = await replay_session(
             session_id=session.session_id,
             symbols=symbols,
@@ -929,9 +756,7 @@ async def _cmd_daily_live(args: argparse.Namespace) -> None:
         "candle_interval_minutes": args.candle_interval_minutes,
         "max_cycles": args.max_cycles,
         "complete_on_exit": args.complete_on_exit,
-        "allow_late_start_fallback": bool(
-            getattr(args, "allow_late_start_fallback", False)
-        ),
+        "allow_late_start_fallback": bool(getattr(args, "allow_late_start_fallback", False)),
     }
 
     if feed_source == "local":
@@ -1008,7 +833,7 @@ async def _run_multi_variants(
     strategy_upper = strategy_override.upper()
     variants = [
         (label, strat, params)
-        for label, strat, params in WALK_FORWARD_STANDARD_MATRIX
+        for label, strat, params in PAPER_STANDARD_MATRIX
         if strat == strategy_upper
     ]
     if not variants:
@@ -1110,9 +935,7 @@ async def _cmd_daily_live_multi(args: argparse.Namespace) -> None:
         "candle_interval_minutes": getattr(args, "candle_interval_minutes", None),
         "max_cycles": getattr(args, "max_cycles", None),
         "complete_on_exit": getattr(args, "complete_on_exit", False),
-        "allow_late_start_fallback": bool(
-            getattr(args, "allow_late_start_fallback", False)
-        ),
+        "allow_late_start_fallback": bool(getattr(args, "allow_late_start_fallback", False)),
     }
 
     async def _execute_variant(
@@ -1157,9 +980,7 @@ async def _cmd_daily_live_multi(args: argparse.Namespace) -> None:
             candle_interval_minutes=live_kwargs.get("candle_interval_minutes"),
             max_cycles=live_kwargs.get("max_cycles"),
             complete_on_exit=bool(live_kwargs.get("complete_on_exit")),
-            allow_late_start_fallback=bool(
-                live_kwargs.get("allow_late_start_fallback", False)
-            ),
+            allow_late_start_fallback=bool(live_kwargs.get("allow_late_start_fallback", False)),
             notes=args.notes,
         )
 
@@ -1191,7 +1012,7 @@ async def _cmd_daily_replay_multi(args: argparse.Namespace) -> None:
     ).upper()
     raw_variants = [
         (label, strat, params)
-        for label, strat, params in WALK_FORWARD_STANDARD_MATRIX
+        for label, strat, params in PAPER_STANDARD_MATRIX
         if strat == strategy_upper
     ]
     if not raw_variants:
@@ -1366,7 +1187,7 @@ async def _cmd_daily_sim(args: argparse.Namespace) -> None:
             # Run both canonical CPR variants (LONG + SHORT)
             variants = [
                 (strategy, apply_paper_strategy_defaults(strategy, dict(params)))
-                for _, strategy, params in WALK_FORWARD_STANDARD_MATRIX
+                for _, strategy, params in PAPER_STANDARD_MATRIX
             ]
 
         results = []
@@ -1394,653 +1215,6 @@ async def _cmd_daily_sim(args: argparse.Namespace) -> None:
             f"\n  Total: {total_trades} trades  ₹{total_pnl:,.0f} across {len(results)} variant(s)"
         )
         print(json.dumps({"trade_date": trade_date, "variants": results}, default=str, indent=2))
-
-
-def iter_trade_dates(start_date: str, end_date: str) -> list[str]:
-    return iter_session_calendar_trade_dates(start_date, end_date)
-
-
-def _wf_run_id(
-    strategy: str,
-    start_date: str,
-    end_date: str,
-    gate_key: str,
-    *,
-    validation_engine: str,
-) -> str:
-    engine_label = "fast" if validation_engine == "fast_validator" else "replay"
-    return f"wf-{engine_label}-{strategy.lower()}-{start_date}-{end_date}-{gate_key[:12]}"
-
-
-def _get_archived_paper_result_run_ids(session_ids: list[str]) -> set[str]:
-    """Return run_ids that already have archived PAPER rows in DuckDB."""
-    if not session_ids:
-        return set()
-
-    from db.duckdb import get_db
-
-    db = get_db()
-    placeholders = ", ".join("?" for _ in session_ids)
-    try:
-        rows = db.con.execute(
-            f"""
-            SELECT DISTINCT run_id
-            FROM backtest_results
-            WHERE execution_mode = 'PAPER' AND run_id IN ({placeholders})
-            """,
-            session_ids,
-        ).fetchall()
-    except Exception:
-        return set()
-    return {str(row[0]) for row in rows if row and row[0] is not None}
-
-
-def _summarize_walk_forward_sessions(
-    session_ids: list[str], portfolio_value: float
-) -> dict[str, Any]:
-    """Query DuckDB backtest_results to get per-day PnL for each session."""
-    if not session_ids:
-        return {"replayed_days": 0, "sessions_with_trades": 0, "total_pnl": 0.0}
-
-    from db.duckdb import get_db
-
-    db = get_db()
-    placeholders = ", ".join("?" for _ in session_ids)
-    try:
-        rows = db.con.execute(
-            f"""
-            SELECT run_id, SUM(profit_loss) AS day_pnl
-            FROM backtest_results
-            WHERE run_id IN ({placeholders}) AND execution_mode = ?
-            GROUP BY run_id
-            """,
-            [*session_ids, "PAPER"],
-        ).fetchall()
-    except Exception:
-        return {"replayed_days": len(session_ids), "sessions_with_trades": 0, "total_pnl": 0.0}
-
-    if not rows:
-        return {"replayed_days": len(session_ids), "sessions_with_trades": 0, "total_pnl": 0.0}
-
-    day_pnls = [float(row[1] or 0.0) for row in rows]
-    pv = portfolio_value if portfolio_value > 0 else 1_000_000.0
-    day_pnl_pcts = [pnl / pv * 100.0 for pnl in day_pnls]
-    if not day_pnl_pcts:
-        return {"replayed_days": len(session_ids), "sessions_with_trades": 0, "total_pnl": 0.0}
-    profitable = sum(1 for p in day_pnl_pcts if p > 0)
-
-    return {
-        "replayed_days": len(session_ids),
-        "sessions_with_trades": len(rows),
-        "total_pnl": round(sum(day_pnls), 2),
-        "total_return_pct": round(sum(day_pnl_pcts), 4),
-        "avg_daily_return_pct": round(sum(day_pnl_pcts) / len(day_pnl_pcts), 4),
-        "profitable_days": profitable,
-        "profitable_days_ratio": round(profitable / len(session_ids), 4),
-        "worst_daily_return_pct": round(min(day_pnl_pcts), 4),
-        "best_daily_return_pct": round(max(day_pnl_pcts), 4),
-    }
-
-
-def _evaluate_walk_forward(
-    summary: dict[str, Any],
-    gate: GateConfig | None = None,
-) -> dict[str, Any]:
-    """Return PASS/FAIL/INCONCLUSIVE decision based on walk-forward summary metrics."""
-    return evaluate_walk_forward_gate(summary, gate)
-
-
-async def run_walk_forward_validation(
-    *,
-    start_date: str,
-    end_date: str,
-    symbols: list[str],
-    strategy: str,
-    strategy_params: dict[str, Any],
-    notes: str | None = None,
-    force: bool = False,
-    all_symbols: bool = False,
-    carry_forward_equity: bool = False,
-    gate_config: GateConfig | None = None,
-    progress_hook: Any | None = None,
-) -> dict[str, Any]:
-    normalized_params = normalize_strategy_params(strategy_params)
-    gate_key = make_gate_key(strategy, normalized_params)
-    scope_key = make_scope_key(symbols, all_symbols=all_symbols)
-    await _validate_walk_forward_runtime_preflight(
-        start_date=start_date,
-        end_date=end_date,
-        symbols=symbols,
-    )
-    wf_id = _wf_run_id(
-        strategy,
-        start_date,
-        end_date,
-        gate_key,
-        validation_engine="fast_validator",
-    )
-    trade_dates = iter_trade_dates(start_date, end_date)
-    lineage = {
-        "validation_engine": "fast_validator",
-        "strategy_params": normalized_params,
-        "symbol_count": len(symbols),
-        "all_symbols": all_symbols,
-        "carry_forward_equity": carry_forward_equity,
-    }
-
-    await create_walk_forward_run(
-        wf_run_id=wf_id,
-        strategy=strategy,
-        start_date=start_date,
-        end_date=end_date,
-        days_requested=len(trade_dates),
-        validation_engine="fast_validator",
-        gate_key=gate_key,
-        scope_key=scope_key,
-        lineage_json=lineage,
-        notes=notes,
-    )
-
-    try:
-        result = run_fast_walk_forward_validation(
-            start_date=start_date,
-            end_date=end_date,
-            symbols=symbols,
-            strategy=strategy,
-            strategy_params=normalized_params,
-            wf_run_id=wf_id,
-            force=force,
-            carry_forward_equity=carry_forward_equity,
-            progress_hook=progress_hook,
-        )
-        folds = result["folds"]
-        await reset_walk_forward_folds(wf_id)
-        for fold in folds:
-            await upsert_walk_forward_fold(
-                wf_run_id=wf_id,
-                fold_index=int(fold["fold_index"]),
-                trade_date=str(fold["trade_date"]),
-                status=str(fold["status"]),
-                reference_run_id=str(fold["reference_run_id"]),
-                total_trades=int(fold.get("total_trades") or 0),
-                total_pnl=float(fold.get("total_pnl") or 0.0),
-                total_return_pct=float(fold.get("total_return_pct") or 0.0),
-                summary_json=fold,
-            )
-
-        summary = summarize_calendar_folds(
-            folds,
-            float(result["portfolio_value"]),
-            carry_forward_equity=bool(result.get("carry_forward_equity", False)),
-            ending_equity=result.get("ending_equity"),
-        )
-        evaluation = _evaluate_walk_forward(summary, gate_config)
-        summary_payload = {
-            **summary,
-            "evaluation": evaluation,
-            "gate_key": gate_key,
-            "scope_key": scope_key,
-            "folds": folds,
-        }
-        await update_walk_forward_run(
-            wf_id,
-            status="COMPLETED",
-            decision=evaluation["status"],
-            decision_reasons=",".join(evaluation["reasons"]) or None,
-            summary_json=summary_payload,
-            replayed_days=int(summary.get("replayed_days") or 0),
-            lineage_json=lineage,
-        )
-        return {
-            "wf_run_id": wf_id,
-            "validation_engine": "fast_validator",
-            "start_date": start_date,
-            "end_date": end_date,
-            "trade_dates": trade_dates,
-            "gate_key": gate_key,
-            "scope_key": scope_key,
-            "summary": summary,
-            "decision": evaluation,
-            "folds": folds,
-        }
-    except Exception:
-        await update_walk_forward_run(wf_id, status="FAILED", lineage_json=lineage)
-        raise
-
-
-async def _cmd_walk_forward_cleanup(args: argparse.Namespace) -> None:
-    wf_run_ids = [value for value in (args.wf_run_id or []) if value]
-    run_ids = [value for value in (args.run_id or []) if value]
-    if not wf_run_ids and not run_ids:
-        raise SystemExit("Provide at least one --wf-run-id or --run-id.")
-
-    plan = await _build_walk_forward_cleanup_plan(
-        wf_run_ids=wf_run_ids,
-        explicit_run_ids=run_ids,
-    )
-    payload: dict[str, Any] = {
-        "apply": bool(args.apply),
-        **plan,
-    }
-
-    if args.apply:
-        with acquire_command_lock("runtime-writer", detail="runtime writer"):
-            from db.backtest_db import get_backtest_db
-            from db.duckdb import get_db as get_market_db
-
-            market_db = get_market_db()
-            backtest_db = get_backtest_db()
-            payload["market_deleted"] = market_db.delete_runs(plan["run_ids_to_delete"])
-            payload["backtest_deleted"] = backtest_db.delete_runs(plan["run_ids_to_delete"])
-            payload["duckdb_deleted"] = payload["market_deleted"]
-            deleted_wf_runs = {}
-            for wf_run_id in wf_run_ids:
-                deleted_wf_runs[wf_run_id] = await delete_walk_forward_run(wf_run_id)
-            payload["postgres_deleted"] = deleted_wf_runs
-
-    print(json.dumps(payload, default=str, indent=2))
-
-
-async def run_walk_forward_replay(
-    *,
-    start_date: str,
-    end_date: str,
-    symbols: list[str],
-    strategy: str,
-    strategy_params: dict,
-    notes: str | None = None,
-    force: bool = False,
-    progress_hook: Any | None = None,
-) -> dict[str, Any]:
-    trade_dates = iter_trade_dates(start_date, end_date)
-    gate_key = make_gate_key(strategy, normalize_strategy_params(strategy_params))
-    await _validate_walk_forward_runtime_preflight(
-        start_date=start_date,
-        end_date=end_date,
-        symbols=symbols,
-    )
-    wf_id = _wf_run_id(
-        strategy,
-        start_date,
-        end_date,
-        gate_key,
-        validation_engine="paper_replay",
-    )
-    canonical_session_ids = {
-        trade_date: _default_session_id("paper", trade_date, strategy) for trade_date in trade_dates
-    }
-    archived_run_ids = _get_archived_paper_result_run_ids(list(canonical_session_ids.values()))
-
-    # Create (or reset) the parent walk-forward run record.
-    await create_walk_forward_run(
-        wf_run_id=wf_id,
-        strategy=strategy,
-        start_date=start_date,
-        end_date=end_date,
-        days_requested=len(trade_dates),
-        validation_engine="paper_replay",
-        gate_key=gate_key,
-        scope_key=make_scope_key(symbols, all_symbols=False),
-        lineage_json={
-            "validation_engine": "paper_replay",
-            "strategy_params": normalize_strategy_params(strategy_params),
-            "symbol_count": len(symbols),
-            "all_symbols": False,
-        },
-        notes=notes,
-    )
-    if force:
-        await reset_walk_forward_folds(wf_id)
-
-    existing_folds = {fold.trade_date: fold for fold in await list_walk_forward_folds(wf_id)}
-
-    results: list[dict[str, Any]] = []
-    recorded_trade_dates: set[str] = set()
-    started_at = time.perf_counter()
-
-    def _emit_progress(
-        *,
-        trade_date: str,
-        status: str,
-        index: int,
-        session_id: str | None = None,
-        extra: dict[str, Any] | None = None,
-    ) -> None:
-        if progress_hook is None:
-            return
-        progress_hook(
-            {
-                "trade_date": trade_date,
-                "status": status,
-                "index": index,
-                "total": len(trade_dates),
-                "session_id": session_id,
-                "replayed_days": len(recorded_trade_dates),
-                "elapsed_sec": round(time.perf_counter() - started_at, 2),
-                **(extra or {}),
-            }
-        )
-
-    for index, trade_date in enumerate(trade_dates, start=1):
-        canonical_id = canonical_session_ids[trade_date]
-
-        if not force:
-            checkpoint = existing_folds.get(trade_date)
-            if checkpoint is not None and checkpoint.status in {"COMPLETED", "SKIPPED"}:
-                payload = {
-                    "trade_date": trade_date,
-                    "status": "ALREADY_DONE",
-                    "session_id": checkpoint.paper_session_id or canonical_id,
-                    "checkpoint": asdict(checkpoint),
-                }
-                results.append(payload)
-                recorded_trade_dates.add(trade_date)
-                _emit_progress(
-                    trade_date=trade_date,
-                    status="ALREADY_DONE",
-                    index=index,
-                    session_id=checkpoint.paper_session_id or canonical_id,
-                )
-                continue
-
-            existing = await get_session(canonical_id)
-            if existing is not None and existing.status == "COMPLETED":
-                if canonical_id not in archived_run_ids:
-                    payload = {
-                        "trade_date": trade_date,
-                        "status": "MISSING_RESULTS",
-                        "session_id": canonical_id,
-                        "reason": "completed session has no archived PAPER results; rerun with --force",
-                    }
-                    results.append(payload)
-                    _emit_progress(
-                        trade_date=trade_date,
-                        status="MISSING_RESULTS",
-                        index=index,
-                        session_id=canonical_id,
-                        extra={"reason": payload["reason"]},
-                    )
-                    continue
-                payload = {
-                    "trade_date": trade_date,
-                    "status": "ALREADY_DONE",
-                    "session_id": canonical_id,
-                }
-                results.append(payload)
-                recorded_trade_dates.add(trade_date)
-                _emit_progress(
-                    trade_date=trade_date,
-                    status="ALREADY_DONE",
-                    index=index,
-                    session_id=canonical_id,
-                )
-                continue
-
-        workflow = await _run_daily_workflow(
-            mode="walk_forward",
-            trade_date=trade_date,
-            symbols=symbols,
-            strategy=strategy,
-            strategy_params=strategy_params,
-            session_id=None,
-            notes=notes,
-            replay_kwargs={"leave_active": False},
-            wf_run_id=wf_id,
-        )
-        if not workflow.get("preparation", {}).get("coverage_ready", False):
-            payload = {
-                "trade_date": trade_date,
-                "status": "SKIPPED",
-                "preparation": workflow["preparation"],
-            }
-            results.append(payload)
-            await upsert_walk_forward_fold(
-                wf_run_id=wf_id,
-                fold_index=index,
-                trade_date=trade_date,
-                status="SKIPPED",
-                reference_run_id=canonical_id,
-                paper_session_id=None,
-                total_trades=0,
-                total_pnl=0.0,
-                total_return_pct=0.0,
-                summary_json=payload,
-            )
-            _emit_progress(
-                trade_date=trade_date,
-                status="SKIPPED",
-                index=index,
-                extra={
-                    "missing_counts": workflow["preparation"]
-                    .get("coverage", {})
-                    .get("missing_counts")
-                },
-            )
-            continue
-
-        session_id = workflow["session_id"]
-        replay_payload = workflow.get("replay") or {}
-        archive_payload = replay_payload.get("archive") or {}
-        day_summary = _summarize_walk_forward_sessions(
-            [session_id], float(strategy_params.get("portfolio_value", 1_000_000))
-        )
-        total_trades = int(archive_payload.get("rows") or archive_payload.get("trade_count") or 0)
-        total_pnl = float(day_summary.get("total_pnl") or 0.0)
-        total_return_pct = float(day_summary.get("total_return_pct") or 0.0)
-        payload = {
-            "trade_date": trade_date,
-            "status": "REPLAYED",
-            "session_id": session_id,
-            "preparation": workflow["preparation"],
-            "replay": replay_payload,
-        }
-        results.append(payload)
-        await upsert_walk_forward_fold(
-            wf_run_id=wf_id,
-            fold_index=index,
-            trade_date=trade_date,
-            status="COMPLETED",
-            reference_run_id=session_id,
-            paper_session_id=session_id,
-            total_trades=total_trades,
-            total_pnl=total_pnl,
-            total_return_pct=total_return_pct,
-            summary_json={
-                "trade_date": trade_date,
-                "session_id": session_id,
-                "preparation": workflow["preparation"],
-                "replay": replay_payload,
-                "archive": archive_payload,
-                "total_trades": total_trades,
-                "total_pnl": total_pnl,
-                "total_return_pct": total_return_pct,
-            },
-        )
-        recorded_trade_dates.add(trade_date)
-        _emit_progress(
-            trade_date=trade_date,
-            status="REPLAYED",
-            index=index,
-            session_id=session_id,
-        )
-
-    final_folds = await list_walk_forward_folds(wf_id)
-    final_fold_payloads = [asdict(fold) for fold in final_folds]
-    pv = float(strategy_params.get("portfolio_value", 1_000_000))
-    summary = summarize_calendar_folds(final_fold_payloads, pv)
-    evaluation = _evaluate_walk_forward(summary)
-
-    replayed_days = int(summary.get("replayed_days") or 0)
-    await update_walk_forward_run(
-        wf_id,
-        status="COMPLETED",
-        decision=evaluation["status"],
-        decision_reasons=",".join(evaluation["reasons"]) or None,
-        summary_json={**summary, "evaluation": evaluation, "folds": final_fold_payloads},
-        replayed_days=replayed_days,
-    )
-
-    return {
-        "wf_run_id": wf_id,
-        "validation_engine": "paper_replay",
-        "start_date": start_date,
-        "end_date": end_date,
-        "trade_dates": trade_dates,
-        "results": results,
-        "replayed_days": replayed_days,
-        "days_requested": len(trade_dates),
-        "summary": summary,
-        "decision": evaluation,
-    }
-
-
-def _build_gate_config(args: argparse.Namespace) -> GateConfig | None:
-    """Build a GateConfig from CLI --gate-* flags, or None for defaults."""
-    overrides: dict[str, Any] = {}
-    if getattr(args, "gate_min_days", None) is not None:
-        overrides["min_replayed_days"] = args.gate_min_days
-    if getattr(args, "gate_min_trades", None) is not None:
-        overrides["min_total_trades"] = args.gate_min_trades
-    if getattr(args, "gate_min_profitable_ratio", None) is not None:
-        overrides["min_profitable_ratio"] = args.gate_min_profitable_ratio
-    if getattr(args, "gate_pf_floor", None) is not None:
-        overrides["min_profit_factor"] = args.gate_pf_floor
-    if getattr(args, "gate_max_daily_loss", None) is not None:
-        overrides["max_worst_daily_loss_pct"] = args.gate_max_daily_loss
-    return GateConfig(**overrides) if overrides else None
-
-
-async def _cmd_walk_forward(args: argparse.Namespace) -> None:
-    with acquire_command_lock("runtime-writer", detail="runtime writer"):
-        symbols = _resolve_cli_symbols(build_parser(), args, read_only=True)
-        strategy = _assert_cpr_only_strategy(args.strategy, source="strategy")
-        strategy_params = _resolve_paper_strategy_params(strategy, args.strategy_params, args)
-
-        def _print_progress(event: dict[str, Any]) -> None:
-            print(
-                f"[WF-FAST] {event['fold_index']}/{event['total']} {event['trade_date']} "
-                f"run_id={event['reference_run_id']} trades={event['total_trades']} "
-                f"return_pct={event['total_return_pct']:.4f} elapsed={event['elapsed_total_sec']:.1f}s"
-            )
-
-        payload = await run_walk_forward_validation(
-            start_date=resolve_trade_date(args.start_date),
-            end_date=resolve_trade_date(args.end_date),
-            symbols=symbols,
-            strategy=strategy,
-            strategy_params=strategy_params,
-            notes=args.notes,
-            force=args.force,
-            all_symbols=bool(args.all_symbols),
-            carry_forward_equity=bool(args.carry_forward_equity),
-            gate_config=_build_gate_config(args),
-            progress_hook=_print_progress,
-        )
-        print(json.dumps(payload, default=str, indent=2))
-
-
-async def _cmd_walk_forward_matrix(args: argparse.Namespace) -> None:
-    with acquire_command_lock("runtime-writer", detail="runtime writer"):
-        parser = build_parser()
-        symbols = _resolve_cli_symbols(parser, args, read_only=True)
-        start_date = resolve_trade_date(args.start_date)
-        end_date = resolve_trade_date(args.end_date)
-        await _validate_walk_forward_runtime_preflight(
-            start_date=start_date,
-            end_date=end_date,
-            symbols=symbols,
-        )
-        runs: list[dict[str, Any]] = []
-        total = len(WALK_FORWARD_STANDARD_MATRIX)
-
-        for index, (label, strategy, strategy_params) in enumerate(
-            WALK_FORWARD_STANDARD_MATRIX, start=1
-        ):
-            print(
-                f"[WF-MATRIX] {index}/{total} {label} start "
-                f"{start_date}->{end_date} symbols={len(symbols)}"
-            )
-
-            def _print_progress(event: dict[str, Any], *, label: str = label) -> None:
-                print(
-                    f"[WF-MATRIX:{label}] {event['fold_index']}/{event['total']} {event['trade_date']} "
-                    f"run_id={event['reference_run_id']} trades={event['total_trades']} "
-                    f"return_pct={event['total_return_pct']:.4f} elapsed={event['elapsed_total_sec']:.1f}s"
-                )
-
-            payload = await run_walk_forward_validation(
-                start_date=start_date,
-                end_date=end_date,
-                symbols=symbols,
-                strategy=strategy,
-                strategy_params=apply_paper_strategy_defaults(strategy, dict(strategy_params)),
-                notes=args.notes,
-                force=args.force,
-                all_symbols=bool(args.all_symbols),
-                carry_forward_equity=bool(args.carry_forward_equity),
-                gate_config=_build_gate_config(args),
-                progress_hook=_print_progress,
-            )
-            runs.append(
-                {
-                    "label": label,
-                    "strategy": strategy,
-                    "strategy_params": apply_paper_strategy_defaults(
-                        strategy, dict(strategy_params)
-                    ),
-                    "wf_run_id": payload.get("wf_run_id"),
-                    "decision": payload.get("decision"),
-                    "summary": payload.get("summary"),
-                    "gate_key": payload.get("gate_key"),
-                    "scope_key": payload.get("scope_key"),
-                    "trade_dates": payload.get("trade_dates"),
-                }
-            )
-            decision = payload.get("decision") or {}
-            print(
-                f"[WF-MATRIX] {index}/{total} {label} done status={decision.get('status', 'UNKNOWN')}"
-            )
-
-        print(
-            json.dumps(
-                {
-                    "start_date": start_date,
-                    "end_date": end_date,
-                    "all_symbols": bool(args.all_symbols),
-                    "symbol_count": len(symbols),
-                    "runs": runs,
-                },
-                default=str,
-                indent=2,
-            )
-        )
-
-
-async def _cmd_walk_forward_replay(args: argparse.Namespace) -> None:
-    with acquire_command_lock("runtime-writer", detail="runtime writer"):
-        symbols = _resolve_cli_symbols(build_parser(), args, read_only=True)
-        strategy = _assert_cpr_only_strategy(args.strategy, source="strategy")
-        strategy_params = _resolve_paper_strategy_params(strategy, args.strategy_params, args)
-
-        def _print_progress(event: dict[str, Any]) -> None:
-            session_txt = f" session={event['session_id']}" if event.get("session_id") else ""
-            print(
-                f"[WF-REPLAY] {event['index']}/{event['total']} {event['trade_date']} "
-                f"{event['status']}{session_txt} replayed_days={event['replayed_days']} "
-                f"elapsed={event['elapsed_sec']:.1f}s"
-            )
-
-        payload = await run_walk_forward_replay(
-            start_date=resolve_trade_date(args.start_date),
-            end_date=resolve_trade_date(args.end_date),
-            symbols=symbols,
-            strategy=strategy,
-            strategy_params=strategy_params,
-            notes=args.notes,
-            force=args.force,
-            progress_hook=_print_progress,
-        )
-        print(json.dumps(payload, default=str, indent=2))
 
 
 async def _cmd_start(args: argparse.Namespace) -> None:
@@ -2254,9 +1428,7 @@ async def _cmd_live(args: argparse.Namespace) -> None:
         candle_interval_minutes=args.candle_interval_minutes,
         max_cycles=args.max_cycles,
         complete_on_exit=args.complete_on_exit,
-        allow_late_start_fallback=bool(
-            getattr(args, "allow_late_start_fallback", False)
-        ),
+        allow_late_start_fallback=bool(getattr(args, "allow_late_start_fallback", False)),
         notes=args.notes,
     )
     print(json.dumps(payload, default=str, indent=2))
@@ -2381,38 +1553,6 @@ def build_parser() -> argparse.ArgumentParser:
             "--cpr-entry-start",
             default=None,
             help="Explicit CPR entry scan start time HH:MM.",
-        )
-
-    def _add_gate_args(sp: argparse.ArgumentParser) -> None:
-        sp.add_argument(
-            "--gate-min-days",
-            type=int,
-            default=None,
-            help="Minimum replayed days for PASS/FAIL (default: 5)",
-        )
-        sp.add_argument(
-            "--gate-min-trades",
-            type=int,
-            default=None,
-            help="Minimum total trades for PASS/FAIL (default: 10)",
-        )
-        sp.add_argument(
-            "--gate-min-profitable-ratio",
-            type=float,
-            default=None,
-            help="Minimum profitable-days ratio for PASS (default: 0.50)",
-        )
-        sp.add_argument(
-            "--gate-pf-floor",
-            type=float,
-            default=None,
-            help="Minimum profit factor for PASS (0 = disabled, default: 0)",
-        )
-        sp.add_argument(
-            "--gate-max-daily-loss",
-            type=float,
-            default=None,
-            help="Worst single-day return %% floor for PASS (negative, default: -10.0)",
         )
 
     def _add_live_args(sp: argparse.ArgumentParser) -> None:
@@ -2700,115 +1840,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Market data source: 'kite' (live WebSocket) or 'local' (DuckDB replay).",
     )
     daily_live.set_defaults(handler=_cmd_daily_live)
-
-    walk_forward = sub.add_parser(
-        "walk-forward",
-        help="Run the fast DuckDB-backed promotion validator across session-calendar folds",
-    )
-    walk_forward.add_argument(
-        "--start-date",
-        "--start",
-        dest="start_date",
-        required=True,
-        help="Fold range start (YYYY-MM-DD)",
-    )
-    walk_forward.add_argument(
-        "--end-date", "--end", dest="end_date", required=True, help="Fold range end (YYYY-MM-DD)"
-    )
-    _add_symbol_args(walk_forward)
-    _add_strategy_args(walk_forward)
-    walk_forward.add_argument("--notes", default=None, help="Optional session notes")
-    walk_forward.add_argument(
-        "--force",
-        action="store_true",
-        help="Recompute validator folds even if matching one-day backtest runs already exist",
-    )
-    walk_forward.add_argument(
-        "--carry-forward-equity",
-        action="store_true",
-        help="Carry ending equity from each fold into the next fold's starting capital",
-    )
-    _add_gate_args(walk_forward)
-    walk_forward.set_defaults(handler=_cmd_walk_forward)
-
-    walk_forward_matrix = sub.add_parser(
-        "walk-forward-matrix",
-        help="Run the canonical 2-run CPR walk-forward matrix (LONG + SHORT).",
-    )
-    walk_forward_matrix.add_argument(
-        "--start-date",
-        "--start",
-        dest="start_date",
-        required=True,
-        help="Fold range start (YYYY-MM-DD)",
-    )
-    walk_forward_matrix.add_argument(
-        "--end-date", "--end", dest="end_date", required=True, help="Fold range end (YYYY-MM-DD)"
-    )
-    _add_symbol_args(walk_forward_matrix)
-    walk_forward_matrix.add_argument("--notes", default=None, help="Optional session notes")
-    walk_forward_matrix.add_argument(
-        "--force",
-        action="store_true",
-        help="Recompute validator folds even if matching one-day backtest runs already exist",
-    )
-    walk_forward_matrix.add_argument(
-        "--carry-forward-equity",
-        action="store_true",
-        help="Carry ending equity from each fold into the next fold's starting capital",
-    )
-    _add_gate_args(walk_forward_matrix)
-    walk_forward_matrix.set_defaults(handler=_cmd_walk_forward_matrix)
-
-    walk_forward_cleanup = sub.add_parser(
-        "walk-forward-cleanup",
-        help="Dry-run or delete walk-forward ledger rows and associated DuckDB fold runs",
-    )
-    walk_forward_cleanup.add_argument(
-        "--wf-run-id",
-        action="append",
-        default=[],
-        help="Walk-forward parent ID to remove (repeatable).",
-    )
-    walk_forward_cleanup.add_argument(
-        "--run-id",
-        action="append",
-        default=[],
-        help=(
-            "Explicit DuckDB fold run_id to remove (repeatable). "
-            "Use for legacy rows created before wf_run_id tagging."
-        ),
-    )
-    walk_forward_cleanup.add_argument(
-        "--apply",
-        action="store_true",
-        help="Execute deletes. Default is dry-run only.",
-    )
-    walk_forward_cleanup.set_defaults(handler=_cmd_walk_forward_cleanup)
-
-    walk_forward_replay = sub.add_parser(
-        "walk-forward-replay",
-        help="Replay each trading date in a range as a separate paper session",
-    )
-    walk_forward_replay.add_argument(
-        "--start-date",
-        "--start",
-        dest="start_date",
-        required=True,
-        help="Replay range start (YYYY-MM-DD)",
-    )
-    walk_forward_replay.add_argument(
-        "--end-date", "--end", dest="end_date", required=True, help="Replay range end (YYYY-MM-DD)"
-    )
-    _add_symbol_args(walk_forward_replay)
-    _add_strategy_args(walk_forward_replay)
-    walk_forward_replay.add_argument("--notes", default=None, help="Optional session notes")
-    walk_forward_replay.add_argument(
-        "--force",
-        action="store_true",
-        help="Re-run all days even if sessions already exist as COMPLETED",
-    )
-    walk_forward_replay.set_defaults(handler=_cmd_walk_forward_replay)
 
     return parser
 

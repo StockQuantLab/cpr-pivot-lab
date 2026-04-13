@@ -25,8 +25,8 @@ doppler run -- uv run pivot-kite-ingest --refresh-instruments --exchange NSE
 doppler run -- uv run pivot-kite-ingest --from 2026-03-10 --to 2026-03-20 --symbols SBIN,RELIANCE
 doppler run -- uv run pivot-kite-ingest --from 2026-03-10 --to 2026-03-20 --symbols SBIN,RELIANCE --5min --resume
 doppler run -- uv run pivot-build --table pack --refresh-since 2026-03-10 --batch-size 64
-doppler run -- uv run pivot-paper-trading walk-forward --start-date 2026-03-10 --end-date 2026-03-20 --symbols SBIN,RELIANCE --strategy CPR_LEVELS
-doppler run -- uv run pivot-paper-trading walk-forward-replay --start-date 2026-03-10 --end-date 2026-03-20 --symbols SBIN,RELIANCE --strategy CPR_LEVELS
+doppler run -- uv run pivot-paper-trading daily-replay --trade-date 2026-03-10 --symbols SBIN,RELIANCE --strategy CPR_LEVELS
+doppler run -- uv run pivot-paper-trading daily-live --trade-date 2026-03-23 --symbols SBIN,RELIANCE --strategy CPR_LEVELS
 doppler run -- uv run pivot-paper-trading daily-live --trade-date 2026-03-23 --symbols SBIN,RELIANCE --strategy CPR_LEVELS
 ```
 
@@ -144,8 +144,8 @@ tailscale serve --https=443 off     # stop serving
 
 ## Paper Trading Notes
 
-- `walk-forward` is the fast validator. Use `walk-forward-replay` only when you need the full paper-session replay path.
-- Walk-forward is launched from the CLI and reviewed on the dedicated `/walk_forward` dashboard page.
+- `daily-replay` is the candle-by-candle parity path. Use `daily-live` for the live websocket code path against historical `intraday_day_pack` data.
+- Replay and live paper execution are reviewed on `/paper_ledger`.
 - Active paper sessions and archived paper-session history are shown under `Paper Sessions` at `/paper_ledger`.
 - `/backtest` and `Strategy Analysis` remain saved-backtest views, not paper-session views.
 - Coding tools such as Copilot, Codex, and Claude Code should reference the CLI commands above when guiding operators.

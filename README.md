@@ -67,7 +67,7 @@ Use this when you want a clean slate in the tables and the four dashboard backte
 Run these from the host Windows shell with Doppler authenticated.
 
 ```bash
-# Wipe DuckDB backtest history and PostgreSQL paper / walk-forward state
+# Wipe DuckDB backtest history and PostgreSQL paper-trading state
 doppler run -- uv run pivot-reset-history --apply
 
 # CPR_LEVELS LONG: RVOL on
@@ -142,8 +142,7 @@ Dashboard URL: `http://127.0.0.1:9999`
 ### 8) Daily paper-trading workflow
 
 Run 4 independent paper sessions each trading day: CPR_LEVELS LONG/SHORT, FBR LONG/SHORT.
-Paper trading IS the validation — walk-forward fold testing is available from the CLI but is not
-part of the daily paper flow. See `docs/PAPER_TRADING_RUNBOOK.md` for the full operating guide.
+Paper trading IS the validation. See `docs/PAPER_TRADING_RUNBOOK.md` for the full operating guide.
 When you compare a specific paper run to a backtest baseline, use the same explicit strategy flags
 and sizing override. `--risk-based-sizing` must be present on both sides if that baseline used it;
 otherwise leave it off.
@@ -163,7 +162,7 @@ dedupes and prefers that overlay automatically.
 The rebuild and validation steps below work against whatever local parquet history is already on
 disk. They do not start a new Kite backfill from a fixed year like 2015.
 
-On Windows, launch long `pivot-build` and `pivot-paper-trading walk-forward` jobs in the
+On Windows, launch long `pivot-build` and `pivot-paper-trading daily-live` jobs in the
 background and poll their log files under `.tmp_logs/` rather than blocking the interactive
 terminal for the full runtime.
 
@@ -178,20 +177,7 @@ doppler run -- uv run pivot-build --table pack --refresh-since 2026-03-10 --batc
 ```
 
 ```bash
-# Fast walk-forward validation from the CLI
-doppler run -- uv run pivot-paper-trading walk-forward-matrix \
-  --start-date 2026-03-10 \
-  --end-date 2026-03-20 \
-  --all-symbols --force
-
-# Full paper-session replay when you need per-bar parity checks
-doppler run -- uv run pivot-paper-trading walk-forward-replay \
-  --start-date 2026-03-10 \
-  --end-date 2026-03-20 \
-  --symbols SBIN,RELIANCE \
-  --strategy CPR_LEVELS
-
-# Monday live paper session after validation
+# Monday live paper session
 doppler run -- uv run pivot-paper-trading daily-live \
   --trade-date 2026-03-23 \
   --symbols SBIN,RELIANCE \
@@ -208,31 +194,11 @@ doppler run -- uv run pivot-paper-trading daily-replay \
 doppler run -- uv run pivot-paper-trading cleanup --apply
 ```
 
-`walk-forward`, `walk-forward-matrix`, and `walk-forward-replay` also accept `--start` / `--end` aliases for the date range.
-
 Important distinctions:
 
-- Walk-forward is a CLI workflow with a dedicated `/walk_forward` dashboard page.
-- Fast walk-forward validation writes fold summaries to PostgreSQL plus DuckDB backtest output.
-- Fold backtest rows are now tagged with their parent `wf_run_id` in DuckDB `run_metadata` so cleanup can be done with a first-class CLI command instead of ad hoc SQL/Python.
-- `walk-forward-matrix` now performs a trade-date coverage preflight before any fold runs. If `market_day_state` / `strategy_day_state` are stale for the requested range, it fails fast instead of returning a false zero-trade result.
-- Each fold expands inline to show the underlying trade ledger for that day.
 - Replay and live paper execution remain on `Paper Sessions` at `/paper_ledger`.
 - `/backtest` and `Strategy Analysis` remain backtest-only views.
-- The local agent can inspect paper sessions and archived ledgers, but it does not yet expose a dedicated tool to launch walk-forward directly.
-
-Cleanup path for a wrong or aborted validator run:
-
-```bash
-# Dry-run first
-doppler run -- uv run pivot-paper-trading walk-forward-cleanup \
-  --wf-run-id <wf-run-id>
-
-# Apply delete after reviewing the scope
-doppler run -- uv run pivot-paper-trading walk-forward-cleanup \
-  --wf-run-id <wf-run-id> \
-  --apply
-```
+- The local agent can inspect paper sessions and archived ledgers.
 
 For full history cleanup before a fresh backtest or paper rerun, use:
 
@@ -264,7 +230,7 @@ Shared portfolio execution model:
 - `max_positions`
 - `max_position_pct`
 
-Paper trading is implemented end-to-end for live session state, replay, walk-forward validation, live feed adapters, strategy execution, flatten/close workflows, and archival. The operator runbook is in `docs/PAPER_TRADING_RUNBOOK.md`, and the implementation details are documented in `docs/DESIGN.md`.
+Paper trading is implemented end-to-end for live session state, replay/live validation, live feed adapters, strategy execution, flatten/close workflows, and archival. The operator runbook is in `docs/PAPER_TRADING_RUNBOOK.md`, and the implementation details are documented in `docs/DESIGN.md`.
 
 ## Troubleshooting
 

@@ -45,9 +45,9 @@ async def home_page() -> None:
                     ui.label("CPR Pivot Lab").classes("text-3xl font-bold").style(
                         f"color: {theme['text_primary']};"
                     )
-                    ui.label(
-                        "CPR/FBR backtesting with walk-forward validation and paper trading."
-                    ).classes("text-sm").style(f"color: {theme['text_secondary']};")
+                    ui.label("CPR/FBR backtesting with paper trading.").classes("text-sm").style(
+                        f"color: {theme['text_secondary']};"
+                    )
                 # Compact status indicators (replaces large KPI cards)
                 tables = status.get("tables", {})
                 symbol_count = status.get("symbols", tables.get("intraday_day_pack", 0))

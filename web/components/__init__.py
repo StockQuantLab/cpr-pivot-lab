@@ -247,7 +247,6 @@ NAV_SECTIONS = [
             {"label": "Pipeline", "icon": "engineering", "path": "/pipeline"},
             {"label": "Paper Sessions", "icon": "receipt_long", "path": "/paper_ledger"},
             {"label": "Market Monitor", "icon": "today", "path": "/daily_summary"},
-            {"label": "Walk Forward", "icon": "rule", "path": "/walk_forward"},
         ],
     },
     {

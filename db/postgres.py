@@ -6,7 +6,6 @@ Market data stays in DuckDB + Parquet.
 
 from __future__ import annotations
 
-import asyncio
 import atexit
 import json
 import re
@@ -201,8 +200,7 @@ _PAPER_SESSION_COLS = """
     ended_at,
     status,
     notes,
-    COALESCE(mode, 'replay') AS mode,
-    wf_run_id
+    COALESCE(mode, 'replay') AS mode
 """
 
 _PAPER_SESSION_SELECT = f"SELECT {_PAPER_SESSION_COLS} FROM paper_trading_sessions"
@@ -275,48 +273,6 @@ _PAPER_FEED_STATE_SELECT = """
     FROM paper_feed_state
 """
 
-_WF_RUN_SELECT = """
-    SELECT
-        wf_run_id,
-        strategy,
-        start_date::text AS start_date,
-        end_date::text AS end_date,
-        validation_engine,
-        gate_key,
-        scope_key,
-        COALESCE(lineage_json, '{}'::jsonb) AS lineage_json,
-        status,
-        decision,
-        decision_reasons,
-        COALESCE(summary_json, '{}'::jsonb) AS summary_json,
-        replayed_days,
-        days_requested,
-        notes,
-        created_at,
-        updated_at
-    FROM walk_forward_runs
-"""
-
-_WF_FOLD_SELECT = """
-    SELECT
-        fold_id,
-        wf_run_id,
-        fold_index,
-        trade_date::text AS trade_date,
-        status,
-        reference_run_id,
-        paper_session_id,
-        total_trades,
-        total_pnl,
-        total_return_pct,
-        COALESCE(summary_json, '{}'::jsonb) AS summary_json,
-        parity_actual_run_id,
-        parity_status,
-        created_at,
-        updated_at
-    FROM walk_forward_folds
-"""
-
 
 @dataclass(slots=True)
 class PaperSession:
@@ -342,7 +298,6 @@ class PaperSession:
     ended_at: datetime | None
     notes: str | None
     mode: str = "replay"
-    wf_run_id: str | None = None
 
 
 @dataclass(slots=True)
@@ -400,46 +355,6 @@ class FeedState:
     last_price: float | None
     stale_reason: str | None
     raw_state: dict[str, Any]
-    updated_at: datetime
-
-
-@dataclass(slots=True)
-class WalkForwardRun:
-    wf_run_id: str
-    strategy: str
-    start_date: str
-    end_date: str
-    validation_engine: str
-    gate_key: str | None
-    scope_key: str | None
-    lineage_json: dict[str, Any]
-    status: str
-    decision: str | None
-    decision_reasons: str | None
-    summary_json: dict[str, Any]
-    replayed_days: int
-    days_requested: int
-    notes: str | None
-    created_at: datetime
-    updated_at: datetime
-
-
-@dataclass(slots=True)
-class WalkForwardFold:
-    fold_id: int
-    wf_run_id: str
-    fold_index: int
-    trade_date: str
-    status: str
-    reference_run_id: str | None
-    paper_session_id: str | None
-    total_trades: int
-    total_pnl: float | None
-    total_return_pct: float | None
-    summary_json: dict[str, Any]
-    parity_actual_run_id: str | None
-    parity_status: str | None
-    created_at: datetime
     updated_at: datetime
 
 
@@ -775,7 +690,6 @@ def _paper_session_from_row(row: Mapping[str, Any]) -> PaperSession:
         ended_at=values.get("ended_at"),
         notes=values.get("notes"),
         mode=str(values.get("mode") or "replay"),
-        wf_run_id=values.get("wf_run_id"),
     )
 
 
@@ -873,7 +787,6 @@ def _paper_session_to_postgres(session: Any) -> PaperSession:
             ended_at=values.get("ended_at"),
             notes=values.get("notes"),
             mode=str(values.get("mode") or "replay"),
-            wf_run_id=values.get("wf_run_id"),
         )
     return PaperSession(
         session_id=session.session_id,
@@ -898,7 +811,6 @@ def _paper_session_to_postgres(session: Any) -> PaperSession:
         ended_at=getattr(session, "ended_at", None),
         notes=getattr(session, "notes", None),
         mode=str(getattr(session, "mode", "replay") or "replay"),
-        wf_run_id=getattr(session, "wf_run_id", None),
     )
 
 
@@ -1037,7 +949,6 @@ async def create_paper_session(
     max_positions: int | None = None,
     max_position_pct: float | None = None,
     mode: str = "replay",
-    wf_run_id: str | None = None,
     notes: str | None = None,
 ) -> PaperSession:
     settings = get_settings()
@@ -1057,7 +968,7 @@ async def create_paper_session(
                         stale_feed_timeout_sec, max_daily_loss_pct,
                         max_drawdown_pct, max_positions, max_position_pct,
                         daily_pnl_used, latest_candle_ts, stale_feed_at,
-                        created_at, updated_at, started_at, ended_at, wf_run_id,
+                        created_at, updated_at, started_at, ended_at,
                         notes
                     ) VALUES (
                         :session_id, :name, :strategy, :symbols, :strategy_params,
@@ -1065,7 +976,7 @@ async def create_paper_session(
                         :stale_feed_timeout_sec, :max_daily_loss_pct,
                         :max_drawdown_pct, :max_positions, :max_position_pct,
                         :daily_pnl_used, :latest_candle_ts, :stale_feed_at,
-                        :created_at, :updated_at, :started_at, :ended_at, :wf_run_id,
+                        :created_at, :updated_at, :started_at, :ended_at,
                         :notes
                     )
                     RETURNING *
@@ -1113,7 +1024,6 @@ async def create_paper_session(
                         "updated_at": _utcnow(),
                         "started_at": None,
                         "ended_at": None,
-                        "wf_run_id": wf_run_id,
                         "notes": notes,
                     },
                 )
@@ -1188,397 +1098,7 @@ async def update_session(
 update_session_state = update_session
 
 
-# ── Walk-forward run CRUD ────────────────────────────────────────────────────
-
-
-def _wf_run_from_row(row: Mapping[str, Any]) -> WalkForwardRun:
-    values = dict(row)
-    return WalkForwardRun(
-        wf_run_id=values["wf_run_id"],
-        strategy=values["strategy"],
-        start_date=str(values["start_date"]),
-        end_date=str(values["end_date"]),
-        validation_engine=str(values.get("validation_engine") or "paper_replay"),
-        gate_key=values.get("gate_key"),
-        scope_key=values.get("scope_key"),
-        lineage_json=_coerce_json_object(values.get("lineage_json")),
-        status=values["status"],
-        decision=values.get("decision"),
-        decision_reasons=values.get("decision_reasons"),
-        summary_json=_coerce_json_object(values.get("summary_json")),
-        replayed_days=int(values.get("replayed_days") or 0),
-        days_requested=int(values.get("days_requested") or 0),
-        notes=values.get("notes"),
-        created_at=values["created_at"],
-        updated_at=values["updated_at"],
-    )
-
-
-def _wf_fold_from_row(row: Mapping[str, Any]) -> WalkForwardFold:
-    values = dict(row)
-    return WalkForwardFold(
-        fold_id=int(values["fold_id"]),
-        wf_run_id=values["wf_run_id"],
-        fold_index=int(values["fold_index"]),
-        trade_date=str(values["trade_date"]),
-        status=values["status"],
-        reference_run_id=values.get("reference_run_id"),
-        paper_session_id=values.get("paper_session_id"),
-        total_trades=int(values.get("total_trades") or 0),
-        total_pnl=float(values["total_pnl"]) if values.get("total_pnl") is not None else None,
-        total_return_pct=(
-            float(values["total_return_pct"])
-            if values.get("total_return_pct") is not None
-            else None
-        ),
-        summary_json=_coerce_json_object(values.get("summary_json")),
-        parity_actual_run_id=values.get("parity_actual_run_id"),
-        parity_status=values.get("parity_status"),
-        created_at=values["created_at"],
-        updated_at=values["updated_at"],
-    )
-
-
-async def get_walk_forward_run(wf_run_id: str) -> WalkForwardRun | None:
-    row = await asyncio.to_thread(
-        _run_sync_query_one,
-        f"{_WF_RUN_SELECT} WHERE wf_run_id = %(wf_run_id)s",
-        {"wf_run_id": wf_run_id},
-    )
-    return _wf_run_from_row(row) if row else None
-
-
-async def get_walk_forward_run_schema() -> dict[str, Any]:
-    """Return walk_forward_runs column and constraint metadata for preflight checks."""
-    column_rows = await asyncio.to_thread(
-        _run_sync_query,
-        """
-        SELECT
-            column_name,
-            data_type,
-            character_maximum_length,
-            is_nullable,
-            udt_name
-        FROM information_schema.columns
-        WHERE table_schema = current_schema()
-          AND table_name = 'walk_forward_runs'
-          AND column_name IN (
-              'status',
-              'decision',
-              'decision_reasons',
-              'summary_json',
-              'replayed_days',
-              'days_requested'
-          )
-        ORDER BY column_name
-        """,
-    )
-    constraint_rows = await asyncio.to_thread(
-        _run_sync_query,
-        """
-        SELECT
-            tc.constraint_name,
-            cc.check_clause
-        FROM information_schema.table_constraints tc
-        JOIN information_schema.check_constraints cc
-          ON cc.constraint_schema = tc.constraint_schema
-         AND cc.constraint_name = tc.constraint_name
-        WHERE tc.table_schema = current_schema()
-          AND tc.table_name = 'walk_forward_runs'
-          AND tc.constraint_type = 'CHECK'
-          AND tc.constraint_name IN ('walk_forward_runs_decision_check')
-        ORDER BY tc.constraint_name
-        """,
-    )
-    return {
-        "columns": {str(row["column_name"]): dict(row) for row in column_rows},
-        "constraints": {
-            str(row["constraint_name"]): str(row["check_clause"]) for row in constraint_rows
-        },
-    }
-
-
-async def get_latest_passed_walk_forward_run(
-    strategy: str,
-    *,
-    gate_key: str | None = None,
-    validation_engine: str | None = None,
-) -> WalkForwardRun | None:
-    """Return the most recent PASS walk-forward run for a strategy (gate check)."""
-    clauses = ["strategy = %(strategy)s", "decision = 'PASS'"]
-    params: dict[str, Any] = {"strategy": strategy}
-    if gate_key:
-        clauses.append("gate_key = %(gate_key)s")
-        params["gate_key"] = gate_key
-    if validation_engine:
-        clauses.append("validation_engine = %(validation_engine)s")
-        params["validation_engine"] = validation_engine
-    row = await asyncio.to_thread(
-        _run_sync_query_one,
-        f"{_WF_RUN_SELECT} WHERE {' AND '.join(clauses)} ORDER BY created_at DESC LIMIT 1",
-        params,
-    )
-    return _wf_run_from_row(row) if row else None
-
-
-async def list_walk_forward_runs(
-    *,
-    limit: int = 25,
-    strategy: str | None = None,
-    validation_engine: str | None = None,
-) -> list[WalkForwardRun]:
-    clauses: list[str] = []
-    params: dict[str, Any] = {"limit": max(0, int(limit))}
-    if strategy:
-        clauses.append("strategy = %(strategy)s")
-        params["strategy"] = strategy
-    if validation_engine:
-        clauses.append("validation_engine = %(validation_engine)s")
-        params["validation_engine"] = validation_engine
-    where_sql = f" WHERE {' AND '.join(clauses)}" if clauses else ""
-    rows = await asyncio.to_thread(
-        _run_sync_query,
-        f"{_WF_RUN_SELECT}{where_sql} ORDER BY created_at DESC LIMIT %(limit)s",
-        params,
-    )
-    return [_wf_run_from_row(row) for row in rows]
-
-
-async def create_walk_forward_run(
-    *,
-    wf_run_id: str,
-    strategy: str,
-    start_date: str,
-    end_date: str,
-    days_requested: int,
-    validation_engine: str = "paper_replay",
-    gate_key: str | None = None,
-    scope_key: str | None = None,
-    lineage_json: dict[str, Any] | None = None,
-    notes: str | None = None,
-) -> WalkForwardRun:
-    now = _utcnow()
-    payload = {
-        "wf_run_id": wf_run_id,
-        "strategy": strategy,
-        "start_date": start_date,
-        "end_date": end_date,
-        "validation_engine": validation_engine,
-        "gate_key": gate_key,
-        "scope_key": scope_key,
-        "lineage_json": _json_dump(lineage_json or {}),
-        "status": "RUNNING",
-        "days_requested": days_requested,
-        "notes": notes,
-        "created_at": now,
-        "updated_at": now,
-    }
-    async with get_db_session() as session:
-        row = (
-            (
-                await session.execute(
-                    text(
-                        """
-                        INSERT INTO walk_forward_runs (
-                            wf_run_id, strategy, start_date, end_date,
-                            validation_engine, gate_key, scope_key, lineage_json,
-                            status, days_requested, notes, created_at, updated_at
-                        )
-                        VALUES (
-                            :wf_run_id, :strategy, CAST(:start_date AS date), CAST(:end_date AS date),
-                            :validation_engine, :gate_key, :scope_key, CAST(:lineage_json AS jsonb),
-                            :status, :days_requested, :notes, :created_at, :updated_at
-                        )
-                        ON CONFLICT (wf_run_id) DO UPDATE
-                            SET status = 'RUNNING',
-                                validation_engine = EXCLUDED.validation_engine,
-                                gate_key = COALESCE(EXCLUDED.gate_key, walk_forward_runs.gate_key),
-                                scope_key = COALESCE(EXCLUDED.scope_key, walk_forward_runs.scope_key),
-                                lineage_json = COALESCE(EXCLUDED.lineage_json, walk_forward_runs.lineage_json),
-                                days_requested = EXCLUDED.days_requested,
-                                notes = COALESCE(EXCLUDED.notes, walk_forward_runs.notes),
-                                updated_at = EXCLUDED.updated_at
-                        RETURNING
-                            wf_run_id, strategy,
-                            start_date::text AS start_date, end_date::text AS end_date,
-                            validation_engine, gate_key, scope_key,
-                            COALESCE(lineage_json, '{}'::jsonb) AS lineage_json,
-                            status, decision, decision_reasons,
-                            COALESCE(summary_json, '{}'::jsonb) AS summary_json,
-                            replayed_days, days_requested, notes, created_at, updated_at
-                        """
-                    ),
-                    payload,
-                )
-            )
-            .mappings()
-            .one()
-        )
-    return _wf_run_from_row(row)
-
-
-async def update_walk_forward_run(
-    wf_run_id: str,
-    *,
-    status: str | None = None,
-    decision: str | None = None,
-    decision_reasons: str | None = None,
-    summary_json: dict[str, Any] | None = None,
-    replayed_days: int | None = None,
-    lineage_json: dict[str, Any] | None = None,
-) -> WalkForwardRun | None:
-    updates: dict[str, Any] = {"updated_at": _utcnow()}
-    if status is not None:
-        updates["status"] = status
-    if decision is not None:
-        updates["decision"] = decision
-    if decision_reasons is not None:
-        updates["decision_reasons"] = decision_reasons
-    if summary_json is not None:
-        updates["summary_json"] = _json_dump(summary_json)
-    if replayed_days is not None:
-        updates["replayed_days"] = replayed_days
-    if lineage_json is not None:
-        updates["lineage_json"] = _json_dump(lineage_json)
-
-    updates["wf_run_id"] = wf_run_id
-    set_sql = ", ".join(f"{key} = :{key}" for key in updates if key != "wf_run_id")
-
-    async with get_db_session() as session:
-        await session.execute(
-            text(f"UPDATE walk_forward_runs SET {set_sql} WHERE wf_run_id = :wf_run_id"),
-            updates,
-        )
-    return await get_walk_forward_run(wf_run_id)
-
-
-async def reset_walk_forward_folds(wf_run_id: str) -> None:
-    async with get_db_session() as session:
-        await session.execute(
-            text("DELETE FROM walk_forward_folds WHERE wf_run_id = :wf_run_id"),
-            {"wf_run_id": wf_run_id},
-        )
-
-
-async def delete_walk_forward_run(wf_run_id: str) -> int:
-    async with get_db_session() as session:
-        result = await session.execute(
-            text("DELETE FROM walk_forward_runs WHERE wf_run_id = :wf_run_id"),
-            {"wf_run_id": wf_run_id},
-        )
-    return int(getattr(result, "rowcount", 0) or 0)
-
-
-async def upsert_walk_forward_fold(
-    *,
-    wf_run_id: str,
-    fold_index: int,
-    trade_date: str,
-    status: str,
-    reference_run_id: str | None = None,
-    paper_session_id: str | None = None,
-    total_trades: int = 0,
-    total_pnl: float | None = None,
-    total_return_pct: float | None = None,
-    summary_json: dict[str, Any] | None = None,
-    parity_actual_run_id: str | None = None,
-    parity_status: str | None = None,
-) -> WalkForwardFold:
-    payload = {
-        "wf_run_id": wf_run_id,
-        "fold_index": fold_index,
-        "trade_date": trade_date,
-        "status": status,
-        "reference_run_id": reference_run_id,
-        "paper_session_id": paper_session_id,
-        "total_trades": total_trades,
-        "total_pnl": total_pnl,
-        "total_return_pct": total_return_pct,
-        "summary_json": _json_dump(summary_json or {}),
-        "parity_actual_run_id": parity_actual_run_id,
-        "parity_status": parity_status,
-        "updated_at": _utcnow(),
-    }
-    async with get_db_session() as session:
-        row = (
-            (
-                await session.execute(
-                    text(
-                        """
-                        INSERT INTO walk_forward_folds (
-                            wf_run_id, fold_index, trade_date, status,
-                            reference_run_id, paper_session_id, total_trades,
-                            total_pnl, total_return_pct, summary_json,
-                            parity_actual_run_id, parity_status, updated_at
-                        )
-                        VALUES (
-                            :wf_run_id, :fold_index, CAST(:trade_date AS date), :status,
-                            :reference_run_id, :paper_session_id, :total_trades,
-                            :total_pnl, :total_return_pct, CAST(:summary_json AS jsonb),
-                            :parity_actual_run_id, :parity_status, :updated_at
-                        )
-                        ON CONFLICT (wf_run_id, fold_index) DO UPDATE
-                            SET trade_date = EXCLUDED.trade_date,
-                                status = EXCLUDED.status,
-                                reference_run_id = COALESCE(EXCLUDED.reference_run_id, walk_forward_folds.reference_run_id),
-                                paper_session_id = COALESCE(EXCLUDED.paper_session_id, walk_forward_folds.paper_session_id),
-                                total_trades = EXCLUDED.total_trades,
-                                total_pnl = EXCLUDED.total_pnl,
-                                total_return_pct = EXCLUDED.total_return_pct,
-                                summary_json = EXCLUDED.summary_json,
-                                parity_actual_run_id = COALESCE(EXCLUDED.parity_actual_run_id, walk_forward_folds.parity_actual_run_id),
-                                parity_status = COALESCE(EXCLUDED.parity_status, walk_forward_folds.parity_status),
-                                updated_at = EXCLUDED.updated_at
-                        RETURNING
-                            fold_id, wf_run_id, fold_index,
-                            trade_date::text AS trade_date, status,
-                            reference_run_id, paper_session_id,
-                            total_trades, total_pnl, total_return_pct,
-                            COALESCE(summary_json, '{}'::jsonb) AS summary_json,
-                            parity_actual_run_id, parity_status,
-                            created_at, updated_at
-                        """
-                    ),
-                    payload,
-                )
-            )
-            .mappings()
-            .one()
-        )
-    return _wf_fold_from_row(row)
-
-
-async def list_walk_forward_folds(wf_run_id: str) -> list[WalkForwardFold]:
-    rows = await asyncio.to_thread(
-        _run_sync_query,
-        f"{_WF_FOLD_SELECT} WHERE wf_run_id = %(wf_run_id)s ORDER BY fold_index ASC",
-        {"wf_run_id": wf_run_id},
-    )
-    return [_wf_fold_from_row(row) for row in rows]
-
-
-async def get_latest_passed_walk_forward_fold(
-    *,
-    strategy: str,
-    gate_key: str,
-    trade_date: str,
-) -> WalkForwardFold | None:
-    row = await asyncio.to_thread(
-        _run_sync_query_one,
-        f"""
-        {_WF_FOLD_SELECT}
-        JOIN walk_forward_runs wfr ON wfr.wf_run_id = walk_forward_folds.wf_run_id
-        WHERE wfr.strategy = %(strategy)s
-          AND wfr.gate_key = %(gate_key)s
-          AND wfr.validation_engine = 'fast_validator'
-          AND wfr.decision = 'PASS'
-          AND trade_date = %(trade_date)s::date
-        ORDER BY wfr.created_at DESC
-        LIMIT 1
-        """,
-        {"strategy": strategy, "gate_key": gate_key, "trade_date": trade_date},
-    )
-    return _wf_fold_from_row(row) if row else None
+# ── Position / Order / Feed CRUD ─────────────────────────────────────────────
 
 
 async def open_position(
@@ -2063,39 +1583,26 @@ __all__ = [
     "PaperOrder",
     "PaperPosition",
     "PaperSession",
-    "WalkForwardFold",
-    "WalkForwardRun",
     "append_order_event",
     "close_position",
     "consume_signal",
     "create_paper_session",
     "create_session",
-    "create_walk_forward_run",
-    "delete_walk_forward_run",
     "get_active_sessions",
     "get_db_session",
     "get_feed_state",
-    "get_latest_passed_walk_forward_fold",
-    "get_latest_passed_walk_forward_run",
     "get_open_positions",
     "get_session",
     "get_session_orders",
     "get_session_positions",
-    "get_walk_forward_run",
-    "get_walk_forward_run_schema",
     "initialize_schema",
-    "list_walk_forward_folds",
-    "list_walk_forward_runs",
     "mark_signal_stale",
     "open_position",
-    "reset_walk_forward_folds",
     "set_signal_state",
     "split_sql_statements",
     "update_position",
     "update_session",
     "update_session_state",
-    "update_walk_forward_run",
     "upsert_feed_state",
-    "upsert_walk_forward_fold",
     "write_signal",
 ]

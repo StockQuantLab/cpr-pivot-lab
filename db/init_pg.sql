@@ -75,53 +75,6 @@ CREATE TABLE IF NOT EXISTS alert_log (
 
 CREATE INDEX IF NOT EXISTS idx_alerts_type ON alert_log(alert_type, created_at DESC);
 
--- ─── Walk-forward run tracking ────────────────────────────────────────────
-
-CREATE TABLE IF NOT EXISTS walk_forward_runs (
-    wf_run_id       VARCHAR(64) PRIMARY KEY,
-    strategy        VARCHAR(32) NOT NULL,
-    start_date      DATE        NOT NULL,
-    end_date        DATE        NOT NULL,
-    validation_engine VARCHAR(24) NOT NULL DEFAULT 'paper_replay'
-        CHECK (validation_engine IN ('fast_validator', 'paper_replay')),
-    gate_key        VARCHAR(64),
-    scope_key       VARCHAR(64),
-    lineage_json    JSONB       DEFAULT '{}'::jsonb,
-    status          VARCHAR(20) NOT NULL DEFAULT 'RUNNING'
-        CHECK (status IN ('RUNNING', 'COMPLETED', 'FAILED')),
-    decision        TEXT
-        CHECK (decision IN ('PASS', 'FAIL', 'INCONCLUSIVE')),
-    decision_reasons TEXT,
-    summary_json    JSONB       DEFAULT '{}'::jsonb,
-    replayed_days   INTEGER     NOT NULL DEFAULT 0,
-    days_requested  INTEGER     NOT NULL DEFAULT 0,
-    notes           TEXT,
-    created_at      TIMESTAMPTZ DEFAULT NOW(),
-    updated_at      TIMESTAMPTZ DEFAULT NOW()
-);
-
-CREATE TABLE IF NOT EXISTS walk_forward_folds (
-    fold_id              BIGSERIAL PRIMARY KEY,
-    wf_run_id            VARCHAR(64) NOT NULL REFERENCES walk_forward_runs(wf_run_id) ON DELETE CASCADE,
-    fold_index           INTEGER     NOT NULL,
-    trade_date           DATE        NOT NULL,
-    status               VARCHAR(20) NOT NULL DEFAULT 'PENDING'
-        CHECK (status IN ('PENDING', 'COMPLETED', 'SKIPPED', 'FAILED')),
-    reference_run_id     VARCHAR(64),
-    paper_session_id     VARCHAR(64),
-    total_trades         INTEGER     NOT NULL DEFAULT 0,
-    total_pnl            NUMERIC(20,4),
-    total_return_pct     NUMERIC(12,4),
-    summary_json         JSONB       DEFAULT '{}'::jsonb,
-    parity_actual_run_id VARCHAR(64),
-    parity_status        VARCHAR(20)
-        CHECK (parity_status IN ('PENDING', 'MATCHED', 'DRIFTED')),
-    created_at           TIMESTAMPTZ DEFAULT NOW(),
-    updated_at           TIMESTAMPTZ DEFAULT NOW(),
-    UNIQUE (wf_run_id, fold_index),
-    UNIQUE (wf_run_id, trade_date)
-);
-
 -- ─── Paper trading mutable state ─────────────────────────────────────────
 
 CREATE TABLE IF NOT EXISTS paper_trading_sessions (
@@ -133,7 +86,7 @@ CREATE TABLE IF NOT EXISTS paper_trading_sessions (
     status                VARCHAR(20) NOT NULL DEFAULT 'PLANNING'
         CHECK (status IN ('PLANNING', 'ACTIVE', 'PAUSED', 'STOPPING', 'COMPLETED', 'FAILED', 'CANCELLED')),
     mode                  VARCHAR(20) NOT NULL DEFAULT 'replay'
-        CHECK (mode IN ('replay', 'live', 'walk_forward', 'manual')),
+        CHECK (mode IN ('replay', 'live', 'manual')),
     created_by            VARCHAR(64),
     flatten_time          TIME,
     stale_feed_timeout_sec INTEGER      NOT NULL DEFAULT 120,
@@ -148,7 +101,6 @@ CREATE TABLE IF NOT EXISTS paper_trading_sessions (
     updated_at            TIMESTAMPTZ DEFAULT NOW(),
     started_at            TIMESTAMPTZ,
     ended_at              TIMESTAMPTZ,
-    wf_run_id             VARCHAR(64) REFERENCES walk_forward_runs(wf_run_id) ON DELETE SET NULL,
     notes                 TEXT
 );
 
@@ -243,48 +195,3 @@ ALTER TABLE paper_trading_sessions
 
 ALTER TABLE paper_trading_sessions
     ADD COLUMN IF NOT EXISTS max_drawdown_pct NUMERIC(8,4) NOT NULL DEFAULT 0.10;
-
-ALTER TABLE paper_trading_sessions
-    ADD COLUMN IF NOT EXISTS wf_run_id VARCHAR(64)
-    REFERENCES walk_forward_runs(wf_run_id) ON DELETE SET NULL;
-
-ALTER TABLE walk_forward_runs
-    ADD COLUMN IF NOT EXISTS validation_engine VARCHAR(24) NOT NULL DEFAULT 'paper_replay';
-
-ALTER TABLE walk_forward_runs
-    ADD COLUMN IF NOT EXISTS gate_key VARCHAR(64);
-
-ALTER TABLE walk_forward_runs
-    ADD COLUMN IF NOT EXISTS scope_key VARCHAR(64);
-
-ALTER TABLE walk_forward_runs
-    ADD COLUMN IF NOT EXISTS lineage_json JSONB DEFAULT '{}'::jsonb;
-
-ALTER TABLE walk_forward_runs
-    ALTER COLUMN decision TYPE TEXT USING decision::text;
-
-CREATE INDEX IF NOT EXISTS idx_wf_runs_strategy
-ON walk_forward_runs(strategy, created_at DESC);
-
-CREATE INDEX IF NOT EXISTS idx_wf_runs_decision
-ON walk_forward_runs(strategy, decision, created_at DESC);
-
-CREATE INDEX IF NOT EXISTS idx_wf_runs_gate
-ON walk_forward_runs(strategy, validation_engine, gate_key, decision, created_at DESC);
-
-CREATE INDEX IF NOT EXISTS idx_wf_folds_run_date
-ON walk_forward_folds(wf_run_id, trade_date);
-
--- §0.4: Widen decision CHECK to include INCONCLUSIVE
-DO $$
-BEGIN
-    IF EXISTS (
-        SELECT 1 FROM information_schema.check_constraints
-        WHERE constraint_name = 'walk_forward_runs_decision_check'
-    ) THEN
-        ALTER TABLE walk_forward_runs DROP CONSTRAINT walk_forward_runs_decision_check;
-        ALTER TABLE walk_forward_runs
-            ADD CONSTRAINT walk_forward_runs_decision_check
-            CHECK (decision IN ('PASS', 'FAIL', 'INCONCLUSIVE'));
-    END IF;
-END $$;

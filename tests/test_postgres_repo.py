@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -225,30 +224,6 @@ class _FakeSession:
                     "status": payload.get("status", "ACTIVE"),
                     "notes": payload.get("notes"),
                     "mode": "replay",
-                    "wf_run_id": None,
-                }
-            )
-
-        if "INSERT INTO walk_forward_runs" in sql:
-            return _FakeResult(
-                row={
-                    "wf_run_id": payload["wf_run_id"],
-                    "strategy": payload["strategy"],
-                    "start_date": payload["start_date"],
-                    "end_date": payload["end_date"],
-                    "validation_engine": payload.get("validation_engine", "paper_replay"),
-                    "gate_key": payload.get("gate_key"),
-                    "scope_key": payload.get("scope_key"),
-                    "lineage_json": payload.get("lineage_json", {}),
-                    "status": "RUNNING",
-                    "decision": "PASS",
-                    "decision_reasons": "kept",
-                    "summary_json": {"existing": True},
-                    "replayed_days": 4,
-                    "days_requested": payload["days_requested"],
-                    "notes": payload.get("notes"),
-                    "created_at": datetime(2024, 1, 1, tzinfo=UTC),
-                    "updated_at": datetime(2024, 1, 1, tzinfo=UTC),
                 }
             )
 
@@ -425,112 +400,6 @@ async def test_paper_session_helpers_use_paper_tables(monkeypatch: pytest.Monkey
     assert any("paper_positions" in sql for sql, _ in fake_session.executed)
     assert any("paper_orders" in sql for sql, _ in fake_session.executed)
     assert any("paper_feed_state" in sql for sql, _ in fake_session.executed)
-
-
-def test_init_pg_schema_includes_wf_run_id_in_session_create_table() -> None:
-    sql = Path("C:\\Users\\kanna\\github\\cpr-pivot-lab\\db\\init_pg.sql").read_text(
-        encoding="utf-8"
-    )
-    session_ddl = sql.split("CREATE TABLE IF NOT EXISTS paper_trading_sessions", maxsplit=1)[1]
-    session_ddl = session_ddl.split(
-        "CREATE INDEX IF NOT EXISTS idx_paper_sessions_status", maxsplit=1
-    )[0]
-    assert "wf_run_id" in session_ddl
-    assert "REFERENCES walk_forward_runs(wf_run_id)" in session_ddl
-
-
-def test_init_pg_schema_includes_walk_forward_folds_table() -> None:
-    sql = Path("C:\\Users\\kanna\\github\\cpr-pivot-lab\\db\\init_pg.sql").read_text(
-        encoding="utf-8"
-    )
-    assert "CREATE TABLE IF NOT EXISTS walk_forward_folds" in sql
-    assert "parity_actual_run_id" in sql
-    assert "parity_status" in sql
-    assert "validation_engine IN ('fast_validator', 'paper_replay')" in sql
-
-
-@pytest.mark.asyncio
-async def test_create_walk_forward_run_does_not_clear_prior_decision(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    fake_session = _FakeSession()
-    monkeypatch.setattr(postgres, "get_db_session", lambda: _fake_db_session(fake_session))
-
-    run = await postgres.create_walk_forward_run(
-        wf_run_id="wf-fbr-2024-01-01-2024-01-31",
-        strategy="FBR",
-        start_date="2024-01-01",
-        end_date="2024-01-31",
-        days_requested=20,
-        validation_engine="fast_validator",
-        gate_key="gate-123",
-        scope_key="scope-123",
-        lineage_json={"validation_engine": "fast_validator"},
-        notes="rerun",
-    )
-
-    insert_sql = next(
-        sql for sql, _ in fake_session.executed if "INSERT INTO walk_forward_runs" in sql
-    )
-    assert "validation_engine, gate_key, scope_key, lineage_json" in insert_sql
-    assert "decision = NULL" not in insert_sql
-    assert "decision_reasons = NULL" not in insert_sql
-    assert "summary_json = '{}'::jsonb" not in insert_sql
-    assert "replayed_days = 0" not in insert_sql
-    assert run.decision == "PASS"
-    assert run.validation_engine == "fast_validator"
-    assert run.gate_key == "gate-123"
-    assert run.scope_key == "scope-123"
-
-
-@pytest.mark.asyncio
-async def test_list_walk_forward_runs_orders_by_created_at_desc(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    captured: dict[str, object] = {}
-
-    def fake_run_sync_query(
-        query: str, params: dict[str, object] | None = None
-    ) -> list[dict[str, object]]:
-        captured["query"] = query
-        captured["params"] = dict(params or {})
-        return [
-            {
-                "wf_run_id": "wf-1",
-                "strategy": "CPR_LEVELS",
-                "start_date": "2026-03-10",
-                "end_date": "2026-03-20",
-                "validation_engine": "fast_validator",
-                "gate_key": "gate-1",
-                "scope_key": "ALL:1819",
-                "lineage_json": {"strategy_params": {"direction_filter": "LONG"}},
-                "status": "COMPLETED",
-                "decision": "PASS",
-                "decision_reasons": None,
-                "summary_json": {"total_trades": 90},
-                "replayed_days": 9,
-                "days_requested": 9,
-                "notes": None,
-                "created_at": datetime(2024, 1, 1, tzinfo=UTC),
-                "updated_at": datetime(2024, 1, 1, tzinfo=UTC),
-            }
-        ]
-
-    monkeypatch.setattr(postgres, "_run_sync_query", fake_run_sync_query)
-
-    runs = await postgres.list_walk_forward_runs(
-        limit=5, strategy="CPR_LEVELS", validation_engine="fast_validator"
-    )
-
-    assert len(runs) == 1
-    assert runs[0].wf_run_id == "wf-1"
-    assert "ORDER BY created_at DESC" in str(captured["query"])
-    assert "LIMIT %(limit)s" in str(captured["query"])
-    assert captured["params"] == {
-        "limit": 5,
-        "strategy": "CPR_LEVELS",
-        "validation_engine": "fast_validator",
-    }
 
 
 @pytest.mark.asyncio

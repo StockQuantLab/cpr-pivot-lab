@@ -302,7 +302,7 @@ def _render_live_paper_sessions(active_sessions: list[dict], colors: dict) -> No
             orders = payload.get("orders") or []
             strategy_params = getattr(session, "strategy_params", {}) or {}
             session_mode = str(getattr(session, "mode", "") or "replay").upper()
-            if session_mode in {"REPLAY", "WALK_FORWARD"}:
+            if session_mode == "REPLAY":
                 feed_source = "HISTORICAL"
             else:
                 feed_source = str(strategy_params.get("feed_source") or "kite").upper()

@@ -132,7 +132,7 @@ while the engine writes backtest results to a different file.
 | `run_metrics` | run_id, strategy, trade_count, win_rate, total_pnl, profit_factor, calmar, max_dd_pct, annual_return_pct | Aggregated run performance |
 | `run_daily_pnl` | run_id, trade_date, day_pnl, cum_pnl | Daily equity curve data |
 | `setup_funnel` | run_id, strategy, universe_count, after_cpr_width, ..., entry_triggered | Filter stage pass counts |
-| `run_metadata` | run_id, strategy, symbols_json, params_json, execution_mode, wf_run_id | Run configuration registry |
+| `run_metadata` | run_id, strategy, symbols_json, params_json, execution_mode | Run configuration registry |
 
 ---
 
@@ -159,7 +159,7 @@ Handled by `db/paper_db.py` (`PaperDB`).
 **Container**: `cpr-pivot-postgres` (postgres:18-alpine)
 **Initialized by**: `pivot-db-init` (runs `db/init_pg.sql`)
 
-PostgreSQL is used **only** for agent sessions and walk-forward validation.
+PostgreSQL is used **only** for agent sessions and signals.
 Paper trading state has migrated to `paper.duckdb`. No market data, backtest results,
 or paper trading state is stored in PostgreSQL.
 
@@ -169,13 +169,6 @@ or paper trading state is stored in PostgreSQL.
 |-------|---------|
 | `agent_sessions` | Phidata agent session state (memory, user_data, agent_data) |
 | `agent_messages` | Chat history per session (role, content, tool interactions) |
-
-### Walk-Forward Tables
-
-| Table | Key Columns | Purpose |
-|-------|-------------|---------|
-| `walk_forward_runs` | wf_run_id, strategy, start/end_date, validation_engine, gate_key, decision (PASS/FAIL/INCONCLUSIVE), decision_reasons, summary_json | WF run header + gate result |
-| `walk_forward_folds` | wf_run_id, fold_index, trade_date, reference_run_id, total_trades, total_pnl, parity_status | Per-fold results |
 
 ### Signal Tables
 
@@ -304,7 +297,7 @@ doppler run -- uv run pivot-build --refresh-since 2026-03-20
 # Check table status
 doppler run -- uv run pivot-build --status
 
-# Initialize PostgreSQL schema (agent sessions / walk-forward only)
+# Initialize PostgreSQL schema (agent sessions / signals only)
 doppler run -- uv run pivot-db-init
 
 # One-time: migrate backtest results from market.duckdb to backtest.duckdb

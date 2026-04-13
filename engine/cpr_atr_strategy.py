@@ -670,7 +670,9 @@ class CPRATRBacktest:
                 if symbol not in setups_by_sym:
                     if self.params.strategy != "CPR_LEVELS":
                         progress.update_symbol(symbol, 0, 0.0)
-                        _emit_progress("symbol_done", symbol=symbol, setups=0, trades=0, elapsed_s=0.0)
+                        _emit_progress(
+                            "symbol_done", symbol=symbol, setups=0, trades=0, elapsed_s=0.0
+                        )
 
             for batch_idx, batch_symbols in enumerate(pack_batches, start=1):
                 if verbose:
@@ -727,7 +729,9 @@ class CPRATRBacktest:
                     if self.params.strategy == "CPR_LEVELS":
                         trades = batch_trades_by_symbol.get(symbol, [])
                     else:
-                        trades = self._simulate_from_preloaded(symbol, run_id, sym_setups, sym_candles)
+                        trades = self._simulate_from_preloaded(
+                            symbol, run_id, sym_setups, sym_candles
+                        )
 
                     all_trades.extend(trades)
 
@@ -1682,7 +1686,9 @@ class CPRATRBacktest:
             rows_by_symbol: dict[str, tuple[dict[str, Any], DayPack]] = {
                 symbol: (setup_row, day_pack) for symbol, setup_row, day_pack in day_rows
             }
-            all_times = sorted({time_str for _, _, day_pack in day_rows for time_str in day_pack.time_str})
+            all_times = sorted(
+                {time_str for _, _, day_pack in day_rows for time_str in day_pack.time_str}
+            )
             tracker = SessionPositionTracker(
                 max_positions=max_positions,
                 portfolio_value=portfolio_value,
@@ -2956,7 +2962,6 @@ class BacktestResult:
         self,
         db: BacktestDB | None = None,
         *,
-        wf_run_id: str | None = None,
         execution_mode: str = "BACKTEST",
     ) -> int:
         """Persist results to DuckDB backtest_results + run_metadata tables."""
@@ -2974,7 +2979,9 @@ class BacktestResult:
             begin_batch()
         target_db.con.execute("BEGIN TRANSACTION")
         try:
-            mode_label = "compound" if self.params and self.params.compound_equity else "daily-reset"
+            mode_label = (
+                "compound" if self.params and self.params.compound_equity else "daily-reset"
+            )
             sizing_label = "risk" if self.params and self.params.risk_based_sizing else "standard"
             target_db.store_run_metadata(
                 run_id=self.run_id,
@@ -2990,7 +2997,6 @@ class BacktestResult:
                 end_date=run_context.get("end_date"),
                 params=params_dict,
                 param_signature=param_signature,
-                wf_run_id=wf_run_id,
                 execution_mode=execution_mode,
             )
             row_count = target_db.store_backtest_results(

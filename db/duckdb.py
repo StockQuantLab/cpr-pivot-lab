@@ -3691,7 +3691,6 @@ class MarketDB:
                 execution_mode VARCHAR,
                 session_id VARCHAR,
                 source_session_id VARCHAR,
-                wf_run_id VARCHAR,
                 created_at TIMESTAMP DEFAULT now()
             )
         """)
@@ -3704,7 +3703,6 @@ class MarketDB:
             "execution_mode",
             "session_id",
             "source_session_id",
-            "wf_run_id",
         ):
             try:
                 self.con.execute(f"ALTER TABLE run_metadata ADD COLUMN IF NOT EXISTS {col} VARCHAR")
@@ -3725,7 +3723,6 @@ class MarketDB:
         execution_mode: str = "BACKTEST",
         session_id: str | None = None,
         source_session_id: str | None = None,
-        wf_run_id: str | None = None,
     ) -> None:
         """Insert a run_id → strategy mapping into run_metadata.
 
@@ -3740,8 +3737,8 @@ class MarketDB:
                 """
                 INSERT INTO run_metadata (
                     run_id, strategy, label, symbols_json, start_date, end_date, params_json,
-                    param_signature, execution_mode, session_id, source_session_id, wf_run_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    param_signature, execution_mode, session_id, source_session_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     run_id,
@@ -3755,29 +3752,10 @@ class MarketDB:
                     execution_mode,
                     session_id,
                     source_session_id or session_id,
-                    wf_run_id,
                 ],
             )
         except Exception as e:
             logger.exception("Failed to insert run_metadata for run_id=%s: %s", run_id, e)
-
-    def get_run_ids_for_wf_run_ids(self, wf_run_ids: list[str]) -> list[str]:
-        """Return DuckDB run_ids tagged to one or more walk-forward parent IDs."""
-        self.ensure_run_metadata_table()
-        ids = sorted({str(run_id).strip() for run_id in wf_run_ids if str(run_id).strip()})
-        if not ids:
-            return []
-        placeholders = ", ".join("?" for _ in ids)
-        rows = self.con.execute(
-            f"""
-            SELECT DISTINCT run_id
-            FROM run_metadata
-            WHERE wf_run_id IN ({placeholders})
-            ORDER BY run_id
-            """,
-            ids,
-        ).fetchall()
-        return [str(row[0]) for row in rows if row and row[0]]
 
     def delete_runs(self, run_ids: list[str]) -> dict[str, int]:
         """Delete run_ids from DuckDB runtime tables in one transaction."""

@@ -14,7 +14,6 @@ import logging
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 
@@ -30,8 +29,6 @@ from db.postgres import (
     get_session,
     get_session_orders,
     get_session_positions,
-    list_walk_forward_folds,
-    list_walk_forward_runs,
 )
 from engine.paper_runtime import summarize_paper_positions
 
@@ -1187,31 +1184,6 @@ def _fetch_run_daily_pnl_sync(run_id: str) -> pl.DataFrame:
         return pl.DataFrame()
 
 
-def _walk_forward_run_payload(run) -> dict[str, object]:
-    payload = asdict(run)
-    lineage = payload.get("lineage_json")
-    if not isinstance(lineage, dict):
-        lineage = {}
-    strategy_params = lineage.get("strategy_params")
-    if not isinstance(strategy_params, dict):
-        strategy_params = {}
-    payload["lineage_json"] = lineage
-    payload["strategy_params"] = strategy_params
-    payload["direction_filter"] = str(strategy_params.get("direction_filter") or "BOTH").upper()
-    payload["all_symbols"] = bool(lineage.get("all_symbols"))
-    payload["symbol_count"] = int(lineage.get("symbol_count") or 0)
-    return payload
-
-
-def _walk_forward_fold_payload(fold) -> dict[str, object]:
-    payload = asdict(fold)
-    summary = payload.get("summary_json")
-    if not isinstance(summary, dict):
-        summary = {}
-    payload["summary_json"] = summary
-    return payload
-
-
 def _warm_cache_sync(force: bool = False) -> dict[str, int]:
     """Warm all major dashboard caches in one executor task."""
     runs = _fetch_runs_sync(force=force)
@@ -1348,16 +1320,6 @@ async def aget_run_ledger(run_id: str, execution_mode: str = "BACKTEST") -> pl.D
     return await loop.run_in_executor(
         _executor, lambda: _fetch_run_ledger_sync(run_id, execution_mode=execution_mode)
     )
-
-
-async def aget_walk_forward_runs(limit: int = 50) -> list[dict[str, object]]:
-    runs = await list_walk_forward_runs(limit=limit)
-    return [_walk_forward_run_payload(r) for r in runs]
-
-
-async def aget_walk_forward_folds(run_id: str) -> list[dict[str, object]]:
-    folds = await list_walk_forward_folds(run_id)
-    return [_walk_forward_fold_payload(f) for f in folds]
 
 
 async def aget_run_daily_pnl(run_id: str) -> pl.DataFrame:
@@ -1580,27 +1542,4 @@ def build_run_options(runs: list[dict]) -> dict[str, str]:
             f"P/L ₹{total_pnl:,.0f} | Trades {trades:,}"
         )
         options[label] = rid
-    return options
-
-
-def build_walk_forward_run_options(runs: list[dict]) -> dict[str, str]:
-    """Build label -> walk-forward run_id mapping for dropdowns (most recent first)."""
-    options: dict[str, str] = {}
-    for run in runs:
-        wf_run_id = str(run.get("wf_run_id") or "")
-        strategy = str(run.get("strategy") or "").split("|")[0].strip()
-        direction = str(run.get("direction_filter") or "BOTH").upper()
-        decision = str(run.get("decision") or run.get("status") or "UNKNOWN").upper()
-        start = str(run.get("start_date") or "")[:10]
-        end = str(run.get("end_date") or "")[:10]
-        scope_key = str(run.get("scope_key") or "")
-        scope_label = scope_key if scope_key.startswith("ALL:") else (scope_key[:8] or "scope")
-        replayed_days = int(run.get("replayed_days") or 0)
-        requested_days = int(run.get("days_requested") or 0)
-        gate_key = str(run.get("gate_key") or "")[:8] or "nogate"
-        label = (
-            f"{strategy} [{direction}] | {start}→{end} | {decision} | "
-            f"{replayed_days}/{requested_days} days | {scope_label} | {gate_key}"
-        )
-        options[label] = wf_run_id
     return options

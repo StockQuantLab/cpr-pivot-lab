@@ -158,8 +158,7 @@ The same RVOL policy is used in backtest, `daily-sim`, and `daily-live` unless a
 If you need a clean rerun from storage, use `pivot-reset-history --apply` from the host shell.
 That wipes DuckDB `backtest_results`, `run_daily_pnl`, `run_metrics`, `run_metadata`,
 `setup_funnel` (in `backtest.duckdb`), plus `paper_sessions`, `paper_positions`,
-`paper_orders`, `paper_feed_state`, and `alert_log` (in `paper.duckdb`),
-and PostgreSQL `walk_forward_runs`, `walk_forward_folds`.
+`paper_orders`, `paper_feed_state`, and `alert_log` (in `paper.duckdb`).
 It is the supported table cleanup path for a full rerun.
 
 **Walk-forward fold testing is not used.** Paper trading is the validation.
@@ -200,10 +199,6 @@ leaving a stale `.writelock` file behind:
 - `pivot-paper-trading daily-sim`
 - `pivot-paper-trading daily-replay`
 - `pivot-paper-trading replay`
-- `pivot-paper-trading walk-forward`
-- `pivot-paper-trading walk-forward-matrix`
-- `pivot-paper-trading walk-forward-replay`
-- `pivot-paper-trading walk-forward-cleanup --apply`
 - `pivot-data-quality --refresh`
 - `pivot-reset-history`
 - `pivot-campaign` runtime coverage auto-fix
@@ -561,8 +556,8 @@ same-bar cash reuse or candidate rejection. Treat that as a parity bug, not as e
 ## Setup (first time)
 
 ```bash
-docker-compose up -d                          # only needed for AI agent / walk-forward
-doppler run -- uv run pivot-db-init            # PostgreSQL schema (agent sessions, walk-forward)
+docker-compose up -d                          # only needed for AI agent
+doppler run -- uv run pivot-db-init            # PostgreSQL schema (agent sessions, signals)
 doppler run -- uv run python -m scripts.migrate_split --split-backtest  # one-time: split backtest tables
 ```
 
