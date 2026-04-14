@@ -12,7 +12,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from engine.bar_orchestrator import SessionPositionTracker
+from engine.bar_orchestrator import minimum_trade_notional_for
 from engine.constants import SL_PHASE_TO_EXIT_REASON
 from engine.cpr_atr_utils import (
     TrailingStop,
@@ -274,12 +274,12 @@ def find_cpr_levels_entry(
         _last_reject_reason.value = "MIN_EFFECTIVE_RR"
         return None
 
-    slot_tracker = SessionPositionTracker(
+    min_notional = minimum_trade_notional_for(
         max_positions=max(1, int(getattr(params, "max_positions", 1) or 1)),
         portfolio_value=float(getattr(params, "portfolio_value", 0.0) or 0.0),
         max_position_pct=float(getattr(params, "max_position_pct", 0.0) or 0.0),
+        capital_base=capital_base,
     )
-    min_notional = slot_tracker.minimum_trade_notional(capital_base=capital_base)
     risk_capital = (
         float(capital_base)
         if capital_base is not None and bool(getattr(params, "risk_based_sizing", False))

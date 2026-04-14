@@ -42,8 +42,10 @@ from db.duckdb import MarketDB
 from db.duckdb import get_db as get_market_db
 from engine.bar_orchestrator import (
     SessionPositionTracker,
+    minimum_trade_notional_for,
     select_entries_for_bar,
     should_process_symbol,
+    slot_capital_for,
 )
 from engine.constants import preview_list
 from engine.cost_model import CostModel, cost_model_from_name
@@ -899,9 +901,11 @@ class CPRATRBacktest:
                 equity = portfolio_value
             day_start_equity = equity
             cash_available = equity
-            slot_capital = min(
-                day_start_equity / max_positions,
-                day_start_equity * max(max_position_pct, 0.0),
+            slot_capital = slot_capital_for(
+                max_positions=max_positions,
+                portfolio_value=day_start_equity,
+                max_position_pct=max_position_pct,
+                capital_base=day_start_equity,
             )
             min_notional = max(1_000.0, slot_capital * 0.05)
             open_positions: list[dict[str, float | str]] = []
@@ -959,6 +963,10 @@ class CPRATRBacktest:
                     direction=trade.direction,
                 )
                 net_pnl_trade = round(gross_pnl_trade - trade_cost, 2)
+                net_pct_trade = round(
+                    (net_pnl_trade / position_value * 100) if position_value > 0 else 0.0,
+                    4,
+                )
                 exit_value = round(position_value + gross_pnl_trade, 2)
                 open_positions.append(
                     {
@@ -974,6 +982,7 @@ class CPRATRBacktest:
                         gross_pnl=gross_pnl_trade,
                         total_costs=round(trade_cost, 2),
                         profit_loss=net_pnl_trade,
+                        profit_loss_pct=net_pct_trade,
                     )
                 )
 
@@ -2156,11 +2165,12 @@ class CPRATRBacktest:
         capital_base = float(p.portfolio_value or 0.0) if p.compound_equity else None
         risk_capital = float(capital_base) if capital_base is not None else float(p.capital or 0.0)
         position_size = calculate_position_size(risk_capital, p.risk_pct, sl_distance)
-        min_notional = SessionPositionTracker(
+        min_notional = minimum_trade_notional_for(
             max_positions=max(1, int(p.max_positions or 1)),
             portfolio_value=float(p.portfolio_value or 0.0),
             max_position_pct=float(p.max_position_pct or 0.0),
-        ).minimum_trade_notional(capital_base=capital_base)
+            capital_base=capital_base,
+        )
         if float(position_size) * float(entry_price) < min_notional:
             return None
 
@@ -2385,11 +2395,12 @@ class CPRATRBacktest:
         capital_base = float(p.portfolio_value or 0.0) if p.compound_equity else None
         risk_capital = float(capital_base) if capital_base is not None else float(p.capital or 0.0)
         position_size = calculate_position_size(risk_capital, p.risk_pct, sl_distance)
-        min_notional = SessionPositionTracker(
+        min_notional = minimum_trade_notional_for(
             max_positions=max(1, int(p.max_positions or 1)),
             portfolio_value=float(p.portfolio_value or 0.0),
             max_position_pct=float(p.max_position_pct or 0.0),
-        ).minimum_trade_notional(capital_base=capital_base)
+            capital_base=capital_base,
+        )
         if float(position_size) * float(entry_price) < min_notional:
             return None
 

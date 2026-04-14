@@ -4797,6 +4797,7 @@ class MarketDB:
                     "FALSE"
                     ") AS risk_based_sizing"
                 )
+                updated_at_sql = "COALESCE(r.updated_at, rm.created_at)::VARCHAR AS updated_at"
                 if has_run_execution_mode:
                     execution_sql = (
                         "UPPER(COALESCE(brm.execution_mode, 'BACKTEST')) AS execution_mode"

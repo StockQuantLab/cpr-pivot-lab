@@ -6,6 +6,7 @@ import pytest
 
 from engine.bar_orchestrator import (
     SessionPositionTracker,
+    minimum_trade_notional_for,
     select_entries_for_bar,
     should_process_symbol,
 )
@@ -154,6 +155,27 @@ def test_compute_position_qty_rejects_dust_notional() -> None:
     )
 
     assert qty == 0
+
+
+def test_minimum_trade_notional_for_matches_tracker_rule() -> None:
+    tracker = SessionPositionTracker(
+        max_positions=10,
+        portfolio_value=1_000_000.0,
+        max_position_pct=0.10,
+    )
+
+    assert minimum_trade_notional_for(
+        max_positions=10,
+        portfolio_value=1_000_000.0,
+        max_position_pct=0.10,
+    ) == pytest.approx(tracker.minimum_trade_notional())
+
+    assert minimum_trade_notional_for(
+        max_positions=10,
+        portfolio_value=1_000_000.0,
+        max_position_pct=0.10,
+        capital_base=2_000_000.0,
+    ) == pytest.approx(tracker.minimum_trade_notional(capital_base=2_000_000.0))
 
 
 def test_current_equity_includes_open_positions_cost_basis() -> None:

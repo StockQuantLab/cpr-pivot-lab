@@ -8,6 +8,42 @@ from datetime import datetime
 from typing import Any
 
 
+def slot_capital_for(
+    *,
+    max_positions: int,
+    portfolio_value: float,
+    max_position_pct: float = 0.0,
+    capital_base: float | None = None,
+) -> float:
+    """Return the per-slot capital cap for a session."""
+    base = float(portfolio_value if capital_base is None else capital_base or 0.0)
+    if base <= 0:
+        return 0.0
+    max_positions = max(1, int(max_positions or 1))
+    pct_cap = base * float(max_position_pct or 0.0)
+    slot_by_count = base / float(max_positions)
+    # When max_position_pct > 0, it caps the per-slot allocation.
+    # When max_position_pct == 0, only max_positions controls sizing.
+    return min(slot_by_count, pct_cap) if pct_cap > 0 else slot_by_count
+
+
+def minimum_trade_notional_for(
+    *,
+    max_positions: int,
+    portfolio_value: float,
+    max_position_pct: float = 0.0,
+    capital_base: float | None = None,
+) -> float:
+    """Return the smallest non-dust allocation allowed for a new position."""
+    slot_capital = slot_capital_for(
+        max_positions=max_positions,
+        portfolio_value=portfolio_value,
+        max_position_pct=max_position_pct,
+        capital_base=capital_base,
+    )
+    return max(1_000.0, slot_capital * 0.05)
+
+
 @dataclass(slots=True)
 class TrackedPosition:
     """Lightweight in-memory position state for one symbol."""
@@ -38,24 +74,23 @@ class SessionPositionTracker:
         self.initial_capital = float(portfolio_value or 0.0)
         self.cash_available = self.initial_capital
         self.max_position_pct = float(max_position_pct or 0.0)
-        self.slot_capital = self._slot_capital_for(self.initial_capital)
+        self.slot_capital = slot_capital_for(
+            max_positions=self.max_positions,
+            portfolio_value=self.initial_capital,
+            max_position_pct=self.max_position_pct,
+            capital_base=self.initial_capital,
+        )
         self._open: dict[str, TrackedPosition] = {}
         self._closed_today: set[str] = set()
 
-    def _slot_capital_for(self, capital_base: float | None = None) -> float:
-        base = self.initial_capital if capital_base is None else float(capital_base or 0.0)
-        if base <= 0:
-            return 0.0
-        pct_cap = base * self.max_position_pct
-        slot_by_count = base / float(self.max_positions)
-        # When max_position_pct > 0, it caps the per-slot allocation.
-        # When max_position_pct == 0, only max_positions controls sizing.
-        return min(slot_by_count, pct_cap) if pct_cap > 0 else slot_by_count
-
     def minimum_trade_notional(self, capital_base: float | None = None) -> float:
         """Return the smallest non-dust allocation we allow for a new position."""
-        slot_capital = self._slot_capital_for(capital_base)
-        return max(1_000.0, slot_capital * 0.05)
+        return minimum_trade_notional_for(
+            max_positions=self.max_positions,
+            portfolio_value=self.initial_capital,
+            max_position_pct=self.max_position_pct,
+            capital_base=capital_base,
+        )
 
     @property
     def open_count(self) -> int:
@@ -148,7 +183,12 @@ class SessionPositionTracker:
     ) -> int:
         if entry_price <= 0:
             return 0
-        slot_capital = self._slot_capital_for(capital_base)
+        slot_capital = slot_capital_for(
+            max_positions=self.max_positions,
+            portfolio_value=self.initial_capital,
+            max_position_pct=self.max_position_pct,
+            capital_base=capital_base,
+        )
         if risk_based_sizing:
             candidate_notional = max(0.0, float(candidate_size or 0) * float(entry_price))
             desired_notional = min(candidate_notional, slot_capital)

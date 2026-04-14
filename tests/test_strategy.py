@@ -976,6 +976,78 @@ class TestPortfolioExecutionOverlay:
         assert stats["not_executed_portfolio"] == 1
         assert stats["skipped_no_slots"] == 1
 
+    def test_apply_portfolio_constraints_recomputes_profit_loss_pct(self):
+        bt = CPRATRBacktest(
+            params=BacktestParams(portfolio_value=100_000, max_positions=1),
+            db=object(),
+        )
+        trades = [
+            TradeResult(
+                run_id="r1",
+                symbol="SBIN",
+                trade_date="2023-01-02",
+                direction="LONG",
+                entry_time="09:20",
+                exit_time="09:40",
+                entry_price=100.0,
+                exit_price=102.0,
+                sl_price=99.0,
+                target_price=102.0,
+                profit_loss=2_000.0,
+                profit_loss_pct=99.9,
+                exit_reason="TARGET",
+                position_size=10,
+            ),
+        ]
+
+        executed, stats = bt._apply_portfolio_constraints(trades)
+
+        assert len(executed) == 1
+        assert executed[0].position_size == 100
+        assert executed[0].position_value == 10_000.0
+        assert executed[0].profit_loss_pct != pytest.approx(99.9)
+        assert executed[0].profit_loss_pct == pytest.approx(
+            executed[0].profit_loss / executed[0].position_value * 100,
+            abs=0.0001,
+        )
+        assert stats["executed_trade_count"] == 1
+
+    def test_apply_portfolio_constraints_allows_zero_max_position_pct(self):
+        bt = CPRATRBacktest(
+            params=BacktestParams(
+                portfolio_value=100_000,
+                max_positions=10,
+                max_position_pct=0.0,
+            ),
+            db=object(),
+        )
+        trades = [
+            TradeResult(
+                run_id="r1",
+                symbol="SBIN",
+                trade_date="2023-01-02",
+                direction="LONG",
+                entry_time="09:20",
+                exit_time="09:40",
+                entry_price=100.0,
+                exit_price=102.0,
+                sl_price=99.0,
+                target_price=102.0,
+                profit_loss=2_000.0,
+                profit_loss_pct=2.0,
+                exit_reason="TARGET",
+                position_size=10,
+            ),
+        ]
+
+        executed, stats = bt._apply_portfolio_constraints(trades)
+
+        assert len(executed) == 1
+        assert executed[0].position_size == 100
+        assert executed[0].position_value == 10_000.0
+        assert stats["executed_trade_count"] == 1
+        assert stats["not_executed_portfolio"] == 0
+
     def test_apply_portfolio_constraints_risk_based_sizing_caps_to_slot_capital(self):
         bt = CPRATRBacktest(
             params=BacktestParams(
@@ -1229,7 +1301,9 @@ class TestPortfolioExecutionOverlay:
                 profit_loss_pct=0.0,
                 exit_reason="TARGET",
                 position_size=int(kwargs["position_size"]),
-                position_value=round(float(kwargs["position_size"]) * float(kwargs["entry_price"]), 2),
+                position_value=round(
+                    float(kwargs["position_size"]) * float(kwargs["entry_price"]), 2
+                ),
             )
 
         monkeypatch.setattr(
