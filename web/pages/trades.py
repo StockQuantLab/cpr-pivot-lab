@@ -16,6 +16,7 @@ from web.components import (
     page_header,
     page_layout,
     paginated_table,
+    safe_timer,
 )
 from web.state import aget_runs, aget_trades, build_run_options
 
@@ -57,7 +58,7 @@ async def trade_analytics_page() -> None:
                 with trades_container:
                     _render_analytics_content(df, colors, theme)
 
-            ui.timer(0.1, _load, once=True)
+            safe_timer(0.1, _load)
 
         _ = (
             ui.select(
@@ -175,7 +176,7 @@ def _section_exit_reasons(df: pl.DataFrame, colors: dict, theme: dict) -> None:
     counts = exit_df["count"].to_list()
     pie_colors = [_exit_colors.get(r, colors["gray"]) for r in reasons]
 
-    with ui.row().classes("w-full gap-6"):
+    with ui.row().classes("w-full gap-6 responsive-row"):
         with ui.column().classes("flex-1"):
             fig = go.Figure(
                 go.Pie(

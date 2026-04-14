@@ -19,6 +19,7 @@ from web.components import (
     kpi_grid,
     page_header,
     page_layout,
+    set_table_mobile_labels,
 )
 from web.state import aget_runs, build_run_options
 
@@ -128,7 +129,7 @@ def _render_param_section(
     ).classes("w-full mb-3"):
         with (
             ui.grid(columns=4)
-            .classes("w-full gap-3 px-2 pb-2 items-center")
+            .classes("w-full gap-3 px-2 pb-2 items-center responsive-grid-4")
             .style(
                 f"color: {theme['text_muted']}; border-bottom: 1px solid {theme['surface_border']};"
             )
@@ -145,7 +146,11 @@ def _render_param_section(
                 if same
                 else f"border-bottom: 1px solid {theme['surface_border']}; background: {theme['surface']};"
             )
-            with ui.grid(columns=4).classes("w-full gap-3 px-2 py-2 items-start").style(row_style):
+            with (
+                ui.grid(columns=4)
+                .classes("w-full gap-3 px-2 py-2 items-start responsive-grid-4")
+                .style(row_style)
+            ):
                 ui.label(str(row.get("parameter") or "")).classes("text-xs min-w-0").style(
                     "word-break: break-word; white-space: normal; "
                     + (
@@ -235,7 +240,7 @@ async def compare_page() -> None:
                 return str(m.get("direction_filter") or "BOTH").upper()
 
             # ── Side-by-side KPIs ────────────────────────────────────────────
-            with ui.grid(columns=2).classes("w-full gap-6"):
+            with ui.row().classes("w-full gap-6 responsive-row"):
                 for meta, label in [(meta1, "Run A"), (meta2, "Run B")]:
                     with ui.column().classes("w-full"):
                         strategy = _strat(meta)
@@ -387,15 +392,17 @@ async def compare_page() -> None:
                     f"{float(meta2.get('calmar') or 0):.2f}",
                 ),
             ]
-            ui.table(
-                columns=[
-                    {"name": "metric", "label": "Metric", "field": "metric", "align": "left"},
-                    {"name": "run_a", "label": f"Run A ({s1})", "field": "run_a", "align": "right"},
-                    {"name": "run_b", "label": f"Run B ({s2})", "field": "run_b", "align": "right"},
-                ],
+            metric_columns = [
+                {"name": "metric", "label": "Metric", "field": "metric", "align": "left"},
+                {"name": "run_a", "label": f"Run A ({s1})", "field": "run_a", "align": "right"},
+                {"name": "run_b", "label": f"Run B ({s2})", "field": "run_b", "align": "right"},
+            ]
+            metric_tbl = ui.table(
+                columns=metric_columns,
                 rows=[{"metric": m, "run_a": a, "run_b": b} for m, a, b in metric_rows],
                 row_key="metric",
             ).classes("w-full")
+            set_table_mobile_labels(metric_tbl, metric_columns)
 
             params1 = {}
             params2 = {}
@@ -434,7 +441,7 @@ async def compare_page() -> None:
                     )
 
         # ── Selectors ────────────────────────────────────────────────────────
-        with ui.row().classes("w-full gap-4 items-end mb-4"):
+        with ui.row().classes("w-full gap-4 items-end mb-4 flex-wrap"):
             sel_a: Any | None = None
             sel_b: Any | None = None
             sel_a = (

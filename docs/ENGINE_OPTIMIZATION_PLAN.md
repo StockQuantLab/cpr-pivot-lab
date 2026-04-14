@@ -489,7 +489,8 @@ documentation for the next tuning pass, not a request to change live logic yet.
 
 Current interpretation:
 
-- The Apr 14 CPR_LEVELS eight-run set is the current reference baseline.
+- The active CPR_LEVELS reference baseline is the exact 8-run table in
+  `docs/PAPER_TRADING_RUNBOOK.md`.
 - `compound-standard` scales with equity as expected.
 - `compound-risk` uses the shared current-equity allocator and is part of the approved
   reference set. Treat any future drift as a regression against the Apr 14 baseline.

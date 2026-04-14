@@ -23,6 +23,8 @@ from web.components import (
     page_header,
     page_layout,
     paginated_table,
+    safe_timer,
+    set_table_mobile_labels,
 )
 from web.state import (
     aget_data_quality_detail,
@@ -60,7 +62,7 @@ def _debounce(key: str, fn, delay: float = 0.3) -> None:
             _debounce_timers[key].deactivate()
         except Exception:
             pass
-    _debounce_timers[key] = ui.timer(delay, fn, once=True)
+    _debounce_timers[key] = safe_timer(delay, fn)
 
 
 async def _render_section_guarded(title: str, render_fn) -> None:
@@ -269,37 +271,24 @@ def _render_overview_tab(detail: dict, status: dict) -> None:
                 }
             )
 
-        ui.table(
-            columns=[
-                {
-                    "name": "status",
-                    "label": "Status",
-                    "field": "status",
-                    "align": "center",
-                },
-                {"name": "table", "label": "Table", "field": "table", "align": "left"},
-                {
-                    "name": "rows",
-                    "label": "Rows",
-                    "field": "rows",
-                    "align": "right",
-                },
-                {
-                    "name": "last_date",
-                    "label": "Last Date",
-                    "field": "last_date",
-                    "align": "center",
-                },
-                {
-                    "name": "desc",
-                    "label": "Description",
-                    "field": "desc",
-                    "align": "left",
-                },
-            ],
+        overview_columns = [
+            {"name": "status", "label": "Status", "field": "status", "align": "center"},
+            {"name": "table", "label": "Table", "field": "table", "align": "left"},
+            {"name": "rows", "label": "Rows", "field": "rows", "align": "right"},
+            {"name": "last_date", "label": "Last Date", "field": "last_date", "align": "center"},
+            {
+                "name": "desc",
+                "label": "Description",
+                "field": "desc",
+                "align": "left",
+            },
+        ]
+        overview_tbl = ui.table(
+            columns=overview_columns,
             rows=table_rows,
             row_key="table",
         ).classes("w-full")
+        set_table_mobile_labels(overview_tbl, overview_columns)
 
     # --- Data Issues section ---
     with ui.expansion("Data Issues", icon="report_problem").classes("w-full"):
@@ -349,30 +338,22 @@ def _render_overview_tab(detail: dict, status: dict) -> None:
                 }
                 for r in dq_by_issue
             ]
-            ui.table(
-                columns=[
-                    {
-                        "name": "severity",
-                        "label": "Severity",
-                        "field": "severity",
-                        "align": "center",
-                    },
-                    {
-                        "name": "code",
-                        "label": "Issue Code",
-                        "field": "code",
-                        "align": "left",
-                    },
-                    {
-                        "name": "symbol_count",
-                        "label": "Symbols Affected",
-                        "field": "symbol_count",
-                        "align": "right",
-                    },
-                ],
+            issue_columns = [
+                {"name": "severity", "label": "Severity", "field": "severity", "align": "center"},
+                {"name": "code", "label": "Issue Code", "field": "code", "align": "left"},
+                {
+                    "name": "symbol_count",
+                    "label": "Symbols Affected",
+                    "field": "symbol_count",
+                    "align": "right",
+                },
+            ]
+            issue_tbl = ui.table(
+                columns=issue_columns,
                 rows=issue_table_rows,
                 row_key="code",
             ).classes("w-full")
+            set_table_mobile_labels(issue_tbl, issue_columns)
 
             info_box(
                 "To see details: doppler run -- uv run pivot-data-quality --issue-code "
@@ -430,14 +411,9 @@ def _render_overview_tab(detail: dict, status: dict) -> None:
 # ---------------------------------------------------------------------------
 
 
-async def _render_coverage_tab() -> None:
+def _render_coverage_tab(coverage_data: list[dict], date_cov: list[dict]) -> None:
     """Per-symbol coverage % with search, filter, chart, and CSV export."""
     colors = COLORS
-
-    coverage_data = await aget_symbol_coverage()
-    date_cov = await aget_date_coverage()
-    if not _client_is_alive():
-        return
 
     if not coverage_data:
         ui.label("No data available.").style(f"color: {THEME['text_muted']};")
@@ -481,7 +457,7 @@ async def _render_coverage_tab() -> None:
     search_input = (
         ui.input("Search symbol", placeholder="e.g. RELIANCE")
         .props("dense outlined clearable")
-        .classes("w-48")
+        .classes("w-48 min-w-[140px]")
     )
     bucket_select = (
         ui.select(
@@ -490,7 +466,7 @@ async def _render_coverage_tab() -> None:
             label="Coverage Filter",
         )
         .props("dense outlined")
-        .classes("w-40")
+        .classes("w-40 min-w-[140px]")
     )
 
     @ui.refreshable
@@ -592,13 +568,10 @@ async def _render_coverage_tab() -> None:
 # ---------------------------------------------------------------------------
 
 
-async def _render_gaps_tab() -> None:
+async def _render_gaps_tab(gaps: list[dict]) -> None:
     """Top gaps > 5 calendar days + symbol drill-down."""
     colors = COLORS
 
-    gaps = await aget_top_gaps()
-    if not _client_is_alive():
-        return
     if not gaps:
         ui.label("No gaps > 5 calendar days detected.").style(f"color: {THEME['text_muted']};")
         return
@@ -685,13 +658,10 @@ async def _render_gaps_tab() -> None:
 # ---------------------------------------------------------------------------
 
 
-async def _render_freshness_tab() -> None:
+def _render_freshness_tab(buckets: list[dict]) -> None:
     """Freshness bucket distribution with pie chart and expandable symbol lists."""
     colors = COLORS
 
-    buckets = await aget_freshness_buckets()
-    if not _client_is_alive():
-        return
     if not buckets:
         ui.label("No data available.").style(f"color: {THEME['text_muted']};")
         return
@@ -752,13 +722,10 @@ async def _render_freshness_tab() -> None:
 # ---------------------------------------------------------------------------
 
 
-async def _render_anomalies_tab() -> None:
+def _render_anomalies_tab(anomalies: list[dict]) -> None:
     """Active DQ issues from pre-computed data_quality_issues table."""
     colors = COLORS
 
-    anomalies = await aget_dq_issues_detail()
-    if not _client_is_alive():
-        return
     if not anomalies:
         ui.label("No data quality issues detected.").style(f"color: {THEME['text_muted']};")
         return
@@ -835,13 +802,10 @@ async def _render_anomalies_tab() -> None:
 # ---------------------------------------------------------------------------
 
 
-async def _render_symbol_lookup_tab() -> None:
+async def _render_symbol_lookup_tab(symbols: list[str]) -> None:
     """Per-symbol profile with daily + 5-min + market_day_state stats + gaps."""
     colors = COLORS
 
-    symbols = await aget_symbols()
-    if not _client_is_alive():
-        return
     if not symbols:
         empty_state(
             "No symbols available",
@@ -964,15 +928,32 @@ async def _render_symbol_lookup_tab() -> None:
 
 
 async def data_quality_page() -> None:
-    """Render the Data Quality page with tabbed analytics."""
+    """Render the Data Quality page with tabbed analytics.
+
+    Strategy: fetch only the lightweight overview data before rendering (fast),
+    then load all heavy per-tab data in parallel in the background after the page
+    is served.  Each tab shows a spinner until its data arrives.
+    """
+    # Lightweight pre-fetch — these two queries are fast (~100ms each).
     try:
         status, detail = await asyncio.gather(
             aget_status(lite=True),
             aget_data_quality_detail(),
         )
     except Exception as exc:
-        logger.exception("Data Quality page: FAILED to load data: %s", exc)
+        logger.exception("Data Quality page: failed to load overview data: %s", exc)
         status, detail = {}, {}
+
+    # Mutable state filled in by the background loader after the page renders.
+    tab_state: dict[str, Any] = {
+        "coverage_data": None,
+        "date_cov": None,
+        "gaps": None,
+        "buckets": None,
+        "anomalies": None,
+        "symbols": None,
+    }
+
     with page_layout("Data Quality", "verified"):
         page_header(
             "Data Quality",
@@ -988,29 +969,131 @@ async def data_quality_page() -> None:
             tab_anomalies = ui.tab("Anomalies", icon="report_problem")
             tab_lookup = ui.tab("Symbol Lookup", icon="search")
 
+        # ---------------------------------------------------------------------------
+        # Spinner helper and per-tab refreshable panels
+        # ---------------------------------------------------------------------------
+
+        def _tab_spinner(msg: str = "Loading…") -> None:
+            with ui.row().classes("justify-center items-center p-12 w-full"):
+                ui.spinner("dots", size="lg").style(f"color: {THEME['primary']};")
+                ui.label(msg).classes("ml-4 text-sm").style(f"color: {THEME['text_muted']};")
+
+        @ui.refreshable
+        def _coverage_panel() -> None:
+            if tab_state["coverage_data"] is None:
+                _tab_spinner("Loading coverage data…")
+            else:
+                _render_coverage_tab(tab_state["coverage_data"], tab_state["date_cov"])
+
+        @ui.refreshable
+        async def _gaps_panel() -> None:
+            if tab_state["gaps"] is None:
+                _tab_spinner("Loading gap data…")
+            else:
+                await _render_gaps_tab(tab_state["gaps"])
+
+        @ui.refreshable
+        def _freshness_panel() -> None:
+            if tab_state["buckets"] is None:
+                _tab_spinner("Loading freshness data…")
+            else:
+                _render_freshness_tab(tab_state["buckets"])
+
+        @ui.refreshable
+        def _anomalies_panel() -> None:
+            if tab_state["anomalies"] is None:
+                _tab_spinner("Loading anomaly data…")
+            else:
+                _render_anomalies_tab(tab_state["anomalies"])
+
+        @ui.refreshable
+        async def _lookup_panel() -> None:
+            if tab_state["symbols"] is None:
+                _tab_spinner("Loading symbol list…")
+            else:
+                await _render_symbol_lookup_tab(tab_state["symbols"])
+
+        # ---------------------------------------------------------------------------
+        # Tab panels — Overview renders immediately; others show spinners
+        # ---------------------------------------------------------------------------
+
         with ui.tab_panels(tabs, value=tab_overview).classes("w-full"):
             with ui.tab_panel(tab_overview):
                 _render_overview_tab(detail, status)
 
             with ui.tab_panel(tab_coverage):
-                await _render_section_guarded("Coverage", _render_coverage_tab)
+                _coverage_panel()
 
             with ui.tab_panel(tab_gaps):
-                await _render_section_guarded("Gaps", _render_gaps_tab)
+                await _gaps_panel()
 
             with ui.tab_panel(tab_freshness):
-                await _render_section_guarded("Freshness", _render_freshness_tab)
+                _freshness_panel()
 
             with ui.tab_panel(tab_anomalies):
-                await _render_section_guarded("Anomalies", _render_anomalies_tab)
+                _anomalies_panel()
 
             with ui.tab_panel(tab_lookup):
-                await _render_section_guarded("Symbol Lookup", _render_symbol_lookup_tab)
+                await _lookup_panel()
 
-        # Background refresh for status
-        async def _refresh() -> None:
+        # ---------------------------------------------------------------------------
+        # Background loader — fires after the page is served to the browser
+        # ---------------------------------------------------------------------------
+
+        async def _load_heavy_tabs() -> None:
+            """Fetch all heavy tab data in parallel, then refresh each panel."""
+            try:
+                (
+                    coverage_data,
+                    date_cov,
+                    gaps,
+                    buckets,
+                    anomalies,
+                    symbols,
+                ) = await asyncio.gather(
+                    aget_symbol_coverage(),
+                    aget_date_coverage(),
+                    aget_top_gaps(),
+                    aget_freshness_buckets(),
+                    aget_dq_issues_detail(),
+                    aget_symbols(),
+                )
+            except Exception as exc:
+                logger.exception("DQ tabs background load failed: %s", exc)
+                coverage_data, date_cov, gaps, buckets, anomalies, symbols = (
+                    [],
+                    [],
+                    [],
+                    [],
+                    [],
+                    [],
+                )
+
+            tab_state.update(
+                {
+                    "coverage_data": coverage_data,
+                    "date_cov": date_cov,
+                    "gaps": gaps,
+                    "buckets": buckets,
+                    "anomalies": anomalies,
+                    "symbols": symbols,
+                }
+            )
+
+            if not _client_is_alive():
+                return
+            _coverage_panel.refresh()
+            _gaps_panel.refresh()
+            _freshness_panel.refresh()
+            _anomalies_panel.refresh()
+            _lookup_panel.refresh()
+
+        safe_timer(0.1, _load_heavy_tabs)
+
+        # Background refresh for the status badge in the Overview tab
+        async def _refresh_status() -> None:
             if not _client_is_alive():
                 return
             await aget_status(lite=False)
 
-        ui.timer(0.5, _refresh, once=True)
+        safe_timer(0.5, _refresh_status)

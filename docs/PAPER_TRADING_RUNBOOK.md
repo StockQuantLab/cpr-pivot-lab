@@ -65,16 +65,22 @@ uv run pivot-backtest --all --universe-size 0 --yes-full-run --start 2025-01-01 
 
 Reference sets (Apr 2026):
 
-- Latest set including `2026-04-09`:
-  - `1993f32beea7` (`CPR_LEVELS_STANDARD_LONG`)
-  - `6d1afd502546` (`CPR_LEVELS_STANDARD_SHORT`)
-  - `89b702775d22` (`CPR_LEVELS_RISK_LONG`)
-  - `e8a7de2d3258` (`CPR_LEVELS_RISK_SHORT`)
-- Rebuilt `2026-04-08` set:
-  - `8e930145831f` (`CPR_LEVELS_STANDARD_LONG`)
-  - `eef97528c63f` (`CPR_LEVELS_STANDARD_SHORT`)
-  - `ee81feba3dbe` (`CPR_LEVELS_RISK_LONG`)
-  - `8f865018cea1` (`CPR_LEVELS_RISK_SHORT`)
+- Current 8-run dashboard reference set:
+
+| Mode | Label | Run ID | Start -> End | TotRet | P/L | Trades |
+|------|-------|--------|--------------|--------|-----|--------|
+| Compound | `cpr-levels-short-risksize-compound-rvoloff-atr0.5` | `06ea445a0108` | 2025-01-01 -> 2026-04-09 | 248.1% | Rs.2,480,614 | 4,579 |
+| Compound | `cpr-levels-long-risksize-compound-rvol1-atr0.5` | `7e3feac35fd6` | 2025-01-01 -> 2026-04-09 | 159.8% | Rs.1,597,668 | 3,102 |
+| Compound | `cpr-levels-short-compound-rvoloff-atr0.5` | `fdea70184c2c` | 2025-01-01 -> 2026-04-09 | 247.1% | Rs.2,470,887 | 4,580 |
+| Compound | `cpr-levels-long-compound-rvol1-atr0.5` | `7d3b85732419` | 2025-01-01 -> 2026-04-09 | 159.8% | Rs.1,598,267 | 3,099 |
+| Daily Reset | `cpr-levels-short-risksize-daily-reset-rvoloff-atr0.5` | `4a2cc2485a6d` | 2025-01-01 -> 2026-04-09 | 103.6% | Rs.1,035,723 | 4,645 |
+| Daily Reset | `cpr-levels-long-risksize-daily-reset-rvol1-atr0.5` | `f1644ae9ce0e` | 2025-01-01 -> 2026-04-09 | 81.8% | Rs.818,525 | 3,101 |
+| Daily Reset | `cpr-levels-short-daily-reset-rvoloff-atr0.5` | `1d6e5e93618e` | 2025-01-01 -> 2026-04-09 | 104.1% | Rs.1,041,450 | 4,638 |
+| Daily Reset | `cpr-levels-long-daily-reset-rvol1-atr0.5` | `84a85d954f99` | 2025-01-01 -> 2026-04-09 | 82.7% | Rs.827,381 | 3,101 |
+
+When extending this set to a later end date, rerun these same eight parameter bundles and
+compare the overlapping dates only. The incremental window should be the only source of P/L
+delta. Do not infer the baseline set from label prefixes alone.
 
 Dashboard note:
 - Home page `Recent Backtest Runs` now has a one-click copy icon for `run_id`.

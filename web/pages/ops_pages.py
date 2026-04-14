@@ -22,6 +22,8 @@ from web.components import (
     page_header,
     page_layout,
     paginated_table,
+    safe_timer,
+    set_table_mobile_labels,
 )
 from web.state import (
     aget_market_breadth_snapshot,
@@ -95,7 +97,7 @@ async def scans_page() -> None:
                     color=colors["primary"],
                 ),
             ],
-            columns=5,
+            columns=4,
         )
         info_box(
             "Scans are not entry decisions; they summarize the intraday setup context precomputed in runtime tables.",
@@ -495,7 +497,7 @@ async def paper_ledger_page() -> None:
         )
         with ui.row().classes("mb-4 items-center gap-3"):
             ui.button("Refresh", icon="refresh", on_click=lambda: ui.navigate.reload()).props(
-                "outline"
+                "outline aria-label='Refresh page'"
             )
             auto_refresh_state = {"on": False, "timer": None}
             ui.checkbox(
@@ -579,7 +581,7 @@ async def paper_ledger_page() -> None:
                                     run_id, archived_runs, ledger_df, run_meta, colors
                                 )
 
-                        ui.timer(0.1, _load_ledger, once=True)
+                        safe_timer(0.1, _load_ledger)
 
                     ui.select(
                         labels,
@@ -591,13 +593,13 @@ async def paper_ledger_page() -> None:
                     )
                     _render(labels[0])
 
-        ui.timer(0.1, _load, once=True)
+        safe_timer(0.1, _load)
 
 
 def _start_auto_refresh(state: dict) -> None:
     """Start a 60-second auto-refresh timer."""
     _stop_auto_refresh(state)
-    state["timer"] = ui.timer(60.0, lambda: ui.navigate.reload(), once=False)
+    state["timer"] = safe_timer(60.0, lambda: ui.navigate.reload(), once=False)
 
 
 def _stop_auto_refresh(state: dict) -> None:
@@ -796,7 +798,7 @@ def _render_ledger_content(
 
     # Trade inspector dialog — reuses run_detail's inspection rendering
     with ui.dialog() as inspector_dialog:
-        with ui.card().classes("w-full max-w-6xl mx-auto"):
+        with ui.card().classes("w-full mx-4").style("max-width:min(1152px, 95vw);"):
             inspector_body = ui.column().classes("w-full gap-4")
 
     async def _open_paper_inspector(row: dict) -> None:
@@ -851,7 +853,6 @@ def _render_ledger_content(
                 "label": "Position ₹",
                 "field": "position_value",
                 "align": "right",
-                "classes": "hide-mobile",
             },
             {"name": "profit_loss", "label": "P/L ₹", "field": "profit_loss", "align": "right"},
             {
@@ -859,14 +860,12 @@ def _render_ledger_content(
                 "label": "Cum P/L ₹",
                 "field": "cum_pnl",
                 "align": "right",
-                "classes": "hide-mobile",
             },
             {
                 "name": "equity",
                 "label": "Equity ₹",
                 "field": "equity",
                 "align": "right",
-                "classes": "hide-mobile",
             },
             {"name": "exit_reason", "label": "Exit", "field": "exit_reason", "align": "left"},
         ],
@@ -892,19 +891,61 @@ def _direction_label(direction: str) -> str:
 def _colored_direction_table(rows: list[dict], colors: dict) -> None:
     """Render a position table with per-row direction coloring via NiceGUI slots."""
     columns = [
-        {"name": "position_id", "label": "ID", "field": "position_id", "align": "right"},
+        {
+            "name": "position_id",
+            "label": "ID",
+            "field": "position_id",
+            "align": "right",
+            "classes": "hide-mobile",
+        },
         {"name": "symbol", "label": "Symbol", "field": "symbol", "align": "left"},
         {"name": "direction", "label": "Dir", "field": "direction", "align": "center"},
         {"name": "status", "label": "Status", "field": "status", "align": "left"},
         {"name": "opened_at", "label": "Opened", "field": "opened_at", "align": "left"},
         {"name": "closed_at", "label": "Closed", "field": "closed_at", "align": "left"},
-        {"name": "qty", "label": "Qty", "field": "qty", "align": "right"},
-        {"name": "entry_price", "label": "Entry", "field": "entry_price", "align": "right"},
-        {"name": "last_price", "label": "Last", "field": "last_price", "align": "right"},
-        {"name": "close_price", "label": "Close", "field": "close_price", "align": "right"},
+        {
+            "name": "qty",
+            "label": "Qty",
+            "field": "qty",
+            "align": "right",
+            "classes": "hide-mobile",
+        },
+        {
+            "name": "entry_price",
+            "label": "Entry",
+            "field": "entry_price",
+            "align": "right",
+            "classes": "hide-mobile",
+        },
+        {
+            "name": "last_price",
+            "label": "Last",
+            "field": "last_price",
+            "align": "right",
+            "classes": "hide-mobile",
+        },
+        {
+            "name": "close_price",
+            "label": "Close",
+            "field": "close_price",
+            "align": "right",
+            "classes": "hide-mobile",
+        },
         {"name": "realized_pnl", "label": "Realized", "field": "realized_pnl", "align": "right"},
-        {"name": "stop_loss", "label": "SL", "field": "stop_loss", "align": "right"},
-        {"name": "target_price", "label": "Target", "field": "target_price", "align": "right"},
+        {
+            "name": "stop_loss",
+            "label": "SL",
+            "field": "stop_loss",
+            "align": "right",
+            "classes": "hide-mobile",
+        },
+        {
+            "name": "target_price",
+            "label": "Target",
+            "field": "target_price",
+            "align": "right",
+            "classes": "hide-mobile",
+        },
         {"name": "exit_reason", "label": "Reason", "field": "exit_reason", "align": "left"},
     ]
     resolved = [{**c, "sortable": c.get("sortable", True)} for c in columns]
@@ -915,6 +956,7 @@ def _colored_direction_table(rows: list[dict], colors: dict) -> None:
         pagination={"rowsPerPage": 10},
     ).classes("w-full")
     tbl.props('flat bordered separator=horizontal role="table"')
+    set_table_mobile_labels(tbl, resolved)
 
     # Slot: color the direction cell by checking the text content
     green = colors["success"]
@@ -922,7 +964,7 @@ def _colored_direction_table(rows: list[dict], colors: dict) -> None:
     tbl.add_slot(
         "body-cell-direction",
         f"""
-        <td class="text-center">
+        <td data-label="Dir" class="text-center">
             <span :style="props.row.direction.includes('LONG')
                 ? 'color:{green};font-weight:700'
                 : props.row.direction.includes('SHORT')

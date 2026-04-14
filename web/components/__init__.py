@@ -16,6 +16,7 @@ Provides:
 
 from __future__ import annotations
 
+import html
 import inspect
 import json
 from collections.abc import Callable, Iterator, Mapping
@@ -538,6 +539,14 @@ body, .q-app {
     font-family: var(--font-mono, 'JetBrains Mono', 'SF Mono', 'Consolas', 'Courier New', monospace) !important;
 }
 .q-table, .q-input, .q-select { letter-spacing: 0.02em; }
+/* Prevent KPI values from overflowing narrow card cells */
+.kpi-value {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 100%;
+    display: block;
+}
 
 h1, .text-4xl { font-size: 2.25rem; font-weight: 700; letter-spacing: -0.02em; }
 h2, .text-3xl { font-size: 1.75rem; font-weight: 600; letter-spacing: -0.01em; }
@@ -569,6 +578,80 @@ body.terminal-mode::after {
     transition: all 0.15s ease;
     box-shadow: var(--card-shadow, 0 2px 8px rgba(0,0,0,0.4));
     position: relative;
+    min-width: 0;        /* allow grid cell to shrink below content size */
+    overflow: hidden;    /* clip long values rather than blowing out the card */
+}
+/* Responsive KPI grid — auto-fit collapses empty tracks so cards fill full row width */
+.kpi-grid {
+    display: grid !important;
+    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)) !important;
+    gap: 16px;
+}
+@media (max-width: 480px) {
+    .kpi-grid {
+        grid-template-columns: repeat(2, 1fr) !important;
+        gap: 8px;
+    }
+    .kpi-card { padding: 12px 14px; }
+}
+/* Responsive side-by-side layouts — stack on mobile */
+.responsive-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 16px;
+}
+.responsive-row > * {
+    flex: 1 1 320px;
+    min-width: 0;
+}
+@media (max-width: 768px) {
+    .responsive-row > * {
+        flex: 1 1 100%;
+    }
+}
+/* Responsive metric grids */
+.responsive-grid-4 {
+    display: grid !important;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)) !important;
+    gap: 12px;
+}
+@media (max-width: 768px) {
+    .responsive-grid-4 {
+        grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
+    }
+}
+@media (max-width: 480px) {
+    .responsive-grid-4 {
+        grid-template-columns: 1fr !important;
+    }
+}
+/* Responsive nav grid on home page */
+.nav-grid-3 {
+    display: grid !important;
+    grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)) !important;
+}
+.nav-grid-2 {
+    display: grid !important;
+    grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)) !important;
+}
+/* Responsive step cards row */
+.step-cards-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 16px;
+}
+.step-cards-row > * {
+    flex: 1 1 280px;
+    min-width: 0;
+}
+/* Responsive mini-card row */
+.mini-card-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+}
+.mini-card-row > * {
+    min-width: 100px;
 }
 .kpi-card::before {
     content: "";
@@ -781,28 +864,39 @@ body.terminal-mode::after {
     .q-table .hide-mobile {
         display: none !important;
     }
-    /* Stack rows on very small screens */
-    @media (max-width: 480px) {
-        .q-table tbody tr {
-            display: block;
-            margin-bottom: 12px;
-            border: 1px solid var(--theme-surface-border);
-        }
-        .q-table tbody td {
-            display: flex;
-            justify-content: space-between;
-            padding: 8px 12px !important;
-            border-bottom: 1px solid var(--theme-surface-border) !important;
-        }
-        .q-table tbody td::before {
-            content: attr(data-label);
-            font-weight: 600;
-            color: var(--theme-text-secondary);
-            margin-right: 16px;
-        }
-        .q-table thead {
-            display: none;
-        }
+    /* Tab bar scroll on mobile */
+    .q-tabs__content {
+        overflow-x: auto !important;
+        -webkit-overflow-scrolling: touch;
+    }
+    .q-tab {
+        min-width: 64px !important;
+        padding: 0 8px !important;
+    }
+    /* Filter bar wrapping */
+    .filter-bar {
+        flex-wrap: wrap !important;
+    }
+    .filter-bar .q-field {
+        min-width: 120px !important;
+        flex: 1 1 120px;
+    }
+}
+/* Small screens: compact padding, horizontal scroll (no card-layout transform) */
+@media (max-width: 480px) {
+    .q-table__card {
+        overflow-x: auto !important;
+        -webkit-overflow-scrolling: touch;
+    }
+    .q-table tbody td {
+        padding: 6px 10px !important;
+        font-size: 0.7rem !important;
+        white-space: nowrap;
+    }
+    .q-table thead th {
+        padding: 6px 10px !important;
+        font-size: 0.65rem !important;
+        white-space: nowrap;
     }
 }
 
@@ -860,17 +954,15 @@ body.terminal-mode::after {
     .mobile-bottom-nav-item.active {
         color: var(--theme-primary);
     }
-    .mobile-bottom-nav-item .q-icon {
+    .mobile-bottom-nav-item .q-icon,
+    .mobile-bottom-nav-item i.q-icon {
         font-size: 1.4rem !important;
         margin-bottom: 2px;
+        display: block;
     }
     /* Adjust main content for bottom nav */
-    .q-page-container {
-        padding-bottom: 60px !important;
-    }
-    /* Hide sidebar on mobile */
-    .q-drawer {
-        display: none !important;
+    .q-page-container, main {
+        padding-bottom: 68px !important;
     }
 }
 
@@ -1067,12 +1159,55 @@ _PLOTLY_RESIZE_GUARD_HTML = """
 def toggle_theme_mode() -> None:
     """Switch between Terminal and Clean modes and reload the page."""
     _theme_state.toggle()
+    announce_live_region("Theme mode updated.")
     ui.navigate.reload()
 
 
-# ---------------------------------------------------------------------------
-# page_layout — wraps every page with sidebar + header
-# ---------------------------------------------------------------------------
+def announce_live_region(message: str) -> None:
+    """Send a polite screen-reader announcement to the shared live region."""
+    message_js = json.dumps(str(message))
+    ui.run_javascript(
+        "(() => {"
+        " const el = document.querySelector('.live-region');"
+        " if (!el) return;"
+        " el.textContent = '';"
+        " window.setTimeout(() => { el.textContent = "
+        f"{message_js};"
+        " }, 50);"
+        "})();"
+    )
+
+
+def safe_timer(delay: float, callback: Callable, once: bool = True) -> ui.timer:
+    """Create a ui.timer whose callback is guarded against deleted-client errors.
+
+    NiceGUI timers that fire after the browser tab closes or the user navigates
+    away raise ``RuntimeError('The client this element belongs to has been
+    deleted.')``.  Wrapping the callback here prevents that error from
+    propagating to the NiceGUI background-task exception handler.
+
+    Both sync and async callbacks are supported.
+    """
+    if inspect.iscoroutinefunction(callback):
+
+        async def _guarded_async() -> None:
+            try:
+                await callback()
+            except RuntimeError:
+                pass
+
+        return ui.timer(delay, _guarded_async, once=once)
+    else:
+
+        def _guarded() -> None:
+            try:
+                callback()
+            except RuntimeError:
+                pass
+
+        return ui.timer(delay, _guarded, once=once)
+
+
 @contextmanager
 def page_layout(title: str, icon: str = "bar_chart"):
     """Context manager: sidebar nav + header + content area.
@@ -1094,6 +1229,30 @@ def page_layout(title: str, icon: str = "bar_chart"):
 
     # Update page title for accessibility (A11Y-011)
     ui.run_javascript(f'document.title = "CPR Pivot Lab — {title}"')
+
+    # Make clickable table rows keyboard-focusable (P1-7 / WCAG 2.1.1)
+    # Runs once and installs a MutationObserver so paginated rows stay focusable.
+    ui.run_javascript(
+        "(function(){"
+        "const apply=()=>{"
+        "document.querySelectorAll('.q-table tbody tr:not([tabindex])').forEach(tr=>{"
+        "tr.setAttribute('tabindex','0');"
+        "tr.setAttribute('role','row');"
+        "tr.addEventListener('keydown',e=>{"
+        "if(e.key==='Enter'||e.key===' '){e.preventDefault();tr.click();}"
+        "});"
+        "});"
+        "};"
+        "apply();"
+        "if(!window.__cprRowFocusObserver){"
+        "window.__cprRowFocusObserver=new MutationObserver(apply);"
+        "window.__cprRowFocusObserver.observe(document.body,{childList:true,subtree:true});"
+        "}"
+        "})();"
+    )
+
+    # Skip navigation link (A11Y-008) — lets keyboard users bypass the sidebar
+    ui.html('<a href="#main-content" class="skip-link">Skip to main content</a>')
 
     # Add live region for dynamic updates (A11Y-010)
     ui.element("div").props('aria-live="polite" aria-atomic="true"').style(
@@ -1170,7 +1329,7 @@ def page_layout(title: str, icon: str = "bar_chart"):
     # -- sidebar drawer ------------------------------------------------------
     with (
         ui.left_drawer(value=True, bordered=False)
-        .props("width=240 mini-width=56 breakpoint=0")
+        .props("width=240 mini-width=56 breakpoint=768")
         .classes("p-0")
         .style(
             f"background: {theme['surface']}; "
@@ -1248,13 +1407,31 @@ def page_layout(title: str, icon: str = "bar_chart"):
                         )
 
     # -- main content --------------------------------------------------------
-    with ui.column().classes("w-full px-6 py-6"):
+    with ui.element("main").props('id="main-content" role="main"').classes("w-full px-6 py-6"):
         yield
 
+    # -- mobile bottom navigation (hidden on desktop via CSS) ----------------
+    _mobile_nav_items = [
+        {"label": "Home", "icon": "home", "path": "/"},
+        {"label": "Backtest", "icon": "bar_chart", "path": "/backtest"},
+        {"label": "Trades", "icon": "analytics", "path": "/trades"},
+        {"label": "Paper", "icon": "receipt_long", "path": "/paper_ledger"},
+        {"label": "Data", "icon": "verified", "path": "/data_quality"},
+    ]
+    with ui.element("nav").classes("mobile-bottom-nav").props('aria-label="Mobile navigation"'):
+        for _nav in _mobile_nav_items:
+            _is_active = _client_path == _nav["path"] or (
+                _nav["path"] == "/backtest" and _client_path.startswith("/backtest")
+            )
+            _cls = "mobile-bottom-nav-item active" if _is_active else "mobile-bottom-nav-item"
+            _path = _nav["path"]
+            with (
+                ui.element("a").classes(_cls).props(f'href="{_path}" aria-label="{_nav["label"]}"')
+            ):
+                ui.icon(_nav["icon"])
+                ui.label(_nav["label"]).style("font-size: 0.6rem; line-height: 1;")
 
-# ---------------------------------------------------------------------------
-# KPI card + grid
-# ---------------------------------------------------------------------------
+
 def kpi_card(
     title: str,
     value: str | float | int,
@@ -1289,8 +1466,13 @@ def kpi_card(
 
 
 def kpi_grid(cards: list[dict[str, Any]], columns: int = 4) -> None:
-    """Render a row of KPI cards. Each dict: title, value, subtitle, icon, color."""
-    with ui.grid(columns=columns).classes("w-full gap-4 mb-6"):
+    """Render a row of KPI cards. Each dict: title, value, subtitle, icon, color.
+
+    Uses CSS auto-fill grid for responsive column collapse on mobile.
+    The `columns` parameter is kept for API compatibility but layout is now
+    driven by CSS `grid-template-columns: repeat(auto-fill, minmax(160px, 1fr))`.
+    """
+    with ui.grid(columns=columns).classes("w-full gap-4 mb-6 kpi-grid"):
         for card in cards:
             kpi_card(**card)
 
@@ -1479,7 +1661,7 @@ def empty_state(
         if action_label and action_callback:
             ui.button(action_label, on_click=action_callback).props("push color=primary").classes(
                 "mt-4"
-            )
+            ).props(f'aria-label="{action_label}"')
 
 
 def copyable_code(text: str, language: str = "bash") -> None:
@@ -1511,7 +1693,7 @@ def copyable_code(text: str, language: str = "bash") -> None:
 
         btn = (
             ui.button(on_click=_copy)
-            .props("flat dense round")
+            .props("flat dense round aria-label='Copy to clipboard'")
             .classes("self-start")
             .tooltip("Copy to clipboard")
         )
@@ -1598,7 +1780,9 @@ def export_button(
     def _download():
         ui.download(csv_content.encode("utf-8"), filename=filename)
 
-    ui.button(label, icon="download", on_click=_download).props("flat").classes("text-sm").style(
+    ui.button(label, icon="download", on_click=_download).props(
+        "flat aria-label='Download CSV'"
+    ).classes("text-sm").style(
         f"color: {theme['text_secondary']}; "
         f"border: 1px solid {theme['surface_border']}; "
         "border-radius: 4px; padding: 6px 14px;"
@@ -1617,7 +1801,7 @@ def export_menu(data: Any, filename_base: str, label: str = "Export") -> None:
     else:
         return
 
-    with ui.button(label, icon="download").props("flat"):
+    with ui.button(label, icon="download").props("flat aria-label='Export data'"):
         with ui.menu().props("anchor=top-end"):
             ui.menu_item(
                 "Download CSV",
@@ -1631,6 +1815,7 @@ def loading_spinner():
 
     Includes aria-live region for screen readers (A11Y-010).
     """
+    announce_live_region("Loading...")
     spinner = (
         ui.spinner("dots")
         .classes("mt-8")
@@ -1639,6 +1824,7 @@ def loading_spinner():
     try:
         yield
     finally:
+        announce_live_region("Loading complete.")
         spinner.delete()
 
 
@@ -1654,19 +1840,28 @@ def paginated_table(
     *,
     sort_by: str | None = None,
     descending: bool = False,
+    mobile_hidden_cols: set[str] | None = None,
 ) -> None:
-    """Render a paginated Quasar QTable.
+    """Render a paginated Quasar QTable with responsive mobile support.
 
     Args:
         sort_by: Column name to sort by initially. Defaults to first column.
         descending: If True, initial sort is descending (newest first for dates).
+        mobile_hidden_cols: Set of column field names to hide on mobile (<768px).
     """
     theme = get_current_theme()
     if not rows:
         ui.label("No data to display.").style(f"color: {theme['text_muted']};")
         return
 
-    resolved_columns = [{**col, "sortable": col.get("sortable", True)} for col in columns]
+    hidden = mobile_hidden_cols or set()
+    resolved_columns = []
+    for col in columns:
+        c = {**col, "sortable": col.get("sortable", True)}
+        if col.get("name") in hidden:
+            c["classes"] = (col.get("classes", "") + " hide-mobile").strip()
+        resolved_columns.append(c)
+
     initial_sort = sort_by or (resolved_columns[0]["name"] if resolved_columns else None)
     tbl = ui.table(
         columns=resolved_columns,
@@ -1679,6 +1874,7 @@ def paginated_table(
         },
     ).classes("w-full")
     tbl.props('flat bordered separator=horizontal role="table"')
+    set_table_mobile_labels(tbl, resolved_columns)
 
     if on_row_click:
 
@@ -1703,6 +1899,31 @@ def paginated_table(
                 await result
 
         tbl.on("row-click", _handle_row_click)
+
+
+def set_table_mobile_labels(tbl: Any, columns: list[dict[str, Any]]) -> None:
+    """Attach mobile-friendly table cell templates with `data-label` values.
+
+    Uses NiceGUI's add_slot("body-cell-{name}", ...) API with Quasar slot props.
+    v-html handles both plain-text and HTML-formatted cell values (e.g. pnl_cell()).
+    Custom slots added after this call (e.g. direction coloring) override as expected.
+    """
+    for col in columns:
+        name = str(col.get("name") or "").strip()
+        if not name:
+            continue
+        label = html.escape(str(col.get("label") or name))
+        extra_class = str(col.get("classes") or "").strip()
+        # Build Vue :class expression — alignment from slot props + optional static classes
+        if extra_class:
+            class_val = f"'text-' + props.col.align + ' {extra_class}'"
+        else:
+            class_val = "'text-' + props.col.align"
+        tbl.add_slot(
+            f"body-cell-{name}",
+            f'<td data-label="{label}" :class="{class_val}">'
+            f'<span v-html="props.value"></span></td>',
+        )
 
 
 def extract_row_payload(event: Any) -> dict[str, Any]:
@@ -1805,7 +2026,7 @@ def trade_filter_bar(
         filters.update(date="", symbol="", direction="ALL", exit_reason="ALL")
         on_change()
 
-    with ui.row().classes("w-full gap-3 mb-3 items-end flex-wrap"):
+    with ui.row().classes("w-full gap-3 mb-3 items-end flex-wrap filter-bar"):
         if show_date:
             opts = date_options if date_options is not None else ["ALL"]
             ui.select(
@@ -1840,7 +2061,7 @@ def trade_filter_bar(
             "Clear",
             icon="clear",
             on_click=_clear,
-        ).props("flat dense").style(f"color: {colors['primary']};")
+        ).props("flat dense aria-label='Clear all filters'").style(f"color: {colors['primary']};")
 
 
 def apply_trade_filters(rows: list[dict], filters: dict) -> list[dict]:
@@ -2259,7 +2480,7 @@ def accessible_heading(text: str, level: int = 1) -> None:
 # P/L cell helper — green/red coloring for table cells
 # ---------------------------------------------------------------------------
 def pnl_cell(value: float | int, prefix: str = "₹", suffix: str = "") -> str:
-    """Format a P/L value as an HTML span with green/red coloring.
+    """Format a P/L value as an HTML span with green/red coloring and ARIA label.
 
     Returns an HTML string for use in table rows where the column
     is configured with ``"html": True``.
@@ -2270,15 +2491,27 @@ def pnl_cell(value: float | int, prefix: str = "₹", suffix: str = "") -> str:
     formatted = (
         f"{prefix}{sign}{value:,.0f}{suffix}" if prefix == "₹" else f"{sign}{value:.4f}{suffix}"
     )
-    return f'<span style="color:{color};font-weight:600;font-family:var(--font-mono)">{formatted}</span>'
+    aria_label = f"{'Gain' if value >= 0 else 'Loss'}: {formatted}"
+    arrow = "↑" if value > 0 else ("↓" if value < 0 else "")
+    return (
+        f'<span aria-label="{aria_label}" '
+        f'style="color:{color};font-weight:600;font-family:var(--font-mono)">'
+        f"{arrow} {formatted}</span>"
+    )
 
 
 def pnl_pct_cell(value: float) -> str:
-    """Format a P/L % value as an HTML span with green/red coloring."""
+    """Format a P/L % value as an HTML span with green/red coloring and ARIA label."""
     colors = get_current_colors()
     color = colors["success"] if value >= 0 else colors["error"]
     sign = "+" if value > 0 else ""
-    return f'<span style="color:{color};font-weight:600;font-family:var(--font-mono)">{sign}{value:.2f}%</span>'
+    aria_label = f"{'Gain' if value >= 0 else 'Loss'}: {sign}{value:.2f}%"
+    arrow = "↑" if value > 0 else ("↓" if value < 0 else "")
+    return (
+        f'<span aria-label="{aria_label}" '
+        f'style="color:{color};font-weight:600;font-family:var(--font-mono)">'
+        f"{arrow} {sign}{value:.2f}%</span>"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2312,9 +2545,9 @@ def _shortcuts_dialog() -> Any:
             ui.label("Keyboard Shortcuts").classes("text-base font-semibold").style(
                 f"color:{theme['text_primary']};"
             )
-            ui.button(icon="close", on_click=dlg.close).props("flat round dense").style(
-                f"color:{theme['text_muted']};"
-            )
+            ui.button(icon="close", on_click=dlg.close).props(
+                "flat round dense aria-label='Close keyboard shortcuts'"
+            ).style(f"color:{theme['text_muted']};")
         for key, desc in shortcuts:
             with ui.row().classes("justify-between w-full py-1"):
                 ui.label(key).classes("text-sm mono-font").style(

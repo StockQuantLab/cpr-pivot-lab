@@ -17,6 +17,7 @@ from web.components import (
     page_header,
     page_layout,
     paginated_table,
+    set_table_mobile_labels,
 )
 from web.state import aget_runs
 
@@ -213,29 +214,27 @@ async def strategy_page() -> None:
                         strat_runs, key=lambda r: float(r.get("calmar") or 0), reverse=True
                     )
                 ]
-                tbl = ui.table(
-                    columns=[
-                        {"name": "run_id", "label": "Run ID", "field": "run_id", "align": "left"},
-                        {"name": "period", "label": "Period", "field": "period", "align": "left"},
-                        {"name": "symbols", "label": "Syms", "field": "symbols", "align": "right"},
-                        {"name": "trades", "label": "Trades", "field": "trades", "align": "right"},
-                        {
-                            "name": "win_rate",
-                            "label": "Win %",
-                            "field": "win_rate",
-                            "align": "right",
-                        },
-                        {
-                            "name": "total_pnl",
-                            "label": "Total P/L",
-                            "field": "total_pnl",
-                            "align": "right",
-                        },
-                        {"name": "calmar", "label": "Calmar", "field": "calmar", "align": "right"},
-                    ],
-                    rows=rows,
-                    row_key="run_id",
-                ).classes("w-full")
+                columns = [
+                    {"name": "run_id", "label": "Run ID", "field": "run_id", "align": "left"},
+                    {"name": "period", "label": "Period", "field": "period", "align": "left"},
+                    {"name": "symbols", "label": "Syms", "field": "symbols", "align": "right"},
+                    {"name": "trades", "label": "Trades", "field": "trades", "align": "right"},
+                    {
+                        "name": "win_rate",
+                        "label": "Win %",
+                        "field": "win_rate",
+                        "align": "right",
+                    },
+                    {
+                        "name": "total_pnl",
+                        "label": "Total P/L",
+                        "field": "total_pnl",
+                        "align": "right",
+                    },
+                    {"name": "calmar", "label": "Calmar", "field": "calmar", "align": "right"},
+                ]
+                tbl = ui.table(columns=columns, rows=rows, row_key="run_id").classes("w-full")
+                set_table_mobile_labels(tbl, columns)
 
                 def _navigate_run_detail(event) -> None:
                     row = extract_row_payload(event)

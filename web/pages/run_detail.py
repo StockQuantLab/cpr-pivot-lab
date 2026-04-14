@@ -30,6 +30,7 @@ from web.components import (  # shared helpers
     paginated_table,
     param_detail_card,
     param_header_strip,
+    safe_timer,
     strat_badge,
     trade_filter_bar,
 )
@@ -181,10 +182,10 @@ async def backtest_page() -> None:
                 with trades_container:
                     _render_content(meta, strategy, df, run_meta, colors, theme)
 
-            ui.timer(0.1, _load_trades, once=True)
+            safe_timer(0.1, _load_trades)
 
         # Selector
-        with ui.row().classes("w-full items-center gap-4 mb-4"):
+        with ui.row().classes("w-full items-center gap-4 mb-4 flex-wrap"):
             sel = (
                 ui.select(
                     labels,
@@ -199,7 +200,7 @@ async def backtest_page() -> None:
                 "Refresh",
                 icon="refresh",
                 on_click=lambda: render_run.refresh(sel.value),
-            ).props("flat dense").style(f"color:{colors['primary']};")
+            ).props("flat dense aria-label='Refresh run data'").style(f"color:{colors['primary']};")
 
         divider()
         render_run(initial_label)
@@ -250,7 +251,7 @@ def _render_content(
 
                 (
                     ui.button(icon="content_copy", on_click=_copy_run_id)
-                    .props("flat dense round size=sm")
+                    .props("flat dense round size=sm aria-label='Copy run ID'")
                     .tooltip("Copy run ID")
                 )
 
@@ -309,7 +310,7 @@ def _render_content(
     )
 
     # Secondary metrics — styled mini cards
-    with ui.row().classes("w-full gap-3 mb-4 flex-wrap"):
+    with ui.row().classes("w-full gap-3 mb-4 flex-wrap mini-card-row"):
         _mini_card("Trades", f"{n_trades:,}", colors["info"])
         _mini_card("Symbols", str(n_syms), colors["info"])
         _mini_card(
@@ -342,7 +343,7 @@ def _render_content(
         return
 
     with ui.dialog() as inspector_dialog:
-        with ui.card().classes("w-full max-w-6xl mx-auto"):
+        with ui.card().classes("w-full mx-4").style("max-width:min(1152px, 95vw);"):
             inspector_body = ui.column().classes("w-full gap-4")
 
     async def _open_trade_inspector(row: dict) -> None:
@@ -862,7 +863,7 @@ def _tab_r_multiple(df: pl.DataFrame, colors: dict, theme: dict) -> None:
         apply_chart_theme(fig)
         ui.plotly(fig).classes("w-full h-72")
 
-        with ui.row().classes("gap-8 mt-4 flex-wrap"):
+        with ui.row().classes("gap-8 mt-4 flex-wrap responsive-row"):
             _stat_chip("Mean R", f"{mean_r:.2f}R", colors["primary"])
             _stat_chip("Avg Win", f"{wins.mean():.2f}R" if len(wins) else "—", colors["success"])
             _stat_chip("Avg Loss", f"{losses.mean():.2f}R" if len(losses) else "—", colors["error"])
@@ -1051,7 +1052,7 @@ def _tab_execution_audit(df: pl.DataFrame, run_meta: dict, colors: dict, theme: 
         .sort(["exit_reason", "direction"])
     )
 
-    with ui.row().classes("w-full gap-4"):
+    with ui.row().classes("w-full gap-4 responsive-row"):
         with ui.column().classes("flex-1"):
             if not entry_bins.is_empty():
                 fig_entry = go.Figure(
@@ -1249,7 +1250,7 @@ def _tab_winners_losers(df: pl.DataFrame, colors: dict, theme: dict, on_trade_cl
         color="blue",
     )
 
-    with ui.row().classes("w-full gap-4"):
+    with ui.row().classes("w-full gap-4 responsive-row"):
         with ui.column().classes("flex-1"):
             ui.label("Top Winners").classes("text-lg font-semibold mb-2").style(
                 f"color: {COLORS['success']};"
@@ -1438,13 +1439,13 @@ def _render_trade_inspector(details: dict, strategy: str, colors: dict, theme: d
         color="yellow",
     )
 
-    with ui.grid(columns=4).classes("w-full gap-3"):
+    with ui.grid(columns=4).classes("w-full gap-3 responsive-grid-4"):
         _inspection_metric("Prev Day", prev_date or "-", colors["info"])
         _inspection_metric("Signal Candle", signal_time, colors["info"])
         _inspection_metric("Entry Time", str(trade.get("entry_time") or "-"), direction_color)
         _inspection_metric("Exit Time", str(trade.get("exit_time") or "-"), colors["warning"])
 
-    with ui.row().classes("w-full gap-4 items-start flex-wrap"):
+    with ui.row().classes("w-full gap-4 items-start flex-wrap responsive-row"):
         with ui.column().classes("flex-1 gap-2").style("min-width:320px;"):
             ui.label("Daily CPR Source").classes("text-base font-semibold")
             _inspection_table(

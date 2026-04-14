@@ -7,7 +7,8 @@ produce the same trades, exits, PnL, and archived rows for the same
 symbol/date/params.
 
 Paper-mode parity (replay/live/local-live) is verified on 2026-04-09.
-The Apr 14 CPR_LEVELS eight-run set is the active reference baseline.
+The active CPR_LEVELS reference baseline is the exact 8-run table in
+`docs/PAPER_TRADING_RUNBOOK.md`.
 Keep correctness fixes separate from optimization; any future strategy sweep
 belongs in the optimization plan, not the parity rework plan.
 
@@ -60,7 +61,8 @@ On 2026-04-09:
 
 ### Current validation status
 
-- The Apr 14 CPR_LEVELS eight-run set is the approved reference baseline
+- The active CPR_LEVELS reference baseline is the exact 8-run table in
+  `docs/PAPER_TRADING_RUNBOOK.md`
 - `compound-standard` and `compound-risk` are both part of that approved set
 - The April 11 CPR_LEVELS runs were retired after the review cycle
 - Any new strategy sweep belongs in `docs/ENGINE_OPTIMIZATION_PLAN.md`

@@ -15,6 +15,7 @@ from web.components import (
     page_header,
     page_layout,
     paginated_table,
+    safe_timer,
 )
 from web.state import aget_runs, aget_trades, build_run_options
 
@@ -52,7 +53,7 @@ async def symbols_page() -> None:
                 with container:
                     _render_symbols_content(df, colors, theme)
 
-            ui.timer(0.1, _load, once=True)
+            safe_timer(0.1, _load)
 
         ui.select(
             labels,
