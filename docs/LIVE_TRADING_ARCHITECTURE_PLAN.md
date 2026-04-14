@@ -846,10 +846,11 @@ with `paper_db=get_dashboard_paper_db()` (reads from `paper_replica/` via
 `ReplicaConsumer`). A `force_paper_db_sync(source_conn=pdb.con)` is called at line
 589 before archiving. **No action needed.**
 
-### 3C — Backtest vs Replay vs Live Parity (1–2 days)
+### 3C — Backtest vs Replay vs Live Parity (historical trigger case)
 
-**Symptom:** Replay opens trades for symbols (e.g., GANESHCP, ASTERDM on 2026-04-01)
-not present in the full baseline backtest run.
+**Historical trigger:** Replay opened trades for symbols (e.g., GANESHCP, ASTERDM on 2026-04-01)
+that were not present in the then-current baseline backtest run. That compare drove the CPR parity rework,
+but it is not a standing open mismatch in the current codebase.
 
 **Existing shared evaluator:** Backtest and paper runtime already share
 `scan_cpr_levels_entry()` via `engine/cpr_atr_shared.py:270`, called from

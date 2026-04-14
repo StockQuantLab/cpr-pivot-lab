@@ -489,10 +489,10 @@ documentation for the next tuning pass, not a request to change live logic yet.
 
 Current interpretation:
 
-- `daily-reset` is the frozen reference set for now.
+- The Apr 14 CPR_LEVELS eight-run set is the current reference baseline.
 - `compound-standard` scales with equity as expected.
-- `compound-risk` now uses the shared current-equity allocator, but it still needs
-  row-by-row reconciliation against the preserved old baselines before we call it closed.
+- `compound-risk` uses the shared current-equity allocator and is part of the approved
+  reference set. Treat any future drift as a regression against the Apr 14 baseline.
 - Strategy tuning is still separate from parity work.
 
 #### Current daily-reset reference runs
@@ -520,10 +520,9 @@ Current interpretation:
 
 #### Pending validation
 
-- Verify the remaining compound-risk row-level deltas against the preserved old baselines.
-- Keep the daily-reset set frozen unless a future change is explicitly intended to alter the
-  reference behavior.
-- Do not interpret the compound-risk profit jump as final until the trade-set diff is reviewed.
+- Keep the Apr 14 reference baseline fixed unless a future change is explicitly intended to alter
+  the reference behavior.
+- Use the current reference baseline set for any future regression checks.
 
 #### Measured follow-up hypotheses
 
@@ -553,7 +552,7 @@ Current interpretation:
      - LONG: 3071/3102 changed (mostly size-only), 6 timing/price changes, 14 removed keys
      - SHORT: 4526/4579 size-only changes, 3 timing, 5 price, 0 exit-reason changes
    - New compound-risk baselines: LONG `2039b1e1b52b`, SHORT `c612d451721f`
-   - Preserved old baselines remain frozen for historical reference.
+   - Historical April 11 baselines were reviewed and retired; the Apr 14 baseline set is now the active reference.
 
 6. **Compound risk sizing now has explicit semantics**
    - Compound risk mode uses the current session capital base.

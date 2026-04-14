@@ -7,9 +7,9 @@ produce the same trades, exits, PnL, and archived rows for the same
 symbol/date/params.
 
 Paper-mode parity (replay/live/local-live) is verified on 2026-04-09.
-Daily-reset backtest parity is now the accepted reference set.
-The remaining open work is compound-risk row-level reconciliation and any
-future strategy sweep. Keep correctness fixes separate from optimization.
+The Apr 14 CPR_LEVELS eight-run set is the active reference baseline.
+Keep correctness fixes separate from optimization; any future strategy sweep
+belongs in the optimization plan, not the parity rework plan.
 
 Hard requirements:
 - no hidden lifecycle differences between modes
@@ -60,9 +60,9 @@ On 2026-04-09:
 
 ### Current validation status
 
-- `daily-reset` backtest baselines are close enough to freeze as the reference set
-- `compound-standard` is behaving as expected for equity growth
-- `compound-risk` is corrected in the shared allocator, but the newest runs still need row-by-row review against the preserved old baselines
+- The Apr 14 CPR_LEVELS eight-run set is the approved reference baseline
+- `compound-standard` and `compound-risk` are both part of that approved set
+- The April 11 CPR_LEVELS runs were retired after the review cycle
 - Any new strategy sweep belongs in `docs/ENGINE_OPTIMIZATION_PLAN.md`
 
 ## Root Cause Analysis: Backtest Divergence
@@ -291,13 +291,12 @@ After all parity work is verified:
 - Daily-reset backtest parity path
 - Dashboard run labels include `updated_at`
 - Legacy duplicate reruns have been cleaned up
+- `select_entries_for_bar()` still uses the canonical alphabetical tie-break by design; it is not a parity bug.
 
 ## What is pending
 
-- Row-by-row review of compound-risk old vs new baselines
 - Any further strategy-quality tuning (breakeven, entry window, CPR width)
 - Scaled exits
-- Optional future tie-break scoring experiments
 
 ## Acceptance Criteria
 

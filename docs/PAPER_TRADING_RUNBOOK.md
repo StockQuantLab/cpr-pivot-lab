@@ -86,10 +86,10 @@ For daily CPR compares, treat strategy filters and session state as separate che
 
 - `daily-replay` starts a fresh paper session for the requested date.
 - Matching params are necessary, but they do not by themselves guarantee identical executed rows across a one-day replay and a multi-day backtest window.
-- The 2026-04-01 CPR compare exposed an open mismatch: paper replay archived trades for `GANESHCP` and `ASTERDM`, while the full backtest runs for the same date did not show those rows.
-- When this happens, compare the setup rows and intraday day packs first, then diff the replay entry path against the backtest entry path before changing the filters.
+- Historical trigger case: the 2026-04-01 CPR compare on `GANESHCP` and `ASTERDM` drove the parity rework.
+- The current backtest, replay, and live/local-live CPR paths share the same entry search. If that compare ever reappears, treat it as a regression and diff the shared input rows first.
 - Capital / sizing may change quantity and P&L, but a trade appearing or disappearing is a separate parity problem.
-- The intended fix direction is to unify the CPR entry search itself. Replay/live should keep the candle-by-candle operational behavior, and backtest should be brought into the same shared entry evaluation so all paths agree.
+- Replay/live should keep the candle-by-candle operational behavior, and backtest should remain on the same shared entry evaluation so all paths agree.
 
 Operational controls remain separate from strategy params:
 
