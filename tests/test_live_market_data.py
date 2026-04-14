@@ -322,6 +322,15 @@ async def test_run_live_session_fails_closed_when_finalization_raises(
                         volume=10.0,
                     )
                 ]
+            if self.calls == 2:
+                return [
+                    MarketSnapshot(
+                        symbol="SBIN",
+                        ts=datetime(2024, 1, 1, 9, 20),
+                        last_price=101.0,
+                        volume=12.0,
+                    )
+                ]
             return []
 
     async def fake_sleep(_: float) -> None:
@@ -369,6 +378,136 @@ async def test_run_live_session_fails_closed_when_finalization_raises(
     assert result["final_status"] == "FAILED"
     assert any(update.get("status") == "FAILED" for update in updates)
     assert feed_states
+
+
+@pytest.mark.asyncio
+async def test_run_live_session_promotes_flatten_time_stop_to_completed_when_flat(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = SimpleNamespace(
+        session_id="sess-stop-flat",
+        status="ACTIVE",
+        symbols=["SBIN"],
+        strategy="CPR_LEVELS",
+        strategy_params={},
+        stale_feed_timeout_sec=30,
+    )
+    updates: list[dict[str, object]] = []
+    complete_calls: list[dict[str, object]] = []
+    archived: list[str] = []
+
+    async def fake_session_loader(session_id: str):
+        assert session_id == "sess-stop-flat"
+        return session
+
+    async def fake_session_updater(session_id: str, **kwargs):
+        assert session_id == "sess-stop-flat"
+        updates.append(dict(kwargs))
+        if "status" in kwargs:
+            session.status = str(kwargs["status"])
+        return session
+
+    async def fake_feed_writer(**kwargs):
+        return SimpleNamespace(**kwargs)
+
+    async def fake_feed_reader(session_id: str):
+        return FeedState(
+            session_id=session_id,
+            status="OK",
+            last_event_ts=None,
+            last_bar_ts=None,
+            last_price=None,
+            stale_reason=None,
+            raw_state={},
+            updated_at=datetime(2024, 1, 1, 9, 15),
+        )
+
+    class OneShotAdapter:
+        def __init__(self):
+            self.calls = 0
+
+        def poll(self, symbols):
+            self.calls += 1
+            if self.calls == 1:
+                return [
+                    MarketSnapshot(
+                        symbol="SBIN",
+                        ts=datetime(2024, 1, 1, 9, 15),
+                        last_price=100.0,
+                        volume=10.0,
+                    )
+                ]
+            if self.calls == 2:
+                return [
+                    MarketSnapshot(
+                        symbol="SBIN",
+                        ts=datetime(2024, 1, 1, 9, 20),
+                        last_price=101.0,
+                        volume=12.0,
+                    )
+                ]
+            return []
+
+    async def fake_sleep(_: float) -> None:
+        return None
+
+    async def fake_risk_enforcer(**kwargs):
+        return {"triggered": True, "daily_pnl_used": 0.0, "reasons": ["flatten_time:15:15:00"]}
+
+    async def fake_evaluate_candle(**kwargs):
+        return {
+            "symbol": kwargs["candle"].symbol,
+            "action": "SKIP",
+            "reason": "setup_ready",
+            "setup_status": "pending",
+            "candidate": None,
+            "advance_result": None,
+            "setup_row": None,
+        }
+
+    async def fake_complete_session(**kwargs):
+        complete_calls.append(dict(kwargs))
+        if kwargs["complete_on_exit"]:
+            await fake_session_updater(kwargs["session_id"], status="COMPLETED")
+
+    def fake_archive_completed_session(session_id: str, paper_db=None):
+        archived.append(session_id)
+        return {"session_id": session_id, "archived": True}
+
+    async def fake_get_session_positions(session_id: str, symbol=None, statuses=None):
+        return []
+
+    monkeypatch.setattr("scripts.paper_live.enforce_session_risk_controls", fake_risk_enforcer)
+    monkeypatch.setattr("scripts.paper_live.evaluate_candle", fake_evaluate_candle)
+    monkeypatch.setattr(
+        "scripts.paper_live.paper_session_driver.complete_session", fake_complete_session
+    )
+    monkeypatch.setattr(
+        "scripts.paper_live.archive_completed_session", fake_archive_completed_session
+    )
+    monkeypatch.setattr("scripts.paper_live.force_paper_db_sync", lambda _db: None)
+    monkeypatch.setattr("scripts.paper_live.get_session_positions", fake_get_session_positions)
+
+    result = await run_live_session(
+        session_id="sess-stop-flat",
+        adapter=OneShotAdapter(),
+        poll_interval_sec=0,
+        candle_interval_minutes=5,
+        max_cycles=3,
+        deps=LiveSessionDeps(
+            session_loader=fake_session_loader,
+            session_updater=fake_session_updater,
+            feed_writer=fake_feed_writer,
+            feed_reader=fake_feed_reader,
+            sleep_fn=fake_sleep,
+            now_fn=lambda: datetime(2024, 1, 1, 9, 15, 10),
+        ),
+    )
+
+    assert result["final_status"] == "COMPLETED"
+    assert complete_calls and complete_calls[0]["complete_on_exit"] is True
+    assert any(update.get("status") == "COMPLETED" for update in updates)
+    assert archived == ["sess-stop-flat"]
 
 
 @pytest.mark.asyncio
@@ -565,6 +704,8 @@ async def test_run_live_session_fails_closed_when_bar_processing_raises(
 
     assert result["final_status"] == "FAILED"
     assert any(update.get("status") == "FAILED" for update in updates)
+
+
 @pytest.mark.asyncio
 async def test_run_live_session_applies_stage_b_direction_filter(
     monkeypatch: pytest.MonkeyPatch,

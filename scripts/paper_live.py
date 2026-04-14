@@ -278,9 +278,7 @@ def _prefetch_setup_rows(
             intraday = _build_intraday_summary(live_candles, or_minutes=candle_interval_minutes)
             live_or_close_5 = intraday.get("or_close_5")
             if live_or_close_5 is not None:
-                direction = resolve_cpr_direction(
-                    live_or_close_5, tc, bc, fallback="NONE"
-                )
+                direction = resolve_cpr_direction(live_or_close_5, tc, bc, fallback="NONE")
                 or_close_5 = live_or_close_5
         rvol_baseline: list[float | None] | None = None
         if row[24]:
@@ -1003,9 +1001,10 @@ async def run_live_session(
             # reconnect to recover.  Only exit after 600s (10 min) of no data.
             stale_exit_sec = 600
             if not local_feed and no_snapshot_streak >= 3:
-                _stale_cooldown_ok = last_stale_alert_ts is None or (
-                    now - last_stale_alert_ts
-                ).total_seconds() > _stale_alert_cooldown_sec
+                _stale_cooldown_ok = (
+                    last_stale_alert_ts is None
+                    or (now - last_stale_alert_ts).total_seconds() > _stale_alert_cooldown_sec
+                )
                 if alerts_enabled and not stale_alerted and _stale_cooldown_ok:
                     stale_alerted = True
                     last_stale_alert_ts = now
@@ -1028,8 +1027,7 @@ async def run_live_session(
                         details=(
                             f"transport={'websocket' if use_websocket else 'rest'}"
                             f" streak={no_snapshot_streak}"
-                            f" last_tick={last_snapshot}"
-                            + pos_detail
+                            f" last_tick={last_snapshot}" + pos_detail
                         ),
                     )
                 stale_duration_sec = (
@@ -1069,9 +1067,7 @@ async def run_live_session(
                         symbol_last_prices[candle.symbol] = candle.close
                         state = runtime_state.symbols.get(candle.symbol)
                         setup_row = state.setup_row if state is not None else None
-                        _log_parity_trace(
-                            session_id=session_id, candle=candle, setup_row=setup_row
-                        )
+                        _log_parity_trace(session_id=session_id, candle=candle, setup_row=setup_row)
                     driver_result = await paper_session_driver.process_closed_bar_group(
                         session_id=session_id,
                         session=session,
@@ -1127,9 +1123,7 @@ async def run_live_session(
                     final_status,
                     tracker.open_count,
                 )
-                await flatten_session_positions(
-                    session_id, notes=f"{final_status}_AUTO_FLATTEN"
-                )
+                await flatten_session_positions(session_id, notes=f"{final_status}_AUTO_FLATTEN")
             except Exception:
                 # Fix 2: alert operator when auto-flatten itself fails — orphaned positions.
                 logger.exception(
@@ -1165,11 +1159,26 @@ async def run_live_session(
                 "[%s] Failed to stamp terminal status %s", session_id, final_status, exc_info=True
             )
 
+    stop_is_terminal = complete_on_exit or final_status in {
+        "NO_ACTIVE_SYMBOLS",
+        "NO_TRADES_ENTRY_WINDOW_CLOSED",
+        "COMPLETED",
+    }
+    if not stop_is_terminal and final_status == "STOPPING":
+        try:
+            open_positions = await get_session_positions(session_id, statuses=["OPEN"])
+            stop_is_terminal = len(open_positions) == 0
+        except Exception:
+            logger.debug(
+                "[%s] Failed to inspect open positions before finalization",
+                session_id,
+                exc_info=True,
+            )
+
     try:
         await paper_session_driver.complete_session(
             session_id=session_id,
-            complete_on_exit=complete_on_exit
-            or final_status in {"NO_ACTIVE_SYMBOLS", "NO_TRADES_ENTRY_WINDOW_CLOSED", "COMPLETED"},
+            complete_on_exit=stop_is_terminal,
             last_bar_ts=last_bar_ts,
             stale_timeout=stale_timeout,
             notes=notes,
@@ -1197,11 +1206,7 @@ async def run_live_session(
                 final_status,
                 exc_info=True,
             )
-    if complete_on_exit or final_status in {
-        "NO_ACTIVE_SYMBOLS",
-        "NO_TRADES_ENTRY_WINDOW_CLOSED",
-        "COMPLETED",
-    }:
+    if stop_is_terminal:
         force_paper_db_sync(get_paper_db())
 
     final_session = await _load_session(session_id, deps)
