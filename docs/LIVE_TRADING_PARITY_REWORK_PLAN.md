@@ -66,6 +66,10 @@ On 2026-04-09:
 - `compound-standard` and `compound-risk` are both part of that approved set
 - The April 11 CPR_LEVELS runs were retired after the review cycle
 - Any new strategy sweep belongs in `docs/ENGINE_OPTIMIZATION_PLAN.md`
+- Replay/local-live parity only proves the candle-based driver matches
+  `intraday_day_pack`; it does not prove the live quote/tick path is equivalent.
+  The 2026-04-13 `MANOMAY` incident showed that a live fill can still drift from
+  the stored candle tape even when replay and local-live match each other.
 
 ## Root Cause Analysis: Backtest Divergence
 
@@ -118,6 +122,30 @@ The correct entry time is 09:45. Both are bugs requiring investigation.
   instead of 09:45. Prefetch setup rows in replay (Step 6) as hardening.
 - Backtest: Fix double portfolio filtering (Step 5). If DHARMAJ still missing
   after the fix, use per-bar tracing (Step 4) to identify the exact rejection.
+
+### 3. Live feed fidelity gap on 2026-04-13 `MANOMAY` (HIGH — confirmed)
+
+The 2026-04-13 `MANOMAY` short trade exposed a live-feed fidelity gap:
+
+- live alert / live log: entry `221.49`, exit `216.31`, `TARGET`
+- current `intraday_day_pack`: `09:25` close `220.90`
+- replay/local-live: match the candle tape, not the historical live fill
+
+This is not a CPR setup bug. The symbol qualified either way. The divergence is in
+the price source used at entry time.
+
+Likely explanation:
+- live uses real-time ticks/quotes aggregated into 5-minute candles
+- replay/local-live use stored 5-minute candles from `intraday_day_pack`
+- the historical candle tape does not preserve the same fill snapshot that the live
+  session saw
+
+Operational implication:
+- treat replay/local-live as candle-driver parity checks
+- treat live-vs-EOD fidelity as a separate audit problem
+- `paper_feed_audit` now captures the compact live-feed rows, and
+  `pivot-paper-trading feed-audit` compares them against `intraday_day_pack`
+  after EOD build for daily assurance
 
 ## Implementation Steps
 

@@ -64,8 +64,47 @@ def test_delete_all_rows_clears_every_paper_table(tmp_path: Path) -> None:
             "paper_positions": 0,
             "paper_orders": 0,
             "paper_feed_state": 0,
+            "paper_feed_audit": 0,
             "alert_log": 0,
         }
         assert position.session_id == session.session_id
+    finally:
+        db.close()
+
+
+def test_delete_sessions_by_trade_date_clears_feed_audit_rows(tmp_path: Path) -> None:
+    db = PaperDB(db_path=tmp_path / "paper.duckdb")
+    try:
+        session = db.create_session(
+            session_id="paper-audit",
+            status="ACTIVE",
+            trade_date="2026-04-13",
+        )
+        db.upsert_feed_audit_rows(
+            [
+                {
+                    "session_id": session.session_id,
+                    "trade_date": "2026-04-13",
+                    "feed_source": "kite",
+                    "transport": "websocket",
+                    "symbol": "MANOMAY",
+                    "bar_start": "2026-04-13 09:20:00",
+                    "bar_end": "2026-04-13 09:25:00",
+                    "open": 221.0,
+                    "high": 222.0,
+                    "low": 220.5,
+                    "close": 221.5,
+                    "volume": 12345.0,
+                    "first_snapshot_ts": "2026-04-13 09:20:01",
+                    "last_snapshot_ts": "2026-04-13 09:24:59",
+                }
+            ]
+        )
+
+        counts = db.delete_sessions_by_trade_date("2026-04-13")
+
+        assert counts["paper_sessions"] == 1
+        assert counts["paper_feed_audit"] == 1
+        assert db.get_feed_audit_rows(trade_date="2026-04-13") == []
     finally:
         db.close()

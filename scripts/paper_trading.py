@@ -34,6 +34,7 @@ from engine.paper_runtime import (
 from engine.strategy_presets import ALL_STRATEGY_PRESETS, list_strategy_preset_names
 from scripts import data_quality as _data_quality
 from scripts.paper_archive import archive_completed_session
+from scripts.paper_feed_audit import compare_feed_audit
 from scripts.paper_live import run_live_session
 from scripts.paper_prepare import (
     pre_filter_symbols_for_strategy,
@@ -1403,6 +1404,17 @@ async def _cmd_cleanup(args: argparse.Namespace) -> None:
         print(json.dumps(payload, default=str, indent=2))
 
 
+async def _cmd_feed_audit(args: argparse.Namespace) -> None:
+    payload = compare_feed_audit(
+        trade_date=args.trade_date,
+        feed_source=args.feed_source,
+        session_id=args.session_id,
+    )
+    print(json.dumps(payload, default=str, indent=2))
+    if not payload.get("ok", False):
+        raise SystemExit(1)
+
+
 async def _cmd_replay(args: argparse.Namespace) -> None:
     with acquire_command_lock("runtime-writer", detail="runtime writer"):
         symbols = (
@@ -1721,6 +1733,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="Execute deletes. Default is dry-run only.",
     )
     cleanup.set_defaults(handler=_cmd_cleanup)
+
+    feed_audit = sub.add_parser(
+        "feed-audit",
+        help="Compare stored paper feed audit rows against intraday_day_pack for a trade date",
+    )
+    feed_audit.add_argument("--trade-date", required=True, help="Audit trade date YYYY-MM-DD")
+    feed_audit.add_argument(
+        "--session-id",
+        default=None,
+        help="Optional paper session to compare. Defaults to all sessions for the date.",
+    )
+    feed_audit.add_argument(
+        "--feed-source",
+        choices=["kite", "local", "replay", "all"],
+        default="kite",
+        help="Filter audit rows by feed source (default: kite/live).",
+    )
+    feed_audit.set_defaults(handler=_cmd_feed_audit)
 
     replay = sub.add_parser("replay", help="Replay historical candles into paper feed state")
     replay.add_argument("--session-id", required=True, help="Session to replay into")

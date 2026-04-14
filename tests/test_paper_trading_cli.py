@@ -46,6 +46,18 @@ def test_paper_trading_parser_supports_cleanup() -> None:
     assert cleanup_args.trade_date == "2026-04-01"
 
 
+def test_paper_trading_parser_supports_feed_audit() -> None:
+    parser = build_parser()
+
+    feed_audit_args = parser.parse_args(
+        ["feed-audit", "--trade-date", "2026-04-13", "--feed-source", "kite"]
+    )
+
+    assert feed_audit_args.command == "feed-audit"
+    assert feed_audit_args.trade_date == "2026-04-13"
+    assert feed_audit_args.feed_source == "kite"
+
+
 def test_paper_trading_parser_supports_replay() -> None:
     parser = build_parser()
 

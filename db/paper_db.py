@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 import duckdb
+import polars as pl
 
 from db.replica import ReplicaSync
 from db.replica_consumer import ReplicaConsumer
@@ -147,6 +148,26 @@ class FeedState:
     last_price: float | None = None
     stale_reason: str | None = None
     raw_state: dict[str, Any] = field(default_factory=dict)
+    updated_at: datetime = field(default_factory=datetime.utcnow)
+
+
+@dataclass(slots=True)
+class FeedAudit:
+    session_id: str
+    trade_date: str
+    feed_source: str
+    transport: str
+    symbol: str
+    bar_start: datetime
+    bar_end: datetime
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float
+    first_snapshot_ts: datetime | None = None
+    last_snapshot_ts: datetime | None = None
+    created_at: datetime = field(default_factory=datetime.utcnow)
     updated_at: datetime = field(default_factory=datetime.utcnow)
 
 
@@ -277,6 +298,34 @@ class PaperDB:
                 updated_at     TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
             )
         """)
+
+        self.con.execute("""
+            CREATE TABLE IF NOT EXISTS paper_feed_audit (
+                session_id         VARCHAR(50) NOT NULL,
+                trade_date         VARCHAR(10) NOT NULL,
+                feed_source        VARCHAR(20) NOT NULL,
+                transport          VARCHAR(20) NOT NULL,
+                symbol             VARCHAR(20) NOT NULL,
+                bar_start          TIMESTAMPTZ NOT NULL,
+                bar_end            TIMESTAMPTZ NOT NULL,
+                open               DOUBLE,
+                high               DOUBLE,
+                low                DOUBLE,
+                close              DOUBLE,
+                volume             DOUBLE,
+                first_snapshot_ts  TIMESTAMPTZ,
+                last_snapshot_ts   TIMESTAMPTZ,
+                created_at         TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+                updated_at         TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (session_id, symbol, bar_end)
+            )
+        """)
+        self.con.execute(
+            "CREATE INDEX IF NOT EXISTS idx_pfa_trade_date ON paper_feed_audit(trade_date, feed_source, session_id)"
+        )
+        self.con.execute(
+            "CREATE INDEX IF NOT EXISTS idx_pfa_session ON paper_feed_audit(session_id)"
+        )
 
         self.con.execute("""
             CREATE SEQUENCE IF NOT EXISTS alert_log_seq START 1
@@ -919,6 +968,100 @@ class PaperDB:
         )
         self._after_write()
 
+    def upsert_feed_audit_rows(self, rows: list[dict[str, Any]]) -> int:
+        if not rows:
+            return 0
+        columns = [
+            "session_id",
+            "trade_date",
+            "feed_source",
+            "transport",
+            "symbol",
+            "bar_start",
+            "bar_end",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+            "first_snapshot_ts",
+            "last_snapshot_ts",
+        ]
+        df = pl.DataFrame(rows).select(columns)
+        self.con.register("_tmp_paper_feed_audit", df.to_arrow())
+        try:
+            self.con.execute("BEGIN TRANSACTION")
+            self.con.execute(
+                f"""
+                INSERT OR REPLACE INTO paper_feed_audit (
+                    {", ".join(columns)}
+                )
+                SELECT {", ".join(columns)} FROM _tmp_paper_feed_audit
+                """
+            )
+            self.con.execute("COMMIT")
+            self._after_write()
+        except Exception:
+            self.con.execute("ROLLBACK")
+            raise
+        finally:
+            try:
+                self.con.unregister("_tmp_paper_feed_audit")
+            except Exception:
+                pass
+        return len(rows)
+
+    def get_feed_audit_rows(
+        self,
+        *,
+        trade_date: str | None = None,
+        session_id: str | None = None,
+        feed_source: str | None = None,
+    ) -> list[FeedAudit]:
+        where: list[str] = []
+        params: list[Any] = []
+        if trade_date is not None:
+            where.append("trade_date = ?")
+            params.append(trade_date)
+        if session_id is not None:
+            where.append("session_id = ?")
+            params.append(session_id)
+        if feed_source is not None:
+            where.append("feed_source = ?")
+            params.append(feed_source)
+        sql = (
+            "SELECT session_id, trade_date, feed_source, transport, symbol, bar_start, bar_end, "
+            "open, high, low, close, volume, first_snapshot_ts, last_snapshot_ts, created_at, updated_at "
+            "FROM paper_feed_audit"
+        )
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY session_id, bar_end, symbol"
+        rows = self.con.execute(sql, params).fetchall()
+        result: list[FeedAudit] = []
+        for row in rows:
+            result.append(
+                FeedAudit(
+                    session_id=str(row[0] or ""),
+                    trade_date=str(row[1] or ""),
+                    feed_source=str(row[2] or ""),
+                    transport=str(row[3] or ""),
+                    symbol=str(row[4] or ""),
+                    bar_start=row[5],
+                    bar_end=row[6],
+                    open=float(row[7] or 0.0),
+                    high=float(row[8] or 0.0),
+                    low=float(row[9] or 0.0),
+                    close=float(row[10] or 0.0),
+                    volume=float(row[11] or 0.0),
+                    first_snapshot_ts=row[12],
+                    last_snapshot_ts=row[13],
+                    created_at=row[14] or datetime.utcnow(),
+                    updated_at=row[15] or datetime.utcnow(),
+                )
+            )
+        return result
+
     def get_feed_state(self, session_id: str) -> FeedState | None:
         row = self.con.execute(
             "SELECT * FROM paper_feed_state WHERE session_id = ?", [session_id]
@@ -1017,6 +1160,7 @@ class PaperDB:
             "paper_positions",
             "paper_orders",
             "paper_feed_state",
+            "paper_feed_audit",
             "alert_log",
         ]
         result: dict[str, int] = {}
@@ -1043,6 +1187,7 @@ class PaperDB:
             "paper_positions",
             "paper_orders",
             "paper_feed_state",
+            "paper_feed_audit",
             "paper_sessions",
             "alert_log",
         ]
@@ -1076,6 +1221,7 @@ class PaperDB:
                 "paper_positions": 0,
                 "paper_orders": 0,
                 "paper_feed_state": 0,
+                "paper_feed_audit": 0,
                 "alert_log": 0,
                 "matched_sessions": 0,
             }
@@ -1085,7 +1231,7 @@ class PaperDB:
         self.con.execute("BEGIN TRANSACTION")
         try:
             # alert_log has no session_id FK — skip it in the cascade
-            for table in ("paper_positions", "paper_orders", "paper_feed_state"):
+            for table in ("paper_positions", "paper_orders", "paper_feed_state", "paper_feed_audit"):
                 row = self.con.execute(
                     f"SELECT COUNT(*) FROM {table} WHERE session_id IN ({placeholders})",
                     session_ids,

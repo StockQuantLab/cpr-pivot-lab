@@ -100,6 +100,9 @@ async def process_closed_bar_group(
     stage_b_applied: bool,
     symbol_last_prices: dict[str, float],
     last_price: float | None,
+    feed_source: str = "unknown",
+    transport: str = "unknown",
+    feed_audit_writer: Callable[..., Any] | None = None,
     evaluate_candle_fn: Callable[..., Any] = evaluate_candle,
     execute_entry_fn: Callable[..., Any] = execute_entry,
     enforce_risk_controls: Callable[..., Any] = enforce_session_risk_controls,
@@ -120,6 +123,17 @@ async def process_closed_bar_group(
     bar_time = bar_candles_sorted[0].bar_end.astimezone(IST).strftime("%H:%M")
     entry_window_end = str(params.entry_window_end)
     normalized_strategy = str(strategy or "").upper()
+
+    if feed_audit_writer is not None:
+        await _maybe_await(
+            feed_audit_writer(
+                session_id=session_id,
+                trade_date=bar_candles_sorted[0].bar_end.date().isoformat(),
+                feed_source=feed_source,
+                transport=transport,
+                bar_candles=bar_candles_sorted,
+            )
+        )
 
     # Step 1: exits/position advances first.
     # Yield to the event loop every 64 symbols so alert consumer can send Telegram messages

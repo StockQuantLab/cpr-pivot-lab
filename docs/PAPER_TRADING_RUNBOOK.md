@@ -416,9 +416,35 @@ Important:
 - use it to verify pruning, completion, and end-of-day flattening before trusting Kite
 - keep alerts enabled for the live rerun unless you explicitly want a silent test
 - on normal completion, the live path emits the EOD summary alert (`FLATTEN_EOD`) even when all positions already closed earlier
+- local-live does **not** prove live quote fidelity; it only proves the candle-based
+  session driver agrees with `intraday_day_pack`
+- if a symbol behaves differently in real Kite live but not in replay/local-live,
+  the likely cause is quote/tick timing or fill-source drift, not the CPR gate
 
 The end-of-day close rule is explicit: positions should be flattened by the configured
 session cutoff, not left open until 15:30 simply because the transport is still running.
+
+### Live feed audit recommendation
+
+If you need to detect live-vs-EOD drift every day, use the compact
+`paper_feed_audit` table in `paper.duckdb` instead of relying only on the paper ledger:
+
+- one row per `session_id + symbol + 5-minute bucket`
+- capture OHLCV as the live driver saw it
+- record `first_snapshot_ts` and `last_snapshot_ts` so the bucket can be audited
+- compare the stored live bars against the EOD-built `intraday_day_pack` after close
+
+This is the right daily guard because `intraday_day_pack` is built from EOD/pre-market
+ingestion, while live paper uses real-time ticks/quotes. A candle-level mismatch can
+change the entry price even when the setup rows are identical.
+
+Daily operator command:
+
+```bash
+doppler run -- uv run pivot-paper-trading feed-audit --trade-date 2026-04-13 --feed-source kite
+```
+
+Use `--feed-source local` or `--feed-source replay` for local-feed/replay investigations.
 
 Running variants as separate commands (without `--multi`) executes them sequentially — each
 command acquires the `runtime-writer` lock exclusively. Use `--multi` to avoid this.

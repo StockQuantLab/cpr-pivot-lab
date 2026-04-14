@@ -32,6 +32,7 @@ from engine.paper_runtime import (
     load_setup_row,
 )
 from scripts.paper_archive import archive_completed_session
+from scripts.paper_feed_audit import record_closed_candles
 
 logger = logging.getLogger(__name__)
 
@@ -375,6 +376,9 @@ async def _process_replay_bar_major(
             stage_b_applied=stage_b_applied,
             symbol_last_prices=symbol_last_prices,
             last_price=last_close,
+            feed_source="replay",
+            transport="replay",
+            feed_audit_writer=record_closed_candles,
             evaluate_candle_fn=evaluate_candle,
             execute_entry_fn=execute_entry,
             enforce_risk_controls=enforce_session_risk_controls,

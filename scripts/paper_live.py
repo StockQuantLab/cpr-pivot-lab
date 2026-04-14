@@ -50,6 +50,7 @@ from engine.paper_runtime import (
     register_session_start,
 )
 from scripts.paper_archive import archive_completed_session
+from scripts.paper_feed_audit import record_closed_candles
 from scripts.paper_prepare import pre_filter_symbols_for_strategy
 
 logger = logging.getLogger(__name__)
@@ -731,6 +732,8 @@ async def run_live_session(
     last_stale_alert_ts: datetime | None = None
     alerts_enabled = deps is None
     _stale_alert_cooldown_sec = 300  # 5 min between repeated FEED_STALE alerts
+    audit_feed_source = "kite"
+    audit_transport = "websocket" if use_websocket else "rest"
 
     try:
         print(
@@ -778,6 +781,8 @@ async def run_live_session(
                 and getattr(ticker_adapter, "_local_feed", False)
             )
             local_feed_exhausted = False
+            audit_feed_source = "local" if local_feed else "kite"
+            audit_transport = "local" if local_feed else ("websocket" if use_websocket else "rest")
 
             if use_websocket and ticker_adapter is not None:
                 current_ticks = ticker_adapter.tick_count
@@ -879,6 +884,9 @@ async def run_live_session(
                             stage_b_applied=stage_b_applied,
                             symbol_last_prices=symbol_last_prices,
                             last_price=last_price,
+                            feed_source=audit_feed_source,
+                            transport=audit_transport,
+                            feed_audit_writer=record_closed_candles,
                             evaluate_candle_fn=evaluate_candle,
                             execute_entry_fn=execute_entry,
                             enforce_risk_controls=enforce_session_risk_controls,
@@ -1081,6 +1089,9 @@ async def run_live_session(
                         stage_b_applied=stage_b_applied,
                         symbol_last_prices=symbol_last_prices,
                         last_price=last_price,
+                        feed_source=audit_feed_source,
+                        transport=audit_transport,
+                        feed_audit_writer=record_closed_candles,
                         evaluate_candle_fn=evaluate_candle,
                         execute_entry_fn=execute_entry,
                         enforce_risk_controls=enforce_session_risk_controls,
