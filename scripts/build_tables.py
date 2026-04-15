@@ -421,7 +421,11 @@ def _build_single(
         )
     if table == "cpr":
         db.build_cpr_table(
-            force=force, symbols=symbols, since_date=since_date, until_date=until_date
+            force=force,
+            symbols=symbols,
+            since_date=since_date,
+            until_date=until_date,
+            # next_trading_date auto-detected inside build_cpr_table when since==until and no data
         )
     elif table == "atr":
         db.build_atr_table(

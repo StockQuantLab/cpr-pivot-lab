@@ -210,8 +210,17 @@ equity bhavcopy). Refresh it when new companies list or you see coverage gaps:
 **After backfill, rebuild runtime tables:**
 
 ```bash
-doppler run -- uv run pivot-build --force
+doppler run -- uv run pivot-build \
+  --force \
+  --full-history \
+  --staged-full-rebuild \
+  --batch-size 64
 ```
+
+`pivot-build --force` alone is no longer sufficient -- it also requires
+`--full-history --staged-full-rebuild` (and optionally `--allow-full-history-rebuild`
+when no `--refresh-since` window is supplied) to acknowledge the full-history scan.
+Prefer `--refresh-since` for incremental date windows instead.
 
 **Impact on backtesting and paper trading:**
 
@@ -237,13 +246,16 @@ doppler run -- uv run pivot-build --table pack --refresh-since 2026-03-21 --batc
 ```
 
 Only use a full-history rebuild when runtime state is inconsistent. That rebuild scans all local
-parquet history already in this repo, not just the newly ingested Kite window:
+parquet history already in this repo, not just the newly ingested Kite window. Bare `--force` alone
+is rejected -- you must also pass `--full-history --staged-full-rebuild`, and when no
+`--refresh-since` date is provided, add `--allow-full-history-rebuild` to acknowledge the cost:
 
 ```bash
 doppler run -- uv run pivot-build \
   --force \
   --full-history \
   --staged-full-rebuild \
+  --allow-full-history-rebuild \
   --duckdb-threads 4 \
   --duckdb-max-memory 24GB \
   --batch-size 64
@@ -361,3 +373,50 @@ doppler run -- uv run pivot-paper-trading daily-live \
   --strategy CPR_LEVELS --direction LONG \
   --min-price 50 --cpr-min-close-atr 0.5 --narrowing-filter
 ```
+
+## CLI Reference
+
+### pivot-kite-ingest
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--today` | off | Use today (Asia/Kolkata) as the ingestion date |
+| `--date YYYY-MM-DD` | -- | Single trading date (shorthand for `--from` / `--to` on the same day) |
+| `--symbols SYM1,SYM2` | -- | Comma-separated symbol list; bypasses universe resolution |
+| `--symbols-file PATH` | -- | Text file with one symbol per line (`#` comments and blank lines ignored) |
+| `--missing` | off | Auto-detect tradeable symbols with no local parquet and ingest them |
+| `--no-filter-tradeable` | off | Include all parquet symbols even if absent from the current instrument master |
+| `--update-features` | off | Run a full local runtime-table rebuild after ingestion completes |
+| `--chunk-days N` | 60 | 5-minute ingestion chunk size in calendar days |
+| `--daily-chunk-days N` | 2000 | Daily ingestion chunk size in calendar days (under Kite's 2000-candle limit) |
+
+For the full flag list see `scripts/kite_ingest.py` argparse (universe, resume, skip-existing, save-raw, etc.).
+
+### pivot-build
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--refresh-date YYYY-MM-DD` | -- | Exact-day incremental build; limits refresh to one trade date. Combine with `--symbols`, `--symbols-file`, or `--missing` for symbol-scoped builds |
+| `--symbols SYM1,SYM2` | -- | Rebuild state/strategy/pack for listed symbols only |
+| `--symbols-file PATH` | -- | Text file with one symbol per line |
+| `--missing` | off | Auto-detect symbols in parquet that are absent from `market_day_state` and rebuild them |
+| `--universe-name NAME` | -- | Use symbols from a saved backtest universe (e.g. `gold_51`). Requires `--table` |
+| `--status` | off | Print current table row counts and exit |
+| `--table CHOICE` | all | Build only one table. Choices: `cpr`, `atr`, `thresholds`, `virgin`, `or`, `state`, `strategy`, `pack`, `meta` |
+| `--resume` | off | Resume an interrupted pack build; skips symbols already present in `intraday_day_pack` |
+| `--pack-lookback N` | 10 | RVOL lookback days for `intraday_day_pack` build |
+| `--allow-full-history-rebuild` | off | Required for `--force --staged-full-rebuild` when no `--refresh-since` is supplied |
+
+For the full flag list see `scripts/build_tables.py` argparse (`--force`, `--refresh-since`, `--full-history`, `--staged-full-rebuild`, `--batch-size`, `--duckdb-threads`, `--duckdb-max-memory`, etc.).
+
+### pivot-data-quality
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--date YYYY-MM-DD` | -- | Trade-date readiness gate: checks whether runtime tables are populated for the given date. Alias: `--trade-date` |
+| `--window-start YYYY-MM-DD` | -- | Window start for a lightweight bounded DQ report |
+| `--window-end YYYY-MM-DD` | -- | Window end for a lightweight bounded DQ report |
+| `--issue-code CODE` | -- | Filter displayed issues by code (e.g. `OHLC_VIOLATION`, `TIMESTAMP_INVALID`) |
+| `--limit N` | 100 | Max rows to print (0 = all) |
+
+For the full flag list see `scripts/data_quality.py` argparse (`--refresh`, `--full`, `--show-inactive`).

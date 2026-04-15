@@ -10,7 +10,7 @@ from types import ModuleType, SimpleNamespace
 import pytest
 
 from db.postgres import FeedState
-from engine.live_market_data import FiveMinuteCandleBuilder, MarketSnapshot
+from engine.live_market_data import IST, ClosedCandle, FiveMinuteCandleBuilder, MarketSnapshot
 from scripts.paper_live import LiveSessionDeps, run_live_session
 
 
@@ -140,7 +140,11 @@ def test_kite_quote_adapter_batches_symbol_requests(monkeypatch: pytest.MonkeyPa
 
 
 @pytest.mark.asyncio
-async def test_run_live_session_marks_stale_then_recovers(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_run_live_session_marks_stale_then_recovers(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level("INFO", logger="scripts.paper_live")
     calls: list[tuple[str, str | None]] = []
     feed_states: list[dict[str, object]] = []
     processed_candles: list[dict[str, object]] = []
@@ -263,6 +267,7 @@ async def test_run_live_session_marks_stale_then_recovers(monkeypatch: pytest.Mo
     assert any(state["status"] == "OK" for state in feed_states)
     assert processed_candles[0]["symbol"] == "SBIN"
     assert processed_candles[0]["bar_end"] == datetime(2024, 1, 1, 9, 20)
+    assert any("LIVE_STARTUP_READY" in record.message for record in caplog.records)
 
 
 @pytest.mark.asyncio
@@ -505,6 +510,7 @@ async def test_run_live_session_promotes_flatten_time_stop_to_completed_when_fla
     )
 
     assert result["final_status"] == "COMPLETED"
+    assert result["terminal_reason"] == "risk_control_triggered"
     assert complete_calls and complete_calls[0]["complete_on_exit"] is True
     assert any(update.get("status") == "COMPLETED" for update in updates)
     assert archived == ["sess-stop-flat"]
@@ -600,6 +606,198 @@ async def test_run_live_session_uses_websocket_path_when_ticker_adapter_is_provi
     assert ticker_adapter.unregister_calls == ["sess-ws"]
     assert ticker_adapter.close_called is False
     assert result["poll_interval_sec"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_run_live_session_survives_all_pending_startup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import engine.paper_runtime as paper_runtime
+    import scripts.paper_live as paper_live
+
+    session = SimpleNamespace(
+        session_id="sess-pending",
+        status="ACTIVE",
+        symbols=["SBIN", "RELIANCE"],
+        strategy="CPR_LEVELS",
+        strategy_params={},
+        stale_feed_timeout_sec=0,
+    )
+
+    def _market_row(symbol: str) -> tuple[object, ...]:
+        return (
+            symbol,
+            "2026-04-15",
+            99.0,
+            100.0,
+            95.0,
+            97.0,
+            105.0,
+            92.0,
+            107.0,
+            90.0,
+            5.0,
+            2.0,
+            101.0,
+            99.0,
+            100.0,
+            100.0,
+            97.5,
+            "INSIDE",
+            0.25,
+            0.1,
+            0.5,
+            "NONE",
+            False,
+            "OVERLAP",
+            [1.0, 2.0, 3.0],
+        )
+
+    class FakeResult:
+        def __init__(self, rows: list[tuple[object, ...]]):
+            self._rows = rows
+
+        def fetchall(self):
+            return list(self._rows)
+
+        def fetchone(self):
+            return self._rows[0] if self._rows else None
+
+    class FakeCon:
+        def execute(self, query, params):
+            del query
+            trade_date = str(params[0])
+            symbols = [str(symbol) for symbol in params[1:]]
+            rows = [_market_row(symbol) for symbol in symbols if trade_date == "2026-04-15"]
+            return FakeResult(rows)
+
+    fake_db = SimpleNamespace(con=FakeCon())
+
+    monkeypatch.setattr(paper_live, "get_dashboard_db", lambda: fake_db)
+    monkeypatch.setattr(paper_runtime, "get_dashboard_db", lambda: fake_db)
+    monkeypatch.setattr(paper_live, "pre_filter_symbols_for_strategy", lambda *args, **kwargs: ["SBIN", "RELIANCE"])
+
+    class FakeTickerAdapter:
+        def __init__(self):
+            self.calls = 0
+            self.register_calls: list[tuple[str, list[str]]] = []
+            self.drain_calls: list[str] = []
+            self.unregister_calls: list[str] = []
+            self.updated_symbols: list[list[str]] = []
+
+        @property
+        def is_connected(self) -> bool:
+            return True
+
+        @property
+        def tick_count(self) -> int:
+            return 0
+
+        @property
+        def last_tick_ts(self):
+            return None
+
+        @property
+        def reconnect_count(self) -> int:
+            return 0
+
+        def register_session(self, session_id, symbols, builder):
+            del builder
+            self.register_calls.append((session_id, list(symbols)))
+
+        def synthesize_quiet_symbols(self, session_id, symbols, now):
+            del session_id, symbols, now
+
+        def drain_closed(self, session_id):
+            self.calls += 1
+            self.drain_calls.append(session_id)
+            if self.calls == 2:
+                return [
+                    ClosedCandle(
+                        symbol="RELIANCE",
+                        bar_start=datetime(2026, 4, 15, 9, 20, tzinfo=IST),
+                        bar_end=datetime(2026, 4, 15, 9, 25, tzinfo=IST),
+                        open=100.0,
+                        high=101.0,
+                        low=99.5,
+                        close=100.5,
+                        volume=10.0,
+                        first_snapshot_ts=datetime(2026, 4, 15, 9, 20, tzinfo=IST),
+                        last_snapshot_ts=datetime(2026, 4, 15, 9, 24, tzinfo=IST),
+                    ),
+                    ClosedCandle(
+                        symbol="SBIN",
+                        bar_start=datetime(2026, 4, 15, 9, 20, tzinfo=IST),
+                        bar_end=datetime(2026, 4, 15, 9, 25, tzinfo=IST),
+                        open=200.0,
+                        high=201.0,
+                        low=199.5,
+                        close=200.5,
+                        volume=11.0,
+                        first_snapshot_ts=datetime(2026, 4, 15, 9, 20, tzinfo=IST),
+                        last_snapshot_ts=datetime(2026, 4, 15, 9, 24, tzinfo=IST),
+                    ),
+                ]
+            return []
+
+        def update_symbols(self, session_id, symbols):
+            del session_id
+            self.updated_symbols.append(list(symbols))
+
+        def unregister_session(self, session_id):
+            self.unregister_calls.append(session_id)
+
+        def close(self):
+            return None
+
+    ticker_adapter = FakeTickerAdapter()
+    time_points = [
+        datetime(2026, 4, 15, 9, 20, tzinfo=IST),
+        datetime(2026, 4, 15, 9, 20, tzinfo=IST),
+        datetime(2026, 4, 15, 9, 25, tzinfo=IST),
+        datetime(2026, 4, 15, 9, 25, tzinfo=IST),
+    ]
+
+    async def fake_session_loader(session_id: str):
+        assert session_id == "sess-pending"
+        return session
+
+    async def fake_session_updater(session_id: str, **kwargs):
+        assert session_id == "sess-pending"
+        return session
+
+    async def fake_feed_writer(**kwargs):
+        return SimpleNamespace(**kwargs)
+
+    async def fake_sleep(_: float) -> None:
+        return None
+
+    now_index = {"value": 0}
+
+    def _advance_now() -> datetime:
+        current = time_points[min(now_index["value"], len(time_points) - 1)]
+        now_index["value"] += 1
+        return current
+
+    result = await run_live_session(
+        session_id="sess-pending",
+        ticker_adapter=ticker_adapter,
+        poll_interval_sec=0,
+        candle_interval_minutes=5,
+        max_cycles=2,
+        deps=LiveSessionDeps(
+            session_loader=fake_session_loader,
+            session_updater=fake_session_updater,
+            feed_writer=fake_feed_writer,
+            sleep_fn=fake_sleep,
+            now_fn=_advance_now,
+        ),
+    )
+
+    assert ticker_adapter.register_calls == [("sess-pending", ["SBIN", "RELIANCE"])]
+    assert result["final_status"] == "ACTIVE"
+    assert result["terminal_reason"] is None
+    assert result["closed_bars"] == 2
 
 
 @pytest.mark.asyncio

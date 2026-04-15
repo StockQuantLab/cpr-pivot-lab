@@ -6,9 +6,10 @@ DuckDB handles ALL market data analytics:
   - Daily OHLCV          → queried directly from Parquet
   - CPR levels           → pre-computed materialized table (built once)
   - ATR values           → pre-computed materialized table (built once)
-  - Backtest results     → stored in DuckDB file
+  - Backtest results     → stored in backtest.duckdb (db/backtest_db.py)
 
-PostgreSQL handles ONLY: agent_sessions, signals, alert_log.
+PostgreSQL handles ONLY: agent_sessions, signals.
+alert_log lives in paper.duckdb (db/paper_db.py).
 
 Data layout expected:
     data/parquet/5min/RELIANCE/2015.parquet
@@ -550,12 +551,20 @@ class MarketDB:
         symbols: list[str] | None = None,
         since_date: str | None = None,
         until_date: str | None = None,
+        next_trading_date: str | None = None,
     ) -> int:
         """
         Pre-compute CPR levels + floor pivot levels for every trading day.
 
         Uses daily Parquet (more reliable than deriving from 5-min).
         CPR for trade_date = previous day's OHLC.
+
+        next_trading_date: When provided (or auto-detected), used as the trade_date
+        for the last available daily parquet row via COALESCE(LEAD(date), next_trading_date).
+        This enables pre-market CPR computation for today when today's daily data has not
+        been ingested yet (e.g. building April 15 CPR from April 13 OHLC when April 14
+        was a holiday and April 15 is a live session not yet in parquet).
+        Auto-detected when since_date == until_date and that date has no daily parquet rows.
 
         Includes:
             - Core CPR: Pivot, TC, BC, cpr_width_pct
@@ -571,6 +580,30 @@ class MarketDB:
         self._require_data("v_daily")
 
         since_date_iso, until_date_iso = _prepare_date_window(since_date, until_date)
+
+        # Auto-detect next_trading_date: when a single target date is requested and that
+        # date has no daily parquet rows (pre-market live day or holiday gap), use it as
+        # the COALESCE fallback so the last available parquet date generates a CPR row.
+        if next_trading_date is None and since_date_iso and since_date_iso == until_date_iso:
+            has_data = self.con.execute(
+                f"SELECT COUNT(*) FROM v_daily WHERE date::DATE = '{since_date_iso}'"
+            ).fetchone()[0]
+            if has_data == 0:
+                next_trading_date = since_date_iso
+                logger.debug(
+                    "build_cpr_table: no daily data for %s — using as next_trading_date "
+                    "for pre-market LEAD COALESCE",
+                    since_date_iso,
+                )
+
+        lead_expr = "LEAD(date) OVER (PARTITION BY symbol ORDER BY date)"
+        if next_trading_date:
+            lead_expr = (
+                f"COALESCE(LEAD(date) OVER (PARTITION BY symbol ORDER BY date), "
+                f"'{next_trading_date}'::DATE)"
+            )
+            print(f"  [cpr] pre-market mode: LEAD COALESCE → {next_trading_date}")
+
         target_symbols = sorted(set(_validate_symbols(symbols))) if symbols else None
         symbol_filter_sql = ""
         if target_symbols:
@@ -613,7 +646,7 @@ class MarketDB:
                     low,
                     close,
                     volume,
-                    LEAD(date) OVER (PARTITION BY symbol ORDER BY date) AS trade_date
+                    {lead_expr} AS trade_date
                 FROM daily
             ),
             with_levels AS (

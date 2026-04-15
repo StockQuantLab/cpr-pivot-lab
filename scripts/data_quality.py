@@ -193,7 +193,12 @@ def build_trade_date_readiness_report(trade_date: str) -> dict[str, Any]:
             freshness_blocking = True
         elif max_date == pack_date:
             status = "OK"
+        elif max_date > pack_date:
+            # State tables ahead of pack — expected pre-market on a live trading day.
+            # Pack only contains historical data; state tables are built one day ahead.
+            status = f"AHEAD of pack ({max_date} > {pack_date})"
         else:
+            # State table is BEHIND pack — genuine staleness problem.
             status = f"OUT OF SYNC vs {pack_date}"
             freshness_blocking = True
         freshness_rows.append({"table": table, "max_trade_date": max_date, "status": status})
@@ -208,6 +213,9 @@ def build_trade_date_readiness_report(trade_date: str) -> dict[str, Any]:
         right_date = table_max_dates.get(right)
         if left_date is not None and right_date is not None and left_date == right_date:
             status = f"OK ({left_date})"
+        elif left_date is not None and right_date is not None and left_date > right_date:
+            # Left (state) is ahead of right (pack) — expected pre-market for live day.
+            status = f"AHEAD ({left_date} > {right_date})"
         else:
             status = f"OUT OF SYNC ({left_date or 'None'} vs {right_date or 'None'})"
             freshness_blocking = True
@@ -248,6 +256,31 @@ def build_trade_date_readiness_report(trade_date: str) -> dict[str, Any]:
             "intraday_day_pack",
         )
     )
+
+    # Direction coverage: how many strategy_day_state rows for this date have
+    # direction_5 resolved to LONG/SHORT vs NONE. Pre-market this is expected
+    # to be 100% NONE (resolved at 9:15 from live ticks). On historical dates
+    # it should be mostly LONG/SHORT. A missing SHORT bucket on today's date
+    # is the specific failure mode from the 2026-04-15 incident.
+    direction_counts: dict[str, int] = {"LONG": 0, "SHORT": 0, "NONE": 0, "OTHER": 0}
+    try:
+        rows = db.con.execute(
+            """
+            SELECT COALESCE(UPPER(direction_5), 'NONE') AS d, COUNT(*)
+            FROM strategy_day_state
+            WHERE trade_date = ?::DATE
+            GROUP BY 1
+            """,
+            [trade_date],
+        ).fetchall()
+        for direction_value, count in rows:
+            key = str(direction_value or "NONE").upper()
+            if key not in direction_counts:
+                key = "OTHER"
+            direction_counts[key] += int(count)
+    except Exception:
+        pass
+
     ready = (
         bool(candidate_symbols)
         and not freshness_blocking

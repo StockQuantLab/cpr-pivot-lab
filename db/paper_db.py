@@ -1231,7 +1231,12 @@ class PaperDB:
         self.con.execute("BEGIN TRANSACTION")
         try:
             # alert_log has no session_id FK — skip it in the cascade
-            for table in ("paper_positions", "paper_orders", "paper_feed_state", "paper_feed_audit"):
+            for table in (
+                "paper_positions",
+                "paper_orders",
+                "paper_feed_state",
+                "paper_feed_audit",
+            ):
                 row = self.con.execute(
                     f"SELECT COUNT(*) FROM {table} WHERE session_id IN ({placeholders})",
                     session_ids,

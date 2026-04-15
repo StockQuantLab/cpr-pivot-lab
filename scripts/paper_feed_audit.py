@@ -158,6 +158,24 @@ def _load_intraday_pack_lookup(
     return lookup
 
 
+def _audit_time_key(*, feed_source: str, bar_start: Any, bar_end: Any) -> str:
+    """Return the pack lookup key for an audited bar.
+
+    Kite live rows are emitted at bar close, but the materialized day-pack contract
+    stores the candle bucket start time. Replay/local rows already use the pack's
+    stored bar timestamp as their `bar_end`, so they keep the existing key.
+    """
+
+    source = str(feed_source or "").strip().lower()
+    if source == "kite":
+        ts = bar_start
+    else:
+        ts = bar_end
+    if hasattr(ts, "astimezone"):
+        ts = ts.astimezone(IST)
+    return ts.strftime("%H:%M") if hasattr(ts, "strftime") else str(ts)
+
+
 def _session_ids_for_trade_date(
     *,
     trade_date: str,
@@ -173,7 +191,7 @@ def _session_ids_for_trade_date(
         f"""
         SELECT DISTINCT session_id
         FROM paper_feed_audit
-        WHERE {' AND '.join(where)}
+        WHERE {" AND ".join(where)}
         ORDER BY session_id
         """,
         params,
@@ -250,17 +268,17 @@ def compare_feed_audit(
     if source_filter not in {"kite", "local", "replay", "all"}:
         raise ValueError("feed_source must be one of kite, local, replay, or all")
 
-    session_ids = [session_id] if session_id else _session_ids_for_trade_date(
-        trade_date=trade_date,
-        feed_source=source_filter,
-        paper_db=db,
+    session_ids = (
+        [session_id]
+        if session_id
+        else _session_ids_for_trade_date(
+            trade_date=trade_date,
+            feed_source=source_filter,
+            paper_db=db,
+        )
     )
     if session_id and source_filter != "all":
-        session_ids = [
-            sid
-            for sid in session_ids
-            if sid == session_id
-        ]
+        session_ids = [sid for sid in session_ids if sid == session_id]
 
     summaries: list[dict[str, Any]] = []
     total_rows = 0
@@ -268,6 +286,9 @@ def compare_feed_audit(
     missing_pack_rows = 0
     mismatched_rows = 0
     mismatch_samples: list[dict[str, Any]] = []
+    price_exact_rows = 0
+    volume_exact_rows = 0
+    field_mismatch_counts = dict.fromkeys(("open", "high", "low", "close", "volume"), 0)
 
     for sid in session_ids:
         audit_rows = db.get_feed_audit_rows(
@@ -299,17 +320,30 @@ def compare_feed_audit(
         session_matched = 0
         session_missing = 0
         session_mismatched = 0
+        session_price_exact = 0
+        session_volume_exact = 0
+        session_field_mismatch_counts = dict.fromkeys(
+            ("open", "high", "low", "close", "volume"), 0
+        )
         session_samples: list[dict[str, Any]] = []
 
         for row in audit_rows:
             session_total += 1
             total_rows += 1
-            bar_time = row.bar_end.astimezone(IST).strftime("%H:%M")
+            bar_time = _audit_time_key(
+                feed_source=str(getattr(row, "feed_source", source_filter) or source_filter),
+                bar_start=getattr(row, "bar_start", None),
+                bar_end=getattr(row, "bar_end", None),
+            )
             pack_row = pack_lookup.get(row.symbol, {}).get(bar_time)
             comparison = _compare_row(audit_row=row, pack_row=pack_row)
             if comparison is None:
                 session_matched += 1
                 matched_rows += 1
+                session_price_exact += 1
+                session_volume_exact += 1
+                price_exact_rows += 1
+                volume_exact_rows += 1
                 continue
             if comparison["status"] == "MISSING_PACK":
                 session_missing += 1
@@ -317,6 +351,20 @@ def compare_feed_audit(
             else:
                 session_mismatched += 1
                 mismatched_rows += 1
+                mismatches = comparison.get("mismatches") or {}
+                price_fields = {"open", "high", "low", "close"}
+                price_ok = all(field not in mismatches for field in price_fields)
+                volume_ok = "volume" not in mismatches
+                if price_ok:
+                    session_price_exact += 1
+                    price_exact_rows += 1
+                if volume_ok:
+                    session_volume_exact += 1
+                    volume_exact_rows += 1
+                for field in mismatches:
+                    if field in session_field_mismatch_counts:
+                        session_field_mismatch_counts[field] += 1
+                        field_mismatch_counts[field] += 1
             if len(session_samples) < 5:
                 session_samples.append(comparison)
             if len(mismatch_samples) < 10:
@@ -329,9 +377,10 @@ def compare_feed_audit(
                 "matched_rows": session_matched,
                 "mismatched_rows": session_mismatched,
                 "missing_pack_rows": session_missing,
-                "status": "PASS"
-                if session_mismatched == 0 and session_missing == 0
-                else "FAIL",
+                "price_exact_rows": session_price_exact,
+                "volume_exact_rows": session_volume_exact,
+                "field_mismatch_counts": session_field_mismatch_counts,
+                "status": "PASS" if session_mismatched == 0 and session_missing == 0 else "FAIL",
                 "samples": session_samples,
             }
         )
@@ -346,6 +395,9 @@ def compare_feed_audit(
         "matched_rows": matched_rows,
         "mismatched_rows": mismatched_rows,
         "missing_pack_rows": missing_pack_rows,
+        "price_exact_rows": price_exact_rows,
+        "volume_exact_rows": volume_exact_rows,
+        "field_mismatch_counts": field_mismatch_counts,
         "ok": overall_ok,
         "sessions": summaries,
         "samples": mismatch_samples,

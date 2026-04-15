@@ -1,4 +1,5 @@
 """Tests for LocalTickerAdapter — DuckDB-backed mock of KiteTickerAdapter."""
+
 from __future__ import annotations
 
 from datetime import datetime, timedelta
@@ -328,7 +329,7 @@ class TestLocalTickerAdapterPartialData:
 
         packs = {
             "SBIN": _make_pack(3),  # 3 bars
-            "TCS": _make_pack(2),   # 2 bars (missing last bar)
+            "TCS": _make_pack(2),  # 2 bars (missing last bar)
         }
         with patch_load(packs):
             adapter = LocalTickerAdapter(trade_date="2024-01-15", symbols=["SBIN", "TCS"])

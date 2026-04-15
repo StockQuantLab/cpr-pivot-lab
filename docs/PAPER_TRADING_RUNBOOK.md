@@ -150,7 +150,7 @@ Paper-only cleanup before a fresh rerun:
 # This does NOT delete baseline BACKTEST runs.
 # Do not delete backtest baseline rows without explicit confirmation when a compare
 # is still in progress.
-doppler run -- uv run pivot-paper-trading cleanup --apply
+doppler run -- uv run pivot-paper-trading cleanup --trade-date YYYY-MM-DD --apply
 ```
 
 Use this when you want a clean paper rerun from storage but need to preserve backtest baselines.
@@ -275,6 +275,35 @@ manually if you see stale for > 10 min past entry window with no active position
   health-check probe and do not force them into the trading list.
 - Do not let a single quiet symbol force a session restart.
 
+**Direction Readiness & Session Startup**:
+
+At session startup, the engine logs a `LIVE_DIRECTION_PREFLIGHT` line showing how many symbols
+have resolved vs pending direction:
+
+```
+LIVE_DIRECTION_PREFLIGHT session=CPR_LEVELS_SHORT-2026-04-15 resolved=5 pending=592
+  with_setup=597 missing=1498 coverage=0%
+```
+
+- `resolved` — symbols whose `strategy_day_state.direction` is LONG or SHORT.
+- `pending` — symbols whose direction is NONE or not yet populated. These are **not rejected**;
+  the session stays alive and retries resolution on every bar via
+  `refresh_pending_setup_rows_for_bar()`.
+- `missing` — symbols with no setup row at all (excluded from trading).
+- There is no 80% hard gate on direction coverage at startup. Stage B direction filter applies
+  once setup rows exist; symbols without a resolved direction pass through and get retried.
+- `evaluate_candle()` calls `refresh_pending_setup_rows_for_bar()` on each 5-minute bar, which
+  re-queries `strategy_day_state` for any symbol still at `direction_pending=True`. Once the
+  live 9:15 candle data is available (or the DB row is updated by a parallel build), the
+  direction resolves and the symbol becomes tradeable.
+- `TICKER_HEALTH` telemetry is logged per-bar when a WebSocket adapter is active, showing:
+  `connected`, `ticks`, `last_tick_age`, `closes`, `reconnects`, `subs`, `coverage`, `stale`,
+  and `missing` counts. Use this to diagnose whether direction resolution failures are caused
+  by a transport problem or a data gap.
+- `MARKET_READY_HHMM = "09:16"` — the WebSocket subscription is delayed until 09:16 IST
+  (market open + 1 minute) so the 9:15 candle has time to close before direction resolution
+  uses it. Before 09:16 the startup code sleeps; after 09:16 it subscribes immediately.
+
 **Failure drills for no-surprises live ops**:
 - `market_data_stale`: use `daily-live --feed-source local` and inject a gap in the feeder, or
   monkeypatch the ticker adapter in `tests/test_live_market_data.py` so `last_tick_ts` stops
@@ -289,6 +318,23 @@ manually if you see stale for > 10 min past entry window with no active position
   `SESSION_ERROR reason=auto_flatten_failed`.
 - `prefetch missing setup`: run `daily-live` before `pivot-refresh` / `daily-prepare`, or stub
   `load_setup_row()` to return `None` in a test. The session should fail fast before trading.
+
+**WebSocket Recovery**:
+
+The Kite ticker adapter includes automatic reconnect logic when the WebSocket disconnects:
+
+- After 20 seconds of being disconnected, a watchdog triggers `recover_connection()` which
+  recreates the WebSocket client and resubscribes to all active symbols.
+- If reconnect attempts reach 3 (configurable via `_WEBSOCKET_RECONNECT_ALERT_ATTEMPTS`),
+  a `SESSION_ERROR reason=websocket_reconnect_stalled` alert is dispatched once. The session
+  continues running; the alert is informational, not terminal.
+- On successful recovery, a `FEED_RECOVERED` alert is dispatched with the downtime duration
+  and reconnect count.
+- If recovery fails (e.g. Kite API is down), a `SESSION_ERROR reason=websocket_reconnect_failed`
+  alert is dispatched. Repeated disconnect alerts are throttled with a 5-minute cooldown
+  (`_stale_alert_cooldown_sec = 300`) to avoid alert fatigue.
+- The session stays alive through recovery attempts. It only exits if the overall session-wide
+  stale timeout is reached (see "Kite WebSocket STALE recovery" above).
 
 **Auto-restart scope**: current live code can auto-flatten abnormal exits, stamp terminal
 status, and alert on feed/session failures. It does **not** auto-spawn a replacement
@@ -334,6 +380,13 @@ the live 9:15 candle automatically when `or_close_5` is NULL in the DB row.
 Add `--no-alerts` only for silent validation runs. Add explicit CPR flags only when you are
 intentionally overriding the canonical preset.
 
+`--skip-coverage`: bypasses the runtime coverage validation step and starts the live session
+immediately even if `intraday_day_pack` or other runtime tables are incomplete. Use only when
+you know coverage is acceptable (e.g. known missing symbols that are suspended/delisted) and
+you do not want the pre-flight check to block startup. Do not use `--skip-coverage` as a
+substitute for running `pivot-build` and `daily-prepare` — missing pack data will cause
+silent no-trade sessions.
+
 Host-shell note: these commands assume a working Doppler login on the Windows host. If `doppler run`
 fails with a keyring or token error, fix Doppler auth on the host first and rerun the command.
 
@@ -351,6 +404,13 @@ Each variant gets its own session, pre-filtered symbol list, and RVOL policy. Th
 reference counting — it only shuts down when all sessions complete. Stale sessions from previous crashes
 are auto-cleaned on startup.
 
+**Multi-variant auto-retry**: `daily-live --multi` wraps each variant in a retry loop. If a variant
+exits prematurely with `FAILED`, `STALE`, `NO_ACTIVE_SYMBOLS`, or any exception, the launcher
+automatically restarts it up to 5 times with a 10-second linear backoff (10s, 20s, 30s, ...).
+Completed variants (after entry window close) are not retried. Retries stop after 14:30 IST (EOD
+cutoff). This handles transient issues like brief WebSocket disconnections or early direction-resolution
+races without manual intervention.
+
 ### 2a-resume. Mid-day session recovery (STALE or FAILED with open positions)
 
 If a live session goes STALE or FAILED mid-day and positions are still open, resume it:
@@ -366,6 +426,10 @@ Behavior:
 - Only `FAILED`, `STALE`, `STOPPING`, or `CANCELLED` sessions can be resumed (avoids hijacking a running session).
 - Sessions with no open positions are rejected — nothing to manage.
 - No new entry signals are evaluated; the resume path only manages existing open positions through to EOD.
+- Closed/flattened positions from the original session are seeded into both
+  `tracker._closed_today` (bar_orchestrator) and `state.position_closed_today`
+  (paper_runtime) so that symbols already traded are never re-entered during the
+  resumed session.
 - Do **not** use `--multi` with `--resume`; the resume path targets a single named session.
 
 **DB status mapping**: `STALE` maps to `FAILED` in the DB (CHECK constraint does not include STALE).
@@ -433,6 +497,16 @@ If you need to detect live-vs-EOD drift every day, use the compact
 - capture OHLCV as the live driver saw it
 - record `first_snapshot_ts` and `last_snapshot_ts` so the bucket can be audited
 - compare the stored live bars against the EOD-built `intraday_day_pack` after close
+
+Important compare contract:
+
+- `daily-live` rows from Kite are stamped at candle close, but the audit compare must key
+  them against the candle bucket start time (`bar_start`) because the pack stores the
+  source candle bucket, not the close timestamp.
+- `daily-replay` and `daily-live --feed-source local` should continue to key against
+  `bar_end`, because those paths already emit the pack bucket timestamp as the candle time.
+- The audit is diagnostic, not a trade parity check. A session with zero trades can still
+  produce useful feed audit rows.
 
 This is the right daily guard because `intraday_day_pack` is built from EOD/pre-market
 ingestion, while live paper uses real-time ticks/quotes. A candle-level mismatch can
@@ -536,6 +610,16 @@ date. All tables must be current through yesterday before the session starts.
 
 ### Stale Feed
 
+**Preferred recovery path**: use `daily-live --resume --session-id <id>` (see section
+"2a-resume. Mid-day session recovery"). This is the recommended operator workflow — it
+loads open and closed positions from DB, seeds re-entry guards, and manages positions to EOD
+without requiring a new session.
+
+The `pause` and `resume` commands below are low-level DB operations that change session
+status and feed state directly. They do not restart the live session loop or reconnect the
+WebSocket. Use them only when you need to manipulate DB state manually (e.g. to reset a
+session to PLANNING before a fresh start).
+
 ```bash
 doppler run -- uv run pivot-paper-trading pause --session-id paper-001
 doppler run -- uv run pivot-paper-trading resume --session-id paper-001
@@ -560,7 +644,7 @@ via `cleanup_stale_sessions()`. You will see: `Cleaned up N stale session(s) fro
 ### Paper-only cleanup before a rerun
 
 ```bash
-doppler run -- uv run pivot-paper-trading cleanup --apply
+doppler run -- uv run pivot-paper-trading cleanup --trade-date YYYY-MM-DD --apply
 ```
 
 This clears only PAPER rows and paper-session state. It does **not** touch baseline backtests.

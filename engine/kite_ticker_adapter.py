@@ -45,6 +45,12 @@ class KiteTickerAdapter:
         self._reconnect_count = 0
         self._session_builders: dict[str, FiveMinuteCandleBuilder] = {}
         self._session_symbols: dict[str, set[str]] = {}
+        # Per-symbol tick timestamps for coverage telemetry.
+        self._symbol_last_tick_ts: dict[str, datetime] = {}
+        self._last_close_ts: datetime | None = None
+        self._close_count = 0
+        self._last_recovery_attempt_ts: datetime | None = None
+        self._last_recovery_success_ts: datetime | None = None
 
     @property
     def is_connected(self) -> bool:
@@ -134,6 +140,114 @@ class KiteTickerAdapter:
                 ticker.close()
             except Exception:
                 logger.exception("KiteTicker close failed")
+
+    def recover_connection(
+        self,
+        *,
+        now: datetime | None = None,
+        reconnect_after_sec: float = 30.0,
+        cooldown_sec: float = 30.0,
+    ) -> dict[str, Any]:
+        """Recreate the underlying KiteTicker if a disconnect has stalled.
+
+        The Kite client already tries to reconnect internally. This watchdog only
+        intervenes when the socket has been down long enough that we should discard
+        the current client object and recreate it from the session registry.
+        """
+
+        current_time = now or datetime.now(IST)
+        reconnect_after_sec = max(0.0, float(reconnect_after_sec or 0.0))
+        cooldown_sec = max(0.0, float(cooldown_sec or 0.0))
+        with self._lock:
+            union_symbols = sorted(self._union_symbols_locked())
+            connected = self._connected.is_set()
+            last_close = self._last_close_ts
+            last_attempt = self._last_recovery_attempt_ts
+            last_success = self._last_recovery_success_ts
+            close_count = self._close_count
+            reconnect_count = self._reconnect_count
+        if not union_symbols:
+            return {
+                "action": "noop",
+                "reason": "no_sessions",
+                "connected": connected,
+                "close_count": close_count,
+                "reconnect_count": reconnect_count,
+            }
+        if connected:
+            return {
+                "action": "noop",
+                "reason": "connected",
+                "connected": True,
+                "close_count": close_count,
+                "reconnect_count": reconnect_count,
+            }
+        if last_close is None:
+            return {
+                "action": "noop",
+                "reason": "no_close_seen",
+                "connected": False,
+                "close_count": close_count,
+                "reconnect_count": reconnect_count,
+            }
+
+        down_sec = max(0.0, (current_time - last_close).total_seconds())
+        if down_sec < reconnect_after_sec:
+            return {
+                "action": "cooldown",
+                "reason": "waiting_for_internal_reconnect",
+                "connected": False,
+                "down_sec": down_sec,
+                "close_count": close_count,
+                "reconnect_count": reconnect_count,
+            }
+        if (
+            last_attempt is not None
+            and (current_time - last_attempt).total_seconds() < cooldown_sec
+        ):
+            return {
+                "action": "cooldown",
+                "reason": "recent_watchdog_attempt",
+                "connected": False,
+                "down_sec": down_sec,
+                "close_count": close_count,
+                "reconnect_count": reconnect_count,
+            }
+
+        with self._lock:
+            self._last_recovery_attempt_ts = current_time
+        logger.warning(
+            "KiteTicker watchdog recreating client down_sec=%.0f closes=%d reconnects=%d sessions=%d",
+            down_sec,
+            close_count,
+            reconnect_count,
+            len(union_symbols),
+        )
+        try:
+            self.connect(union_symbols)
+        except Exception as exc:
+            logger.exception("KiteTicker watchdog reconnect failed")
+            return {
+                "action": "failed",
+                "reason": "connect_failed",
+                "error": str(exc),
+                "connected": False,
+                "down_sec": down_sec,
+                "close_count": close_count,
+                "reconnect_count": reconnect_count,
+            }
+
+        with self._lock:
+            self._last_recovery_success_ts = current_time
+        return {
+            "action": "recovered",
+            "reason": "recreated_client",
+            "connected": self._connected.is_set(),
+            "down_sec": down_sec,
+            "close_count": close_count,
+            "reconnect_count": self._reconnect_count,
+            "last_success_ts": last_success.isoformat() if last_success else None,
+        }
 
     def update_symbols(self, session_id: str, symbols: list[str]) -> None:
         wanted = {s.strip() for s in symbols if s and s.strip()}
@@ -312,6 +426,9 @@ class KiteTickerAdapter:
             self._tick_count += tick_count
             if latest_ts is not None:
                 self._last_tick_ts = latest_ts
+            for sym, snaps in snapshots_by_symbol.items():
+                if snaps:
+                    self._symbol_last_tick_ts[sym] = snaps[-1].ts
 
         builder_batches: dict[FiveMinuteCandleBuilder, list[MarketSnapshot]] = defaultdict(list)
         for symbol, snapshots in snapshots_by_symbol.items():
@@ -327,7 +444,16 @@ class KiteTickerAdapter:
 
     def _on_close(self, _ws: Any, code: Any, reason: Any) -> None:
         self._connected.clear()
-        logger.warning("KiteTicker closed code=%s reason=%s", code, reason)
+        with self._lock:
+            self._close_count += 1
+            self._last_close_ts = datetime.now(IST)
+        logger.warning(
+            "KiteTicker closed code=%s reason=%s close_count=%d — waiting on "
+            "internal reconnect or watchdog recreation",
+            code,
+            reason,
+            self._close_count,
+        )
 
     def _on_error(self, _ws: Any, code: Any, reason: Any) -> None:
         logger.error("KiteTicker error code=%s reason=%s", code, reason)
@@ -335,3 +461,70 @@ class KiteTickerAdapter:
     def _on_reconnect(self, _ws: Any, attempts: int) -> None:
         self._reconnect_count = int(attempts or 0)
         logger.warning("KiteTicker reconnecting attempt=%d", self._reconnect_count)
+
+    def health_stats(self) -> dict[str, Any]:
+        """Return a telemetry snapshot for logging / alerting."""
+        now = datetime.now(IST)
+        with self._lock:
+            last_tick = self._last_tick_ts
+            last_close = self._last_close_ts
+            tick_count = self._tick_count
+            close_count = self._close_count
+            reconnect_count = self._reconnect_count
+            recovery_attempt_ts = self._last_recovery_attempt_ts
+            recovery_success_ts = self._last_recovery_success_ts
+            subscribed = len(self._subscribed_tokens)
+            sessions = list(self._session_symbols.keys())
+            per_symbol = dict(self._symbol_last_tick_ts)
+        last_tick_age_sec: float | None = None
+        if last_tick is not None:
+            last_tick_age_sec = (now - last_tick).total_seconds()
+        return {
+            "connected": self._connected.is_set(),
+            "tick_count": tick_count,
+            "last_tick_ts": last_tick.isoformat() if last_tick else None,
+            "last_tick_age_sec": last_tick_age_sec,
+            "last_close_ts": last_close.isoformat() if last_close else None,
+            "close_count": close_count,
+            "reconnect_count": reconnect_count,
+            "last_recovery_attempt_ts": (
+                recovery_attempt_ts.isoformat() if recovery_attempt_ts else None
+            ),
+            "last_recovery_success_ts": (
+                recovery_success_ts.isoformat() if recovery_success_ts else None
+            ),
+            "subscribed_tokens": subscribed,
+            "sessions": sessions,
+            "per_symbol_last_tick_count": len(per_symbol),
+        }
+
+    def symbol_coverage(self, symbols: list[str], within_sec: float = 300.0) -> dict[str, Any]:
+        """Return tick-coverage stats for a specific symbol set.
+
+        covered = symbols whose last tick is within ``within_sec`` seconds.
+        """
+        now = datetime.now(IST)
+        with self._lock:
+            per_symbol = dict(self._symbol_last_tick_ts)
+        covered = 0
+        stale: list[str] = []
+        missing: list[str] = []
+        for sym in symbols:
+            ts = per_symbol.get(sym)
+            if ts is None:
+                missing.append(sym)
+                continue
+            if (now - ts).total_seconds() <= within_sec:
+                covered += 1
+            else:
+                stale.append(sym)
+        total = max(1, len(symbols))
+        return {
+            "total": len(symbols),
+            "covered": covered,
+            "stale": len(stale),
+            "missing": len(missing),
+            "coverage_pct": 100.0 * covered / total,
+            "stale_sample": stale[:10],
+            "missing_sample": missing[:10],
+        }

@@ -542,6 +542,7 @@ async def test_cmd_daily_live_local_feed_alert_toggle(
     import scripts.paper_trading as pt
 
     calls: list[bool] = []
+    wait_calls: list[tuple[str, str]] = []
     workflow_calls: dict[str, object] = {}
 
     class _FakeLocalTickerAdapter:
@@ -576,6 +577,11 @@ async def test_cmd_daily_live_local_feed_alert_toggle(
     monkeypatch.setattr(pt, "set_alerts_suppressed", lambda value: calls.append(value))
     monkeypatch.setattr(lta, "LocalTickerAdapter", _FakeLocalTickerAdapter)
     monkeypatch.setattr(pt, "_run_daily_workflow", fake_run_daily_workflow)
+    monkeypatch.setattr(
+        pt,
+        "_wait_until_market_ready",
+        lambda trade_date: wait_calls.append(("wait", trade_date)),
+    )
 
     await pt._cmd_daily_live(
         SimpleNamespace(
@@ -598,6 +604,7 @@ async def test_cmd_daily_live_local_feed_alert_toggle(
     )
 
     assert calls == expected_calls
+    assert wait_calls == []
     assert workflow_calls["local_ticker"] == {
         "trade_date": "2026-04-09",
         "symbols": ["SBIN"],
@@ -605,6 +612,58 @@ async def test_cmd_daily_live_local_feed_alert_toggle(
     }
     assert workflow_calls["workflow"]["strategy_params"]["feed_source"] == "local"
     assert workflow_calls["workflow"]["live_kwargs"]["ticker_adapter"].trade_date == "2026-04-09"
+
+
+@pytest.mark.asyncio
+async def test_cmd_daily_live_kite_feed_waits_until_market_ready(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import scripts.paper_trading as pt
+
+    calls: list[tuple[str, str]] = []
+    workflow_calls: dict[str, object] = {}
+
+    async def fake_wait_until_market_ready(trade_date: str) -> None:
+        calls.append(("wait", trade_date))
+
+    async def fake_run_daily_workflow(**kwargs):
+        workflow_calls["workflow"] = kwargs
+        return {"status": "LIVE"}
+
+    monkeypatch.setattr(pt, "resolve_trade_date", lambda value: value)
+    monkeypatch.setattr(pt, "_resolve_cli_symbols", lambda *args, **kwargs: ["SBIN"])
+    monkeypatch.setattr(
+        pt,
+        "_resolve_paper_strategy_params",
+        lambda *args, **kwargs: {"direction_filter": "LONG", "skip_rvol_check": False},
+    )
+    monkeypatch.setattr(pt, "pre_filter_symbols_for_strategy", lambda *args, **kwargs: ["SBIN"])
+    monkeypatch.setattr(pt, "set_alerts_suppressed", lambda value: None)
+    monkeypatch.setattr(pt, "_wait_until_market_ready", fake_wait_until_market_ready)
+    monkeypatch.setattr(pt, "_run_daily_workflow", fake_run_daily_workflow)
+
+    await pt._cmd_daily_live(
+        SimpleNamespace(
+            trade_date="2026-04-09",
+            symbols="SBIN",
+            all_symbols=False,
+            strategy="CPR_LEVELS",
+            strategy_params=None,
+            session_id="paper-test",
+            notes=None,
+            skip_coverage=True,
+            poll_interval_sec=1.0,
+            candle_interval_minutes=5,
+            max_cycles=1,
+            complete_on_exit=False,
+            feed_source="kite",
+            no_alerts=False,
+            multi=False,
+        )
+    )
+
+    assert calls == [("wait", "2026-04-09")]
+    assert "ticker_adapter" not in workflow_calls["workflow"]["live_kwargs"]
 
 
 @pytest.mark.asyncio

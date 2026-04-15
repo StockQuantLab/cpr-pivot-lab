@@ -34,12 +34,12 @@ class _FakeMarketDB:
         return column == "minute_arr"
 
 
-def _make_pack_frame(*, close: float) -> pl.DataFrame:
+def _make_pack_frame(*, close: float, minute: int) -> pl.DataFrame:
     return pl.DataFrame(
         {
             "symbol": ["MANOMAY"],
             "trade_date": ["2026-04-13"],
-            "pack_time_arr": [[565]],
+            "pack_time_arr": [[minute]],
             "open_arr": [[221.49]],
             "high_arr": [[222.0]],
             "low_arr": [[220.5]],
@@ -83,13 +83,62 @@ def test_compare_feed_audit_passes_on_matching_pack(tmp_path: Path) -> None:
             feed_source="kite",
             session_id="paper-audit",
             paper_db=db,
-            market_db=_FakeMarketDB(_make_pack_frame(close=221.49)),
+            market_db=_FakeMarketDB(_make_pack_frame(close=221.49, minute=560)),
         )
 
         assert result["ok"] is True
         assert result["matched_rows"] == 1
         assert result["mismatched_rows"] == 0
         assert result["missing_pack_rows"] == 0
+        assert result["price_exact_rows"] == 1
+        assert result["volume_exact_rows"] == 1
+    finally:
+        db.close()
+
+
+def test_compare_feed_audit_replay_local_uses_bar_end(tmp_path: Path) -> None:
+    db = PaperDB(db_path=tmp_path / "paper.duckdb")
+    try:
+        db.create_session(
+            session_id="paper-audit",
+            status="COMPLETED",
+            trade_date="2026-04-13",
+        )
+        db.upsert_feed_audit_rows(
+            [
+                {
+                    "session_id": "paper-audit",
+                    "trade_date": "2026-04-13",
+                    "feed_source": "replay",
+                    "transport": "replay",
+                    "symbol": "MANOMAY",
+                    "bar_start": "2026-04-13 09:20:00",
+                    "bar_end": "2026-04-13 09:25:00",
+                    "open": 221.49,
+                    "high": 222.0,
+                    "low": 220.5,
+                    "close": 221.49,
+                    "volume": 12345.0,
+                    "first_snapshot_ts": "2026-04-13 09:20:01",
+                    "last_snapshot_ts": "2026-04-13 09:24:59",
+                }
+            ]
+        )
+
+        result = compare_feed_audit(
+            trade_date="2026-04-13",
+            feed_source="replay",
+            session_id="paper-audit",
+            paper_db=db,
+            market_db=_FakeMarketDB(_make_pack_frame(close=221.49, minute=565)),
+        )
+
+        assert result["ok"] is True
+        assert result["matched_rows"] == 1
+        assert result["mismatched_rows"] == 0
+        assert result["missing_pack_rows"] == 0
+        assert result["price_exact_rows"] == 1
+        assert result["volume_exact_rows"] == 1
     finally:
         db.close()
 
@@ -128,12 +177,14 @@ def test_compare_feed_audit_flags_value_mismatch(tmp_path: Path) -> None:
             feed_source="kite",
             session_id="paper-audit",
             paper_db=db,
-            market_db=_FakeMarketDB(_make_pack_frame(close=220.90)),
+            market_db=_FakeMarketDB(_make_pack_frame(close=220.90, minute=560)),
         )
 
         assert result["ok"] is False
         assert result["matched_rows"] == 0
         assert result["mismatched_rows"] == 1
+        assert result["price_exact_rows"] == 0
+        assert result["volume_exact_rows"] == 1
         assert result["samples"][0]["mismatches"]["close"]["delta"] > 0.5
     finally:
         db.close()

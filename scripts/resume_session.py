@@ -41,6 +41,7 @@ async def _main() -> None:
 
     if args.no_alerts:
         from engine.paper_runtime import set_alerts_suppressed
+
         set_alerts_suppressed(True)
 
     from scripts.paper_live import run_live_session

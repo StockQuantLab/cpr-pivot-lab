@@ -32,6 +32,51 @@ def test_default_session_id_includes_direction_for_daily_sessions() -> None:
     )
 
 
+def test_variant_exit_summary_and_retry_policy_detects_spurious_early_completion() -> None:
+    summary = paper_trading._variant_exit_summary(
+        {
+            "final_status": "COMPLETED",
+            "last_bar_ts": "2026-04-15T09:25:00+05:30",
+            "terminal_reason": "spurious_completion",
+            "closed_bars": 17,
+            "cycles": 9,
+        }
+    )
+
+    should_retry, reason = paper_trading._should_retry_variant_exit(
+        summary,
+        current_hhmm="09:26",
+        entry_window_closed_hhmm="10:30",
+        eod_cutoff_hhmm="14:30",
+    )
+
+    assert summary["status"] == "COMPLETED"
+    assert summary["last_bar_hhmm"] == "09:25"
+    assert summary["closed_bars"] == 17
+    assert should_retry is True
+    assert reason == "completed early at 09:25"
+
+
+def test_variant_exit_summary_and_retry_policy_respects_intentional_completion() -> None:
+    summary = paper_trading._variant_exit_summary(
+        {
+            "final_status": "COMPLETED",
+            "last_bar_ts": "2026-04-15T09:25:00+05:30",
+            "terminal_reason": "complete_on_exit",
+        }
+    )
+
+    should_retry, reason = paper_trading._should_retry_variant_exit(
+        summary,
+        current_hhmm="09:26",
+        entry_window_closed_hhmm="10:30",
+        eod_cutoff_hhmm="14:30",
+    )
+
+    assert should_retry is False
+    assert reason == "complete_on_exit"
+
+
 @pytest.mark.asyncio
 async def test_run_daily_workflow_replay_uses_shared_preparation_and_session(
     monkeypatch: pytest.MonkeyPatch,

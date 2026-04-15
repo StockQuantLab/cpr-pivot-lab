@@ -22,17 +22,35 @@ from engine.paper_runtime import (
     enforce_session_risk_controls,
     evaluate_candle,
     execute_entry,
+    refresh_pending_setup_rows_for_bar,
+    runtime_setup_status,
 )
 
 logger = logging.getLogger(__name__)
 
 
-def _runtime_setup_status(runtime_state: PaperRuntimeState, symbol: str) -> str:
-    state = runtime_state.symbols.get(symbol)
-    if state is None or state.setup_row is None:
-        return "pending"
-    direction = str(state.setup_row.get("direction") or "").upper()
-    return "candidate" if direction in {"LONG", "SHORT"} else "rejected"
+def _direction_readiness(
+    runtime_state: PaperRuntimeState, active_symbols: list[str]
+) -> tuple[int, int, int, float]:
+    """Return (resolved, pending, with_setup, coverage_pct_of_setup_loaded)."""
+    resolved = 0
+    pending = 0
+    with_setup = 0
+    for symbol in active_symbols:
+        state = runtime_state.symbols.get(symbol)
+        if state is None or state.setup_row is None:
+            continue
+        with_setup += 1
+        if bool(state.setup_row.get("direction_pending")):
+            pending += 1
+            continue
+        direction = str(state.setup_row.get("direction") or "").upper()
+        if direction in {"LONG", "SHORT"}:
+            resolved += 1
+        else:
+            pending += 1
+    coverage = (resolved / with_setup) if with_setup else 0.0
+    return resolved, pending, with_setup, coverage
 
 
 async def _maybe_await(value: Any) -> Any:
@@ -135,6 +153,16 @@ async def process_closed_bar_group(
             )
         )
 
+    # Refresh unresolved setup rows once per bar before any symbol-level evaluation.
+    refresh_pending_setup_rows_for_bar(
+        runtime_state=runtime_state,
+        symbols=active_symbols,
+        trade_date=bar_candles_sorted[0].bar_end.date().isoformat(),
+        bar_candles=bar_candles_sorted,
+        or_minutes=int(getattr(params, "or_minutes", 5) or 5),
+        allow_live_fallback=bool(getattr(runtime_state, "allow_live_setup_fallback", True)),
+    )
+
     # Step 1: exits/position advances first.
     # Yield to the event loop every 64 symbols so alert consumer can send Telegram messages
     # between symbol batches — otherwise 600+ synchronous evaluations starve the consumer.
@@ -183,7 +211,7 @@ async def process_closed_bar_group(
     for _i, candle in enumerate(bar_candles_sorted):
         if tracker.has_open_position(candle.symbol):
             continue
-        setup_status = _runtime_setup_status(runtime_state, candle.symbol)
+        setup_status = runtime_setup_status(runtime_state, candle.symbol)
         if not should_process_symbol(
             bar_time=bar_time,
             entry_window_end=entry_window_end,
@@ -225,27 +253,35 @@ async def process_closed_bar_group(
                 float(candidate.get("entry_price") or 0.0),
             )
 
-    # Step 4: apply CPR LONG/SHORT direction filter once per session.
-    # Fire on the first bar that has any setup rows loaded — no bar-time guard needed
-    # because direction comes from setup_row["direction"] (pre-computed by pivot-build),
-    # not from a live candle close.
-    if (
-        not stage_b_applied
-        and normalized_strategy == "CPR_LEVELS"
-        and any(
-            (state := runtime_state.symbols.get(candle.symbol)) is not None
-            and state.setup_row is not None
-            for candle in bar_candles_sorted
+    # Step 4: apply CPR LONG/SHORT direction filter as soon as any setup rows
+    # are loaded. Unresolved directions remain pending and are kept alive by
+    # should_process_symbol(); resolved opposite-direction rows are dropped
+    # immediately so we do not trade the wrong side while waiting on slow ticks.
+    if not stage_b_applied and normalized_strategy == "CPR_LEVELS":
+        resolved, pending, with_setup, coverage = _direction_readiness(
+            runtime_state, active_symbols
         )
-    ):
-        active_symbols = apply_stage_b_direction_filter(
-            active_symbols=active_symbols,
-            runtime_state=runtime_state,
-            direction_filter=direction_filter,
-        )
-        stage_b_applied = True
-        if update_symbols_cb is not None:
-            update_symbols_cb(active_symbols)
+        if with_setup > 0:
+            log_fn = logger.warning if pending > 0 and coverage < 0.80 else logger.info
+            log_fn(
+                "[%s] Stage B applied: resolved=%d pending=%d with_setup=%d coverage=%.0f%% "
+                "bar_time=%s direction=%s",
+                session_id,
+                resolved,
+                pending,
+                with_setup,
+                coverage * 100,
+                bar_time,
+                direction_filter,
+            )
+            active_symbols = apply_stage_b_direction_filter(
+                active_symbols=active_symbols,
+                runtime_state=runtime_state,
+                direction_filter=direction_filter,
+            )
+            stage_b_applied = True
+            if update_symbols_cb is not None:
+                update_symbols_cb(active_symbols)
 
     # Step 5: prune symbol universe with shared logic.
     reduced_symbols = [
@@ -256,7 +292,7 @@ async def process_closed_bar_group(
             entry_window_end=entry_window_end,
             tracker=tracker,
             symbol=symbol,
-            setup_status=_runtime_setup_status(runtime_state, symbol),
+            setup_status=runtime_setup_status(runtime_state, symbol),
         )
     ]
     if update_symbols_cb is not None and reduced_symbols != active_symbols:

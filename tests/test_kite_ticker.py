@@ -3,12 +3,15 @@ from __future__ import annotations
 import sys
 from datetime import datetime
 from types import ModuleType, SimpleNamespace
+from typing import ClassVar
 
 from engine.kite_ticker_adapter import KiteTickerAdapter
 from engine.live_market_data import IST, FiveMinuteCandleBuilder
 
 
 class _FakeKiteTicker:
+    instances: ClassVar[list[object]] = []
+
     def __init__(self, api_key: str, access_token: str):
         self.api_key = api_key
         self.access_token = access_token
@@ -22,6 +25,7 @@ class _FakeKiteTicker:
         self.mode_calls: list[tuple[str, list[int]]] = []
         self.closed = False
         self.MODE_QUOTE = "quote"
+        self.__class__.instances.append(self)
 
     def connect(self, threaded: bool = True) -> None:
         _ = threaded
@@ -58,6 +62,7 @@ class _FakeKiteConnect:
 
 
 def _install_fake_kite(monkeypatch):
+    _FakeKiteTicker.instances.clear()
     kite_module = ModuleType("kiteconnect")
     kite_module.KiteConnect = _FakeKiteConnect
     kite_module.KiteTicker = _FakeKiteTicker
@@ -161,3 +166,29 @@ def test_kite_ticker_adapter_batches_snapshots_per_builder(monkeypatch) -> None:
     assert builder_b.batches == [["SBIN", "TCS"]]
     assert builder_a.ingest_calls == 0
     assert builder_b.ingest_calls == 0
+
+
+def test_kite_ticker_adapter_recover_connection_recreates_client(monkeypatch) -> None:
+    _install_fake_kite(monkeypatch)
+    adapter = KiteTickerAdapter()
+    builder = FiveMinuteCandleBuilder(interval_minutes=5)
+    adapter.register_session("A", ["SBIN"], builder)
+
+    first_ticker = adapter._ticker
+    assert first_ticker is not None
+    adapter._on_close(None, 100, "network drop")
+    with adapter._lock:
+        adapter._last_close_ts = datetime(2024, 1, 1, 9, 0, tzinfo=IST)
+
+    result = adapter.recover_connection(
+        now=datetime(2024, 1, 1, 9, 1, tzinfo=IST),
+        reconnect_after_sec=30.0,
+        cooldown_sec=0.0,
+    )
+
+    assert result["action"] == "recovered"
+    assert adapter.is_connected is True
+    assert adapter._ticker is not None
+    assert adapter._ticker is not first_ticker
+    assert first_ticker.closed is True
+    assert len(_FakeKiteTicker.instances) >= 2

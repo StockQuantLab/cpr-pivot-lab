@@ -507,6 +507,7 @@ class SymbolRuntimeState:
     closes: list[float] = field(default_factory=list)
     volumes: list[float] = field(default_factory=list)
     setup_row: dict[str, Any] | None = None
+    setup_refresh_bar_end: datetime | None = None
     position_closed_today: bool = False
     entry_window_closed_without_trade: bool = False
 
@@ -753,6 +754,7 @@ def _load_live_setup_row(
         "gap_abs_pct": abs(calculate_gap_pct(open_915, prev_close)),
         "or_atr_5": calculate_or_atr_ratio(or_high_5, or_low_5, atr),
         "direction": direction,
+        "direction_pending": direction not in {"LONG", "SHORT"},
         "is_narrowing": int(cpr_width_pct < cpr_threshold),
         "setup_source": setup_source,
     }
@@ -868,6 +870,7 @@ def load_setup_row(
         "gap_abs_pct": _float_or_none(row[18]),
         "or_atr_5": _float_or_none(row[19]),
         "direction": direction,
+        "direction_pending": direction not in {"LONG", "SHORT"},
         "is_narrowing": bool(row[21]),
         "cpr_shift": str(row[22] or "OVERLAP"),
         "rvol_baseline": rvol_baseline,
@@ -878,10 +881,198 @@ def load_setup_row(
 def _live_setup_status(setup_row: dict[str, Any] | None) -> str:
     if setup_row is None:
         return "pending"
+    if bool(setup_row.get("direction_pending")):
+        return "pending"
     direction = str(setup_row.get("direction") or "").upper()
     if direction in {"LONG", "SHORT"}:
         return "candidate"
-    return "rejected"
+    return "pending"
+
+
+def _bar_candle_payload(candle: Any) -> dict[str, Any]:
+    return {
+        "bar_end": candle.bar_end,
+        "open": float(candle.open),
+        "high": float(candle.high),
+        "low": float(candle.low),
+        "close": float(candle.close),
+        "volume": float(candle.volume),
+    }
+
+
+def _hydrate_setup_row_from_market_row(
+    *,
+    trade_date: str,
+    row: tuple[Any, ...],
+    live_candles: list[dict[str, Any]] | None = None,
+    or_minutes: int = 5,
+) -> dict[str, Any] | None:
+    tc = float(row[3] or 0.0)
+    bc = float(row[4] or 0.0)
+    atr = float(row[10] or 0.0)
+    if tc <= 0.0 or bc <= 0.0 or atr <= 0.0:
+        return None
+    or_close_5 = float(row[16]) if row[16] is not None else None
+    direction = resolve_cpr_direction(or_close_5, tc, bc, fallback="NONE")
+    if direction == "NONE" and or_close_5 is None:
+        direction = str(row[21] or "NONE")
+    if direction == "NONE" and live_candles:
+        intraday = _build_intraday_summary(live_candles, or_minutes=or_minutes)
+        live_or_close_5 = intraday.get("or_close_5")
+        if live_or_close_5 is not None:
+            direction = resolve_cpr_direction(live_or_close_5, tc, bc, fallback="NONE")
+            or_close_5 = live_or_close_5
+    rvol_baseline: list[float | None] | None = None
+    if row[24]:
+        rvol_baseline = [float(v) if v is not None else None for v in row[24]]
+    return {
+        "trade_date": str(row[1] or trade_date),
+        "prev_day_close": float(row[2]) if row[2] is not None else None,
+        "tc": tc,
+        "bc": bc,
+        "pivot": float(row[5] or 0.0),
+        "r1": float(row[6] or 0.0),
+        "s1": float(row[7] or 0.0),
+        "r2": float(row[8] or 0.0),
+        "s2": float(row[9] or 0.0),
+        "atr": atr,
+        "cpr_width_pct": float(row[11] or 0.0),
+        "cpr_threshold": float(row[12] or 0.0),
+        "or_high_5": float(row[13] or 0.0),
+        "or_low_5": float(row[14] or 0.0),
+        "open_915": float(row[15] or 0.0),
+        "or_close_5": or_close_5,
+        "open_side": str(row[17] or ""),
+        "open_to_cpr_atr": float(row[18]) if row[18] is not None else None,
+        "gap_abs_pct": float(row[19]) if row[19] is not None else None,
+        "or_atr_5": float(row[20]) if row[20] is not None else None,
+        "direction": direction,
+        "direction_pending": direction not in {"LONG", "SHORT"},
+        "is_narrowing": bool(row[22]),
+        "cpr_shift": str(row[23] or "OVERLAP"),
+        "rvol_baseline": rvol_baseline,
+        "setup_source": "market_day_state",
+    }
+
+
+def refresh_pending_setup_rows_for_bar(
+    *,
+    runtime_state: PaperRuntimeState,
+    symbols: list[str],
+    trade_date: str,
+    bar_candles: list[Any] | None,
+    or_minutes: int,
+    allow_live_fallback: bool,
+) -> dict[str, int]:
+    """Batch-refresh unresolved setup rows once per bar cycle."""
+    if not symbols:
+        return {"resolved": 0, "pending": 0, "missing": 0, "updated": 0}
+
+    bar_end = bar_candles[0].bar_end if bar_candles else None
+    current_rows: dict[str, dict[str, Any]] = {}
+    for candle in bar_candles or []:
+        current_rows[str(candle.symbol)] = _bar_candle_payload(candle)
+
+    pending_symbols: list[str] = []
+    for symbol in dict.fromkeys(symbols):
+        state = runtime_state.symbols.get(symbol)
+        if state is None:
+            state = runtime_state.for_symbol(symbol)
+        if bar_end is not None and state.setup_refresh_bar_end == bar_end:
+            continue
+        if runtime_setup_status(runtime_state, symbol) == "pending":
+            pending_symbols.append(symbol)
+
+    if not pending_symbols:
+        return {"resolved": 0, "pending": 0, "missing": 0, "updated": 0}
+
+    db = get_dashboard_db()
+    placeholders = ", ".join(["?"] * len(pending_symbols))
+    query = f"""
+        SELECT
+            m.symbol,
+            m.trade_date::VARCHAR,
+            m.prev_close,
+            m.tc,
+            m.bc,
+            m."pivot",
+            m.r1,
+            m.s1,
+            m.r2,
+            m.s2,
+            m.atr,
+            m.cpr_width_pct,
+            m.cpr_threshold_pct,
+            m.or_high_5,
+            m.or_low_5,
+            m.open_915,
+            m.or_close_5,
+            s.open_side,
+            s.open_to_cpr_atr,
+            s.gap_abs_pct,
+            s.or_atr_5,
+            s.direction_5,
+            m.is_narrowing,
+            m.cpr_shift,
+            p.rvol_baseline_arr
+        FROM market_day_state m
+        LEFT JOIN strategy_day_state s
+          ON s.symbol = m.symbol
+         AND s.trade_date = m.trade_date
+        LEFT JOIN intraday_day_pack p
+          ON p.symbol = m.symbol
+         AND p.trade_date = m.trade_date
+        WHERE m.trade_date = ?::DATE
+          AND m.symbol IN ({placeholders})
+    """
+    with _MARKET_DB_READ_LOCK:
+        rows = db.con.execute(query, [trade_date, *pending_symbols]).fetchall()
+    batch_rows = {str(row[0]): row for row in rows}
+
+    resolved = 0
+    pending = 0
+    missing = 0
+    updated = 0
+    for symbol in pending_symbols:
+        state = runtime_state.for_symbol(symbol)
+        state.setup_refresh_bar_end = bar_end
+        row = batch_rows.get(symbol)
+        live_candles = list(state.candles)
+        if current_rows.get(symbol) is not None:
+            live_candles = [*live_candles, current_rows[symbol]]
+        if row is None:
+            missing += 1
+            if allow_live_fallback:
+                fallback_row = _load_live_setup_row(
+                    symbol,
+                    trade_date,
+                    live_candles,
+                    or_minutes=or_minutes,
+                )
+                if fallback_row is not None:
+                    state.setup_row = fallback_row
+                    updated += 1
+                    if bool(fallback_row.get("direction_pending")):
+                        pending += 1
+                    else:
+                        resolved += 1
+            continue
+        setup_row = _hydrate_setup_row_from_market_row(
+            trade_date=trade_date,
+            row=row,
+            live_candles=live_candles,
+            or_minutes=or_minutes,
+        )
+        if setup_row is None:
+            missing += 1
+            continue
+        state.setup_row = setup_row
+        updated += 1
+        if bool(setup_row.get("direction_pending")):
+            pending += 1
+        else:
+            resolved += 1
+    return {"resolved": resolved, "pending": pending, "missing": missing, "updated": updated}
 
 
 def _reset_symbol_state_for_trade_date(
@@ -891,6 +1082,10 @@ def _reset_symbol_state_for_trade_date(
 ) -> None:
     if state.trade_date == trade_date:
         return
+    keep_setup_row = (
+        state.setup_row is not None
+        and str(state.setup_row.get("trade_date") or "") == trade_date
+    )
     state.trade_date = trade_date
     state.candles = []
     state.time_str = []
@@ -899,7 +1094,9 @@ def _reset_symbol_state_for_trade_date(
     state.lows = []
     state.closes = []
     state.volumes = []
-    state.setup_row = None
+    if not keep_setup_row:
+        state.setup_row = None
+        state.setup_refresh_bar_end = None
     state.position_closed_today = False
     state.entry_window_closed_without_trade = False
 
@@ -952,6 +1149,16 @@ def _append_candle_to_symbol_state(state: SymbolRuntimeState, candle: Any) -> st
     state.closes.append(close_price)
     state.volumes.append(volume)
     return str(time_str or "")
+
+
+def runtime_setup_status(runtime_state: PaperRuntimeState, symbol: str) -> str:
+    state = runtime_state.symbols.get(symbol)
+    if state is None or state.setup_row is None:
+        return "pending"
+    if bool(state.setup_row.get("direction_pending")):
+        return "pending"
+    direction = str(state.setup_row.get("direction") or "").upper()
+    return "candidate" if direction in {"LONG", "SHORT"} else "pending"
 
 
 def _build_day_pack(state: SymbolRuntimeState) -> DayPack:
@@ -1761,16 +1968,21 @@ async def evaluate_candle(
     _reset_symbol_state_for_trade_date(state, trade_date=trade_date)
     candle_time = _append_candle_to_symbol_state(state, candle)
 
-    if state.setup_row is None:
+    setup_status = _live_setup_status(state.setup_row)
+    needs_setup_refresh = state.setup_row is None or setup_status == "pending"
+    if needs_setup_refresh and state.setup_refresh_bar_end != candle.bar_end:
         # Keep setup-row reads synchronous in the event loop. This avoids
         # thread contention/crashes on shared DuckDB connections.
-        state.setup_row = load_setup_row(
+        setup_row = load_setup_row(
             candle.symbol,
             trade_date,
             live_candles=state.candles,
             or_minutes=params.or_minutes,
             allow_live_fallback=runtime_state.allow_live_setup_fallback,
         )
+        if setup_row is not None:
+            state.setup_row = setup_row
+        state.setup_refresh_bar_end = candle.bar_end
     setup_status = _live_setup_status(state.setup_row)
     if state.setup_row is None:
         return {
@@ -1835,6 +2047,17 @@ async def evaluate_candle(
             "symbol": candle.symbol,
             "action": "SKIP",
             "reason": "entry_window_closed",
+            "setup_status": setup_status,
+            "candidate": None,
+            "advance_result": None,
+            "setup_row": state.setup_row,
+        }
+
+    if setup_status == "pending":
+        return {
+            "symbol": candle.symbol,
+            "action": "SKIP",
+            "reason": "setup_pending",
             "setup_status": setup_status,
             "candidate": None,
             "advance_result": None,
@@ -2066,7 +2289,9 @@ __all__ = [
     "mark_price_for_position",
     "maybe_shutdown_alert_dispatcher",
     "process_closed_candle",
+    "refresh_pending_setup_rows_for_bar",
     "register_session_start",
+    "runtime_setup_status",
     "set_alert_sink",
     "set_alerts_suppressed",
     "summarize_paper_positions",

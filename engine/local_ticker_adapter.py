@@ -3,6 +3,7 @@
 Replaces KiteTickerAdapter for --feed-source local mode. Emits ClosedCandle objects
 directly from intraday_day_pack data — no synthetic ticks, no builder dependency.
 """
+
 from __future__ import annotations
 
 import logging

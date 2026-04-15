@@ -47,7 +47,9 @@ from engine.paper_runtime import (
     get_session_positions,
     load_setup_row,
     maybe_shutdown_alert_dispatcher,
+    refresh_pending_setup_rows_for_bar,
     register_session_start,
+    runtime_setup_status,
 )
 from scripts.paper_archive import archive_completed_session
 from scripts.paper_feed_audit import record_closed_candles
@@ -60,6 +62,9 @@ _SETUP_PARITY_CHECK_ENABLED = (
     str(os.getenv("PIVOT_LIVE_SETUP_PARITY_CHECK", "0")).strip().lower() in _BOOL_TRUE
 )
 _ORIGINAL_LOAD_SETUP_ROW = load_setup_row
+_WEBSOCKET_RECONNECT_ALERT_ATTEMPTS = 3
+_WEBSOCKET_RECOVERY_AFTER_SEC = 20.0
+_WEBSOCKET_RECOVERY_COOLDOWN_SEC = 30.0
 
 
 @dataclass(slots=True)
@@ -376,8 +381,8 @@ def _prefetch_setup_rows(
             setup_row = _hydrate_setup_row(symbol=symbol, row=row, live_candles=state.candles)
             if setup_row is None:
                 continue
-            state.setup_row = setup_row
-            _log_setup_row_parity(symbol, trade_date, setup_row)
+            state.setup_row = _normalize_setup_row_direction(setup_row)
+            _log_setup_row_parity(symbol, trade_date, state.setup_row)
     else:
         for symbol in unique_symbols:
             state = runtime_state.symbols.setdefault(symbol, SymbolRuntimeState())
@@ -403,8 +408,8 @@ def _prefetch_setup_rows(
                 invalid_symbols.append((symbol, tc, bc, atr))
                 continue
             setup_row.setdefault("setup_source", "market_day_state")
-            state.setup_row = setup_row
-            _log_setup_row_parity(symbol, trade_date, setup_row)
+            state.setup_row = _normalize_setup_row_direction(setup_row)
+            _log_setup_row_parity(symbol, trade_date, state.setup_row)
     if invalid_symbols:
         sample = ", ".join(
             f"{symbol}(tc={tc:.4f},bc={bc:.4f},atr={atr:.4f})"
@@ -426,12 +431,11 @@ def _prefetch_setup_rows(
     runtime_state.invalid_setup_rows += len(invalid_symbols)
 
 
-def _runtime_setup_status(runtime_state: PaperRuntimeState, symbol: str) -> str:
-    state = runtime_state.symbols.get(symbol)
-    if state is None or state.setup_row is None:
-        return "pending"
-    direction = str(state.setup_row.get("direction") or "").upper()
-    return "candidate" if direction in {"LONG", "SHORT"} else "rejected"
+def _normalize_setup_row_direction(setup_row: dict[str, Any]) -> dict[str, Any]:
+    direction = str(setup_row.get("direction") or "").upper()
+    setup_row["direction"] = direction
+    setup_row["direction_pending"] = direction not in {"LONG", "SHORT"}
+    return setup_row
 
 
 def _log_parity_trace(
@@ -482,6 +486,85 @@ def _log_bar_heartbeats(
         )
 
 
+def _log_ticker_health(
+    *,
+    session_id: str,
+    ticker_adapter: Any,
+    active_symbols: list[str],
+) -> dict[str, Any] | None:
+    """Emit a one-line ticker health summary. No-op for non-Kite adapters."""
+    if ticker_adapter is None or not hasattr(ticker_adapter, "health_stats"):
+        return None
+    try:
+        stats = ticker_adapter.health_stats()
+        coverage = ticker_adapter.symbol_coverage(active_symbols, within_sec=300.0)
+    except Exception:
+        logger.debug("ticker health_stats failed", exc_info=True)
+        return None
+    logger.info(
+        "TICKER_HEALTH session=%s connected=%s ticks=%d last_tick_age=%s "
+        "closes=%d reconnects=%d subs=%d coverage=%.0f%% (%d/%d) stale=%d missing=%d",
+        session_id,
+        stats["connected"],
+        stats["tick_count"],
+        f"{stats['last_tick_age_sec']:.0f}s" if stats["last_tick_age_sec"] is not None else "none",
+        stats["close_count"],
+        stats["reconnect_count"],
+        stats["subscribed_tokens"],
+        coverage["coverage_pct"],
+        coverage["covered"],
+        coverage["total"],
+        coverage["stale"],
+        coverage["missing"],
+    )
+    return {"stats": stats, "coverage": coverage}
+
+
+def _log_direction_readiness(
+    *,
+    session_id: str,
+    runtime_state: PaperRuntimeState,
+    active_symbols: list[str],
+) -> dict[str, int | float]:
+    resolved = 0
+    pending = 0
+    missing = 0
+    with_setup = 0
+    for symbol in active_symbols:
+        state = runtime_state.symbols.get(symbol)
+        setup_row = state.setup_row if state is not None else None
+        if setup_row is None:
+            missing += 1
+            continue
+        with_setup += 1
+        if bool(setup_row.get("direction_pending")):
+            pending += 1
+            continue
+        direction = str(setup_row.get("direction") or "").upper()
+        if direction in {"LONG", "SHORT"}:
+            resolved += 1
+        else:
+            pending += 1
+    coverage = (resolved / with_setup) if with_setup else 0.0
+    logger.info(
+        "LIVE_DIRECTION_PREFLIGHT session=%s resolved=%d pending=%d with_setup=%d missing=%d "
+        "coverage=%.0f%%",
+        session_id,
+        resolved,
+        pending,
+        with_setup,
+        missing,
+        coverage * 100,
+    )
+    return {
+        "resolved": resolved,
+        "pending": pending,
+        "missing": missing,
+        "with_setup": with_setup,
+        "coverage_pct": coverage * 100,
+    }
+
+
 async def _process_closed_bar_group(
     *,
     session_id: str,
@@ -497,6 +580,15 @@ async def _process_closed_bar_group(
     bar_candles_sorted = sorted(bar_candles, key=lambda c: c.symbol)
     bar_time = bar_candles_sorted[0].bar_end.astimezone(IST).strftime("%H:%M")
     entry_window_end = str(params.entry_window_end)
+
+    refresh_pending_setup_rows_for_bar(
+        runtime_state=runtime_state,
+        symbols=active_symbols,
+        trade_date=bar_candles_sorted[0].bar_end.date().isoformat(),
+        bar_candles=bar_candles_sorted,
+        or_minutes=int(getattr(params, "or_minutes", 5) or 5),
+        allow_live_fallback=bool(getattr(runtime_state, "allow_live_setup_fallback", True)),
+    )
 
     # Step 1: exits/position advances first.
     for candle in bar_candles_sorted:
@@ -527,7 +619,7 @@ async def _process_closed_bar_group(
     for candle in bar_candles_sorted:
         if tracker.has_open_position(candle.symbol):
             continue
-        setup_status = _runtime_setup_status(runtime_state, candle.symbol)
+        setup_status = runtime_setup_status(runtime_state, candle.symbol)
         if not should_process_symbol(
             bar_time=bar_time,
             entry_window_end=entry_window_end,
@@ -576,7 +668,7 @@ async def _process_closed_bar_group(
             entry_window_end=entry_window_end,
             tracker=tracker,
             symbol=symbol,
-            setup_status=_runtime_setup_status(runtime_state, symbol),
+            setup_status=runtime_setup_status(runtime_state, symbol),
         )
     ]
     return reduced_symbols, float(bar_candles_sorted[-1].close)
@@ -683,6 +775,22 @@ async def run_live_session(
             trade_date=trade_date,
             candle_interval_minutes=candle_interval,
         )
+    direction_readiness = _log_direction_readiness(
+        session_id=session_id,
+        runtime_state=runtime_state,
+        active_symbols=active_symbols,
+    )
+    logger.info(
+        "LIVE_STARTUP_READY session=%s resolved=%d pending=%d missing=%d with_setup=%d "
+        "coverage=%.0f%% symbols=%d",
+        session_id,
+        int(direction_readiness["resolved"]),
+        int(direction_readiness["pending"]),
+        int(direction_readiness["missing"]),
+        int(direction_readiness["with_setup"]),
+        float(direction_readiness["coverage_pct"]),
+        len(active_symbols),
+    )
     tracker = SessionPositionTracker(
         max_positions=int(getattr(session, "max_positions", 1) or 1),
         portfolio_value=float(getattr(params, "portfolio_value", 0.0) or 0.0),
@@ -721,6 +829,7 @@ async def run_live_session(
     closed_bars = 0
     cycles = 0
     final_status = "ACTIVE"
+    terminal_reason: str | None = None
     last_snapshot_ts: datetime | None = None
     last_bar_ts: datetime | None = None
     last_bucket_start = _floor_bucket_start(_session_now(deps), candle_interval)
@@ -729,6 +838,7 @@ async def run_live_session(
     last_ticker_tick_count = ticker_adapter.tick_count if ticker_adapter is not None else 0
     reconnect_alerted = False
     stale_alerted = False
+    last_disconnect_alert_ts: datetime | None = None
     last_stale_alert_ts: datetime | None = None
     alerts_enabled = deps is None
     _stale_alert_cooldown_sec = 300  # 5 min between repeated FEED_STALE alerts
@@ -747,6 +857,7 @@ async def run_live_session(
             current_session = await _load_session(session_id, deps)
             if current_session is None:
                 final_status = "MISSING"
+                terminal_reason = "session_missing"
                 break
             if current_session.status == "PAUSED":
                 await _write_feed_state(
@@ -760,6 +871,7 @@ async def run_live_session(
                     raw_state={
                         "mode": "paused",
                         "symbols": active_symbols,
+                        "direction_readiness": direction_readiness,
                         "setup_prefetch": {
                             "skipped": runtime_state.skipped_setup_rows,
                             "invalid": runtime_state.invalid_setup_rows,
@@ -770,6 +882,7 @@ async def run_live_session(
                 continue
             if current_session.status in {"STOPPING", "COMPLETED", "CANCELLED", "FAILED"}:
                 final_status = str(current_session.status)
+                terminal_reason = f"db_status:{str(current_session.status).lower()}"
                 break
 
             cycle_closed: list[ClosedCandle] = []
@@ -800,22 +913,87 @@ async def run_live_session(
                     ticker_adapter.synthesize_quiet_symbols(session_id, active_symbols, now)
                     cycle_closed = ticker_adapter.drain_closed(session_id)
                     last_bucket_start = current_bucket_start
-                if ticker_adapter.reconnect_count >= 5 and not reconnect_alerted:
+                if (
+                    ticker_adapter.reconnect_count >= _WEBSOCKET_RECONNECT_ALERT_ATTEMPTS
+                    and not reconnect_alerted
+                ):
                     reconnect_alerted = True
                     logger.error(
-                        "WebSocket unstable session=%s reconnect_attempts=%d",
+                        "WebSocket reconnect stalled session=%s reconnect_attempts=%d",
                         session_id,
                         ticker_adapter.reconnect_count,
                     )
                     if alerts_enabled:
                         dispatch_session_error_alert(
                             session_id=session_id,
-                            reason="websocket_unstable",
+                            reason="websocket_reconnect_stalled",
                             details=(
                                 f"reconnect_attempts={ticker_adapter.reconnect_count}"
+                                f" threshold={_WEBSOCKET_RECONNECT_ALERT_ATTEMPTS}"
                                 f" symbols={len(active_symbols)}"
                             ),
                         )
+
+                # If the socket stays down long enough, recreate the client rather
+                # than waiting forever on Kite's internal reconnect loop.
+                if not ticker_adapter.is_connected and hasattr(
+                    ticker_adapter, "recover_connection"
+                ):
+                    recovery: dict[str, Any] = {}
+                    try:
+                        recovery = await asyncio.to_thread(
+                            ticker_adapter.recover_connection,
+                            now=now,
+                            reconnect_after_sec=_WEBSOCKET_RECOVERY_AFTER_SEC,
+                            cooldown_sec=_WEBSOCKET_RECOVERY_COOLDOWN_SEC,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "WebSocket recovery watchdog failed session=%s", session_id
+                        )
+                        recovery = {"action": "failed", "reason": "watchdog_exception"}
+
+                    recovery_action = str(recovery.get("action") or "noop")
+                    if recovery_action == "recovered":
+                        logger.warning(
+                            "WebSocket recovered via watchdog session=%s down_sec=%.0f reconnects=%d",
+                            session_id,
+                            float(recovery.get("down_sec") or 0.0),
+                            int(recovery.get("reconnect_count") or 0),
+                        )
+                        if alerts_enabled:
+                            dispatch_feed_recovered_alert(
+                                session_id=session_id,
+                                details=(
+                                    "WebSocket recovered after "
+                                    f"{float(recovery.get('down_sec') or 0.0):.0f}s down."
+                                    f" reconnects={int(recovery.get('reconnect_count') or 0)}"
+                                ),
+                            )
+                    elif recovery_action == "failed":
+                        _failed_cooldown_ok = (
+                            last_disconnect_alert_ts is None
+                            or (now - last_disconnect_alert_ts).total_seconds()
+                            >= _stale_alert_cooldown_sec
+                        )
+                        if alerts_enabled and _failed_cooldown_ok:
+                            last_disconnect_alert_ts = now
+                            logger.error(
+                                "WebSocket watchdog recovery failed session=%s down_sec=%s reason=%s",
+                                session_id,
+                                recovery.get("down_sec"),
+                                recovery.get("reason"),
+                            )
+                            dispatch_session_error_alert(
+                                session_id=session_id,
+                                reason="websocket_reconnect_failed",
+                                details=(
+                                    f"down_sec={float(recovery.get('down_sec') or 0.0):.0f} "
+                                    f"trigger_after={_WEBSOCKET_RECOVERY_AFTER_SEC:.0f}s "
+                                    f"reconnects={int(recovery.get('reconnect_count') or 0)} "
+                                    f"error={recovery.get('error') or recovery.get('reason')}"
+                                ),
+                            )
             else:
                 assert market_adapter is not None
                 try:
@@ -846,6 +1024,12 @@ async def run_live_session(
                 active_symbols=active_symbols,
                 cycle_closed=cycle_closed,
             )
+            if cycle_closed:
+                _log_ticker_health(
+                    session_id=session_id,
+                    ticker_adapter=ticker_adapter,
+                    active_symbols=active_symbols,
+                )
             stop_requested = False
             if cycle_closed:
                 bars_by_end: dict[datetime, list[ClosedCandle]] = {}
@@ -910,6 +1094,7 @@ async def run_live_session(
                                 details=f"bar_end={bar_end.isoformat()} symbols={len(bar_candles)}",
                             )
                         final_status = "FAILED"
+                        terminal_reason = "bar_processing_error"
                         stop_requested = True
                         break
                     active_symbols = list(driver_result["active_symbols"])
@@ -918,13 +1103,28 @@ async def run_live_session(
                     if deps is None:
                         if driver_result["should_complete"]:
                             final_status = "NO_TRADES_ENTRY_WINDOW_CLOSED"
+                            terminal_reason = (
+                                driver_result.get("stop_reason") or "entry_window_closed"
+                            )
+                            logger.info(
+                                "[%s] Entry window closed with no open positions bar_end=%s",
+                                session_id,
+                                bar_end.isoformat(),
+                            )
                             stop_requested = True
                         elif not active_symbols:
                             final_status = "NO_ACTIVE_SYMBOLS"
+                            terminal_reason = "no_active_symbols"
+                            logger.info(
+                                "[%s] No active symbols remain after bar_end=%s",
+                                session_id,
+                                bar_end.isoformat(),
+                            )
                             stop_requested = True
 
                     if driver_result["triggered"]:
                         final_status = "STOPPING"
+                        terminal_reason = "risk_control_triggered"
                         stop_requested = True
 
                     if stop_requested:
@@ -934,6 +1134,7 @@ async def run_live_session(
 
                 if local_feed and local_feed_exhausted:
                     final_status = "COMPLETED"
+                    terminal_reason = "local_feed_exhausted"
                     complete_on_exit = True
                     break
 
@@ -1049,6 +1250,7 @@ async def run_live_session(
                         stale_exit_sec,
                     )
                     final_status = "STALE"
+                    terminal_reason = "feed_stale"
                     break
 
             await _sleep(deps, supervision_sleep)
@@ -1103,6 +1305,7 @@ async def run_live_session(
         except Exception:
             logger.exception("[%s] Final flush failed — some candles may be dropped", session_id)
             final_status = "FAILED"
+            terminal_reason = "final_flush_failed"
             if alerts_enabled:
                 dispatch_session_error_alert(
                     session_id=session_id,
@@ -1170,6 +1373,11 @@ async def run_live_session(
                 "[%s] Failed to stamp terminal status %s", session_id, final_status, exc_info=True
             )
 
+    if complete_on_exit and final_status == "COMPLETED" and terminal_reason is None:
+        terminal_reason = "complete_on_exit"
+    elif final_status == "STOPPING" and terminal_reason is None:
+        terminal_reason = "manual_stop"
+
     stop_is_terminal = complete_on_exit or final_status in {
         "NO_ACTIVE_SYMBOLS",
         "NO_TRADES_ENTRY_WINDOW_CLOSED",
@@ -1198,6 +1406,7 @@ async def run_live_session(
     except Exception:
         logger.exception("[%s] Final session completion failed", session_id)
         final_status = "FAILED"
+        terminal_reason = "session_finalize_failed"
         if alerts_enabled:
             dispatch_session_error_alert(
                 session_id=session_id,
@@ -1225,11 +1434,21 @@ async def run_live_session(
         loaded_status = str(final_session.status)
         if loaded_status.upper() != "ACTIVE":
             final_status = loaded_status
+            terminal_reason = terminal_reason or f"db_status:{loaded_status.lower()}"
     archive_payload = None
     if final_session and final_session.status == "COMPLETED":
         archive_payload = archive_completed_session(session_id, paper_db=get_dashboard_paper_db())
 
     feed_state = get_paper_db().get_feed_state(session_id)
+    logger.info(
+        "[%s] Live exit summary status=%s reason=%s last_bar_ts=%s open_count=%d cycles=%d",
+        session_id,
+        final_status,
+        terminal_reason or "none",
+        last_bar_ts.isoformat() if last_bar_ts else "none",
+        tracker.open_count,
+        cycles,
+    )
     return {
         "session_id": session_id,
         "strategy": strategy,
@@ -1241,6 +1460,7 @@ async def run_live_session(
         "closed_bars": closed_bars,
         "last_snapshot_ts": last_snapshot_ts.isoformat() if last_snapshot_ts else None,
         "last_bar_ts": last_bar_ts.isoformat() if last_bar_ts else None,
+        "terminal_reason": terminal_reason,
         "final_status": final_status
         if final_status != "ACTIVE"
         else getattr(final_session, "status", "ACTIVE"),

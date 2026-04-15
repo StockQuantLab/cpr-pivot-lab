@@ -10,6 +10,7 @@ import logging
 import re
 import time
 from dataclasses import asdict
+from datetime import datetime
 from typing import Any
 from uuid import uuid4
 
@@ -23,6 +24,7 @@ from engine.cli_setup import configure_windows_asyncio, configure_windows_stdio,
 from engine.command_lock import acquire_command_lock
 from engine.cpr_atr_strategy import BacktestResult, CPRATRBacktest
 from engine.kite_ticker_adapter import KiteTickerAdapter
+from engine.live_market_data import IST
 from engine.paper_runtime import (
     apply_paper_strategy_defaults,
     build_backtest_params_from_overrides,
@@ -737,6 +739,9 @@ async def _cmd_daily_live(args: argparse.Namespace) -> None:
     feed_source = getattr(args, "feed_source", "kite")
     suppress_alerts = bool(getattr(args, "no_alerts", False))
 
+    if feed_source == "kite":
+        await _wait_until_market_ready(trade_date)
+
     filtered = pre_filter_symbols_for_strategy(trade_date, symbols, args.strategy, strategy_params)
     if not filtered:
         raise SystemExit(
@@ -811,6 +816,72 @@ def _namespace_to_argv(args: argparse.Namespace, *, exclude: set[str] | None = N
     return argv
 
 
+def _variant_exit_summary(result: Any) -> dict[str, Any]:
+    """Normalize a variant result for retry decisions and logging."""
+    if isinstance(result, Exception):
+        return {
+            "status": "ERROR",
+            "terminal_reason": type(result).__name__,
+            "last_bar_hhmm": None,
+            "cycles": None,
+            "closed_bars": None,
+        }
+    if not isinstance(result, dict):
+        return {
+            "status": "unknown",
+            "terminal_reason": type(result).__name__,
+            "last_bar_hhmm": None,
+            "cycles": None,
+            "closed_bars": None,
+        }
+
+    last_bar_ts = result.get("last_bar_ts")
+    last_bar_hhmm: str | None = None
+    if isinstance(last_bar_ts, str) and last_bar_ts:
+        try:
+            last_bar_hhmm = datetime.fromisoformat(last_bar_ts).astimezone(IST).strftime("%H:%M")
+        except ValueError:
+            last_bar_hhmm = None
+
+    return {
+        "status": str(result.get("final_status") or "unknown"),
+        "terminal_reason": str(result.get("terminal_reason") or result.get("stop_reason") or ""),
+        "last_bar_hhmm": last_bar_hhmm,
+        "cycles": result.get("cycles"),
+        "closed_bars": result.get("closed_bars"),
+    }
+
+
+def _should_retry_variant_exit(
+    summary: dict[str, Any],
+    *,
+    current_hhmm: str,
+    entry_window_closed_hhmm: str,
+    eod_cutoff_hhmm: str,
+) -> tuple[bool, str]:
+    """Decide whether a variant exit should be restarted."""
+    status = str(summary.get("status") or "unknown").upper()
+    terminal_reason = str(summary.get("terminal_reason") or "").lower()
+    last_bar_hhmm = str(summary.get("last_bar_hhmm") or "")
+
+    if current_hhmm >= eod_cutoff_hhmm:
+        return False, "past EOD cutoff"
+    if status == "SKIPPED":
+        return False, "no symbols remain after pre-filtering"
+    if status == "COMPLETED":
+        if terminal_reason in {"complete_on_exit", "entry_window_closed", "local_feed_exhausted"}:
+            return False, terminal_reason or "completed"
+        compare_hhmm = last_bar_hhmm or current_hhmm
+        if compare_hhmm < entry_window_closed_hhmm:
+            return True, f"completed early at {compare_hhmm}"
+        return False, f"completed at {compare_hhmm}"
+    if status == "NO_TRADES_ENTRY_WINDOW_CLOSED":
+        return True, terminal_reason or "entry window closed early"
+    if status in {"FAILED", "STALE", "MISSING", "NO_ACTIVE_SYMBOLS", "ERROR", "ACTIVE"}:
+        return True, terminal_reason or status.lower()
+    return True, terminal_reason or status.lower()
+
+
 async def _run_multi_variants(
     args: argparse.Namespace,
     *,
@@ -818,6 +889,7 @@ async def _run_multi_variants(
     read_only: bool,
     banner_label: str,
     execute_variant: Any,
+    retry_on_early_exit: bool = False,
 ) -> None:
     """Run multiple paper variants with shared orchestration."""
     strategy_override = _assert_cpr_only_strategy(
@@ -873,10 +945,76 @@ async def _run_multi_variants(
 
     register_session_start()
 
+    retry_max = 5
+    retry_wait_base_sec = 10
+    # Don't retry COMPLETED after entry window + buffer (10:15 + 15 min).
+    entry_window_closed_hhmm = "10:30"
+    # Hard stop — no retries after EOD.
+    eod_cutoff_hhmm = "14:30"
+
+    async def _execute_with_retry(
+        label: str, strategy: str, normalized_params: dict[str, Any], filtered: list[str]
+    ) -> Any:
+        """Run a variant; auto-restart if it exits prematurely before EOD.
+
+        Premature exits that trigger a retry:
+          - Any exception
+          - final_status FAILED / STALE / MISSING / NO_ACTIVE_SYMBOLS
+          - final_status COMPLETED before 10:30 (entry window not yet closed)
+          - final_status NO_TRADES_ENTRY_WINDOW_CLOSED before 10:30
+
+        _ensure_daily_session automatically creates a fallback session ID
+        (base-{uuid[:6]}) when the original session_id already exists, so
+        retries never clash with the previous run.
+        """
+        if not retry_on_early_exit:
+            try:
+                return await execute_variant(label, strategy, normalized_params, filtered)
+            except Exception as exc:
+                logger.exception("[%s] Variant raised exception", label)
+                return exc
+
+        result: Any = None
+        for attempt in range(retry_max + 1):
+            try:
+                result = await execute_variant(label, strategy, normalized_params, filtered)
+            except Exception as exc:
+                result = exc
+                logger.exception("[%s] Variant raised exception (attempt %d)", label, attempt)
+
+            now_hhmm = datetime.now(IST).strftime("%H:%M")
+            summary = _variant_exit_summary(result)
+            final_status = summary["status"]
+
+            # ── decide whether to retry ───────────────────────────────────
+            if attempt >= retry_max:
+                break
+            should_retry, retry_reason = _should_retry_variant_exit(
+                summary,
+                current_hhmm=now_hhmm,
+                entry_window_closed_hhmm=entry_window_closed_hhmm,
+                eod_cutoff_hhmm=eod_cutoff_hhmm,
+            )
+            if not should_retry:
+                break
+            # ─────────────────────────────────────────────────────────────
+
+            wait_sec = retry_wait_base_sec * (attempt + 1)
+            print(
+                f"\n  [{label}] Variant exited early: status={final_status}"
+                f" reason={summary['terminal_reason'] or retry_reason}"
+                f" last_bar={summary['last_bar_hhmm'] or 'n/a'} at {now_hhmm}"
+                f" — restart {attempt + 1}/{retry_max} in {wait_sec}s",
+                flush=True,
+            )
+            await asyncio.sleep(wait_sec)
+
+        return result
+
     results = list(
         await asyncio.gather(
             *[
-                execute_variant(label, strategy, normalized_params, filtered)
+                _execute_with_retry(label, strategy, normalized_params, filtered)
                 for label, strategy, normalized_params, filtered in variant_setup
             ],
             return_exceptions=True,
@@ -888,13 +1026,13 @@ async def _run_multi_variants(
     # Report results
     print(f"\n{'=' * 60}")
     for (label, _strategy, _params, _filtered), result in zip(variant_setup, results, strict=True):
+        summary = _variant_exit_summary(result)
         if isinstance(result, Exception):
             print(f"  {label:20s} ERROR: {result}")
         else:
-            status = (
-                result.get("final_status", "unknown") if isinstance(result, dict) else "unknown"
-            )
-            print(f"  {label:20s} status={status}")
+            reason = summary["terminal_reason"]
+            suffix = f" reason={reason}" if reason else ""
+            print(f"  {label:20s} status={summary['status']}{suffix}")
     print(f"{'=' * 60}\n")
 
     payloads = [
@@ -902,6 +1040,32 @@ async def _run_multi_variants(
         for (label, _s, _p, _f), result in zip(variant_setup, results, strict=True)
     ]
     print(json.dumps({"trade_date": trade_date, "variants": payloads}, default=str, indent=2))
+
+
+# Market opens at 09:15 IST. Waiting until 09:16 before connecting the
+# WebSocket avoids the pre-market→regular cycle event at 09:15 (KiteTicker
+# disconnects + reconnects when the segment flips), and gives the 9:15 candle
+# roughly a minute of ticks before prefetch so direction resolution from the
+# live candle has data to work with. Before 09:16 we sleep; after, we start
+# immediately. See docs/PARITY_INCIDENT_LOG.md 2026-04-15 entry.
+MARKET_READY_HHMM = "09:16"
+
+
+async def _wait_until_market_ready(trade_date: str) -> None:
+    now = datetime.now(IST)
+    if now.date().isoformat() != trade_date:
+        return
+    ready_hh, ready_mm = (int(x) for x in MARKET_READY_HHMM.split(":"))
+    ready_at = now.replace(hour=ready_hh, minute=ready_mm, second=0, microsecond=0)
+    if now >= ready_at:
+        return
+    wait_sec = (ready_at - now).total_seconds()
+    print(
+        f"  Waiting {wait_sec:.0f}s until {MARKET_READY_HHMM} IST "
+        f"(market open + 1min) before subscribing WebSocket...",
+        flush=True,
+    )
+    await asyncio.sleep(wait_sec)
 
 
 async def _cmd_daily_live_multi(args: argparse.Namespace) -> None:
@@ -916,6 +1080,9 @@ async def _cmd_daily_live_multi(args: argparse.Namespace) -> None:
 
     feed_source = getattr(args, "feed_source", "kite")
     suppress_alerts = bool(getattr(args, "no_alerts", False))
+
+    if feed_source == "kite":
+        await _wait_until_market_ready(trade_date)
 
     if feed_source == "local":
         from engine.local_ticker_adapter import LocalTickerAdapter
@@ -992,6 +1159,7 @@ async def _cmd_daily_live_multi(args: argparse.Namespace) -> None:
             read_only=True,
             banner_label="Launching",
             execute_variant=_execute_variant,
+            retry_on_early_exit=not bool(getattr(args, "complete_on_exit", False)),
         )
     finally:
         shared_ticker.close()

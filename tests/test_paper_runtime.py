@@ -358,6 +358,7 @@ def test_load_setup_row_falls_back_to_live_intraday_context(
     assert row["atr"] == pytest.approx(4.0)
     assert row["cpr_threshold"] == pytest.approx(1.5)
     assert row["direction"] == "LONG"
+    assert row["direction_pending"] is False
 
 
 def test_load_setup_row_waits_for_full_opening_range_window(
@@ -497,8 +498,153 @@ async def test_process_closed_candle_loads_setup_row_from_runtime_path(
     assert called["trade_date"] == "2024-01-01"
     assert called["kwargs"]["or_minutes"] == 5
     assert called["kwargs"]["allow_live_fallback"] is True
+    assert result["reason"] == "setup_pending"
+    assert result["setup_status"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_process_closed_candle_refreshes_pending_setup_row_from_runtime_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = _make_session("CPR_LEVELS")
+    state = PaperRuntimeState()
+    state.for_symbol("SBIN").setup_row = {
+        **_make_cpr_setup_row(),
+        "direction": "NONE",
+        "direction_pending": True,
+    }
+    tracker = _make_tracker(session)
+    called: list[dict[str, object]] = []
+
+    def fake_load_setup_row(symbol: str, trade_date: str, live_candles=None, **kwargs):
+        called.append({"symbol": symbol, "trade_date": trade_date, "kwargs": kwargs})
+        return {
+            **_make_cpr_setup_row(),
+            "direction": "LONG",
+        }
+
+    async def fake_get_session_positions(session_id: str, symbol: str | None = None, statuses=None):
+        return []
+
+    monkeypatch.setattr("engine.paper_runtime.load_setup_row", fake_load_setup_row)
+    monkeypatch.setattr("engine.paper_runtime.get_session_positions", fake_get_session_positions)
+    monkeypatch.setattr("engine.paper_runtime._maybe_open_cpr_levels", lambda **kwargs: None)
+
+    candle = _make_candle(
+        symbol="SBIN",
+        bar_end=datetime(2024, 1, 1, 9, 20, tzinfo=UTC),
+        open_price=100.0,
+        high=101.0,
+        low=99.5,
+        close=100.5,
+        volume=1_000.0,
+    )
+
+    result = await process_closed_candle(
+        session=session,
+        candle=candle,
+        runtime_state=state,
+        now=candle.bar_end,
+        position_tracker=tracker,
+    )
+
+    assert called and called[0]["symbol"] == "SBIN"
+    assert result["setup_status"] == "candidate"
     assert result["reason"] == "setup_ready"
-    assert result["setup_status"] == "rejected"
+
+
+@pytest.mark.asyncio
+async def test_pending_setup_rows_refresh_once_per_bar(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = _make_session("CPR_LEVELS")
+    state = PaperRuntimeState()
+    state.for_symbol("SBIN").setup_row = {
+        **_make_cpr_setup_row(),
+        "direction": "NONE",
+        "direction_pending": True,
+    }
+    tracker = _make_tracker(session)
+
+    class FakeResult:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def fetchall(self):
+            return list(self._rows)
+
+    class FakeCon:
+        def execute(self, query, params):
+            del query, params
+            row = (
+                "SBIN",
+                "2024-01-01",
+                99.0,
+                100.0,
+                95.0,
+                97.0,
+                105.0,
+                92.0,
+                107.0,
+                90.0,
+                5.0,
+                2.0,
+                101.0,
+                99.0,
+                100.0,
+                100.0,
+                101.0,
+                "BELOW",
+                0.25,
+                0.1,
+                0.5,
+                "LONG",
+                False,
+                "OVERLAP",
+                [1.0, 2.0, 3.0],
+            )
+            return FakeResult([row])
+
+    monkeypatch.setattr(
+        "engine.paper_runtime.get_dashboard_db",
+        lambda: SimpleNamespace(con=FakeCon()),
+    )
+    monkeypatch.setattr("engine.paper_runtime.load_setup_row", lambda *args, **kwargs: pytest.fail("load_setup_row should not run after batch refresh"))
+    monkeypatch.setattr("engine.paper_runtime._maybe_open_cpr_levels", lambda **kwargs: None)
+
+    candle = _make_candle(
+        symbol="SBIN",
+        bar_end=datetime(2024, 1, 1, 9, 20, tzinfo=UTC),
+        open_price=100.0,
+        high=101.0,
+        low=99.5,
+        close=100.5,
+        volume=1_000.0,
+    )
+
+    refresh = paper_runtime.refresh_pending_setup_rows_for_bar(
+        runtime_state=state,
+        symbols=["SBIN"],
+        trade_date="2024-01-01",
+        bar_candles=[candle],
+        or_minutes=5,
+        allow_live_fallback=True,
+    )
+    assert refresh["updated"] == 1
+    assert state.for_symbol("SBIN").setup_refresh_bar_end == candle.bar_end
+    assert state.for_symbol("SBIN").setup_row["direction"] == "LONG"
+    assert state.for_symbol("SBIN").setup_row["direction_pending"] is False
+
+    result = await process_closed_candle(
+        session=session,
+        candle=candle,
+        runtime_state=state,
+        now=candle.bar_end,
+        position_tracker=tracker,
+    )
+
+    assert result["setup_status"] == "candidate"
+    assert result["reason"] == "setup_ready"
 
 
 def test_realized_pnl_for_close_applies_transaction_costs() -> None:
@@ -575,7 +721,7 @@ async def test_process_closed_candle_opens_and_closes_position(
 
 
 @pytest.mark.asyncio
-async def test_process_closed_candle_marks_rejected_setups_for_pruning(
+async def test_process_closed_candle_marks_pending_setups_for_pruning(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     session = _make_session("CPR_LEVELS")
@@ -612,8 +758,8 @@ async def test_process_closed_candle_marks_rejected_setups_for_pruning(
         position_tracker=tracker,
     )
 
-    assert result["setup_status"] == "rejected"
-    assert result["reason"] == "setup_ready"
+    assert result["setup_status"] == "pending"
+    assert result["reason"] == "setup_pending"
 
 
 @pytest.mark.asyncio
@@ -1111,7 +1257,9 @@ async def test_flatten_session_positions_uses_ist_closed_at_and_dispatches_per_t
     set_alert_sink(lambda t, s, b: dispatched.append((t, s, b)))
     try:
         feed_state = SimpleNamespace(raw_state={"symbol_last_prices": {"SUKHJITS": 176.34}})
-        result = await flatten_session_positions("test-flatten-1", notes="eod", feed_state=feed_state)
+        result = await flatten_session_positions(
+            "test-flatten-1", notes="eod", feed_state=feed_state
+        )
     finally:
         set_alert_sink(None)
         set_alerts_suppressed(False)
@@ -1120,7 +1268,9 @@ async def test_flatten_session_positions_uses_ist_closed_at_and_dispatches_per_t
     assert len(update_position_calls) == 1
     closed_at = update_position_calls[0].get("closed_at")
     assert closed_at is not None, "closed_at must be passed to update_position when status=CLOSED"
-    assert closed_at.tzinfo is not None, "closed_at must be timezone-aware (was UTC-naive before fix)"
+    assert closed_at.tzinfo is not None, (
+        "closed_at must be timezone-aware (was UTC-naive before fix)"
+    )
     assert str(closed_at.tzinfo) == "Asia/Kolkata", f"expected IST tz, got {closed_at.tzinfo}"
 
     # per-position TRADE_CLOSED must fire for every force-flattened symbol

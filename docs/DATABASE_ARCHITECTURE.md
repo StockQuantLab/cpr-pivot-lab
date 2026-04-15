@@ -1,6 +1,6 @@
 # Database Architecture
 
-Last updated: 2026-04-07
+Last updated: 2026-04-15
 
 ---
 
@@ -21,10 +21,10 @@ DuckDB market.duckdb (~500 MB)
 DuckDB backtest.duckdb (~50-200 MB)    DuckDB paper.duckdb (~1 MB)
   backtest_results, run_metrics,        paper_sessions, paper_positions,
   run_daily_pnl, run_metadata,          paper_orders, paper_feed_state,
-  setup_funnel                          alert_log
-      |                                 |
-      v                                 v
-  backtest_replica/                  paper_replica/
+  setup_funnel                          paper_feed_audit, alert_log
+      |                |                |
+      v                v                v
+  market_replica/  backtest_replica/  paper_replica/
   (ReplicaSync -> ReplicaConsumer for dashboard reads)
 ```
 
@@ -128,11 +128,11 @@ while the engine writes backtest results to a different file.
 
 | Table | Key Columns | Purpose |
 |-------|-------------|---------|
-| `backtest_results` | run_id, symbol, trade_date, direction, entry/exit prices, profit_loss, exit_reason, gross_pnl, total_costs, reached_1r, reached_2r, max_r | Trade-level results |
-| `run_metrics` | run_id, strategy, trade_count, win_rate, total_pnl, profit_factor, calmar, max_dd_pct, annual_return_pct | Aggregated run performance |
+| `backtest_results` | run_id, session_id, source_session_id, execution_mode, symbol, trade_date, direction, entry_time, exit_time, entry_timestamp, exit_timestamp, entry_price, exit_price, sl_price, target_price, profit_loss, profit_loss_pct, exit_reason, sl_phase, atr, cpr_width_pct, position_size, position_value, mfe_r, mae_r, or_atr_ratio, gap_pct, gross_pnl, total_costs, reached_1r, reached_2r, max_r | Trade-level results |
+| `run_metrics` | run_id, strategy, strategy_code, label, start_date, end_date, trade_count, symbol_count, allocated_capital, total_pnl, total_return_pct, win_rate, profit_factor, max_dd_abs, max_dd_pct, annual_return_pct, calmar, updated_at | Aggregated run performance |
 | `run_daily_pnl` | run_id, trade_date, day_pnl, cum_pnl | Daily equity curve data |
 | `setup_funnel` | run_id, strategy, universe_count, after_cpr_width, ..., entry_triggered | Filter stage pass counts |
-| `run_metadata` | run_id, strategy, symbols_json, params_json, execution_mode | Run configuration registry |
+| `run_metadata` | run_id, strategy, label, symbols_json, start_date, end_date, params_json, param_signature, execution_mode, session_id, source_session_id, created_at | Run configuration registry |
 
 ---
 
@@ -145,10 +145,11 @@ Handled by `db/paper_db.py` (`PaperDB`).
 
 | Table | Key Columns | Purpose |
 |-------|-------------|---------|
-| `paper_sessions` | session_id, strategy, symbols JSON, status (PLANNING->ACTIVE->COMPLETED), mode (replay/live), flatten_time, daily_pnl_used | Master session record |
-| `paper_positions` | position_id, session_id, symbol, direction, status (OPEN/CLOSED), entry_price, stop_loss, target_price, trail_state JSON | Position tracking |
-| `paper_orders` | order_id, session_id, position_id, side (BUY/SELL), fill_price, status | Order execution log |
-| `paper_feed_state` | session_id, status (OK/STALE/DISCONNECTED), last_event_ts, last_price | Data feed health |
+| `paper_sessions` | session_id, strategy, symbols JSON, status (PLANNING/ACTIVE/PAUSED/STOPPING/COMPLETED/FAILED/CANCELLED), mode (replay/live), flatten_time, daily_pnl_used | Master session record |
+| `paper_positions` | position_id, session_id, symbol, direction, status (OPEN/CLOSED/FLATTENED), entry_price, stop_loss, target_price, exit_price, exit_reason, pnl, qty, trail_state VARCHAR(2000), entry_time, exit_time, current_qty, last_price, signal_id, opened_by, closed_by | Position tracking |
+| `paper_orders` | order_id, session_id, position_id, signal_id, symbol, side (BUY/SELL), order_type, requested_qty, request_price, fill_price, fill_qty, status (PENDING/FILLED/CANCELLED/REJECTED), requested_at, filled_at, exchange_order_id, notes | Order execution log |
+| `paper_feed_state` | session_id, status (default IDLE), last_event_ts, last_bar_ts, last_price, stale_reason, raw_state | Data feed health |
+| `paper_feed_audit` | session_id, trade_date, feed_source, transport, symbol, bar_start, bar_end, open, high, low, close, volume, first_snapshot_ts, last_snapshot_ts, created_at, updated_at | Per-bar feed audit trail (PK: session_id, symbol, bar_end) |
 | `alert_log` | id BIGINT PK (sequence), alert_type, alert_level, subject, body, channel (TELEGRAM/EMAIL/BOTH/LOG), status (sent/failed/queued), error_msg, created_at | Alert delivery audit trail |
 
 ---
@@ -198,13 +199,17 @@ data/paper.duckdb                get_dashboard_paper_db()
 ReplicaSync (db/replica.py)      ReplicaConsumer (db/replica_consumer.py)
     │                                    │
     ▼                                    ▼
-data/backtest_replica/           Reads versioned snapshots
+data/market_replica/             Reads versioned snapshots
   *_v15.duckdb                   via pointer file (*_latest)
-  *_v16.duckdb
-  *_latest                       Auto-reconnects when version changes
-data/paper_replica/
+  *_v16.duckdb                   Auto-reconnects when version changes
+  *_latest
+data/backtest_replica/
   *_v372.duckdb
   *_v373.duckdb
+  *_latest
+data/paper_replica/
+  *_v580.duckdb
+  *_v581.duckdb
   *_latest
 ```
 
@@ -226,7 +231,7 @@ data/paper_replica/
 
 | Canonical DB | Replica directory | Sync interval | Dashboard function | Source code |
 |---|---|---|---|---|
-| `market.duckdb` (~500 MB) | `data/backtest_replica/` | 10s debounce | `get_dashboard_db()` | `db/duckdb.py:5117` |
+| `market.duckdb` (~500 MB) | `data/market_replica/` | 10s debounce | `get_dashboard_db()` | `db/duckdb.py:5117` |
 | `backtest.duckdb` (~50-200 MB) | `data/backtest_replica/` | 30s debounce | `get_dashboard_backtest_db()` | `db/backtest_db.py:1203` |
 | `paper.duckdb` (~1 MB) | `data/paper_replica/` | 5s debounce | `get_dashboard_paper_db()` | `db/paper_db.py:1119` |
 
@@ -269,8 +274,9 @@ market.duckdb Runtime Tables:
   dataset_meta                1 row
 
 Replica snapshots:
-  data/backtest_replica/  (market + backtest)  ~2 versions, auto-cleaned
-  data/paper_replica/                           ~2 versions, auto-cleaned
+  data/market_replica/   (market)      ~2 versions, auto-cleaned
+  data/backtest_replica/ (backtest)    ~2 versions, auto-cleaned
+  data/paper_replica/    (paper)       ~2 versions, auto-cleaned
 
 backtest.duckdb Result Tables:
   backtest_results       67,473 rows   4 runs (full universe, net of costs)

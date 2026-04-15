@@ -20,7 +20,7 @@ For a quick high-level read, use:
 - CPR and pivots are computed from previous trading day:
   - `pivot = (H + L + C) / 3`
   - `BC = (H + L) / 2`
-  - `TC = 2 * pivot - BC`
+  - `TC = (pivot + BC) / 2`
   - `R1 = 2 * pivot - L`, `S1 = 2 * pivot - H`
 - Intraday ATR uses previous-day 5-min candles (`atr_periods = 12`)
 - Execution uses shared portfolio model (`portfolio_value`, `max_positions`, `max_position_pct`)
@@ -98,9 +98,9 @@ Use this as the quick reference for what each common parameter means.
 | `strategy` | Which rule set to run. | `CPR_LEVELS` for CPR breakouts, `FBR` for failed breakout reversals. |
 | `direction_filter` | Which side to trade. | `LONG` means buy-only; `SHORT` means sell-only; `BOTH` means take both sides. |
 | `risk_based_sizing` | Size trades by stop-loss risk instead of the normal capped capital slot model. | `true` means a tight stop may get a larger position, `false` means use the standard portfolio overlay. |
-| `portfolio_value` | Starting account value used for sizing and compounding. | `₹1,00,000` means the engine thinks it is managing a 1 lakh account. |
-| `max_positions` | Maximum number of trades allowed at the same time. | `4` means only four open positions can exist together. |
-| `max_position_pct` | Hard cap on how much of the account one trade can use. | `0.25` means one trade cannot use more than 25% of equity. |
+| `portfolio_value` | Starting account value used for sizing and compounding. | `₹10,00,000` means the engine thinks it is managing a 10 lakh account. |
+| `max_positions` | Maximum number of trades allowed at the same time. | `10` means up to ten open positions can exist together. |
+| `max_position_pct` | Hard cap on how much of the account one trade can use. | `0.10` means one trade cannot use more than 10% of equity. |
 | `rvol_threshold` | Minimum relative volume needed before a trade is allowed. | `1.0` means volume must be at least average; `1.2` means 20% above average. |
 | `skip_rvol` | Turn the RVOL filter off completely. | `true` means ignore RVOL and take the setup without a volume check. |
 | `cpr_percentile` | How strict the CPR narrowing filter should be. | `33` means only narrow CPR days qualify, based on the chosen percentile rule. |
@@ -108,7 +108,7 @@ Use this as the quick reference for what each common parameter means.
 | `narrowing_filter` | Whether to require CPR to be narrow enough before trading. | `true` means only narrow CPR days are eligible. |
 | `min_price` | Skip cheap stocks below this price. | `50` means ignore stocks trading under 50 rupees. |
 | `buffer_pct` | Small extra distance used to avoid taking borderline entries. | `0.0005` adds a tiny buffer above or below the CPR boundary. |
-| `or_minutes` | Opening range length in minutes. | `15` means the OR window is the first 15 minutes of trade. |
+| `or_minutes` | Opening range length in minutes. | `5` means the OR window is the first 5 minutes of trade. Note: CPR_LEVELS presets use `15`; code default is `5`. |
 | `or_atr_min` | Minimum opening-range size, measured in ATR. | `0.3` means the opening range must be at least 0.3 ATR wide. |
 | `or_atr_max` | Maximum opening-range size, measured in ATR. | `2.5` means very huge opening ranges are rejected. |
 | `time_exit` | Forced exit time if no stop or target was hit. | `15:15` means flatten any open trade near market close. |
@@ -117,13 +117,37 @@ Use this as the quick reference for what each common parameter means.
 | `reversal_buffer_pct` | FBR only: small buffer used when entering the reversal. | `0.001` means 0.1% extra room around the failure level. |
 | `fbr_min_or_atr` | FBR only: minimum opening-range size filter. | `0.5` means ignore tiny OR breakouts. |
 | `fbr_failure_depth` | FBR only: how deep the breakout must fail before reversal. | `0.3` means the breakout must reverse enough to count as a real failure. |
-| `cpr_scale_out_pct` | Optional scale-out split between first target and runner. | `0.8` means sell 80% at the first target and keep 20% for the runner. |
+| `cpr_scale_out_pct` | Optional scale-out split between first target and runner. | `0.0` means no scale-out (opt-in; tested at 0.8 but rejected as default). |
 
 Rule of thumb:
 
 - If the parameter changes *which trades qualify*, it is an entry filter.
 - If the parameter changes *how much to buy or sell*, it is a sizing rule.
 - If the parameter changes *when to exit*, it is an exit rule.
+
+## Full Parameter Reference
+
+Parameters below are code-level defaults from `BacktestParams` and `CPRParams` dataclasses. Presets and CLI flags may override these at runtime.
+
+| Parameter | Default | Description |
+|---|---|---|
+| `cpr_max_width_pct` | `2.0` | Hard cap on CPR width; skip days wider than this. |
+| `entry_window_end` | `"10:15"` | Stop looking for CPR entries after this time. |
+| `min_sl_atr_ratio` | `0.5` | Minimum SL distance as a fraction of ATR. |
+| `max_sl_atr_ratio` | `2.0` | Maximum SL distance as a fraction of ATR. |
+| `breakeven_r` | `1.0` | R-multiple at which SL moves to entry price. |
+| `atr_sl_buffer` | `0.0` | ATR multiplier added as noise buffer beyond the stop level. |
+| `risk_pct` | `0.01` | Fraction of capital risked per trade (used with `risk_based_sizing`). |
+| `compound_equity` | `False` | Carry forward equity across days. `True` restores old compounding behavior. |
+| `rvol_lookback_days` | `10` | Lookback window for relative volume calculation. |
+| `runtime_batch_size` | `512` | Symbols per day-pack fetch batch (memory vs latency tradeoff). |
+| `max_gap_pct` | `1.5` | Skip symbols with opening gap larger than this percentage. |
+| `commission_model` | `"zerodha"` | Brokerage cost model (`"zerodha"` or `"zero"`). |
+| `slippage_bps` | `0.0` | Slippage in basis points per side. |
+| `min_effective_rr` | `2.0` | CPR entry gate; reward/risk must meet this threshold before taking the trade. |
+| `cpr_shift_filter` | `"ALL"` | Filter by CPR shift direction (`"ALL"`, `"UP"`, `"DOWN"`). |
+| `cpr_entry_start` | `""` | Override CPR entry scan start time (empty string = derive from `or_minutes`). |
+| `scale_out_pct` | `0.0` | Fraction of position to close at first target; remainder trails to R2/S2. |
 
 ## Strategy 1: CPR_LEVELS
 
@@ -165,6 +189,12 @@ On narrow CPR days, the normalized CPR band controls direction and R1/S1 becomes
   - Keep it opt-in only unless a narrower variant proves better.
 
 ### Recommended baseline params (production)
+
+> **Note:** The values below include several that are set by named presets (`CPR_LEVELS_RISK_LONG`,
+> `CPR_LEVELS_RISK_SHORT`, `CPR_LEVELS_STANDARD_LONG`, `CPR_LEVELS_STANDARD_SHORT`) and are **not**
+> code defaults. Specifically: `min_price=50`, `cpr_min_close_atr=0.5`, and
+> `use_narrowing_filter=True` are preset overrides. The code defaults are `min_price=0`,
+> `cpr_min_close_atr=0.0`, and `use_narrowing_filter=False`.
 
 - `cpr_percentile = 33.0`
 - `or_atr_min = 0.3`
