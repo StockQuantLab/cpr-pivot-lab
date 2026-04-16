@@ -916,12 +916,24 @@ def _hydrate_setup_row_from_market_row(
     direction = resolve_cpr_direction(or_close_5, tc, bc, fallback="NONE")
     if direction == "NONE" and or_close_5 is None:
         direction = str(row[21] or "NONE")
+    live_intraday: dict[str, Any] | None = None
     if direction == "NONE" and live_candles:
-        intraday = _build_intraday_summary(live_candles, or_minutes=or_minutes)
-        live_or_close_5 = intraday.get("or_close_5")
+        live_intraday = _build_intraday_summary(live_candles, or_minutes=or_minutes)
+        live_or_close_5 = live_intraday.get("or_close_5")
         if live_or_close_5 is not None:
             direction = resolve_cpr_direction(live_or_close_5, tc, bc, fallback="NONE")
             or_close_5 = live_or_close_5
+    # OR OHLCV fields: DB is NULL pre-market (market_day_state built before 9:15 candle).
+    # Fall back to live candle summary so or_atr_ratio / gap filters use real values.
+    _db_or_high = float(row[13] or 0.0)
+    _db_or_low = float(row[14] or 0.0)
+    _db_open_915 = float(row[15] or 0.0)
+    if live_intraday is not None:
+        or_high_5 = _db_or_high or float(live_intraday.get("or_high_5") or 0.0)
+        or_low_5 = _db_or_low or float(live_intraday.get("or_low_5") or 0.0)
+        open_915_val = _db_open_915 or float(live_intraday.get("open_915") or 0.0)
+    else:
+        or_high_5, or_low_5, open_915_val = _db_or_high, _db_or_low, _db_open_915
     rvol_baseline: list[float | None] | None = None
     if row[24]:
         rvol_baseline = [float(v) if v is not None else None for v in row[24]]
@@ -938,9 +950,9 @@ def _hydrate_setup_row_from_market_row(
         "atr": atr,
         "cpr_width_pct": float(row[11] or 0.0),
         "cpr_threshold": float(row[12] or 0.0),
-        "or_high_5": float(row[13] or 0.0),
-        "or_low_5": float(row[14] or 0.0),
-        "open_915": float(row[15] or 0.0),
+        "or_high_5": or_high_5,
+        "or_low_5": or_low_5,
+        "open_915": open_915_val,
         "or_close_5": or_close_5,
         "open_side": str(row[17] or ""),
         "open_to_cpr_atr": float(row[18]) if row[18] is not None else None,
@@ -1083,8 +1095,7 @@ def _reset_symbol_state_for_trade_date(
     if state.trade_date == trade_date:
         return
     keep_setup_row = (
-        state.setup_row is not None
-        and str(state.setup_row.get("trade_date") or "") == trade_date
+        state.setup_row is not None and str(state.setup_row.get("trade_date") or "") == trade_date
     )
     state.trade_date = trade_date
     state.candles = []
@@ -1272,6 +1283,7 @@ async def flatten_session_positions(
             last_price=close_price,
             close_price=close_price,
             realized_pnl=realized,
+            exit_reason="MANUAL_FLATTEN",
             closed_by="MANUAL_FLATTEN",
             closed_at=now_ist,
             trail_state={**(position.trail_state or {}), "close_reason": "MANUAL_FLATTEN"},
@@ -1310,32 +1322,44 @@ async def flatten_session_positions(
     # (they may have exited earlier via SL/target).
     # Guard: only fire once per session_id (multiple processes / resume runs can
     # each call flatten_session_positions — only the first should send the alert).
+    #
+    # NOTE: all_closed is fetched AFTER update_position commits above, so the
+    # just-flattened positions are already included. Do NOT add len(closed) again
+    # (double-count) and always sum from all_closed so the EOD P&L reflects the
+    # full session, not just the force-closed subset.
     all_closed = await get_session_positions(session_id, statuses=["CLOSED"])
-    total_trades = len(all_closed) + len(closed)
-    # Sum P&L from all closed positions when no force-closes happened
-    if not closed and all_closed:
-        total_realized = sum(float(p.realized_pnl or 0) for p in all_closed)
+    total_trades = len(all_closed)
+    total_realized = sum(float(p.realized_pnl or 0) for p in all_closed)
     try:
-        already_sent = (
-            _db()
-            .con.execute(
-                "SELECT COUNT(*) FROM alert_log WHERE alert_type = 'FLATTEN_EOD' AND subject LIKE ?",
-                [f"%{str(session_id)[:16]}%"],
-            )
-            .fetchone()[0]
-        )
-        if already_sent:
-            logger.debug("FLATTEN_EOD already sent for session %s — skipping duplicate", session_id)
+        # Skip if nothing to report — zero-trade restart sessions after a FAILED original
+        # should not send a second EOD with 0 trades, 0 PnL.
+        if total_trades == 0 and not closed:
+            logger.debug("FLATTEN_EOD skipped for session %s — no trades to report", session_id)
         else:
-            subject, body = _format_risk_alert(
-                reason=notes or "session flatten",
-                net_pnl=total_realized,
-                session_id=session_id,
-                positions_closed=len(closed),
-                total_trades=total_trades,
-                trade_date=getattr(session, "trade_date", None),
+            # Dedup: body contains the full session_id; subject is date-only so cannot be
+            # used reliably to detect the already-sent original-session alert.
+            already_sent = (
+                _db()
+                .con.execute(
+                    "SELECT COUNT(*) FROM alert_log WHERE alert_type = 'FLATTEN_EOD' AND body LIKE ?",
+                    [f"%{str(session_id)[:24]}%"],
+                )
+                .fetchone()[0]
             )
-            _dispatch_alert(AlertType.FLATTEN_EOD, subject, body)
+            if already_sent:
+                logger.debug(
+                    "FLATTEN_EOD already sent for session %s — skipping duplicate", session_id
+                )
+            else:
+                subject, body = _format_risk_alert(
+                    reason=notes or "session flatten",
+                    net_pnl=total_realized,
+                    session_id=session_id,
+                    positions_closed=len(closed),
+                    total_trades=total_trades,
+                    trade_date=getattr(session, "trade_date", None),
+                )
+                _dispatch_alert(AlertType.FLATTEN_EOD, subject, body)
     except Exception:
         logger.debug("Alert dispatch for flatten failed (best-effort)", exc_info=True)
     return {"session_id": session_id, "closed_positions": len(closed), "positions": closed}
@@ -1699,6 +1723,7 @@ async def _advance_open_position(
             last_price=close_price,
             close_price=close_price,
             realized_pnl=realized,
+            exit_reason=exit_reason,
             closed_by=exit_reason,
             closed_at=candle.get("bar_end") if isinstance(candle, dict) else None,
         )
@@ -1775,6 +1800,7 @@ async def _advance_open_position(
                     last_price=final_target_price,
                     close_price=final_target_price,
                     realized_pnl=realized,
+                    exit_reason="TARGET",
                     closed_by="TARGET",
                     closed_at=candle.get("bar_end") if isinstance(candle, dict) else None,
                 )
@@ -1912,6 +1938,7 @@ async def _advance_open_position(
         last_price=close_price,
         close_price=close_price,
         realized_pnl=realized,
+        exit_reason=resolved_exit_reason,
         closed_by=resolved_exit_reason,
         closed_at=candle.get("bar_end") if isinstance(candle, dict) else None,
     )

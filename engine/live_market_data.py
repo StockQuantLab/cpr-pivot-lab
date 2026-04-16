@@ -96,9 +96,12 @@ class FiveMinuteCandleBuilder:
         if snapshot.volume is not None:
             cumulative = float(snapshot.volume)
             prev = self._prev_cumulative_vol.get(snapshot.symbol)
-            bar_volume_delta = (
-                max(0.0, cumulative - prev) if prev is not None else max(0.0, cumulative)
-            )
+            if prev is not None:
+                # Delta from previous tick — correct per-bar volume
+                bar_volume_delta = max(0.0, cumulative - prev)
+            # else: first tick for this symbol has no reference point; cumulative volume
+            # includes all pre-session activity so we can't attribute it to this bar.
+            # Leave bar_volume_delta=0 rather than inflating the first bar.
             self._prev_cumulative_vol[snapshot.symbol] = cumulative
 
         state = self._states.get(snapshot.symbol)

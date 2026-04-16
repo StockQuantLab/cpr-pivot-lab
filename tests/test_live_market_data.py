@@ -75,7 +75,9 @@ def test_five_minute_candle_builder_emits_closed_bars() -> None:
     assert candle.high == pytest.approx(101.5)
     assert candle.low == pytest.approx(100.0)
     assert candle.close == pytest.approx(101.5)
-    assert candle.volume == pytest.approx(11.0)
+    # First tick (vol=10) has no previous reference → volume delta is 0 (unknown pre-session
+    # cumulative). Second tick (vol=11): delta = 11 - 10 = 1. Bar volume = 1.
+    assert candle.volume == pytest.approx(1.0)
 
 
 def test_five_minute_candle_builder_flushes_partial_bar() -> None:
@@ -675,7 +677,9 @@ async def test_run_live_session_survives_all_pending_startup(
 
     monkeypatch.setattr(paper_live, "get_dashboard_db", lambda: fake_db)
     monkeypatch.setattr(paper_runtime, "get_dashboard_db", lambda: fake_db)
-    monkeypatch.setattr(paper_live, "pre_filter_symbols_for_strategy", lambda *args, **kwargs: ["SBIN", "RELIANCE"])
+    monkeypatch.setattr(
+        paper_live, "pre_filter_symbols_for_strategy", lambda *args, **kwargs: ["SBIN", "RELIANCE"]
+    )
 
     class FakeTickerAdapter:
         def __init__(self):

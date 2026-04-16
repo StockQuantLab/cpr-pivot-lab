@@ -390,6 +390,7 @@ class KiteTickerAdapter:
         snapshots_by_symbol: dict[str, list[MarketSnapshot]] = defaultdict(list)
         ltp_updates: dict[str, float] = {}
         tick_count = 0
+        fallback_count = 0
         latest_ts: datetime | None = None
         for tick in ticks:
             token = tick.get("instrument_token")
@@ -405,6 +406,7 @@ class KiteTickerAdapter:
             ts = tick.get("exchange_timestamp")
             if not isinstance(ts, datetime):
                 ts = now
+                fallback_count += 1
             volume = tick.get("volume_traded")
             snapshot = MarketSnapshot(
                 symbol=symbol,
@@ -420,6 +422,13 @@ class KiteTickerAdapter:
 
         if tick_count == 0:
             return
+
+        if fallback_count > 0:
+            logger.debug(
+                "exchange_timestamp missing on %d/%d ticks in batch — using receive-time",
+                fallback_count,
+                tick_count,
+            )
 
         with self._lock:
             self._last_ltp.update(ltp_updates)

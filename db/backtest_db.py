@@ -450,6 +450,18 @@ class BacktestDB:
             )
             if transactional:
                 self.con.execute("BEGIN TRANSACTION")
+            # For PAPER runs, run_id == session_id — re-archiving must not duplicate rows.
+            # Delete existing rows for this run_id before inserting so a second call is
+            # idempotent (backtest run_ids are UUIDs so this branch is never hit for them).
+            run_id_for_dedup: str | None = None
+            if "run_id" in working_df.columns:
+                run_id_for_dedup = str(working_df["run_id"][0])
+            if "execution_mode" in working_df.columns and run_id_for_dedup:
+                mode_val = str(working_df["execution_mode"][0]).upper()
+                if mode_val == "PAPER":
+                    self.con.execute(
+                        "DELETE FROM backtest_results WHERE run_id = ?", [run_id_for_dedup]
+                    )
             self.con.execute(insert_sql)
 
             run_id_val: str | None = None

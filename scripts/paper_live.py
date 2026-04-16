@@ -1148,8 +1148,15 @@ async def run_live_session(
                     # the WebSocket reports it is connected.  A genuinely broken connection will
                     # be detected faster because is_connected flips to False when the handshake
                     # drops, at which point we apply the normal (shorter) stale_timeout.
+                    # Guard: a "zombie" TCP socket can stay connected while the exchange sends
+                    # no ticks for 30+ minutes.  Cap the connected multiplier at 300s (5 min)
+                    # so a silent-but-alive socket is treated as disconnected after 5 min.
                     if use_websocket and ticker_adapter is not None and ticker_adapter.is_connected:
-                        stale = elapsed > max(stale_timeout * 4, 120)
+                        tick_age = (ticker_adapter.get_stats() or {}).get("last_tick_age_sec") or 0
+                        if tick_age > 300:
+                            stale = elapsed > stale_timeout  # zombie — treat as disconnected
+                        else:
+                            stale = elapsed > max(stale_timeout * 4, 120)
                     else:
                         stale = True
             if stale:
@@ -1436,7 +1443,10 @@ async def run_live_session(
             final_status = loaded_status
             terminal_reason = terminal_reason or f"db_status:{loaded_status.lower()}"
     archive_payload = None
-    if final_session and final_session.status == "COMPLETED":
+    if final_session and final_session.status in ("COMPLETED", "FAILED"):
+        # Archive on both COMPLETED and FAILED exits so stale/crash sessions with
+        # closed positions are visible in the dashboard without manual intervention.
+        # store_backtest_results has a PAPER dedup guard so re-archiving is safe.
         archive_payload = archive_completed_session(session_id, paper_db=get_dashboard_paper_db())
 
     feed_state = get_paper_db().get_feed_state(session_id)

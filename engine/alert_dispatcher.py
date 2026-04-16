@@ -110,6 +110,12 @@ class AlertDispatcher:
             return
         self._running = True
         self._consumer_task = asyncio.create_task(self._consumer_loop())
+        logger.info(
+            "AlertDispatcher started: telegram.enabled=%s chat_ids=%d email.enabled=%s",
+            self.telegram.enabled,
+            len(self.telegram._chat_ids),
+            self.email.enabled,
+        )
 
     async def dispatch(self, alert_type: AlertType, subject: str, body: str) -> None:
         """Enqueue an alert for delivery. Non-blocking; drops if queue is full."""
