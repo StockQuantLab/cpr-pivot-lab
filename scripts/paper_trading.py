@@ -878,6 +878,10 @@ def _should_retry_variant_exit(
     if status == "NO_TRADES_ENTRY_WINDOW_CLOSED":
         return True, terminal_reason or "entry window closed early"
     if status in {"FAILED", "STALE", "MISSING", "NO_ACTIVE_SYMBOLS", "ERROR", "ACTIVE"}:
+        # Feed stale after entry window: positions were auto-flattened. A fresh session
+        # has no open positions and can't take new trades — restart is pointless.
+        if terminal_reason == "feed_stale" and current_hhmm >= entry_window_closed_hhmm:
+            return False, "feed_stale after entry window — no new trades or open positions"
         return True, terminal_reason or status.lower()
     return True, terminal_reason or status.lower()
 

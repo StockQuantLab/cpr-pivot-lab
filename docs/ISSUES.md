@@ -504,6 +504,228 @@ be connected before the first trade).
 
 ---
 
+## 2026-04-17 — Zombie stale check is event-driven; never fires when ticks stop
+
+**Status:** FIXED (2026-04-17)
+**Severity:** High — stale detection silently inactive for 22 minutes; positions exposed
+
+### Symptom
+Feed went dead at ~11:08 IST. STALE exit fired at 11:30 (1334s stale, 22 minutes).
+Apr 16 zombie fix (tick_age > 300 cap) was confirmed in code but did NOT fire.
+Both sessions auto-flattened 2 open positions each and restarted unnecessarily.
+
+### Root Cause
+The stale watchdog was still running in the session supervision loop, but the
+`stale_timeout > 0` guard prevented the zombie path from running when
+`stale_feed_timeout_sec` was `NULL` or `0` in the live session row.
+
+That meant a connected-but-silent WebSocket could stay alive far longer than intended
+because the "zombie" check was effectively disabled by config.
+
+### Proposed Fix
+Keep the watchdog in the existing supervision loop, but always evaluate the WebSocket
+zombie path even when `stale_timeout` is unset.
+
+```python
+# scripts/paper_live.py — evaluate zombie sockets even if stale_timeout is NULL/0
+if use_websocket and ticker_adapter is not None and ticker_adapter.is_connected:
+    tick_age = (ticker_adapter.get_stats() or {}).get("last_tick_age_sec") or 0
+    if tick_age > 300:
+        stale = elapsed > 600
+    elif stale_timeout > 0:
+        stale = elapsed > max(stale_timeout * 4, 120)
+elif stale_timeout > 0 and elapsed > stale_timeout:
+    stale = True
+```
+
+### Files to Change
+- `scripts/paper_live.py` — keep the watchdog in the supervision loop and remove the stale_timeout gate
+
+---
+
+## 2026-04-17 — Auto-restart creates new sessions instead of resuming
+
+**Status:** FIXED (2026-04-17)
+**Severity:** High — open positions auto-flattened unnecessarily; new session is useless post-entry-window
+
+### Symptom
+After STALE exit at 11:30, `--multi` restarted both variants with new session IDs:
+- `CPR_LEVELS_SHORT-2026-04-17-63b13c` — completed immediately, 0 trades
+- `CPR_LEVELS_LONG-2026-04-17-401b74` — completed immediately, 0 trades
+
+Original sessions had open positions (AWFIS, DIXON, VENTIVE, ALGOQUANT) that were
+auto-flattened at the stale exit tick price (11:08 IST) instead of monitoring them
+to their natural SL/target/time-exit. Dashboard shows the suffixed sessions as the
+"latest" but they have 0 trades — confusing and incomplete.
+
+### Root Cause
+`paper_live.py` restart logic (line ~1050) always creates a fresh session on restart.
+It does not check whether the failed session had open positions that should be resumed.
+`--resume --session-id <id>` exists in the CLI but is not used by the auto-restart path.
+
+### Proposed Fix
+In the `--multi` restart loop, check if the failed session has OPEN positions in DB.
+If yes: use `--resume --session-id <original_id>` instead of creating a new session.
+If no (all closed): proceed with a new session as today (entry window check still applies).
+
+```python
+# scripts/paper_live.py — in variant restart logic
+open_count = await count_open_positions(session_id)
+if open_count > 0:
+    # resume the existing session — no new entries, just monitor to EOD
+    await run_variant_resume(session_id, ...)
+else:
+    # no open positions and entry window likely closed — skip restart
+    logger.info(f"[{session_id}] No open positions and entry window closed — skipping restart")
+    return
+```
+
+This avoids the premature flatten + useless empty-session restart pattern.
+
+### Files to Change
+- `scripts/paper_live.py` — `_run_multi` restart logic
+
+---
+
+## 2026-04-17 — Dashboard P&L does not match Telegram EOD summary
+
+**Status:** FIXED (2026-04-17)
+**Severity:** Medium — creates confusion about actual daily P&L
+
+### Symptom
+Dashboard showed ~₹1,603 mid-session. Telegram EOD showed:
+- SHORT: +₹1,208.32 (21 trades)
+- LONG: +₹1,432.85 (25 trades)
+- Combined: +₹2,641.17
+
+Dashboard figure was lower than EOD final. Root cause not fully pinned — likely a
+combination of:
+1. Dashboard reads from replica (may lag by 1 snapshot version behind live DB)
+2. Mid-session dashboard number included only closed trades up to that snapshot;
+   final EOD includes auto-flattened positions from the STALE exit
+3. Restarted session (suffix IDs) archived separately — dashboard may aggregate
+   inconsistently across original + restart sessions
+
+### Related
+Similar issue occurred Apr 16 (doubled archive). The Apr 16 dedup fix prevents
+double-counting but does not address cross-session aggregation when a restart
+creates a new session_id for the same trade date.
+
+### Proposed Fix
+Dashboard "Today's P&L" view should aggregate by `trade_date` across ALL session_ids
+for that date (both original and restarted suffix sessions), rather than showing
+sessions individually. This way the combined figure always matches the EOD Telegram
+total.
+
+### Files to Change
+- `web/` dashboard components — today's P&L aggregation query
+
+---
+
+## 2026-04-17 — Breakeven exits leaking unrealized profit (strategy observation)
+
+**Status:** OPEN (strategy tuning)
+**Severity:** Low — not a bug; expected behavior but suboptimal P&L capture
+
+### Symptom
+Multiple trades hit 1R (triggering `breakeven_r=1.0` → SL moves to entry), ran
+further into profit showing large unrealized gains, then reversed back through entry
+and exited at ~₹-83 (commission only). Dashboard appeared to show large P&L swings
+(₹4,500 → ₹1,603) as these unrealized gains evaporated.
+
+Examples from 2026-04-17: CHEMCON, COSMOFIRST, ASHIANA, DIGITIDE, SBILIFE all
+hit 1R, were seen running in profit, then exited BREAKEVEN_SL at ~₹-83.
+
+### Root Cause (Design)
+`breakeven_r=1.0` is the correct move-to-breakeven trigger. The issue is that after
+moving to breakeven, the trailing phase (`trail_atr_mult`) doesn't engage until
+further price progress — leaving a gap between "move to BE" and "start trailing"
+where the trade can reverse all the way back to entry.
+
+### Options to Evaluate
+1. **Lower `breakeven_r`** (e.g., 0.7–0.8): move SL to entry sooner; reduces the
+   window but also exits good trades earlier.
+2. **Partial profit lock at 1R**: exit 50% of position at 1R, trail the rest.
+   Already supported via scale-out logic.
+3. **Tighter trail after BE**: once SL is at entry, set trail multiplier to 0.5× ATR
+   instead of 1× ATR — locks in profit faster on subsequent movement.
+4. **Accept it**: historically, BREAKEVEN_SL trades are free rolls. The ~₹83 loss is
+   just commission. The strategy's Calmar (5.46) was computed WITH this behavior.
+   Tuning this may hurt more trades than it helps.
+
+Backtest experiments needed before changing any parameter in production.
+
+---
+
+## 2026-04-18 — Live WebSocket OR values differ from EOD parquet, causing symbol divergence
+
+**Status:** OPEN (root cause confirmed, fix under discussion)
+**Severity:** High — 11% symbol overlap between Kite live and local feed; PnL comparison unreliable
+
+### Symptom
+Kite live (Apr 17): LONG +₹1,432 / SHORT +₹1,208 = +₹2,641
+Local feed (`daily-live --feed-source local`, run after EOD): LONG +₹5,178 / SHORT +₹843 = +₹6,020
+Only 5 out of 46 symbols overlapped between the two sessions.
+
+### Root Cause (Confirmed)
+
+**ATR is consistent** — verified all 2030 symbols in `market_day_state` match
+`atr_intraday[trade_date=Apr 17]` exactly (ATR from Apr 16's last 14 five-min candles).
+The pre-market `pivot-refresh` picks up this row because it was built during Apr 16's EOD
+pipeline. ATR is NOT the divergence cause.
+
+The actual root cause: **live WebSocket OR values differ from EOD parquet OR values**.
+
+The Kite live session starts at 09:16 with pre-market `market_day_state` (NULL `or_high_5`,
+`or_low_5`, `or_close_5` — no 9:15 candle data yet). At the 09:20 bar (after 9:15 candle
+completes), `refresh_pending_setup_rows_for_bar()` resolves direction from live candles and
+the fallback in `_hydrate_setup_row_from_market_row()` provides OR values from live
+WebSocket ticks.
+
+The Kite WebSocket operates in MODE_QUOTE — one update per price change, not per trade.
+In liquid symbols, 50 trades can occur in 200ms at different prices while Kite delivers
+only 2-3 ticks. The live 9:15 candle has a **smaller high-low range** than the EOD parquet
+(which captures every trade). This produces a **lower or_atr_ratio**, allowing more symbols
+to pass the `or_atr_ratio ≤ 2.5` filter.
+
+| Symbol | EOD or_atr_ratio | Filter | Kite live |
+|--------|-----------------|--------|-----------|
+| CORONA | 4.11 | FAIL | Traded (live ratio ≤ 2.5) |
+| NOCIL | 2.90 | FAIL | Traded (live ratio ≤ 2.5) |
+| SUNDARMFIN | 2.82 | FAIL | Traded (live ratio ≤ 2.5) |
+| ALGOQUANT | 2.28 | PASS | Traded (same) |
+
+This is a manifestation of the known OHLCV drift issue (#7), amplified by the or_atr_ratio
+filter which converts small OHLCV differences into binary PASS/FAIL decisions.
+
+### Why Local Feed Uses Different OR Values
+The local feed runs AFTER EOD pipeline rebuilds `market_day_state` with actual 9:15 candle
+data from `intraday_day_pack` (EOD parquet). These values include all trades, producing
+larger OR ranges and higher or_atr_ratio values. The `intraday_day_pack` and
+`market_day_state` have identical OR values (verified diff=0.0).
+
+### Parity Requirement
+Backtest, paper replay, and paper live should produce the same results for the same date.
+The live session's OR values (from WebSocket ticks) are inherently different from EOD
+parquet values. This is an architectural limitation of MODE_QUOTE WebSocket feeds.
+
+### Fix Options
+1. **Poll Kite historical API during live session**: Replace WebSocket-built candles with
+   authoritative 1-min candles polled every 60s. Eliminates drift at the cost of 60s entry
+   latency. Keeps SL/target monitoring on WebSocket LTP.
+2. **Store live OR values for post-hoc comparison**: After the live session, save the
+   OR values used. Local feed can then replay with these exact values.
+3. **Accept the difference**: Live trades symbols that the backtest filters out. For
+   reliable comparison, compare at the strategy level (overall P&L, WR, Calmar) rather
+   than symbol-by-symbol.
+
+### Related Issues
+- #7 (OHLCV drift) — same underlying cause, this issue is a specific manifestation
+- #1 (OR fields NULL → 0.0) — the Apr 16 fix enabled the live OR fallback
+- #8 (live candle OHLCV diverges from intraday_day_pack) — same architectural limitation
+
+---
+
 ## Template for New Issues
 
 ```

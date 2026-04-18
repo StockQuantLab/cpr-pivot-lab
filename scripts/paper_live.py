@@ -1139,26 +1139,23 @@ async def run_live_session(
                     break
 
             stale = False
-            if not local_feed and stale_timeout > 0 and last_snapshot_ts is not None:
+            if not local_feed and last_snapshot_ts is not None:
                 elapsed = (now - last_snapshot_ts).total_seconds()
-                if elapsed > stale_timeout:
-                    # For WebSocket mode: if the connection is alive, symbols may just be quiet.
-                    # Low-liquidity stocks can go 30–90 s without a trade tick; that is not a
-                    # broken feed.  Only declare stale after 4× the base timeout (≥120 s) when
-                    # the WebSocket reports it is connected.  A genuinely broken connection will
-                    # be detected faster because is_connected flips to False when the handshake
-                    # drops, at which point we apply the normal (shorter) stale_timeout.
-                    # Guard: a "zombie" TCP socket can stay connected while the exchange sends
-                    # no ticks for 30+ minutes.  Cap the connected multiplier at 300s (5 min)
-                    # so a silent-but-alive socket is treated as disconnected after 5 min.
-                    if use_websocket and ticker_adapter is not None and ticker_adapter.is_connected:
-                        tick_age = (ticker_adapter.get_stats() or {}).get("last_tick_age_sec") or 0
-                        if tick_age > 300:
-                            stale = elapsed > stale_timeout  # zombie — treat as disconnected
-                        else:
-                            stale = elapsed > max(stale_timeout * 4, 120)
-                    else:
-                        stale = True
+                # Zombie check: runs regardless of stale_timeout config.
+                # stale_feed_timeout_sec may be NULL/0 in the DB (common for live sessions),
+                # which previously caused the entire stale block to be skipped. A WebSocket
+                # that is "connected" but silent for >5 min is a zombie — detect it always.
+                if use_websocket and ticker_adapter is not None and ticker_adapter.is_connected:
+                    tick_age = (ticker_adapter.get_stats() or {}).get("last_tick_age_sec") or 0
+                    if tick_age > 300:
+                        # Zombie: socket alive but no ticks for 5+ min — treat as disconnected.
+                        # 600s matches the stale_exit_sec threshold defined below.
+                        stale = elapsed > 600
+                    elif stale_timeout > 0:
+                        # Normal connected path: lenient threshold to tolerate quiet symbols.
+                        stale = elapsed > max(stale_timeout * 4, 120)
+                elif stale_timeout > 0 and elapsed > stale_timeout:
+                    stale = True
             if stale:
                 no_snapshot_streak += 1
                 await _write_feed_state(
@@ -1447,7 +1444,24 @@ async def run_live_session(
         # Archive on both COMPLETED and FAILED exits so stale/crash sessions with
         # closed positions are visible in the dashboard without manual intervention.
         # store_backtest_results has a PAPER dedup guard so re-archiving is safe.
-        archive_payload = archive_completed_session(session_id, paper_db=get_dashboard_paper_db())
+        # Skip archiving zero-trade restart sessions (entry window already closed) —
+        # they have no trades and create spurious entries in the dashboard dropdown.
+        _is_zero_trade_restart = (
+            terminal_reason in ("no_trades_entry_window_closed", "NO_TRADES_ENTRY_WINDOW_CLOSED")
+            and len(tracker._closed_today) == 0
+            and "-" in session_id
+            and len(session_id.split("-")[-1]) == 6  # suffix pattern: -abc123
+        )
+        if _is_zero_trade_restart:
+            logger.info(
+                "[%s] Skipping archive: zero-trade restart session (entry window closed)",
+                session_id,
+            )
+            archive_payload = None
+        else:
+            archive_payload = archive_completed_session(
+                session_id, paper_db=get_dashboard_paper_db()
+            )
 
     feed_state = get_paper_db().get_feed_state(session_id)
     logger.info(
