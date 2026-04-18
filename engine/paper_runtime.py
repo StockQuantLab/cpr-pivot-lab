@@ -324,6 +324,28 @@ def dispatch_session_error_alert(
     _dispatch_alert(AlertType.SESSION_ERROR, subject, body)
 
 
+def dispatch_session_state_alert(
+    *,
+    session_id: str,
+    state: str,
+    details: str | None = None,
+) -> None:
+    """Emit a non-blocking session lifecycle alert for manual pause/resume actions."""
+
+    normalized_state = str(state or "").strip().upper()
+    if normalized_state not in {"PAUSED", "RESUMED"}:
+        raise ValueError(f"Unsupported session state alert: {normalized_state!r}")
+    session_tag = str(session_id or "")[:16]
+    alert_type = (
+        AlertType.SESSION_PAUSED if normalized_state == "PAUSED" else AlertType.SESSION_RESUMED
+    )
+    subject = f"{alert_type.value} {session_tag}"
+    body = f"Session: <code>{session_tag}</code>\nState: {normalized_state}"
+    if details:
+        body += f"\nDetails: {details}"
+    _dispatch_alert(alert_type, subject, body)
+
+
 def dispatch_feed_stale_alert(
     *,
     session_id: str,
@@ -2308,6 +2330,7 @@ __all__ = [
     "build_backtest_params_from_overrides",
     "build_summary_feed_state",
     "dispatch_session_error_alert",
+    "dispatch_session_state_alert",
     "enforce_session_risk_controls",
     "evaluate_candle",
     "execute_entry",

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from db.paper_db import PaperDB
@@ -106,5 +107,79 @@ def test_delete_sessions_by_trade_date_clears_feed_audit_rows(tmp_path: Path) ->
         assert counts["paper_sessions"] == 1
         assert counts["paper_feed_audit"] == 1
         assert db.get_feed_audit_rows(trade_date="2026-04-13") == []
+    finally:
+        db.close()
+
+
+def test_cleanup_feed_audit_older_than_removes_only_expired_rows(tmp_path: Path) -> None:
+    db = PaperDB(db_path=tmp_path / "paper.duckdb")
+    try:
+        now = datetime.now(UTC)
+        old_ts = now - timedelta(days=10)
+        recent_ts = now - timedelta(days=2)
+
+        db.con.execute(
+            """
+            INSERT INTO paper_feed_audit (
+                session_id, trade_date, feed_source, transport, symbol,
+                bar_start, bar_end, open, high, low, close, volume,
+                first_snapshot_ts, last_snapshot_ts, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                "sess-old",
+                "2026-04-01",
+                "kite",
+                "websocket",
+                "OLDSYM",
+                old_ts,
+                old_ts + timedelta(minutes=5),
+                100.0,
+                101.0,
+                99.5,
+                100.5,
+                1234.0,
+                old_ts,
+                old_ts + timedelta(minutes=5),
+                old_ts,
+                old_ts,
+            ],
+        )
+        db.con.execute(
+            """
+            INSERT INTO paper_feed_audit (
+                session_id, trade_date, feed_source, transport, symbol,
+                bar_start, bar_end, open, high, low, close, volume,
+                first_snapshot_ts, last_snapshot_ts, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                "sess-new",
+                "2026-04-17",
+                "kite",
+                "websocket",
+                "NEWSYM",
+                recent_ts,
+                recent_ts + timedelta(minutes=5),
+                200.0,
+                201.0,
+                199.5,
+                200.5,
+                5678.0,
+                recent_ts,
+                recent_ts + timedelta(minutes=5),
+                recent_ts,
+                recent_ts,
+            ],
+        )
+
+        deleted = db.cleanup_feed_audit_older_than(7)
+
+        assert deleted == 1
+        rows = db.get_feed_audit_rows()
+        assert len(rows) == 1
+        assert rows[0].session_id == "sess-new"
     finally:
         db.close()

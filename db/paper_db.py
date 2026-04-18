@@ -16,7 +16,7 @@ import logging
 import threading
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -1061,6 +1061,37 @@ class PaperDB:
                 )
             )
         return result
+
+    def cleanup_feed_audit_older_than(self, retention_days: int) -> int:
+        """Delete feed audit rows older than the retention window.
+
+        The audit table is only meant to preserve a short rolling trail for
+        parity investigation. We keep it bounded so the live paper DB does not
+        grow indefinitely.
+        """
+
+        retention_days = int(retention_days or 0)
+        if retention_days <= 0:
+            return 0
+
+        cutoff = datetime.now(UTC) - timedelta(days=retention_days)
+        count_row = self.con.execute(
+            "SELECT COUNT(*) FROM paper_feed_audit WHERE created_at < ?",
+            [cutoff],
+        ).fetchone()
+        deleted = int(count_row[0] or 0) if count_row else 0
+        if deleted == 0:
+            return 0
+
+        self.con.execute("BEGIN TRANSACTION")
+        try:
+            self.con.execute("DELETE FROM paper_feed_audit WHERE created_at < ?", [cutoff])
+            self.con.execute("COMMIT")
+            self._after_write()
+        except Exception:
+            self.con.execute("ROLLBACK")
+            raise
+        return deleted
 
     def get_feed_state(self, session_id: str) -> FeedState | None:
         row = self.con.execute(

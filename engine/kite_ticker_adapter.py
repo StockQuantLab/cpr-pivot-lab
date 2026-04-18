@@ -15,6 +15,31 @@ from engine.live_market_data import IST, FiveMinuteCandleBuilder, MarketSnapshot
 logger = logging.getLogger(__name__)
 
 
+def _coerce_tick_timestamp(tick: dict[str, Any], fallback_now: datetime) -> tuple[datetime, str]:
+    """Pick the most authoritative timestamp available on a Kite tick.
+
+    Kite emits exchange timestamps in quote/full mode. Some SDK payloads also
+    carry `timestamp` or `last_trade_time`. Prefer those exchange-sourced values
+    first and only fall back to local receive time as a last resort.
+    """
+
+    for key in ("exchange_timestamp", "timestamp", "last_trade_time"):
+        ts = tick.get(key)
+        if isinstance(ts, datetime):
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=IST)
+            return ts, key
+        if isinstance(ts, str) and ts:
+            try:
+                parsed = datetime.fromisoformat(ts)
+            except ValueError:
+                continue
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=IST)
+            return parsed, key
+    return fallback_now, "receive-time"
+
+
 class KiteTickerAdapter:
     """Thread-safe wrapper around KiteTicker with per-session builders."""
 
@@ -403,9 +428,8 @@ class KiteTickerAdapter:
             last_price = tick.get("last_price")
             if last_price is None:
                 continue
-            ts = tick.get("exchange_timestamp")
-            if not isinstance(ts, datetime):
-                ts = now
+            ts, ts_source = _coerce_tick_timestamp(tick, now)
+            if ts_source != "exchange_timestamp":
                 fallback_count += 1
             volume = tick.get("volume_traded")
             snapshot = MarketSnapshot(
@@ -425,7 +449,7 @@ class KiteTickerAdapter:
 
         if fallback_count > 0:
             logger.debug(
-                "exchange_timestamp missing on %d/%d ticks in batch — using receive-time",
+                "exchange_timestamp missing on %d/%d ticks in batch — used timestamp fallback where available, else receive-time",
                 fallback_count,
                 tick_count,
             )

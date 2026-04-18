@@ -104,6 +104,95 @@ def test_kite_ticker_adapter_fans_out_ticks(monkeypatch) -> None:
     adapter.close()
 
 
+def test_kite_ticker_adapter_uses_timestamp_fallback(monkeypatch) -> None:
+    _install_fake_kite(monkeypatch)
+    adapter = KiteTickerAdapter()
+    builder = FiveMinuteCandleBuilder(interval_minutes=5)
+
+    adapter.register_session("A", ["SBIN"], builder)
+
+    adapter._on_ticks(
+        None,
+        [
+            {
+                "instrument_token": 1,
+                "last_price": 100.0,
+                "volume_traded": 1000,
+                # Some SDK payloads provide `timestamp` even when
+                # `exchange_timestamp` is absent. We should still anchor the
+                # candle to the exchange-side timestamp instead of wall clock.
+                "timestamp": datetime(2024, 1, 1, 9, 15, tzinfo=IST),
+            }
+        ],
+    )
+    adapter.synthesize_quiet_symbols("A", ["SBIN"], datetime(2024, 1, 1, 9, 20, tzinfo=IST))
+    closed = adapter.drain_closed("A")
+
+    assert len(closed) == 1
+    assert closed[0].symbol == "SBIN"
+    assert closed[0].bar_start == datetime(2024, 1, 1, 9, 15, tzinfo=IST)
+    assert closed[0].bar_end == datetime(2024, 1, 1, 9, 20, tzinfo=IST)
+    adapter.close()
+
+
+def test_kite_ticker_adapter_replays_scripted_tick_stream(monkeypatch) -> None:
+    _install_fake_kite(monkeypatch)
+    adapter = KiteTickerAdapter()
+    builder = FiveMinuteCandleBuilder(interval_minutes=5)
+
+    adapter.register_session("A", ["SBIN"], builder)
+
+    scripted_ticks = [
+        {
+            "instrument_token": 1,
+            "last_price": 100.0,
+            "volume_traded": 1000,
+            "exchange_timestamp": datetime(2024, 1, 1, 9, 15, tzinfo=IST),
+        },
+        {
+            "instrument_token": 1,
+            "last_price": 101.0,
+            "volume_traded": 1005,
+            "exchange_timestamp": datetime(2024, 1, 1, 9, 17, tzinfo=IST),
+        },
+        {
+            "instrument_token": 1,
+            "last_price": 102.0,
+            "volume_traded": 1010,
+            "exchange_timestamp": datetime(2024, 1, 1, 9, 20, tzinfo=IST),
+        },
+        {
+            "instrument_token": 1,
+            "last_price": 103.0,
+            "volume_traded": 1015,
+            "exchange_timestamp": datetime(2024, 1, 1, 9, 22, tzinfo=IST),
+        },
+        {
+            "instrument_token": 1,
+            "last_price": 104.0,
+            "volume_traded": 1020,
+            "exchange_timestamp": datetime(2024, 1, 1, 9, 25, tzinfo=IST),
+        },
+    ]
+
+    for tick in scripted_ticks:
+        adapter._on_ticks(None, [tick])
+
+    closed = adapter.drain_closed("A")
+
+    assert [c.bar_start for c in closed] == [
+        datetime(2024, 1, 1, 9, 15, tzinfo=IST),
+        datetime(2024, 1, 1, 9, 20, tzinfo=IST),
+    ]
+    assert [c.bar_end for c in closed] == [
+        datetime(2024, 1, 1, 9, 20, tzinfo=IST),
+        datetime(2024, 1, 1, 9, 25, tzinfo=IST),
+    ]
+    assert [c.close for c in closed] == [101.0, 103.0]
+    assert adapter.tick_count >= 5
+    adapter.close()
+
+
 def test_kite_ticker_adapter_updates_subscriptions(monkeypatch) -> None:
     _install_fake_kite(monkeypatch)
     adapter = KiteTickerAdapter()
@@ -192,3 +281,29 @@ def test_kite_ticker_adapter_recover_connection_recreates_client(monkeypatch) ->
     assert adapter._ticker is not first_ticker
     assert first_ticker.closed is True
     assert len(_FakeKiteTicker.instances) >= 2
+
+
+def test_kite_ticker_adapter_recover_connection_reports_connect_failure(monkeypatch) -> None:
+    _install_fake_kite(monkeypatch)
+    adapter = KiteTickerAdapter()
+    builder = FiveMinuteCandleBuilder(interval_minutes=5)
+    adapter.register_session("A", ["SBIN"], builder)
+    adapter._on_close(None, 100, "network drop")
+    with adapter._lock:
+        adapter._last_close_ts = datetime(2024, 1, 1, 9, 0, tzinfo=IST)
+
+    def fake_connect(symbols: list[str]) -> None:
+        assert symbols == ["SBIN"]
+        raise RuntimeError("connect boom")
+
+    monkeypatch.setattr(adapter, "connect", fake_connect)
+
+    result = adapter.recover_connection(
+        now=datetime(2024, 1, 1, 9, 1, tzinfo=IST),
+        reconnect_after_sec=30.0,
+        cooldown_sec=0.0,
+    )
+
+    assert result["action"] == "failed"
+    assert result["reason"] == "connect_failed"
+    assert "connect boom" in str(result["error"])

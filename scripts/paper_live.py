@@ -75,6 +75,7 @@ class LiveSessionDeps:
     feed_reader: Callable[[str], Any] | None = None
     sleep_fn: Callable[[float], Awaitable[None]] | None = None
     now_fn: Callable[[], datetime] | None = None
+    alerts_enabled: bool | None = None
 
 
 def _feed_snapshot_payload(snapshot: MarketSnapshot) -> dict[str, Any]:
@@ -716,6 +717,7 @@ async def run_live_session(
     candle_interval_minutes: int | None = None,
     max_cycles: int | None = None,
     complete_on_exit: bool = False,
+    auto_flatten_on_abnormal_exit: bool = True,
     allow_late_start_fallback: bool = False,
     notes: str | None = None,
     deps: LiveSessionDeps | None = None,
@@ -840,7 +842,7 @@ async def run_live_session(
     stale_alerted = False
     last_disconnect_alert_ts: datetime | None = None
     last_stale_alert_ts: datetime | None = None
-    alerts_enabled = deps is None
+    alerts_enabled = True if deps is None else bool(deps.alerts_enabled)
     _stale_alert_cooldown_sec = 300  # 5 min between repeated FEED_STALE alerts
     audit_feed_source = "kite"
     audit_transport = "websocket" if use_websocket else "rest"
@@ -899,8 +901,15 @@ async def run_live_session(
 
             if use_websocket and ticker_adapter is not None:
                 current_ticks = ticker_adapter.tick_count
-                if current_ticks >= last_ticker_tick_count:
-                    quote_events += current_ticks - last_ticker_tick_count
+                tick_delta = current_ticks - last_ticker_tick_count
+                if tick_delta > 0:
+                    quote_events += tick_delta
+                    no_snapshot_streak = 0
+                elif tick_delta == 0:
+                    no_snapshot_streak += 1
+                else:
+                    # A reconnect may reset the adapter tick counter.
+                    no_snapshot_streak = 0
                 last_ticker_tick_count = current_ticks
                 if ticker_adapter.last_tick_ts is not None:
                     last_snapshot_ts = ticker_adapter.last_tick_ts
@@ -1333,31 +1342,41 @@ async def run_live_session(
             except Exception:
                 logger.debug("Final EOD flatten/summary failed (best-effort)", exc_info=True)
         elif final_status in {"STALE", "FAILED"} and tracker.open_count > 0:
-            # Auto-flatten on abnormal exit so positions don't linger overnight.
-            try:
+            if auto_flatten_on_abnormal_exit:
+                # Auto-flatten on abnormal exit so positions don't linger overnight.
+                try:
+                    logger.warning(
+                        "[%s] %s exit with %d open position(s) — auto-flattening",
+                        session_id,
+                        final_status,
+                        tracker.open_count,
+                    )
+                    await flatten_session_positions(
+                        session_id, notes=f"{final_status}_AUTO_FLATTEN"
+                    )
+                except Exception:
+                    # Fix 2: alert operator when auto-flatten itself fails — orphaned positions.
+                    logger.exception(
+                        "[%s] %s auto-flatten failed — positions may be orphaned",
+                        session_id,
+                        final_status,
+                    )
+                    if alerts_enabled:
+                        dispatch_session_error_alert(
+                            session_id=session_id,
+                            reason="auto_flatten_failed",
+                            details=(
+                                f"{final_status} exit; {tracker.open_count} position(s) may be orphaned."
+                                " Check paper.duckdb and close manually in Kite."
+                            ),
+                        )
+            else:
                 logger.warning(
-                    "[%s] %s exit with %d open position(s) — auto-flattening",
+                    "[%s] %s exit with %d open position(s) — preserving for resume",
                     session_id,
                     final_status,
                     tracker.open_count,
                 )
-                await flatten_session_positions(session_id, notes=f"{final_status}_AUTO_FLATTEN")
-            except Exception:
-                # Fix 2: alert operator when auto-flatten itself fails — orphaned positions.
-                logger.exception(
-                    "[%s] %s auto-flatten failed — positions may be orphaned",
-                    session_id,
-                    final_status,
-                )
-                if alerts_enabled:
-                    dispatch_session_error_alert(
-                        session_id=session_id,
-                        reason="auto_flatten_failed",
-                        details=(
-                            f"{final_status} exit; {tracker.open_count} position(s) may be orphaned."
-                            " Check paper.duckdb and close manually in Kite."
-                        ),
-                    )
 
         await maybe_shutdown_alert_dispatcher()
 

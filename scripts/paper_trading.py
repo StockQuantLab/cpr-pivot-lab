@@ -28,6 +28,7 @@ from engine.live_market_data import IST
 from engine.paper_runtime import (
     apply_paper_strategy_defaults,
     build_backtest_params_from_overrides,
+    dispatch_session_state_alert,
     flatten_session_positions,
     maybe_shutdown_alert_dispatcher,
     register_session_start,
@@ -57,6 +58,23 @@ def normalize_strategy_params(strategy_params: dict[str, Any] | None) -> dict[st
 
 def _pdb():
     return get_paper_db()
+
+
+def _cleanup_feed_audit_retention(*, command_name: str) -> int:
+    """Keep the live/replay feed audit bounded to a rolling retention window."""
+
+    retention_days = int(get_settings().feed_audit_retention_days or 0)
+    if retention_days <= 0:
+        return 0
+    deleted = _pdb().cleanup_feed_audit_older_than(retention_days)
+    if deleted > 0:
+        logger.info(
+            "%s purged %d paper_feed_audit row(s) older than %d day(s)",
+            command_name,
+            deleted,
+            retention_days,
+        )
+    return deleted
 
 
 async def get_session(session_id: str):
@@ -403,9 +421,17 @@ async def _ensure_daily_session(
             notes=notes,
         )
 
+    if mode == "live":
+        logger.info(
+            "paper session_id %s already exists (status=%s); reusing existing live session",
+            requested_session_id,
+            getattr(session, "status", "UNKNOWN"),
+        )
+        return session
+
     fallback_session_id = f"{requested_session_id}-{uuid4().hex[:6]}"
     logger.warning(
-        "paper session_id %s already exists (status=%s); creating fresh session %s",
+        "paper session_id %s already exists (status=%s); creating fresh replay session %s",
         requested_session_id,
         getattr(session, "status", "UNKNOWN"),
         fallback_session_id,
@@ -421,8 +447,6 @@ async def _ensure_daily_session(
         mode=mode,
         notes=notes,
     )
-
-    return session
 
 
 def _handle_coverage_gaps(preparation: dict[str, Any], *, trade_date: str, mode: str) -> None:
@@ -557,6 +581,9 @@ async def _run_daily_workflow(
             candle_interval_minutes=(live_kwargs or {}).get("candle_interval_minutes"),
             max_cycles=(live_kwargs or {}).get("max_cycles"),
             complete_on_exit=bool((live_kwargs or {}).get("complete_on_exit")),
+            auto_flatten_on_abnormal_exit=bool(
+                (live_kwargs or {}).get("auto_flatten_on_abnormal_exit", True)
+            ),
             allow_late_start_fallback=bool(
                 (live_kwargs or {}).get("allow_late_start_fallback", False)
             ),
@@ -665,6 +692,7 @@ async def _cmd_daily_replay(args: argparse.Namespace) -> None:
             )
             print(json.dumps(payload, default=str, indent=2))
         finally:
+            _cleanup_feed_audit_retention(command_name="daily-replay")
             if suppress_alerts:
                 set_alerts_suppressed(False)
 
@@ -708,6 +736,11 @@ async def _cmd_daily_live_resume(args: argparse.Namespace) -> None:
         set_alerts_suppressed(True)
 
     try:
+        dispatch_session_state_alert(
+            session_id=session_id,
+            state="RESUMED",
+            details=f"open_positions={len(symbols)}",
+        )
         payload = await run_live_session(
             session_id=session_id,
             symbols=symbols,
@@ -715,6 +748,7 @@ async def _cmd_daily_live_resume(args: argparse.Namespace) -> None:
             candle_interval_minutes=getattr(args, "candle_interval_minutes", None),
             max_cycles=getattr(args, "max_cycles", None),
             complete_on_exit=getattr(args, "complete_on_exit", False),
+            auto_flatten_on_abnormal_exit=False,
         )
     finally:
         if suppress_alerts:
@@ -792,6 +826,7 @@ async def _cmd_daily_live(args: argparse.Namespace) -> None:
             live_kwargs=live_kwargs,
         )
     finally:
+        _cleanup_feed_audit_retention(command_name="daily-live")
         if suppress_alerts:
             set_alerts_suppressed(False)
 
@@ -967,9 +1002,9 @@ async def _run_multi_variants(
           - final_status COMPLETED before 10:30 (entry window not yet closed)
           - final_status NO_TRADES_ENTRY_WINDOW_CLOSED before 10:30
 
-        _ensure_daily_session automatically creates a fallback session ID
-        (base-{uuid[:6]}) when the original session_id already exists, so
-        retries never clash with the previous run.
+        live retries reuse the original session_id so the same session can be
+        resumed; replay still creates a fallback session ID (base-{uuid[:6]})
+        when the original session_id already exists.
         """
         if not retry_on_early_exit:
             try:
@@ -1102,6 +1137,7 @@ async def _cmd_daily_live_multi(args: argparse.Namespace) -> None:
     if suppress_alerts:
         set_alerts_suppressed(True)
 
+    preserve_open_positions_on_restart = not bool(getattr(args, "complete_on_exit", False))
     live_kwargs = {
         "poll_interval_sec": getattr(args, "poll_interval_sec", None),
         "candle_interval_minutes": getattr(args, "candle_interval_minutes", None),
@@ -1152,6 +1188,7 @@ async def _cmd_daily_live_multi(args: argparse.Namespace) -> None:
             candle_interval_minutes=live_kwargs.get("candle_interval_minutes"),
             max_cycles=live_kwargs.get("max_cycles"),
             complete_on_exit=bool(live_kwargs.get("complete_on_exit")),
+            auto_flatten_on_abnormal_exit=not preserve_open_positions_on_restart,
             allow_late_start_fallback=bool(live_kwargs.get("allow_late_start_fallback", False)),
             notes=args.notes,
         )
@@ -1166,6 +1203,7 @@ async def _cmd_daily_live_multi(args: argparse.Namespace) -> None:
             retry_on_early_exit=not bool(getattr(args, "complete_on_exit", False)),
         )
     finally:
+        _cleanup_feed_audit_retention(command_name="daily-live --multi")
         shared_ticker.close()
         if suppress_alerts:
             set_alerts_suppressed(False)
@@ -1274,6 +1312,7 @@ async def _cmd_daily_replay_multi(args: argparse.Namespace) -> None:
             execute_variant=_execute_variant,
         )
     finally:
+        _cleanup_feed_audit_retention(command_name="daily-replay --multi")
         if suppress_alerts:
             set_alerts_suppressed(False)
 
@@ -1463,11 +1502,23 @@ async def _cmd_status(args: argparse.Namespace) -> None:
 
 async def _cmd_pause(args: argparse.Namespace) -> None:
     session = _pdb().update_session(args.session_id, status="PAUSED", notes=args.notes)
+    if session is not None:
+        dispatch_session_state_alert(
+            session_id=args.session_id,
+            state="PAUSED",
+            details=args.notes,
+        )
     print(json.dumps(asdict(session), default=str, indent=2) if session else "{}")
 
 
 async def _cmd_resume(args: argparse.Namespace) -> None:
     session = _pdb().update_session(args.session_id, status="ACTIVE", notes=args.notes)
+    if session is not None:
+        dispatch_session_state_alert(
+            session_id=args.session_id,
+            state="RESUMED",
+            details=args.notes,
+        )
     print(json.dumps(asdict(session), default=str, indent=2) if session else "{}")
 
 

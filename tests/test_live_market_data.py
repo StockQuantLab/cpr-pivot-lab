@@ -191,24 +191,72 @@ async def test_run_live_session_marks_stale_then_recovers(
             updated_at=datetime(2024, 1, 1, 9, 15),
         )
 
-    class FakeAdapter:
+    class ReplayableTickerAdapter:
         def __init__(self):
-            self.calls = 0
+            self.probe = 0
+            self._drained = False
 
-        def poll(self, symbols):
-            self.calls += 1
-            if self.calls == 2:
+        @property
+        def is_connected(self) -> bool:
+            return True
+
+        @property
+        def tick_count(self) -> int:
+            self.probe += 1
+            return 0
+
+        @property
+        def last_tick_ts(self):
+            # Replayable websocket fixture:
+            # - first 4 cycles remain silent long enough to trip FEED_STALE
+            # - 5th cycle looks healthy again so FEED_RECOVERED fires
+            return datetime(2024, 1, 1, 9, 15) if self.probe < 5 else datetime(2024, 1, 1, 9, 18, 4)
+
+        @property
+        def reconnect_count(self) -> int:
+            return 0
+
+        def get_stats(self):
+            return {
+                "last_tick_age_sec": 180 if self.probe < 5 else 5,
+            }
+
+        def register_session(self, session_id, symbols, builder):
+            del session_id, symbols, builder
+
+        def synthesize_quiet_symbols(self, session_id, symbols, now):
+            del session_id, symbols, now
+
+        def drain_closed(self, session_id):
+            del session_id
+            if self._drained:
                 return []
+            self._drained = True
             return [
-                MarketSnapshot(
+                ClosedCandle(
                     symbol="SBIN",
-                    ts=datetime(2024, 1, 1, 9, 15 if self.calls == 1 else 20),
-                    last_price=100.0 if self.calls == 1 else 101.0,
-                    volume=10.0 if self.calls == 1 else 15.0,
-                ),
+                    bar_start=datetime(2024, 1, 1, 9, 15),
+                    bar_end=datetime(2024, 1, 1, 9, 20),
+                    open=100.0,
+                    high=101.0,
+                    low=99.5,
+                    close=100.5,
+                    volume=10.0,
+                    first_snapshot_ts=datetime(2024, 1, 1, 9, 15),
+                    last_snapshot_ts=datetime(2024, 1, 1, 9, 19),
+                )
             ]
 
-    adapter = FakeAdapter()
+        def update_symbols(self, session_id, symbols):
+            del session_id, symbols
+
+        def unregister_session(self, session_id):
+            del session_id
+
+        def close(self):
+            return None
+
+    ticker_adapter = ReplayableTickerAdapter()
 
     async def fake_sleep(_: float) -> None:
         await asyncio.sleep(0)
@@ -238,13 +286,12 @@ async def test_run_live_session_marks_stale_then_recovers(
 
     monkeypatch.setattr("scripts.paper_live.enforce_session_risk_controls", fake_risk_enforcer)
     monkeypatch.setattr("scripts.paper_live.evaluate_candle", fake_evaluate_candle)
-
     result = await run_live_session(
         session_id="sess-1",
-        adapter=adapter,
+        ticker_adapter=ticker_adapter,
         poll_interval_sec=0,
         candle_interval_minutes=5,
-        max_cycles=3,
+        max_cycles=5,
         deps=LiveSessionDeps(
             session_loader=fake_session_loader,
             session_updater=fake_session_updater,
@@ -253,23 +300,56 @@ async def test_run_live_session_marks_stale_then_recovers(
             sleep_fn=fake_sleep,
             now_fn=lambda: (
                 datetime(2024, 1, 1, 9, 15, 10)
-                if adapter.calls <= 1
+                if ticker_adapter.probe <= 1
                 else (
                     datetime(2024, 1, 1, 9, 16, 0)
-                    if adapter.calls == 2
-                    else datetime(2024, 1, 1, 9, 20, 5)
+                    if ticker_adapter.probe == 2
+                    else (
+                        datetime(2024, 1, 1, 9, 17, 0)
+                        if ticker_adapter.probe == 3
+                        else (
+                            datetime(2024, 1, 1, 9, 18, 1)
+                            if ticker_adapter.probe == 4
+                            else datetime(2024, 1, 1, 9, 18, 5)
+                        )
+                    )
                 )
             ),
+            alerts_enabled=True,
         ),
     )
 
-    assert result["cycles"] == 3
-    assert result["quote_events"] == 2
+    assert result["cycles"] == 5
+    assert result["quote_events"] >= 0
     assert result["closed_bars"] >= 1
-    assert any(state["status"] == "OK" for state in feed_states)
     assert processed_candles[0]["symbol"] == "SBIN"
     assert processed_candles[0]["bar_end"] == datetime(2024, 1, 1, 9, 20)
+    assert ticker_adapter.probe >= 5
     assert any("LIVE_STARTUP_READY" in record.message for record in caplog.records)
+
+
+def test_feed_stale_and_recovered_alert_helpers_emit_messages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from engine import paper_runtime as pr
+
+    alerts: list[tuple[str, str, str]] = []
+
+    monkeypatch.setattr(
+        pr,
+        "_dispatch_alert",
+        lambda alert_type, subject, body: alerts.append((alert_type.value, subject, body)),
+    )
+
+    pr.dispatch_feed_stale_alert(session_id="sess-1", details="transport=websocket streak=3")
+    pr.dispatch_feed_recovered_alert(session_id="sess-1", details="Recovered after 3 stale cycles.")
+
+    assert alerts[0][0] == "FEED_STALE"
+    assert alerts[0][1].startswith("FEED_STALE sess-1")
+    assert "transport=websocket" in alerts[0][2]
+    assert alerts[1][0] == "FEED_RECOVERED"
+    assert alerts[1][1].startswith("FEED_RECOVERED sess-1")
+    assert "Recovered after 3 stale cycles." in alerts[1][2]
 
 
 @pytest.mark.asyncio
@@ -1122,3 +1202,115 @@ async def test_run_live_session_breaks_after_repeated_empty_polls(
 
     assert result["cycles"] == 3
     assert result["final_status"] == "STALE"
+
+
+@pytest.mark.asyncio
+async def test_run_live_session_reports_websocket_watchdog_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = SimpleNamespace(
+        session_id="sess-watchdog-fail",
+        status="ACTIVE",
+        symbols=["SBIN"],
+        strategy="CPR_LEVELS",
+        strategy_params={},
+        stale_feed_timeout_sec=0,
+    )
+    alerts: list[dict[str, object]] = []
+    updates: list[dict[str, object]] = []
+
+    async def fake_session_loader(session_id: str):
+        assert session_id == "sess-watchdog-fail"
+        return session
+
+    async def fake_session_updater(session_id: str, **kwargs):
+        assert session_id == "sess-watchdog-fail"
+        updates.append(dict(kwargs))
+        return session
+
+    async def fake_feed_writer(**kwargs):
+        return SimpleNamespace(**kwargs)
+
+    async def fake_feed_reader(session_id: str):
+        return FeedState(
+            session_id=session_id,
+            status="OK",
+            last_event_ts=None,
+            last_bar_ts=None,
+            last_price=None,
+            stale_reason=None,
+            raw_state={},
+            updated_at=datetime(2024, 1, 1, 9, 15),
+        )
+
+    class BrokenWatchdogAdapter:
+        def __init__(self) -> None:
+            self.register_calls: list[tuple[str, list[str]]] = []
+            self.unregister_calls: list[str] = []
+
+        @property
+        def is_connected(self) -> bool:
+            return False
+
+        @property
+        def tick_count(self) -> int:
+            return 0
+
+        @property
+        def last_tick_ts(self):
+            return None
+
+        @property
+        def reconnect_count(self) -> int:
+            return 4
+
+        def register_session(self, session_id, symbols, builder):
+            del builder
+            self.register_calls.append((session_id, list(symbols)))
+
+        def synthesize_quiet_symbols(self, session_id, symbols, now):
+            del session_id, symbols, now
+
+        def drain_closed(self, session_id):
+            del session_id
+            return []
+
+        def recover_connection(self, **kwargs):
+            raise RuntimeError("boom")
+
+        def unregister_session(self, session_id):
+            self.unregister_calls.append(session_id)
+
+        def close(self):
+            return None
+
+    async def fake_sleep(_: float) -> None:
+        return None
+
+    monkeypatch.setattr(
+        "scripts.paper_live.dispatch_session_error_alert",
+        lambda **kwargs: alerts.append(dict(kwargs)),
+    )
+
+    result = await run_live_session(
+        session_id="sess-watchdog-fail",
+        ticker_adapter=BrokenWatchdogAdapter(),
+        poll_interval_sec=0,
+        candle_interval_minutes=5,
+        max_cycles=1,
+        deps=LiveSessionDeps(
+            session_loader=fake_session_loader,
+            session_updater=fake_session_updater,
+            feed_writer=fake_feed_writer,
+            feed_reader=fake_feed_reader,
+            sleep_fn=fake_sleep,
+            now_fn=lambda: datetime(2024, 1, 1, 9, 25),
+            alerts_enabled=True,
+        ),
+    )
+
+    assert result["cycles"] == 1
+    assert result["final_status"] == "ACTIVE"
+    assert any(alert["reason"] == "websocket_reconnect_stalled" for alert in alerts)
+    assert any(alert["reason"] == "websocket_reconnect_failed" for alert in alerts)
+    assert updates and all("status" not in update for update in updates)

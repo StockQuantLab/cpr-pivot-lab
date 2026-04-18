@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import Field
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy.engine import URL
 
@@ -45,6 +45,13 @@ class Settings(BaseSettings):
     paper_live_poll_interval_sec: float = Field(default=1.0)
     paper_candle_interval_minutes: int = Field(default=5)
     paper_live_quote_batch_size: int = Field(default=500)
+    feed_audit_retention_days: int = Field(
+        default=7,
+        validation_alias=AliasChoices(
+            "feed_audit_retention_days",
+            "paper_feed_audit_retention_days",
+        ),
+    )
 
     # Telegram alerts (optional — Doppler: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_IDS)
     telegram_bot_token: str | None = Field(default=None)

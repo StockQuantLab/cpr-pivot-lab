@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pytest import MonkeyPatch
 from sqlalchemy.engine import URL
 
 from config.settings import Settings
@@ -70,6 +71,15 @@ def test_paper_trading_settings_defaults_are_present() -> None:
     assert settings.paper_live_poll_interval_sec == 1.0
     assert settings.paper_candle_interval_minutes == 5
     assert settings.paper_live_quote_batch_size == 500
+    assert settings.feed_audit_retention_days == 7
+
+
+def test_feed_audit_retention_alias_accepts_legacy_env(monkeypatch: MonkeyPatch) -> None:
+    monkeypatch.setenv("PAPER_FEED_AUDIT_RETENTION_DAYS", "14")
+
+    settings = Settings()
+
+    assert settings.feed_audit_retention_days == 14
 
 
 def test_settings_redact_sensitive_values_in_safe_dict() -> None:
