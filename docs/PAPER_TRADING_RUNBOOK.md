@@ -25,6 +25,8 @@ execution rules; none of them is exempt from parity.
 - `daily-replay` and `daily-live` use the same shared `StrategyConfig` defaults as backtest.
 - Paper does **not** inject extra paper-only strategy defaults.
 - If you want a paper run to match a specific backtest run, pass the same explicit flags or JSON overrides.
+- Default rule: every canonical backtest, replay, live, or paper run must start from a named preset.
+  Use hand-spelled flags only for ad hoc analysis, hypothesis testing, or deliberate override validation.
 - Prefer named presets such as `CPR_LEVELS_RISK_LONG` and `CPR_LEVELS_RISK_SHORT` instead of hand-spelling the full flag bundle.
 - Live finalization is defensive: final flush is guarded, abnormal exits auto-flatten, and a
   `SESSION_ERROR` alert is emitted if terminal cleanup fails. A clean shutdown still requires
@@ -383,7 +385,8 @@ Keep `--all-symbols` for daily-live; use the signal scan for situational awarene
 
 ### 2a. Live paper trading - primary sessions (current trading day)
 
-Use the canonical CPR preset bundle by default. `--all-symbols` scans the full universe;
+Use the canonical CPR preset bundle by default. Start from a named preset for every canonical run;
+only use explicit flags when you are intentionally doing ad hoc analysis. `--all-symbols` scans the full universe;
 the Kite adapter batches 500 symbols per API call so 2106 symbols = 5 calls per poll,
 well within rate limits. `max_positions=10` caps concurrent open trades, not total trades per day.
 
