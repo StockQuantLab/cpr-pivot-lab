@@ -703,9 +703,21 @@ async def _cmd_daily_live_resume(args: argparse.Namespace) -> None:
     Loads open positions directly from DB — no pre-filter, no fresh session.
     run_live_session() seeds open + closed positions and updates status to ACTIVE.
     """
-    session_id = args.session_id
-    if not session_id:
-        raise SystemExit("--resume requires --session-id <session_id>")
+    trade_date = resolve_trade_date(getattr(args, "trade_date", None))
+    strategy = _assert_cpr_only_strategy(
+        getattr(args, "strategy", None) or _paper_default_strategy(get_settings()),
+        source="strategy",
+    )
+    strategy_params = _resolve_paper_strategy_params(
+        strategy, getattr(args, "strategy_params", None), args
+    )
+    session_id = args.session_id or _default_session_id(
+        "paper",
+        trade_date,
+        strategy,
+        strategy_params,
+        "live",
+    )
 
     session = await get_session(session_id)
     if session is None:
@@ -1897,7 +1909,10 @@ def build_parser() -> argparse.ArgumentParser:
     pause.add_argument("--notes", default=None, help="Optional free-text annotation")
     pause.set_defaults(handler=_cmd_pause)
 
-    resume = sub.add_parser("resume", help="Resume a paused session")
+    resume = sub.add_parser(
+        "resume",
+        help="Mark a paused session ACTIVE in DB (DB-only; does not restart the live loop)",
+    )
     resume.add_argument("--session-id", required=True, help="Session to resume")
     resume.add_argument("--notes", default=None, help="Optional free-text annotation")
     resume.set_defaults(handler=_cmd_resume)
@@ -2069,9 +2084,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--resume",
         action="store_true",
         help=(
-            "Resume a stale/stopped session by --session-id. "
-            "Loads open positions from DB and monitors them to EOD. "
-            "No new entries. Skips pre-filter and session creation."
+            "Resume a stale/stopped session. When --session-id is omitted, the "
+            "deterministic preset-based session_id is inferred from "
+            "--strategy/--preset and --trade-date. Loads open positions from DB "
+            "and monitors them to EOD. No new entries. Skips pre-filter and "
+            "session creation."
         ),
     )
     _add_live_args(daily_live)

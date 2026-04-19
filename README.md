@@ -9,6 +9,10 @@ Current production strategy set:
 
 Strategy rules, defaults, and parameter examples live in [STRATEGY.md](STRATEGY.md).
 
+Default operating rule: use a named preset for every canonical backtest, replay, live, or paper
+run. Only spell out explicit flags for ad hoc analysis, hypothesis testing, or deliberate
+override validation.
+
 **Stack:** DuckDB + Parquet, PostgreSQL (sessions/signals), NiceGUI, Phidata + Ollama.
 
 ## Quick Setup
@@ -60,6 +64,9 @@ doppler run -- uv run pivot-backtest --universe-name gold_51 --strategy CPR_LEVE
 doppler run -- uv run pivot-backtest --symbol RELIANCE --strategy CPR_LEVELS --direction LONG --start 2025-01-01 --end 2026-03-09 --save
 doppler run -- uv run pivot-backtest --symbol RELIANCE --strategy CPR_LEVELS --direction SHORT --start 2025-01-01 --end 2026-03-31 --save
 ```
+
+When you are creating or extending a baseline, prefer the named preset path over hand-spelled
+flags. That keeps backtest, replay, and live parity tied to one canonical config bundle.
 
 ### 5) Canonical rerun recipe
 
@@ -146,6 +153,10 @@ Paper trading IS the validation. See `docs/PAPER_TRADING_RUNBOOK.md` for the ful
 When you compare a specific paper run to a backtest baseline, use the same explicit strategy flags
 and sizing override. `--risk-based-sizing` must be present on both sides if that baseline used it;
 otherwise leave it off.
+
+For canonical runs, prefer named presets such as `CPR_LEVELS_RISK_LONG` and
+`CPR_LEVELS_RISK_SHORT` instead of spelling out the full flag bundle. Reserve explicit flags for
+ad hoc analysis only.
 
 Before validation, make sure `KITE_ACCESS_TOKEN` is current in Doppler, then refresh local market
 data from Kite into this repo's parquet files. The step-by-step ingestion runbook is in

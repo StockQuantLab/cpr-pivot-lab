@@ -427,7 +427,6 @@ async def test_ensure_daily_session_reuses_existing_live_session(
     assert calls == ["paper-live-1"]
 
 
-@pytest.mark.asyncio
 async def test_ensure_daily_session_creates_fallback_for_replay_collisions(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -531,6 +530,69 @@ async def test_cmd_daily_live_resume_reuses_same_session_id(
     assert calls["run"]["auto_flatten_on_abnormal_exit"] is False
     assert alerts and alerts[0]["state"] == "RESUMED"
     assert alerts[0]["session_id"] == "paper-live-1"
+
+
+@pytest.mark.asyncio
+async def test_cmd_daily_live_resume_infers_session_id_from_preset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import scripts.paper_trading as pt
+
+    session = SimpleNamespace(
+        session_id="paper-cpr_levels-short-2024-01-03-live",
+        status="FAILED",
+        strategy="CPR_LEVELS",
+    )
+    open_positions = [SimpleNamespace(symbol="SBIN")]
+    calls: dict[str, object] = {}
+
+    async def fake_get_session(session_id: str):
+        calls["get_session"] = session_id
+        return session
+
+    async def fake_get_session_positions(session_id: str, statuses=None, symbol=None):
+        calls["get_positions"] = {
+            "session_id": session_id,
+            "statuses": list(statuses or []),
+            "symbol": symbol,
+        }
+        return open_positions
+
+    async def fake_run_live_session(**kwargs):
+        calls["run"] = kwargs
+        return {"status": "LIVE"}
+
+    monkeypatch.setattr(pt, "get_session", fake_get_session)
+    monkeypatch.setattr(pt, "get_session_positions", fake_get_session_positions)
+    monkeypatch.setattr(pt, "run_live_session", fake_run_live_session)
+    monkeypatch.setattr(pt, "dispatch_session_state_alert", lambda **kwargs: None)
+
+    await pt._cmd_daily_live_resume(
+        SimpleNamespace(
+            session_id=None,
+            trade_date="2024-01-03",
+            strategy="CPR_LEVELS",
+            preset="CPR_LEVELS_RISK_SHORT",
+            strategy_params=None,
+            poll_interval_sec=1.5,
+            candle_interval_minutes=5,
+            max_cycles=9,
+            complete_on_exit=False,
+            no_alerts=True,
+        )
+    )
+
+    assert calls["get_session"] == "paper-cpr_levels-short-2024-01-03-live"
+    assert calls["get_positions"] == {
+        "session_id": "paper-cpr_levels-short-2024-01-03-live",
+        "statuses": ["OPEN"],
+        "symbol": None,
+    }
+    assert calls["run"]["session_id"] == "paper-cpr_levels-short-2024-01-03-live"
+    assert calls["run"]["symbols"] == ["SBIN"]
+    assert calls["run"]["poll_interval_sec"] == 1.5
+    assert calls["run"]["candle_interval_minutes"] == 5
+    assert calls["run"]["max_cycles"] == 9
 
 
 @pytest.mark.asyncio

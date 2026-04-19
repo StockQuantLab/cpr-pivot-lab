@@ -639,6 +639,10 @@ date. All tables must be current through yesterday before the session starts.
 loads open and closed positions from DB, seeds re-entry guards, and manages positions to EOD
 without requiring a new session.
 
+If the session was started from a canonical named preset, `daily-live --resume` can also infer
+the deterministic session id from `--strategy`/`--preset` and `--trade-date` when
+`--session-id` is omitted.
+
 The `pause` and `resume` commands below are low-level DB operations that change session
 status and feed state directly. They do not restart the live session loop or reconnect the
 WebSocket. Use them only when you need to manipulate DB state manually (e.g. to reset a
