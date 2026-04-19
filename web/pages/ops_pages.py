@@ -267,6 +267,7 @@ def _render_live_paper_sessions(active_sessions: list[dict], colors: dict) -> No
         summary = payload.get("summary") or {}
         session_id = str(getattr(session, "session_id", ""))
         name = getattr(session, "name", None) or session_id[:8]
+        session_mode = str(getattr(session, "mode", "") or "replay").upper()
         # Extract direction from session_id for sessions that pre-date the name fix
         # Session IDs follow patterns: CPR_LEVELS_LONG-2026-04-01-xxx, paper-cpr_levels-short-...
         sid_upper = session_id.upper()
@@ -281,6 +282,7 @@ def _render_live_paper_sessions(active_sessions: list[dict], colors: dict) -> No
         label = (
             f"{name} · "
             f"{getattr(session, 'strategy', '')} · "
+            f"{session_mode} · "
             f"{summary.get('status') or getattr(session, 'status', '')}"
         )
         labels.append(label)
