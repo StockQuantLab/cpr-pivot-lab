@@ -274,7 +274,7 @@ def _format_risk_alert(
     else:
         subject = "📊 EOD Summary"
     body = (
-        f"Session: <code>{session_id[:16]}</code>\n"
+        f"Session: <code>{session_id}</code>\n"
         f"Net P&L: <code>{net_pnl:+,.2f}</code> {pnl_emoji}\n"
         f"Trades closed: {total_trades if total_trades is not None else positions_closed}"
     )
@@ -1364,7 +1364,7 @@ async def flatten_session_positions(
                 _db()
                 .con.execute(
                     "SELECT COUNT(*) FROM alert_log WHERE alert_type = 'FLATTEN_EOD' AND body LIKE ?",
-                    [f"%{str(session_id)[:24]}%"],
+                    [f"%{str(session_id)}%"],
                 )
                 .fetchone()[0]
             )

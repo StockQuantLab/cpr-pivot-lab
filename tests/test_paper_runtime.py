@@ -609,7 +609,10 @@ async def test_pending_setup_rows_refresh_once_per_bar(
         "engine.paper_runtime.get_dashboard_db",
         lambda: SimpleNamespace(con=FakeCon()),
     )
-    monkeypatch.setattr("engine.paper_runtime.load_setup_row", lambda *args, **kwargs: pytest.fail("load_setup_row should not run after batch refresh"))
+    monkeypatch.setattr(
+        "engine.paper_runtime.load_setup_row",
+        lambda *args, **kwargs: pytest.fail("load_setup_row should not run after batch refresh"),
+    )
     monkeypatch.setattr("engine.paper_runtime._maybe_open_cpr_levels", lambda **kwargs: None)
 
     candle = _make_candle(
@@ -1282,5 +1285,106 @@ async def test_flatten_session_positions_uses_ist_closed_at_and_dispatches_per_t
     # exactly one FLATTEN_EOD summary at the end
     eod = [d for d in dispatched if d[0] == AlertType.FLATTEN_EOD]
     assert len(eod) == 1, f"expected 1 FLATTEN_EOD alert, got {len(eod)}"
+
+    assert result["closed_positions"] == 1
+
+
+@pytest.mark.asyncio
+async def test_flatten_session_positions_eod_dedup_uses_full_session_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from engine.paper_runtime import (
+        flatten_session_positions,
+        set_alert_sink,
+        set_alerts_suppressed,
+    )
+
+    session_id = "CPR_LEVELS_SHORT-2026-04-13-RESUME-001"
+    session = SimpleNamespace(
+        session_id=session_id,
+        strategy="CPR_LEVELS",
+        strategy_params={},
+        max_positions=10,
+        max_daily_loss_pct=0.0,
+        max_position_pct=0.1,
+        portfolio_value=1_000_000.0,
+        trade_date="2026-04-13",
+    )
+    open_position = SimpleNamespace(
+        position_id="pos-1",
+        session_id=session_id,
+        symbol="SUKHJITS",
+        direction="SHORT",
+        status="OPEN",
+        entry_price=175.90,
+        current_qty=568.0,
+        quantity=568.0,
+        stop_loss=180.0,
+        target_price=165.0,
+        last_price=176.34,
+        trail_state={},
+        realized_pnl=None,
+        opened_by="CPR_LEVELS",
+    )
+
+    execute_calls: list[tuple[str, list[object]]] = []
+
+    async def fake_get_session(session_id_arg: str):
+        assert session_id_arg == session_id
+        return session
+
+    async def fake_get_session_positions(session_id_arg: str, *, symbol=None, statuses=None):
+        assert session_id_arg == session_id
+        if statuses == ["OPEN"]:
+            return [open_position]
+        return []
+
+    async def fake_append_order_event(**kwargs):
+        return SimpleNamespace(**kwargs)
+
+    async def fake_update_position(position_id: str, **kwargs):
+        return None
+
+    async def fake_update_session_state(session_id_arg: str, **kwargs):
+        assert session_id_arg == session_id
+        return session
+
+    class _FakeCon:
+        def execute(self, sql: str, params: list[object]):
+            execute_calls.append((sql, list(params)))
+            if "FROM alert_log" in sql:
+                return SimpleNamespace(fetchone=lambda: (0,))
+            return SimpleNamespace(fetchone=lambda: None)
+
+    class _FakeDB:
+        con = _FakeCon()
+
+    monkeypatch.setattr("engine.paper_runtime.get_session", fake_get_session)
+    monkeypatch.setattr("engine.paper_runtime.get_session_positions", fake_get_session_positions)
+    monkeypatch.setattr("engine.paper_runtime.append_order_event", fake_append_order_event)
+    monkeypatch.setattr("engine.paper_runtime.update_position", fake_update_position)
+    monkeypatch.setattr("engine.paper_runtime.update_session_state", fake_update_session_state)
+    monkeypatch.setattr("engine.paper_runtime._db", lambda: _FakeDB())
+
+    dispatched: list[tuple] = []
+    set_alerts_suppressed(False)
+    set_alert_sink(lambda t, s, b: dispatched.append((t, s, b)))
+    try:
+        result = await flatten_session_positions(
+            session_id,
+            notes="eod",
+            feed_state=SimpleNamespace(raw_state={"symbol_last_prices": {"SUKHJITS": 176.34}}),
+        )
+    finally:
+        set_alert_sink(None)
+        set_alerts_suppressed(False)
+
+    eod_calls = [entry for entry in execute_calls if "FROM alert_log" in entry[0]]
+    assert len(eod_calls) == 1
+    assert eod_calls[0][1] == [f"%{session_id}%"]
+
+    eod_alerts = [d for d in dispatched if d[0].value == "FLATTEN_EOD"]
+    assert len(eod_alerts) == 1
+    assert session_id in eod_alerts[0][2]
 
     assert result["closed_positions"] == 1
