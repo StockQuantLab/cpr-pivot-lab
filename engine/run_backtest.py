@@ -371,6 +371,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="ATR multiplier for noise buffer below/above OR extreme (default 0.0)",
     )
     parser.add_argument(
+        "--trail-atr-multiplier",
+        type=float,
+        default=None,
+        help="LONG trailing-stop ATR multiplier once TRAIL begins (default: preset/default config)",
+    )
+    parser.add_argument(
+        "--short-trail-atr-multiplier",
+        type=float,
+        default=None,
+        help=(
+            "SHORT trailing-stop ATR multiplier once TRAIL begins (default: preset/default config)"
+        ),
+    )
+    parser.add_argument(
         "--time-exit",
         default="15:15",
         help="Time to close all positions HH:MM (default 15:15). Use 12:00 for mid-day kill.",
@@ -800,6 +814,10 @@ def _run_with_lock(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
             "use_narrowing_filter": args.narrowing_filter,
         },
     }
+    if args.trail_atr_multiplier is not None:
+        strategy_overrides["trail_atr_multiplier"] = args.trail_atr_multiplier
+    if args.short_trail_atr_multiplier is not None:
+        strategy_overrides["short_trail_atr_multiplier"] = args.short_trail_atr_multiplier
     if args.preset:
         # When using a preset, pass only infrastructure fields plus strategy flags that were
         # explicitly set.  Passing the full strategy_overrides dict would silently override
@@ -827,6 +845,10 @@ def _run_with_lock(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
             preset_cli_overrides["min_price"] = args.min_price
         if args.direction != "BOTH":
             preset_cli_overrides["direction_filter"] = args.direction
+        if args.trail_atr_multiplier is not None:
+            preset_cli_overrides["trail_atr_multiplier"] = args.trail_atr_multiplier
+        if args.short_trail_atr_multiplier is not None:
+            preset_cli_overrides["short_trail_atr_multiplier"] = args.short_trail_atr_multiplier
         params = build_strategy_config_from_preset(args.preset, preset_cli_overrides)
     else:
         params = build_strategy_config_from_overrides(args.strategy, strategy_overrides)

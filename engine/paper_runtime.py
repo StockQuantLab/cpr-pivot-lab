@@ -1589,6 +1589,11 @@ async def _open_position_from_candidate(
             "initial_sl": float(candidate["sl_price"]),
             "current_sl": float(candidate["sl_price"]),
             "atr": float(setup_row["atr"]),
+            "trail_atr_multiplier": float(
+                params.short_trail_atr_multiplier
+                if str(candidate["direction"]).upper() == "SHORT"
+                else params.trail_atr_multiplier
+            ),
             "rr_ratio": float(candidate["rr_ratio"]),
             "breakeven_r": float(params.breakeven_r),
             "phase": "PROTECT",
@@ -1695,6 +1700,7 @@ async def _advance_open_position(
         # collapses sl_distance after breakeven and causes premature TRAIL transitions.
         sl_price=float(initial_sl),
         atr=float(trail_state.get("atr") or 0.0),
+        trail_atr_multiplier=float(trail_state.get("trail_atr_multiplier") or 1.0),
         rr_ratio=float(trail_state.get("rr_ratio") or params.rr_ratio),
         breakeven_r=float(trail_state.get("breakeven_r") or params.breakeven_r),
     )
@@ -1706,7 +1712,7 @@ async def _advance_open_position(
     candle_count = int(trail_state.get("candle_count") or 0) + 1
 
     mark_price = float(candle["close"])
-    ts.update(mark_price)
+    ts.update(mark_price, candle_high=float(candle["high"]), candle_low=float(candle["low"]))
     next_trail_state = _updated_trail_state(ts, trail_state, candle)
     next_trail_state["candle_count"] = candle_count
     direction = position.direction.upper()

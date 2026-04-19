@@ -35,10 +35,15 @@ class TrailingStop:
     Usage:
         ts = TrailingStop(entry_price=520.0, direction="LONG", sl_price=515.0, atr=3.5)
         for candle in candles:
-            ts.update(candle["close"])
+            ts.update(candle["close"], candle_high=candle["high"], candle_low=candle["low"])
             if ts.is_hit(candle["low"], candle["high"]):
                 exit_price = ts.current_sl
                 break
+
+    Note on SL deferral: TRAIL phase activation (whether via candle close or intraday
+    high/low) always defers SL tightening to the *next* bar. This avoids same-bar
+    ambiguity — OHLC order within a 5-min candle is unknown, so applying a tighter
+    stop on the activation bar itself would be an optimistic modeling assumption.
     """
 
     def __init__(
@@ -47,12 +52,14 @@ class TrailingStop:
         direction: str,  # "LONG" or "SHORT"
         sl_price: float,
         atr: float,
+        trail_atr_multiplier: float = 1.0,
         rr_ratio: float = 2.0,
         breakeven_r: float = 1.0,
     ):
         self.entry_price = entry_price
         self.direction = direction.upper()
         self.atr = atr
+        self.trail_atr_multiplier = trail_atr_multiplier
         self.initial_sl = sl_price
         self.current_sl = sl_price
 
@@ -69,41 +76,77 @@ class TrailingStop:
         self.highest_since_entry = entry_price
         self.lowest_since_entry = entry_price
 
-    def update(self, current_price: float) -> dict:
+    def update(
+        self,
+        current_price: float,
+        candle_high: float | None = None,
+        candle_low: float | None = None,
+    ) -> dict:
         """
         Update state based on current candle close price.
+
+        Args:
+            current_price: Candle close price (used for all phase tracking).
+            candle_high: Candle high — when provided, also used to trigger the
+                BREAKEVEN→TRAIL transition for LONG positions so that intraday
+                peaks activate trailing even if the close does not reach 2R.
+                SL tightening is deferred to the next bar when triggered only
+                by the intraday high (same-bar ambiguity avoidance).
+            candle_low: Candle low — mirror of candle_high for SHORT positions.
 
         Returns: {"sl": float, "phase": str}
         """
         if self.direction == "LONG":
+            # highest_since_entry tracks closes only; SL is computed from this anchor.
+            # Note: using closes (not highs) is intentional and conservative — it keeps
+            # the trailing reference tighter, which benefits LONG continuation trades but
+            # can cause SHORT trailing exits to clip below the original fixed target when
+            # the post-2R SHORT move is weak. The trade-off is accepted to avoid over-fit.
             self.highest_since_entry = max(self.highest_since_entry, current_price)
+
+            # BREAKEVEN→TRAIL trigger considers intraday high so that a bar whose
+            # high reaches 2R (but close does not) still activates the trail phase.
+            trail_trigger = (
+                max(current_price, candle_high) if candle_high is not None else current_price
+            )
 
             if self.phase == "PROTECT" and current_price >= self.breakeven_level:
                 self.current_sl = self.entry_price
                 self.phase = "BREAKEVEN"
 
-            elif self.phase == "BREAKEVEN" and current_price >= self.target_price:
-                self.current_sl = max(self.current_sl, self.highest_since_entry - self.atr)
+            # Separate (not elif) so PROTECT→BREAKEVEN and BREAKEVEN→TRAIL can both
+            # fire on the same bar when a single candle crosses both thresholds.
+            if self.phase == "BREAKEVEN" and trail_trigger >= self.target_price:
+                # SL tightening is always deferred to the next bar — whether TRAIL was
+                # triggered by the candle close or the intraday high. The OHLC order
+                # inside a 5-min bar is unknown, so tightening on the activation bar
+                # itself would be optimistic: a candle that closes through 2R can also
+                # have traded back through the new stop within the same bar.
+                # The TRAIL branch on the next update() call tightens correctly.
                 self.phase = "TRAIL"
 
             elif self.phase == "TRAIL":
-                new_sl = self.highest_since_entry - self.atr
+                new_sl = self.highest_since_entry - (self.atr * self.trail_atr_multiplier)
                 if new_sl > self.current_sl:
                     self.current_sl = new_sl
 
         else:  # SHORT
             self.lowest_since_entry = min(self.lowest_since_entry, current_price)
 
+            trail_trigger = (
+                min(current_price, candle_low) if candle_low is not None else current_price
+            )
+
             if self.phase == "PROTECT" and current_price <= self.breakeven_level:
                 self.current_sl = self.entry_price
                 self.phase = "BREAKEVEN"
 
-            elif self.phase == "BREAKEVEN" and current_price <= self.target_price:
-                self.current_sl = min(self.current_sl, self.lowest_since_entry + self.atr)
+            if self.phase == "BREAKEVEN" and trail_trigger <= self.target_price:
+                # Same deferred-SL logic as LONG: tightening happens on the next bar.
                 self.phase = "TRAIL"
 
             elif self.phase == "TRAIL":
-                new_sl = self.lowest_since_entry + self.atr
+                new_sl = self.lowest_since_entry + (self.atr * self.trail_atr_multiplier)
                 if new_sl < self.current_sl:
                     self.current_sl = new_sl
 

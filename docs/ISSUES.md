@@ -589,7 +589,7 @@ This avoids the premature flatten + useless empty-session restart pattern.
 
 ## 2026-04-17 — Dashboard P&L does not match Telegram EOD summary
 
-**Status:** FIXED (2026-04-17)
+**Status:** OPEN (proposed fix documented; not yet implemented in code)
 **Severity:** Medium — creates confusion about actual daily P&L
 
 ### Symptom
@@ -624,7 +624,7 @@ total.
 
 ## 2026-04-17 — Breakeven exits leaking unrealized profit (strategy observation)
 
-**Status:** OPEN (strategy tuning)
+**Status:** FIXED (2026-04-28) — intraday high now triggers TRAIL activation
 **Severity:** Low — not a bug; expected behavior but suboptimal P&L capture
 
 ### Symptom
@@ -636,24 +636,86 @@ and exited at ~₹-83 (commission only). Dashboard appeared to show large P&L sw
 Examples from 2026-04-17: CHEMCON, COSMOFIRST, ASHIANA, DIGITIDE, SBILIFE all
 hit 1R, were seen running in profit, then exited BREAKEVEN_SL at ~₹-83.
 
-### Root Cause (Design)
-`breakeven_r=1.0` is the correct move-to-breakeven trigger. The issue is that after
-moving to breakeven, the trailing phase (`trail_atr_mult`) doesn't engage until
-further price progress — leaving a gap between "move to BE" and "start trailing"
-where the trade can reverse all the way back to entry.
+### Root Cause (Fixed)
+`TrailingStop.update()` only checked the candle CLOSE to trigger BREAKEVEN→TRAIL
+transition. A candle whose HIGH reaches 2R (trail target) but whose CLOSE stays below
+2R never activated trailing. On the next candle, if price reversed below entry, the
+trade exited BREAKEVEN_SL despite having had profitable unrealized gains.
 
-### Options to Evaluate
-1. **Lower `breakeven_r`** (e.g., 0.7–0.8): move SL to entry sooner; reduces the
-   window but also exits good trades earlier.
-2. **Partial profit lock at 1R**: exit 50% of position at 1R, trail the rest.
-   Already supported via scale-out logic.
-3. **Tighter trail after BE**: once SL is at entry, set trail multiplier to 0.5× ATR
-   instead of 1× ATR — locks in profit faster on subsequent movement.
-4. **Accept it**: historically, BREAKEVEN_SL trades are free rolls. The ~₹83 loss is
-   just commission. The strategy's Calmar (5.46) was computed WITH this behavior.
-   Tuning this may hurt more trades than it helps.
+Average MFE on BREAKEVEN_SL trades was 2.58R — meaning intraday highs were routinely
+reaching/exceeding 2R without activating TRAIL.
 
-Backtest experiments needed before changing any parameter in production.
+### Fix Applied (2026-04-19)
+`engine/cpr_atr_utils.py` — `TrailingStop.update()`:
+
+1. **Added `candle_high`/`candle_low` params** — call sites pass full OHLC data.
+2. **Trail trigger uses `max(close, candle_high)`** (LONG) or `min(close, candle_low)`
+   (SHORT) to detect intraday 2R crossings.
+3. **Deferred SL — both trigger paths** — regardless of whether TRAIL was activated by
+   candle close or intraday high, the SL stays at entry price for the activation bar's
+   `is_hit()` check and tightens on the next bar. This avoids a same-bar ordering
+   assumption: a candle that closes through 2R could also have reversed back through the
+   tighter stop level within the same 5-minute bar (OHLC order is unknown).
+4. **Separate `if` for multi-phase transitions** — changed `elif self.phase == "BREAKEVEN"`
+   to a standalone `if`, allowing PROTECT→BREAKEVEN AND BREAKEVEN→TRAIL to both fire on
+   the same bar when a single candle crosses both 1R close and 2R high simultaneously.
+
+Call sites updated:
+- `engine/cpr_atr_shared.py:445` — `ts.update(close, candle_high=high, candle_low=low)`
+- `engine/paper_runtime.py:1709` — same, using candle dict fields
+
+### Backtest Impact (baseline comparison 2025-01-01 → 2026-04-17, full 2044 symbols)
+
+| Metric | Old LONG | New LONG | Old SHORT | New SHORT |
+|---|---|---|---|---|
+| run_id | `a267ead61ffa` | `3898e767c6a9` | `23376249a6ca` | `3c139d78214a` |
+| Total P&L | ₹813,889 | ₹893,968 | ₹1,014,394 | ₹1,053,952 |
+| BREAKEVEN_SL | 1,130 | 1,107 (−23) | 1,608 | 1,576 (−32) |
+| TARGET exits | 741 | 561 (−180) | 1,025 | 1,346 (+321) |
+| TRAILING_SL | 264 | 467 (+203) | 322 | 34 (−288) |
+| Calmar | 117.2 | 143.1 | 70.0 | 73.1 |
+
+LONG improved significantly (+₹80K, Calmar 117→143). SHORT improved after the
+`short_trail_atr_multiplier = 1.25` tuning (+₹41.7K, Calmar 70→73) because more
+trades were allowed to continue to the fixed target instead of being clipped by the
+trail. See `docs/trailing-stop-explained.md` for the mechanism and the candle-by-candle
+examples.
+
+Remaining BREAKEVEN_SL trades (1,107 LONG / 1,575 SHORT) are structurally correct —
+trades that reached 1R breakeven but price never went on to reach 2R (high OR close),
+so they reversed to entry. These are expected capital-protection outcomes.
+
+### All-preset impact (2025-01-01 → 2026-04-17)
+
+| Preset | Old P&L | New P&L | Δ | Old Calmar | New Calmar |
+|---|---|---|---|---|---|
+| DR-Std LONG | ₹824,702 | ₹905,186 | +₹80K (+9.8%) | 119 | 145 |
+| DR-Std SHORT | ₹1,017,785 | ₹1,057,696 | +₹42K (+3.9%) | 61 | 66 |
+| DR-Risk LONG | ₹813,889 | ₹893,968 | +₹80K (+9.8%) | 117 | 143 |
+| DR-Risk SHORT | ₹1,014,394 | ₹1,053,952 | +₹42K (+3.9%) | 70 | 73 |
+| Cmp-Std LONG | ₹1,593,174 | ₹1,827,199 | +₹234K (+14.7%) | 145 | 181 |
+| Cmp-Std SHORT | ₹2,393,497 | ₹2,539,392 | +₹146K (+6.1%) | 93 | 104 |
+| Cmp-Risk LONG | ₹1,592,321 | ₹1,826,581 | +₹234K (+14.7%) | 145 | 181 |
+| Cmp-Risk SHORT | ₹2,354,156 | ₹2,536,852 | +₹183K (+7.8%) | 92 | 104 |
+
+### Current v3 baseline run IDs
+
+| Preset | Run ID |
+|---|---|
+| DR-Risk LONG | `3898e767c6a9` |
+| DR-Risk SHORT | `3c139d78214a` |
+| DR-Std LONG | `e4f3123e8ad7` |
+| DR-Std SHORT | `ab10eca1e9c9` |
+| Cmp-Std LONG | `206283c94744` |
+| Cmp-Std SHORT | `b7688096ded7` |
+| Cmp-Risk LONG | `dcb0f8fd2ddf` |
+| Cmp-Risk SHORT | `c2fcdfa605ef` |
+
+### Files Changed
+- `engine/cpr_atr_utils.py` — `TrailingStop.update()` rewrite
+- `engine/cpr_atr_shared.py` — updated `ts.update()` call at line 445
+- `engine/paper_runtime.py` — updated `ts.update()` call at line 1709
+- `tests/test_cpr_utils.py` — 4 new unit tests + 2 updated existing tests
 
 ---
 

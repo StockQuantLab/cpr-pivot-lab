@@ -21,7 +21,7 @@ from web.components import (
     page_layout,
     set_table_mobile_labels,
 )
-from web.state import aget_runs, build_run_options
+from web.state import aget_compare_breakdown, aget_runs, build_run_options
 
 
 def _format_param_value(value: object) -> str:
@@ -207,19 +207,19 @@ async def compare_page() -> None:
         init2 = id_to_label.get(saved2 or "", labels[1] if len(labels) > 1 else labels[0])
 
         @ui.refreshable
-        def render_comparison(label1: str, label2: str) -> None:
+        async def render_comparison(label1: str, label2: str) -> None:
             id1 = options.get(label1, "")
             id2 = options.get(label2, "")
 
+            safe_id1 = json.dumps(id1)
+            safe_id2 = json.dumps(id2)
             ui.run_javascript(
-                f"sessionStorage.setItem('cpr_compare_run1','{id1}');"
-                f"sessionStorage.setItem('cpr_compare_run2','{id2}');"
+                f"sessionStorage.setItem('cpr_compare_run1',{safe_id1});"
+                f"sessionStorage.setItem('cpr_compare_run2',{safe_id2});"
             )
 
             if id1 == id2:
-                ui.label("⚠ Please select two different runs.").style(
-                    f"color: {colors['warning']};"
-                )
+                ui.label("Please select two different runs.").style(f"color: {colors['warning']};")
                 return
 
             meta1 = next((r for r in runs if r.get("run_id") == id1), {})
@@ -234,7 +234,7 @@ async def compare_page() -> None:
             def _period(m: dict) -> str:
                 s = str(m.get("start_date") or "")[:7]
                 e = str(m.get("end_date") or "")[:7]
-                return f"{s} → {e}"
+                return f"{s} -> {e}"
 
             def _direction(m: dict) -> str:
                 return str(m.get("direction_filter") or "BOTH").upper()
@@ -246,7 +246,6 @@ async def compare_page() -> None:
                         strategy = _strat(meta)
                         period = _period(meta)
                         direction = _direction(meta)
-                        # Use centralized theme colors instead of hard-coded values
                         strat_color_key = {
                             "CPR_LEVELS": "strat_cpr_levels",
                             "FBR": "strat_fbr",
@@ -343,10 +342,311 @@ async def compare_page() -> None:
 
             divider()
 
-            # ── Detailed comparison table ────────────────────────────────────
+            # ── Trade-level breakdown (async DB query) ─────────────────────
+            bd = await aget_compare_breakdown(id1, id2)
+
+            # ── Exit Reason Comparison ─────────────────────────────────────
+            exit_reasons = bd.get("exit_reasons", {})
+            if exit_reasons:
+                ui.label("Exit Reason Breakdown").classes("text-base font-semibold mb-3").style(
+                    f"color: {theme['text_primary']};"
+                )
+
+                reason_order = ["TARGET", "INITIAL_SL", "BREAKEVEN_SL", "TRAILING_SL", "TIME"]
+                reason_labels = {
+                    "TARGET": "Target Hit",
+                    "INITIAL_SL": "Initial SL",
+                    "BREAKEVEN_SL": "Breakeven SL",
+                    "TRAILING_SL": "Trailing SL",
+                    "TIME": "Time Exit",
+                }
+                present = [r for r in reason_order if r in exit_reasons]
+                x_labels = [reason_labels.get(r, r) for r in present]
+
+                cnt_a = [exit_reasons[r].get(id1, {}).get("count", 0) for r in present]
+                cnt_b = [exit_reasons[r].get(id2, {}).get("count", 0) for r in present]
+
+                exit_fig = go.Figure()
+                exit_fig.add_trace(
+                    go.Bar(name=s1, x=x_labels, y=cnt_a, marker_color=colors["primary"])
+                )
+                exit_fig.add_trace(
+                    go.Bar(name=s2, x=x_labels, y=cnt_b, marker_color=colors["info"])
+                )
+                exit_fig.update_layout(
+                    title="Trades by Exit Reason",
+                    barmode="group",
+                    xaxis_title="Exit Reason",
+                    yaxis_title="Trade Count",
+                    showlegend=True,
+                )
+                apply_chart_theme(exit_fig)
+                ui.plotly(exit_fig).classes("w-full h-64")
+
+                # Exit reason detail table
+                wl_a = bd.get("win_loss", {}).get(id1, {})
+                wl_b = bd.get("win_loss", {}).get(id2, {})
+                total_a = wl_a.get("total", 0) or 1
+                total_b = wl_b.get("total", 0) or 1
+
+                er_rows = []
+                for r in present:
+                    ra = exit_reasons[r].get(id1, {})
+                    rb = exit_reasons[r].get(id2, {})
+                    ca, cb = ra.get("count", 0), rb.get("count", 0)
+                    pa, pb = ra.get("avg_pnl", 0), rb.get("avg_pnl", 0)
+                    er_rows.append(
+                        {
+                            "reason": reason_labels.get(r, r),
+                            "a_count": f"{ca:,} ({ca / total_a * 100:.0f}%)",
+                            "a_avg": f"₹{pa:,.0f}",
+                            "b_count": f"{cb:,} ({cb / total_b * 100:.0f}%)",
+                            "b_avg": f"₹{pb:,.0f}",
+                            "delta": f"{cb - ca:+,}",
+                        }
+                    )
+                er_columns = [
+                    {"name": "reason", "label": "Exit Reason", "field": "reason", "align": "left"},
+                    {
+                        "name": "a_count",
+                        "label": f"{s1} Count",
+                        "field": "a_count",
+                        "align": "right",
+                    },
+                    {"name": "a_avg", "label": f"{s1} Avg P/L", "field": "a_avg", "align": "right"},
+                    {
+                        "name": "b_count",
+                        "label": f"{s2} Count",
+                        "field": "b_count",
+                        "align": "right",
+                    },
+                    {"name": "b_avg", "label": f"{s2} Avg P/L", "field": "b_avg", "align": "right"},
+                    {"name": "delta", "label": "Delta", "field": "delta", "align": "right"},
+                ]
+                er_tbl = ui.table(columns=er_columns, rows=er_rows, row_key="reason").classes(
+                    "w-full mt-2"
+                )
+                set_table_mobile_labels(er_tbl, er_columns)
+
+                divider()
+
+            # ── Win/Loss & R-Multiple Comparison ────────────────────────────
+            wl_a = bd.get("win_loss", {}).get(id1, {})
+            wl_b = bd.get("win_loss", {}).get(id2, {})
+            rm_a = bd.get("r_multiple", {}).get(id1, {})
+            rm_b = bd.get("r_multiple", {}).get(id2, {})
+
+            if wl_a or wl_b:
+
+                def _delta_str(va: float, vb: float, fmt: str = ".2f", prefix: str = "") -> str:
+                    d = vb - va
+                    return f"{prefix}{d:+{fmt}}"
+
+                ui.label("Win / Loss Analysis").classes("text-base font-semibold mb-3").style(
+                    f"color: {theme['text_primary']};"
+                )
+
+                trade_rows = [
+                    {
+                        "metric": "Avg Win",
+                        "run_a": f"₹{wl_a.get('avg_win', 0):,.0f}",
+                        "run_b": f"₹{wl_b.get('avg_win', 0):,.0f}",
+                        "delta": _delta_str(
+                            wl_a.get("avg_win", 0), wl_b.get("avg_win", 0), ".0f", "₹"
+                        ),
+                    },
+                    {
+                        "metric": "Avg Loss",
+                        "run_a": f"₹{wl_a.get('avg_loss', 0):,.0f}",
+                        "run_b": f"₹{wl_b.get('avg_loss', 0):,.0f}",
+                        "delta": _delta_str(
+                            wl_a.get("avg_loss", 0), wl_b.get("avg_loss", 0), ".0f", "₹"
+                        ),
+                    },
+                    {
+                        "metric": "Best Trade",
+                        "run_a": f"₹{wl_a.get('best_trade', 0):,.0f}",
+                        "run_b": f"₹{wl_b.get('best_trade', 0):,.0f}",
+                        "delta": _delta_str(
+                            wl_a.get("best_trade", 0), wl_b.get("best_trade", 0), ".0f", "₹"
+                        ),
+                    },
+                    {
+                        "metric": "Worst Trade",
+                        "run_a": f"₹{wl_a.get('worst_trade', 0):,.0f}",
+                        "run_b": f"₹{wl_b.get('worst_trade', 0):,.0f}",
+                        "delta": _delta_str(
+                            wl_a.get("worst_trade", 0), wl_b.get("worst_trade", 0), ".0f", "₹"
+                        ),
+                    },
+                    {
+                        "metric": "Gross Profit",
+                        "run_a": f"₹{wl_a.get('gross_profit', 0):,.0f}",
+                        "run_b": f"₹{wl_b.get('gross_profit', 0):,.0f}",
+                        "delta": _delta_str(
+                            wl_a.get("gross_profit", 0), wl_b.get("gross_profit", 0), ".0f", "₹"
+                        ),
+                    },
+                    {
+                        "metric": "Gross Loss",
+                        "run_a": f"₹{wl_a.get('gross_loss', 0):,.0f}",
+                        "run_b": f"₹{wl_b.get('gross_loss', 0):,.0f}",
+                        "delta": _delta_str(
+                            wl_a.get("gross_loss", 0), wl_b.get("gross_loss", 0), ".0f", "₹"
+                        ),
+                    },
+                ]
+
+                # R-multiple rows (if available)
+                if rm_a or rm_b:
+                    trade_rows.append(
+                        {
+                            "metric": "Avg MFE (R)",
+                            "run_a": f"{rm_a.get('avg_mfe_r', 0):.2f}R",
+                            "run_b": f"{rm_b.get('avg_mfe_r', 0):.2f}R",
+                            "delta": _delta_str(rm_a.get("avg_mfe_r", 0), rm_b.get("avg_mfe_r", 0)),
+                        }
+                    )
+                    trade_rows.append(
+                        {
+                            "metric": "Avg MAE (R)",
+                            "run_a": f"{rm_a.get('avg_mae_r', 0):.2f}R",
+                            "run_b": f"{rm_b.get('avg_mae_r', 0):.2f}R",
+                            "delta": _delta_str(rm_a.get("avg_mae_r", 0), rm_b.get("avg_mae_r", 0)),
+                        }
+                    )
+                    trade_rows.append(
+                        {
+                            "metric": "% Reached 1R",
+                            "run_a": f"{rm_a.get('pct_reached_1r', 0):.1f}%",
+                            "run_b": f"{rm_b.get('pct_reached_1r', 0):.1f}%",
+                            "delta": _delta_str(
+                                rm_a.get("pct_reached_1r", 0), rm_b.get("pct_reached_1r", 0), ".1f"
+                            ),
+                        }
+                    )
+                    trade_rows.append(
+                        {
+                            "metric": "% Reached 2R",
+                            "run_a": f"{rm_a.get('pct_reached_2r', 0):.1f}%",
+                            "run_b": f"{rm_b.get('pct_reached_2r', 0):.1f}%",
+                            "delta": _delta_str(
+                                rm_a.get("pct_reached_2r", 0), rm_b.get("pct_reached_2r", 0), ".1f"
+                            ),
+                        }
+                    )
+
+                trade_columns = [
+                    {"name": "metric", "label": "Metric", "field": "metric", "align": "left"},
+                    {
+                        "name": "run_a",
+                        "label": f"Run A ({s1})",
+                        "field": "run_a",
+                        "align": "right",
+                    },
+                    {
+                        "name": "run_b",
+                        "label": f"Run B ({s2})",
+                        "field": "run_b",
+                        "align": "right",
+                    },
+                    {"name": "delta", "label": "Delta (B-A)", "field": "delta", "align": "right"},
+                ]
+                trade_tbl = ui.table(
+                    columns=trade_columns, rows=trade_rows, row_key="metric"
+                ).classes("w-full")
+                set_table_mobile_labels(trade_tbl, trade_columns)
+
+                divider()
+
+            # ── Direction Performance ───────────────────────────────────────
+            dir_a = bd.get("direction", {}).get(id1, {})
+            dir_b = bd.get("direction", {}).get(id2, {})
+            if dir_a or dir_b:
+                ui.label("Direction Performance").classes("text-base font-semibold mb-3").style(
+                    f"color: {theme['text_primary']};"
+                )
+
+                dir_rows = []
+                for d in ["LONG", "SHORT"]:
+                    da, db_ = dir_a.get(d, {}), dir_b.get(d, {})
+                    if not da and not db_:
+                        continue
+                    a_cnt, b_cnt = da.get("count", 0), db_.get("count", 0)
+                    a_wr, b_wr = da.get("win_pct", 0), db_.get("win_pct", 0)
+                    a_pnl, b_pnl = da.get("total_pnl", 0), db_.get("total_pnl", 0)
+                    dir_rows.append(
+                        {
+                            "direction": d,
+                            "a_trades": str(a_cnt),
+                            "a_wr": f"{a_wr:.1f}%",
+                            "a_pnl": f"₹{a_pnl:,.0f}",
+                            "b_trades": str(b_cnt),
+                            "b_wr": f"{b_wr:.1f}%",
+                            "b_pnl": f"₹{b_pnl:,.0f}",
+                            "d_trades": f"{b_cnt - a_cnt:+,}",
+                            "d_wr": f"{b_wr - a_wr:+.1f}%",
+                            "d_pnl": f"₹{b_pnl - a_pnl:+,.0f}",
+                        }
+                    )
+                dir_columns = [
+                    {
+                        "name": "direction",
+                        "label": "Direction",
+                        "field": "direction",
+                        "align": "left",
+                    },
+                    {
+                        "name": "a_trades",
+                        "label": f"{s1} Trades",
+                        "field": "a_trades",
+                        "align": "right",
+                    },
+                    {"name": "a_wr", "label": f"{s1} WR", "field": "a_wr", "align": "right"},
+                    {"name": "a_pnl", "label": f"{s1} P/L", "field": "a_pnl", "align": "right"},
+                    {
+                        "name": "b_trades",
+                        "label": f"{s2} Trades",
+                        "field": "b_trades",
+                        "align": "right",
+                    },
+                    {"name": "b_wr", "label": f"{s2} WR", "field": "b_wr", "align": "right"},
+                    {"name": "b_pnl", "label": f"{s2} P/L", "field": "b_pnl", "align": "right"},
+                    {
+                        "name": "d_trades",
+                        "label": "Trades Δ",
+                        "field": "d_trades",
+                        "align": "right",
+                    },
+                    {"name": "d_wr", "label": "WR Δ", "field": "d_wr", "align": "right"},
+                    {"name": "d_pnl", "label": "P/L Δ", "field": "d_pnl", "align": "right"},
+                ]
+                dir_tbl = ui.table(columns=dir_columns, rows=dir_rows, row_key="direction").classes(
+                    "w-full"
+                )
+                set_table_mobile_labels(dir_tbl, dir_columns)
+
+                divider()
+
+            # ── Detailed comparison table (with delta) ─────────────────────
             ui.label("Detailed Metrics").classes("text-base font-semibold mb-3").style(
                 f"color: {theme['text_primary']};"
             )
+
+            def _num_delta(a_val: str, b_val: str) -> str:
+                """Extract numeric delta from formatted strings."""
+                try:
+                    a_num = float(a_val.replace("₹", "").replace("%", "").replace(",", ""))
+                    b_num = float(b_val.replace("₹", "").replace("%", "").replace(",", ""))
+                    d = b_num - a_num
+                    if "%" in a_val:
+                        return f"{d:+.1f}%"
+                    if "₹" in a_val:
+                        return f"₹{d:+,.0f}"
+                    return f"{d:+.2f}"
+                except (ValueError, TypeError):
+                    return ""
+
             metric_rows = [
                 ("Strategy", _strat(meta1), _strat(meta2)),
                 ("Direction", _direction(meta1), _direction(meta2)),
@@ -396,12 +696,17 @@ async def compare_page() -> None:
                 {"name": "metric", "label": "Metric", "field": "metric", "align": "left"},
                 {"name": "run_a", "label": f"Run A ({s1})", "field": "run_a", "align": "right"},
                 {"name": "run_b", "label": f"Run B ({s2})", "field": "run_b", "align": "right"},
+                {"name": "delta", "label": "Delta (B-A)", "field": "delta", "align": "right"},
             ]
-            metric_tbl = ui.table(
-                columns=metric_columns,
-                rows=[{"metric": m, "run_a": a, "run_b": b} for m, a, b in metric_rows],
-                row_key="metric",
-            ).classes("w-full")
+            tbl_rows = []
+            for m, a, b in metric_rows:
+                delta = _num_delta(a, b)
+                row = {"metric": m, "run_a": a, "run_b": b, "delta": delta}
+                tbl_rows.append(row)
+
+            metric_tbl = ui.table(columns=metric_columns, rows=tbl_rows, row_key="metric").classes(
+                "w-full"
+            )
             set_table_mobile_labels(metric_tbl, metric_columns)
 
             params1 = {}
@@ -472,4 +777,4 @@ async def compare_page() -> None:
             )
 
         divider()
-        render_comparison(init1, init2)
+        await render_comparison(init1, init2)

@@ -657,6 +657,125 @@ class BacktestDB:
             params,
         ).pl()
 
+    def get_compare_breakdown(self, run_a: str, run_b: str) -> dict:
+        """Trade-level breakdown for two runs used by the compare page.
+
+        Returns a dict with keys: exit_reasons, win_loss, r_multiple, direction.
+        Each contains per-run aggregates keyed by run_id.
+        """
+        try:
+            self.ensure_backtest_table()
+        except Exception as e:
+            logger.debug("ensure_backtest_results for compare: %s", e)
+            return {}
+
+        has_exit_reason = self._table_has_column("backtest_results", "exit_reason")
+        has_r_cols = self._table_has_column("backtest_results", "mfe_r") and self._table_has_column(
+            "backtest_results", "reached_1r"
+        )
+
+        # ── Exit reason breakdown ─────────────────────────────────────
+        exit_rows = []
+        if has_exit_reason:
+            exit_rows = self.con.execute(
+                """
+                SELECT run_id,
+                       exit_reason,
+                       COUNT(*) AS cnt,
+                       ROUND(AVG(profit_loss), 2) AS avg_pnl
+                FROM backtest_results
+                WHERE run_id IN (?, ?) AND exit_reason IS NOT NULL
+                GROUP BY run_id, exit_reason
+                ORDER BY exit_reason, run_id
+                """,
+                [run_a, run_b],
+            ).fetchall()
+
+        exit_reasons: dict[str, dict[str, dict]] = {}
+        for row in exit_rows:
+            rid, reason, cnt, avg = row
+            exit_reasons.setdefault(reason, {})
+            exit_reasons[reason][rid] = {"count": int(cnt or 0), "avg_pnl": float(avg or 0)}
+
+        # ── Win/Loss + R-multiple aggregate ───────────────────────────
+        r_cols = ""
+        r_cols_keys: list[str] = []
+        if has_r_cols:
+            r_cols = (
+                ", AVG(mfe_r) FILTER (WHERE mfe_r IS NOT NULL) AS avg_mfe_r"
+                ", AVG(mae_r) FILTER (WHERE mae_r IS NOT NULL) AS avg_mae_r"
+                ", AVG(CASE WHEN reached_1r THEN 1.0 ELSE 0.0 END) * 100.0 AS pct_reached_1r"
+                ", AVG(CASE WHEN reached_2r THEN 1.0 ELSE 0.0 END) * 100.0 AS pct_reached_2r"
+            )
+            r_cols_keys = ["avg_mfe_r", "avg_mae_r", "pct_reached_1r", "pct_reached_2r"]
+
+        agg_rows = self.con.execute(
+            f"""
+            SELECT run_id
+                , COUNT(*) AS total
+                , AVG(profit_loss) FILTER (WHERE profit_loss > 0) AS avg_win
+                , AVG(profit_loss) FILTER (WHERE profit_loss <= 0) AS avg_loss
+                , MAX(profit_loss) AS best_trade
+                , MIN(profit_loss) AS worst_trade
+                , SUM(profit_loss) FILTER (WHERE profit_loss > 0) AS gross_profit
+                , ABS(SUM(profit_loss) FILTER (WHERE profit_loss < 0)) AS gross_loss
+                {r_cols}
+            FROM backtest_results
+            WHERE run_id IN (?, ?)
+            GROUP BY run_id
+            """,
+            [run_a, run_b],
+        ).fetchall()
+        cols = [d[0] for d in self.con.description]
+
+        win_loss: dict[str, dict] = {}
+        r_multiple: dict[str, dict] = {}
+        for row in agg_rows:
+            rec = dict(zip(cols, row, strict=True))
+            rid = str(rec.pop("run_id"))
+            wl_keys = [
+                "total",
+                "avg_win",
+                "avg_loss",
+                "best_trade",
+                "worst_trade",
+                "gross_profit",
+                "gross_loss",
+            ]
+            win_loss[rid] = {k: float(rec.get(k) or 0) for k in wl_keys}
+            if r_cols_keys:
+                r_multiple[rid] = {k: float(rec.get(k) or 0) for k in r_cols_keys}
+
+        # ── Direction breakdown ────────────────────────────────────────
+        dir_rows = self.con.execute(
+            """
+            SELECT run_id, direction,
+                   COUNT(*) AS cnt,
+                   AVG(profit_loss) FILTER (WHERE profit_loss > 0) * 100.0 AS win_pct,
+                   SUM(profit_loss) AS total_pnl
+            FROM backtest_results
+            WHERE run_id IN (?, ?)
+            GROUP BY run_id, direction
+            """,
+            [run_a, run_b],
+        ).fetchall()
+
+        direction: dict[str, dict[str, dict]] = {}
+        for row in dir_rows:
+            rid, d, cnt, wp, tp = row
+            direction.setdefault(rid, {})[d] = {
+                "count": int(cnt or 0),
+                "win_pct": float(wp or 0),
+                "total_pnl": float(tp or 0),
+            }
+
+        return {
+            "exit_reasons": exit_reasons,
+            "win_loss": win_loss,
+            "r_multiple": r_multiple,
+            "direction": direction,
+        }
+
     def get_runs_with_metrics(
         self,
         limit: int | None = None,

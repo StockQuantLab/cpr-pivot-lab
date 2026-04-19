@@ -183,6 +183,8 @@ class StrategyConfig:
     rr_ratio: float = 2.0  # 1:2 risk-reward
     breakeven_r: float = 1.0  # Move SL to entry at this R-multiple (0.3 = early breakeven)
     atr_sl_buffer: float = 0.0  # ATR multiplier added as noise buffer beyond OR extreme
+    trail_atr_multiplier: float = 1.0  # LONG trailing SL ATR multiplier once TRAIL begins
+    short_trail_atr_multiplier: float = 1.0  # SHORT trailing SL ATR multiplier
 
     # Position sizing
     capital: float = 100_000  # Risk-based sizing base for candidate trades
@@ -2453,6 +2455,7 @@ class CPRATRBacktest:
         candle_exit: int = 0,
         rr_ratio: float | None = None,
         runner_target_price: float | None = None,
+        trail_atr_multiplier: float = 1.0,
     ) -> TradeResult:
         """
         Shared trade simulation loop for all three strategies.
@@ -2488,6 +2491,13 @@ class CPRATRBacktest:
         """
         p = self.params
         actual_rr_ratio = rr_ratio if rr_ratio is not None else p.rr_ratio
+        effective_trail_atr_multiplier = trail_atr_multiplier
+        if effective_trail_atr_multiplier == 1.0:
+            effective_trail_atr_multiplier = (
+                p.short_trail_atr_multiplier
+                if direction.upper() == "SHORT"
+                else p.trail_atr_multiplier
+            )
         outcome: TradeLifecycleOutcome = simulate_trade_lifecycle(
             day_pack=day_pack,
             start_idx=start_idx,
@@ -2502,6 +2512,7 @@ class CPRATRBacktest:
             position_size=position_size,
             entry_time=entry_time,
             time_exit=p.time_exit,
+            trail_atr_multiplier=effective_trail_atr_multiplier,
             rr_ratio=actual_rr_ratio,
             breakeven_r=p.breakeven_r,
             candle_exit=candle_exit,

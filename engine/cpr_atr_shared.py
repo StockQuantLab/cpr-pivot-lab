@@ -374,6 +374,7 @@ def simulate_trade_lifecycle(
     time_exit: str,
     rr_ratio: float,
     breakeven_r: float,
+    trail_atr_multiplier: float = 1.0,
     runner_target_price: float | None = None,
     scale_out_pct: float = 0.0,
     candle_exit: int = 0,
@@ -384,6 +385,7 @@ def simulate_trade_lifecycle(
         direction=direction,
         sl_price=sl_price,
         atr=atr,
+        trail_atr_multiplier=trail_atr_multiplier,
         rr_ratio=rr_ratio,
         breakeven_r=breakeven_r,
     )
@@ -442,7 +444,7 @@ def simulate_trade_lifecycle(
         max_favorable = max(max_favorable, favorable)
         max_adverse = max(max_adverse, adverse)
 
-        ts.update(close)
+        ts.update(close, candle_high=high, candle_low=low)
         final_phase = ts.phase
 
         if ts.is_hit(low, high):

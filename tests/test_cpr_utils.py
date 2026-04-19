@@ -196,9 +196,11 @@ class TestTrailingStop:
             breakeven_r=1.0,
         )
         ts.update(105.0)  # → BREAKEVEN
-        ts.update(110.0)  # → TRAIL (target = 100 + 2*5 = 110)
+        ts.update(110.0)  # → TRAIL activates; SL deferred to next bar (OHLC order unknown)
         assert ts.phase == "TRAIL"
-        # Trail SL = highest - ATR = 110 - 3 = 107
+        assert ts.current_sl == pytest.approx(100.0, abs=0.01)  # Still at entry (deferred)
+        # Next bar: TRAIL branch tightens SL = highest_since_entry(110) - atr(3) = 107
+        ts.update(110.0)
         assert ts.current_sl == pytest.approx(107.0, abs=0.01)
 
     def test_short_protect_phase(self):
@@ -239,11 +241,106 @@ class TestTrailingStop:
             breakeven_r=1.0,
         )
         ts.update(105.0)  # → BREAKEVEN
-        ts.update(110.0)  # → TRAIL, SL=107
-        ts.update(108.0)  # Price drops, SL should NOT move down
+        ts.update(110.0)  # → TRAIL activates, SL deferred at 100
+        ts.update(110.0)  # TRAIL tightens: highest=110, SL=107
         assert ts.current_sl == pytest.approx(107.0, abs=0.01)
-        ts.update(112.0)  # New high, SL should move up to 109
+        ts.update(108.0)  # Price drops — SL must NOT move down
+        assert ts.current_sl == pytest.approx(107.0, abs=0.01)
+        ts.update(112.0)  # New high — SL moves up to 109
         assert ts.current_sl == pytest.approx(109.0, abs=0.01)
+
+    def test_long_intraday_high_triggers_trail_after_breakeven(self):
+        """Bar whose high reaches 2R but close doesn't should activate TRAIL."""
+        ts = TrailingStop(
+            entry_price=100.0,
+            direction="LONG",
+            sl_price=95.0,
+            atr=3.0,
+            rr_ratio=2.0,
+            breakeven_r=1.0,
+        )
+        ts.update(105.0)  # Close=1R → BREAKEVEN
+        assert ts.phase == "BREAKEVEN"
+        # Close=107 (< 2R=110), candle high=112 (>2R) → TRAIL activates, SL deferred
+        ts.update(107.0, candle_high=112.0)
+        assert ts.phase == "TRAIL"
+        assert ts.current_sl == pytest.approx(100.0, abs=0.01)  # Deferred: SL at entry
+        # Next bar: TRAIL phase tightens SL using close history (highest=107, atr=3 → SL=104)
+        ts.update(107.0)
+        assert ts.current_sl == pytest.approx(104.0, abs=0.01)
+
+    def test_long_same_bar_multi_transition_protect_to_trail(self):
+        """Single candle crossing both 1R close and 2R high fires both transitions."""
+        ts = TrailingStop(
+            entry_price=100.0,
+            direction="LONG",
+            sl_price=95.0,
+            atr=3.0,
+            rr_ratio=2.0,
+            breakeven_r=1.0,
+        )
+        # close=105 (≥ 1R breakeven), high=112 (≥ 2R trail target=110)
+        # Both PROTECT→BREAKEVEN and BREAKEVEN→TRAIL should fire in one call.
+        ts.update(105.0, candle_high=112.0)
+        assert ts.phase == "TRAIL"
+        assert ts.current_sl == pytest.approx(100.0, abs=0.01)  # Deferred (close<2R)
+        # Next bar: highest_since_entry=106, new_sl=103
+        ts.update(106.0)
+        assert ts.current_sl == pytest.approx(103.0, abs=0.01)
+
+    def test_short_intraday_low_triggers_trail_after_breakeven(self):
+        """SHORT: bar whose low reaches 2R but close doesn't should activate TRAIL."""
+        ts = TrailingStop(
+            entry_price=100.0,
+            direction="SHORT",
+            sl_price=105.0,
+            atr=3.0,
+            rr_ratio=2.0,
+            breakeven_r=1.0,
+        )
+        ts.update(95.0)  # Close=1R → BREAKEVEN
+        assert ts.phase == "BREAKEVEN"
+        # Close=93 (>target=90), candle low=88 (<90) → TRAIL activates, SL deferred
+        ts.update(93.0, candle_low=88.0)
+        assert ts.phase == "TRAIL"
+        assert ts.current_sl == pytest.approx(100.0, abs=0.01)  # Deferred
+        # Next bar: lowest_since_entry=93, new_sl=93+3=96 < 100 → SL tightens
+        ts.update(93.0)
+        assert ts.current_sl == pytest.approx(96.0, abs=0.01)
+
+    def test_short_same_bar_multi_transition_protect_to_trail(self):
+        """SHORT: single candle crossing both 1R close and 2R low fires both transitions."""
+        ts = TrailingStop(
+            entry_price=100.0,
+            direction="SHORT",
+            sl_price=105.0,
+            atr=3.0,
+            rr_ratio=2.0,
+            breakeven_r=1.0,
+        )
+        # close=95 (≤ 1R breakeven), low=88 (≤ 2R target=90)
+        ts.update(95.0, candle_low=88.0)
+        assert ts.phase == "TRAIL"
+        assert ts.current_sl == pytest.approx(100.0, abs=0.01)  # Deferred (close>target=90)
+        # Next bar: lowest_since_entry=94, new_sl=94+3=97 < 100 → tightens
+        ts.update(94.0)
+        assert ts.current_sl == pytest.approx(97.0, abs=0.01)
+
+    def test_short_trail_multiplier_can_loosen_stop(self):
+        """SHORT trail multiplier should widen the post-activation stop distance."""
+        ts = TrailingStop(
+            entry_price=100.0,
+            direction="SHORT",
+            sl_price=105.0,
+            atr=3.0,
+            trail_atr_multiplier=1.5,
+            rr_ratio=2.0,
+            breakeven_r=1.0,
+        )
+        ts.update(95.0)  # → BREAKEVEN
+        ts.update(93.0, candle_low=88.0)  # → TRAIL, SL deferred
+        ts.update(93.0)  # trailing branch now uses 1.5x ATR
+        assert ts.current_sl == pytest.approx(97.5, abs=0.01)
 
 
 class TestValidateAndAdjustSLDistance:

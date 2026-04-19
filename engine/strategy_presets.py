@@ -34,6 +34,7 @@ CPR_LEVELS_PRESETS: dict[str, dict[str, Any]] = {
             "narrowing_filter": True,
             "risk_based_sizing": True,
             "skip_rvol_check": True,
+            "short_trail_atr_multiplier": 1.25,
         },
     },
     "CPR_LEVELS_STANDARD_LONG": {
@@ -56,6 +57,7 @@ CPR_LEVELS_PRESETS: dict[str, dict[str, Any]] = {
             "narrowing_filter": True,
             "risk_based_sizing": False,
             "skip_rvol_check": True,
+            "short_trail_atr_multiplier": 1.25,
         },
     },
 }
@@ -113,6 +115,8 @@ def build_strategy_config_from_overrides(
         "rr_ratio",
         "breakeven_r",
         "atr_sl_buffer",
+        "trail_atr_multiplier",
+        "short_trail_atr_multiplier",
         "capital",
         "risk_pct",
         "portfolio_value",

@@ -1214,6 +1214,16 @@ async def aget_runs(force: bool = False, execution_mode: str = "BACKTEST") -> li
     return await loop.run_in_executor(_executor, lambda: _fetch_runs_sync(force, execution_mode))
 
 
+async def aget_compare_breakdown(run_a: str, run_b: str) -> dict:
+    loop = asyncio.get_running_loop()
+
+    def _go() -> dict:
+        db = get_dashboard_backtest_db()
+        return db.get_compare_breakdown(run_a, run_b) if db else {}
+
+    return await loop.run_in_executor(_executor, _go)
+
+
 async def aget_symbols(force: bool = False) -> list[str]:
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(_executor, lambda: _fetch_symbols_sync(force))

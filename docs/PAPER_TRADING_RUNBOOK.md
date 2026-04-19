@@ -65,22 +65,43 @@ uv run pivot-backtest --all --universe-size 0 --yes-full-run --start 2025-01-01 
 
 Reference sets (Apr 2026):
 
-- Current 8-run dashboard reference set:
+- **Pre-fix baselines (v1 — kept for history, do not use as new comparison target):**
 
-| Mode | Label | Run ID | Start -> End | TotRet | P/L | Trades |
-|------|-------|--------|--------------|--------|-----|--------|
-| Compound | `cpr-levels-short-risksize-compound-rvoloff-atr0.5` | `06ea445a0108` | 2025-01-01 -> 2026-04-09 | 248.1% | Rs.2,480,614 | 4,579 |
-| Compound | `cpr-levels-long-risksize-compound-rvol1-atr0.5` | `7e3feac35fd6` | 2025-01-01 -> 2026-04-09 | 159.8% | Rs.1,597,668 | 3,102 |
-| Compound | `cpr-levels-short-compound-rvoloff-atr0.5` | `fdea70184c2c` | 2025-01-01 -> 2026-04-09 | 247.1% | Rs.2,470,887 | 4,580 |
-| Compound | `cpr-levels-long-compound-rvol1-atr0.5` | `7d3b85732419` | 2025-01-01 -> 2026-04-09 | 159.8% | Rs.1,598,267 | 3,099 |
-| Daily Reset | `cpr-levels-short-risksize-daily-reset-rvoloff-atr0.5` | `4a2cc2485a6d` | 2025-01-01 -> 2026-04-09 | 103.6% | Rs.1,035,723 | 4,645 |
-| Daily Reset | `cpr-levels-long-risksize-daily-reset-rvol1-atr0.5` | `f1644ae9ce0e` | 2025-01-01 -> 2026-04-09 | 81.8% | Rs.818,525 | 3,101 |
-| Daily Reset | `cpr-levels-short-daily-reset-rvoloff-atr0.5` | `1d6e5e93618e` | 2025-01-01 -> 2026-04-09 | 104.1% | Rs.1,041,450 | 4,638 |
-| Daily Reset | `cpr-levels-long-daily-reset-rvol1-atr0.5` | `84a85d954f99` | 2025-01-01 -> 2026-04-09 | 82.7% | Rs.827,381 | 3,101 |
+| Mode | Run ID | Start → End | P/L |
+|------|--------|-------------|-----|
+| Compound Risk SHORT | `06ea445a0108` | 2025-01-01 → 2026-04-09 | ₹2,480,614 |
+| Compound Risk LONG | `7e3feac35fd6` | 2025-01-01 → 2026-04-09 | ₹1,597,668 |
+| Compound Std SHORT | `fdea70184c2c` | 2025-01-01 → 2026-04-09 | ₹2,470,887 |
+| Compound Std LONG | `7d3b85732419` | 2025-01-01 → 2026-04-09 | ₹1,598,267 |
+| Daily Reset Risk SHORT | `4a2cc2485a6d` | 2025-01-01 → 2026-04-09 | ₹1,035,723 |
+| Daily Reset Risk LONG | `f1644ae9ce0e` | 2025-01-01 → 2026-04-09 | ₹818,525 |
+| Daily Reset Std SHORT | `1d6e5e93618e` | 2025-01-01 → 2026-04-09 | ₹1,041,450 |
+| Daily Reset Std LONG | `84a85d954f99` | 2025-01-01 → 2026-04-09 | ₹827,381 |
 
-When extending this set to a later end date, rerun these same eight parameter bundles and
-compare the overlapping dates only. The incremental window should be the only source of P/L
-delta. Do not infer the baseline set from label prefixes alone.
+- **Current v2 baselines (TrailingStop intraday-high fix — use these for all future comparisons):**
+- **Current v3 baselines (TrailingStop fix + SHORT trail tuning — use these for all future comparisons):**
+
+SHORT presets now use `short_trail_atr_multiplier = 1.25`. LONG keeps `trail_atr_multiplier = 1.0`.
+
+| Mode | Preset | Run ID | Start → End | P/L | Calmar |
+|------|--------|--------|-------------|-----|--------|
+| Daily Reset | `CPR_LEVELS_RISK_LONG` | `3898e767c6a9` | 2025-01-01 → 2026-04-17 | ₹893,968 | 143 |
+| Daily Reset | `CPR_LEVELS_RISK_SHORT` | `3c139d78214a` | 2025-01-01 → 2026-04-17 | ₹1,053,952 | 73 |
+| Daily Reset | `CPR_LEVELS_STANDARD_LONG` | `e4f3123e8ad7` | 2025-01-01 → 2026-04-17 | ₹905,186 | 145 |
+| Daily Reset | `CPR_LEVELS_STANDARD_SHORT` | `ab10eca1e9c9` | 2025-01-01 → 2026-04-17 | ₹1,057,696 | 66 |
+| Compound | `CPR_LEVELS_STANDARD_LONG` | `206283c94744` | 2025-01-01 → 2026-04-17 | ₹1,827,199 | 181 |
+| Compound | `CPR_LEVELS_STANDARD_SHORT` | `b7688096ded7` | 2025-01-01 → 2026-04-17 | ₹2,539,392 | 104 |
+| Compound | `CPR_LEVELS_RISK_LONG` | `dcb0f8fd2ddf` | 2025-01-01 → 2026-04-17 | ₹1,826,581 | 181 |
+| Compound | `CPR_LEVELS_RISK_SHORT` | `c2fcdfa605ef` | 2025-01-01 → 2026-04-17 | ₹2,536,852 | 104 |
+
+The v2 fix (2026-04-19) makes TRAIL activate on intraday HIGH ≥ 2R (not just close).
+The v3 short-tuning step lifts SHORT by another ~₹42K daily-reset / ~₹173K compound.
+LONG still benefits strongly from the fix (+₹80K daily-reset, +₹234K compound). See
+`docs/ISSUES.md` and `docs/trailing-stop-explained.md` for the full explanation.
+
+When extending the v2 set to a later end date, rerun these same eight presets and
+compare the overlapping window only. The incremental window should be the only source
+of P/L delta. Do not infer the reference set from label prefixes alone.
 
 Dashboard note:
 - Home page `Recent Backtest Runs` now has a one-click copy icon for `run_id`.

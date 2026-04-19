@@ -96,6 +96,7 @@ class TestBacktestParams:
         assert short_cfg.skip_rvol_check is True
         assert short_cfg.cpr_levels.cpr_min_close_atr == 0.5
         assert short_cfg.cpr_levels.use_narrowing_filter is True
+        assert short_cfg.short_trail_atr_multiplier == 1.25
 
     def test_fbr_risk_presets(self):
         assert "FBR_RISK_LONG" in FBR_PRESETS
@@ -153,6 +154,7 @@ class TestBacktestParams:
         cfg_short = build_strategy_config_from_preset("CPR_LEVELS_RISK_SHORT", preset_cli_overrides)
         assert cfg_short.direction_filter == "SHORT", "direction clobbered"
         assert cfg_short.skip_rvol_check is True, "skip_rvol_check clobbered by False"
+        assert cfg_short.short_trail_atr_multiplier == 1.25, "short trail multiplier clobbered"
 
     def test_custom_params(self):
         p = BacktestParams(

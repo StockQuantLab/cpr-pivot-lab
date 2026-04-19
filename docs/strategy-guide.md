@@ -95,6 +95,37 @@ The promoted long default is `rvol_threshold = 1.0`.
 - `FBR` is a reversal-contingency test (momentum failed and turned).
 - They are complementary. Running LONG-only vs SHORT-only can isolate when one side fails in specific market regimes.
 
+## Trailing Stop Mechanics
+
+Both strategies use the same three-phase `TrailingStop` engine.  After entry a trade
+advances through PROTECT → BREAKEVEN → TRAIL as price moves in your favour.
+
+| Phase | SL sits at | Advance condition |
+|---|---|---|
+| **PROTECT** | Original SL (CPR boundary ± ATR buffer) | Candle close ≥ entry + 1R |
+| **BREAKEVEN** | Entry price | Candle HIGH or CLOSE ≥ entry + 2R |
+| **TRAIL** | Highest close since entry − 1× ATR | Ratchet — only moves in your favour |
+
+**Key behaviours that operators should know:**
+
+- **1R** is the SL distance at entry, not a fixed rupee amount.  For CPR\_LEVELS LONG the SL
+  is at `BC − ATR buffer`, so 1R varies by symbol and day.
+- **2R** is twice the SL distance.  `min_effective_rr = 2.0` ensures the target (R1/S1) is
+  always at least 2R away from entry, so TRAIL activation and the exit target are reachable.
+- When TRAIL activates, the SL does **not** tighten on the activation bar.  It tightens from
+  the next bar onward.  This avoids a modelling assumption about OHLC order within a single
+  5-minute candle (we cannot know whether the HIGH or the LOW happened first).
+- The trail anchor (`highest_since_entry`) tracks **closes only**.  An intrabar spike that
+  does not hold to the close does not move the trail level up.  This is intentional and
+  conservative — it benefits LONG continuation trades but means SHORT runners may exit the
+  trail earlier than the original fixed target would have.
+- Canonical CPR SHORT presets now use `short_trail_atr_multiplier = 1.25` so the trail has
+  a little more room before ratcheting. LONG keeps the default `trail_atr_multiplier = 1.0`.
+- TIME\_EXIT at 15:15 takes priority — any open position is force-closed regardless of phase.
+
+For candle-by-candle worked examples (including the April 2026 intraday-high bug and its fix)
+see `docs/trailing-stop-explained.md`.
+
 ## Where to inspect behavior for any run
 
 - **High-level run summary + params:** Dashboard `Run Results` (`/backtest`) header and KPI cards.
