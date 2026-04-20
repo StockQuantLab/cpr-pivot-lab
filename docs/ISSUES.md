@@ -7,6 +7,229 @@ Supersedes: `docs/PARITY_INCIDENT_LOG.md` (contents migrated below).
 
 ---
 
+## 2026-04-20 — BUG: Telegram 429 rate-limit drops alert permanently at burst open
+
+**Status:** FIXED — `engine/alert_dispatcher.py`
+**Severity:** Medium — 1 TRADE_OPENED alert lost (MVGJL SHORT); no trading impact
+
+### Root Cause
+At 09:25, the 9:25 bar fired a burst of ~20 alerts simultaneously (10 SL_HIT + new TRADE_OPENED
+for both LONG and SHORT sessions). Telegram's bot API limit is **20 messages/minute per chat**.
+MVGJL SHORT OPENED (alert_log ID 1042) was message 21, got a `429 Too Many Requests`.
+
+The existing retry logic used fixed backoff: 1s → 2s → 4s (7s total). Telegram's response body
+specified `retry_after: 26` — all 3 retries fired within the cooldown window and also got 429.
+Alert was permanently dropped (`status=failed`, `channel=BOTH`).
+
+### Fix
+`AlertDispatcher._send_with_retry` now extracts the server-specified wait from the 429 response:
+1. Checks `response.json()["parameters"]["retry_after"]` (Telegram-specific field)
+2. Falls back to standard `Retry-After` HTTP header
+3. If found, sleeps exactly that duration before retry; logs a WARNING with the wait time
+4. If not found, falls back to the existing fixed `RETRY_BACKOFF`
+
+### Files Changed
+- `engine/alert_dispatcher.py` — `_send_with_retry` + `_telegram_retry_after` static helper
+
+---
+
+## 2026-04-20 — BUG: Duplicate FLATTEN_EOD Telegram alert at EOD
+
+**Status:** FIXED — `engine/paper_runtime.py`
+**Severity:** Medium — double Telegram noise, no trading impact
+
+### Root Cause
+`flatten_session_positions` deduped via `SELECT COUNT(*) FROM alert_log WHERE alert_type='FLATTEN_EOD'`.
+`_dispatch_alert` is fire-and-forget — `log_alert` writes to `alert_log` AFTER the Telegram POST
+completes, inside the async consumer loop. Any two concurrent (or near-simultaneous) callers both
+see 0 before either write commits, so both dispatch.
+
+On 2026-04-20, `CPR_LEVELS_SHORT` had EMKAY close at TARGET at 15:10 as the last open position.
+The session exit triggered `flatten_session_positions` with the dedup window still open, resulting
+in two FLATTEN_EOD items queued (alert_log IDs 1157 and 1158, sent 360ms apart).
+
+### Fix
+Replaced DB dedup with a module-level `_flatten_eod_sent: set[str]` in `paper_runtime.py`.
+The set is updated synchronously (`_flatten_eod_sent.add(session_id)`) before `_dispatch_alert`
+is called, making it immune to async timing. `_flatten_eod_sent` persists for the process lifetime
+so cross-session dedup also works (e.g., resume sessions).
+
+---
+
+## 2026-04-20 — FEATURE: Progressive trail stop between 1R and T1 (pre-target ratchet)
+
+**Status:** PENDING — backtest analysis required
+**Severity:** Enhancement — prevents giving back unrealised gains when position stalls before target
+
+### Problem
+Current trail design has a dead zone between BREAKEVEN (1R) and TARGET (T1):
+- At 1R: SL moves to entry (scratch protection only)
+- At T1: ATR trail begins
+- **Between 1R and T1: SL sits flat at entry regardless of how far price has moved**
+
+Example (2026-04-20 EMKAY SHORT):
+- Entry 241.16, SL 243.44, Target 232.15 (3.93R away)
+- Price reached 237.7 (+1.51R, unrealised +₹1,428)
+- If price reverses to entry → BREAKEVEN_SL fires → -₹83 scratch
+- Position gave back entire ₹1,428 unrealised gain for a scratch exit
+
+On days where SHORT entries move 1–1.5R but never reach T1, every trade ends as a scratch
+or initial SL. The trail never activates because the target is too far. LONG avoids this
+on good days because T1 gets hit early and the ATR trail captures the extension.
+
+### Proposed Solution: ratchet trail after 1R
+
+Add `trail_after_r` parameter — once position reaches N×R, start trailing at 1×ATR from
+best price immediately (instead of waiting for T1):
+
+```
+Entry 241.16, risk = 2.28/share
+  1.0R (238.88) → SL to entry (current — BREAKEVEN)
+  1.5R (237.72) → SL to +0.5R locked  ← new ratchet step
+  2.0R (236.56) → SL to +1.0R locked  ← new ratchet step
+  T1 hit        → ATR trail (current behaviour continues)
+```
+
+### Implementation Plan
+1. **SQL analysis first**: query baseline SHORT run (`23376249a6ca`, 2025-01-01→2026-04-17).
+   For each trade that closed BREAKEVEN_SL: check max_excursion vs 1R. Count how many
+   reached 1.5R+ before reversing. Estimate P&L improvement with ratchet.
+2. **Backtest flag**: `--trail-after-r 1.5` on `pivot-backtest` (default disabled).
+3. **Sweep**: test 1.0 / 1.25 / 1.5 / 2.0 thresholds. Check Calmar vs baseline.
+4. **Paper parity**: add to both engines before enabling in live.
+
+### Notes
+- Only affects trades that pass BREAKEVEN but don't reach T1 (the "stalled" trades)
+- Risk: cutting winners short if 1.5R dip is just noise before the big move to T1
+- Asymmetric impact: SHORT benefits more than LONG on range-bound days
+- Pairs well with the 10:15 win-rate checkpoint (complementary, not redundant)
+
+---
+
+## 2026-04-20 — FEATURE: 10:15 intraday win-rate checkpoint to flatten losing sessions early
+
+**Status:** PENDING — implement at EOD
+**Severity:** Enhancement — reduces drawdown on bad market days
+
+### Problem
+On bearish days (like 2026-04-20), the SHORT session opens many trades that go against it.
+By 10:15 (entry window close), the session's intraday win rate is already below its
+long-run baseline (~33%). Remaining open positions have unrealized profit but keep bleeding
+as the market whipsaws. Continuing to 15:15 turns a small loss into a large one.
+
+Simply closing all sessions at 10:15 is too blunt — on a good day (LONG today), the
+trailing phase (10:15→15:15) generates the biggest winners (INTERARCH +₹2,326, THERMAX
++₹1,652). We need a per-session, market-adaptive signal.
+
+### Proposed Solution: intraday win-rate checkpoint
+
+At 10:15 (entry window close), independently evaluate each session:
+
+```
+intraday_win_rate = winning_closed_trades / total_closed_trades (up to 10:15)
+
+if intraday_win_rate < checkpoint_winrate_threshold:
+    flatten all remaining open positions at current market price
+    emit CHECKPOINT_FLATTEN alert
+else:
+    continue to 15:15 TIME_EXIT as normal
+```
+
+**Why win rate vs rupee threshold:**
+- Win rate is relative to the strategy's known edge — it's market-condition adaptive
+- A rupee threshold is position-size dependent (breaks with risk-based sizing)
+- Win rate < baseline (33%) = "strategy edge not present today" = clear exit signal
+- Each session (LONG, SHORT) evaluated independently — good session continues, bad exits
+
+### Example (2026-04-20 SHORT at 10:15):
+- 32 closed trades, win rate likely ~20-25% (several INITIAL_SL hits vs targets)
+- Threshold = 30% → flatten 6 remaining open positions at ~10:15 price
+- Locks unrealized +₹1,954 instead of watching it bleed to 15:15
+
+### Implementation Plan
+1. **SQL analysis first** (no code changes): query `backtest_results` for existing baseline
+   run, simulate checkpoint at different thresholds (0.20, 0.25, 0.30, 0.33, 0.40).
+   Compare Calmar vs baseline. Do SHORT first (today's pain), then LONG.
+
+2. **Engine flag** (if SQL shows Calmar improvement > 10%):
+   - `--checkpoint-winrate-threshold 0.30` on both `pivot-backtest` and `daily-live`
+   - In `paper_session_driver.py`: `on_entry_window_close()` hook
+   - In backtest engine: mid-day session-level aggregation at 10:15 bar
+   - Must be added to BOTH engines for paper parity
+
+3. **Sweep** with `pivot-sweep` YAML across threshold values per direction.
+
+### Notes
+- Default = disabled (current behavior preserved)
+- Backtest parity required before enabling in live — do not add paper-only
+- Only valid at entry window close (10:15) — not a rolling intraday check
+
+---
+
+## 2026-04-20 — `get_stats` AttributeError crashes both sessions at market open
+
+**Status:** FIXED (same day, ~9:18 AM)
+**Severity:** Critical — both LONG and SHORT sessions crashed on first candle bar
+
+### Symptom
+Both CPR_LEVELS LONG and SHORT sessions connected to WebSocket successfully at 9:16 AM,
+processed the first Stage B direction filter, then immediately crashed with:
+```
+AttributeError: 'KiteTickerAdapter' object has no attribute 'get_stats'.
+Did you mean: 'health_stats'?
+```
+Both variants entered the retry loop (2/5, 3/5...) but all retries failed with the same error.
+Sessions were in ACTIVE state in paper.duckdb but not processing any bars.
+
+### Root Cause
+`scripts/paper_live.py:1168` called `ticker_adapter.get_stats()` inside the zombie-check
+block (stale WebSocket detection). The method was renamed to `health_stats()` in
+`engine/kite_ticker_adapter.py` but the call site in `paper_live.py` was not updated.
+
+```python
+# Before (broken):
+tick_age = (ticker_adapter.get_stats() or {}).get("last_tick_age_sec") or 0
+# After (fixed):
+tick_age = (ticker_adapter.health_stats() or {}).get("last_tick_age_sec") or 0
+```
+
+### Fix Applied
+`scripts/paper_live.py:1168`: `get_stats()` → `health_stats()`.
+Session restarted at 9:18 AM, both variants reconnected, caught the 9:20 entry bar.
+
+### Impact
+9:15 and first half of 9:20 bar missed. No trades lost — entry window runs to 10:15 AM
+and the 9:20 bar was caught in full after restart.
+
+---
+
+## 2026-04-20 — Daily startup confusion: separate LONG/SHORT processes fail on Windows
+
+**Status:** Documented (process issue, not code bug)
+**Severity:** Operational — wasted ~15 minutes before market open
+
+### Symptom
+Attempting to start two separate `daily-live` processes (one `--preset CPR_LEVELS_RISK_LONG`,
+one `--preset CPR_LEVELS_RISK_SHORT`) fails: the second process crashes immediately with
+`IOException: paper.duckdb is already open by PID N`.
+
+### Root Cause
+DuckDB on Windows uses OS-level exclusive file locking. Two separate `daily-live` processes
+both try to open `paper.duckdb` in read-write mode. The second process always fails.
+
+### Fix / Canonical Command
+Always use `--multi` — runs both LONG and SHORT in one process with a single DB writer.
+`--multi` uses `PAPER_STANDARD_MATRIX` which hardcodes `CPR_CANONICAL_PARAMS` (= RISK sizing).
+`--risk-based-sizing` flag is redundant with `--multi` but harmless.
+
+```bash
+PYTHONUNBUFFERED=1 doppler run -- uv run pivot-paper-trading daily-live \
+  --multi --strategy CPR_LEVELS --trade-date today --all-symbols \
+  >> .tmp_logs/live_YYYYMMDD.log 2>&1
+```
+
+---
+
 ## 2026-04-16 — OR fields NULL→0.0 kills all entry evaluations
 
 **Status:** FIXED (same day)

@@ -52,6 +52,9 @@ _background_tasks: set[asyncio.Task] = set()
 _active_session_count = 0
 _suppress_alerts = False
 _alert_sink: Callable[[AlertType, str, str], Any] | None = None
+# In-memory dedup guard: session IDs that have already dispatched FLATTEN_EOD.
+# Checked and set synchronously before dispatch so no async race with alert_log writes.
+_flatten_eod_sent: set[str] = set()
 
 
 def set_alerts_suppressed(suppress: bool) -> None:
@@ -1374,31 +1377,23 @@ async def flatten_session_positions(
         # should not send a second EOD with 0 trades, 0 PnL.
         if total_trades == 0 and not closed:
             logger.debug("FLATTEN_EOD skipped for session %s — no trades to report", session_id)
-        else:
-            # Dedup: body contains the full session_id; subject is date-only so cannot be
-            # used reliably to detect the already-sent original-session alert.
-            already_sent = (
-                _db()
-                .con.execute(
-                    "SELECT COUNT(*) FROM alert_log WHERE alert_type = 'FLATTEN_EOD' AND body LIKE ?",
-                    [f"%{str(session_id)}%"],
-                )
-                .fetchone()[0]
+        elif session_id in _flatten_eod_sent:
+            # Synchronous in-memory dedup — set before dispatch so concurrent callers
+            # can't race past the check before alert_log is written.
+            logger.debug(
+                "FLATTEN_EOD already sent for session %s — skipping duplicate", session_id
             )
-            if already_sent:
-                logger.debug(
-                    "FLATTEN_EOD already sent for session %s — skipping duplicate", session_id
-                )
-            else:
-                subject, body = _format_risk_alert(
-                    reason=notes or "session flatten",
-                    net_pnl=total_realized,
-                    session_id=session_id,
-                    positions_closed=len(closed),
-                    total_trades=total_trades,
-                    trade_date=getattr(session, "trade_date", None),
-                )
-                _dispatch_alert(AlertType.FLATTEN_EOD, subject, body)
+        else:
+            _flatten_eod_sent.add(session_id)
+            subject, body = _format_risk_alert(
+                reason=notes or "session flatten",
+                net_pnl=total_realized,
+                session_id=session_id,
+                positions_closed=len(closed),
+                total_trades=total_trades,
+                trade_date=getattr(session, "trade_date", None),
+            )
+            _dispatch_alert(AlertType.FLATTEN_EOD, subject, body)
     except Exception:
         logger.debug("Alert dispatch for flatten failed (best-effort)", exc_info=True)
     return {"session_id": session_id, "closed_positions": len(closed), "positions": closed}

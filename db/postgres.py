@@ -322,6 +322,7 @@ class PaperPosition:
     updated_at: datetime
     signal_id: int | None
     created_at: datetime
+    exit_reason: str | None = None
 
 
 @dataclass(slots=True)
@@ -840,6 +841,7 @@ def _paper_position_to_postgres(position: Any) -> PaperPosition:
             updated_at=values.get("updated_at", _utcnow()),
             signal_id=values.get("signal_id"),
             created_at=values.get("created_at", _utcnow()),
+            exit_reason=values.get("exit_reason") or values.get("closed_by"),
         )
     quantity = getattr(position, "quantity", None)
     if quantity is None:
@@ -872,6 +874,7 @@ def _paper_position_to_postgres(position: Any) -> PaperPosition:
         updated_at=getattr(position, "updated_at", _utcnow()),
         signal_id=getattr(position, "signal_id", None),
         created_at=getattr(position, "created_at", _utcnow()),
+        exit_reason=getattr(position, "exit_reason", None) or getattr(position, "closed_by", None),
     )
 
 

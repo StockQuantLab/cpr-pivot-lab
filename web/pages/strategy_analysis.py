@@ -263,15 +263,27 @@ async def strategy_page() -> None:
                     columns=[
                         {"name": "run_id", "label": "Run ID", "field": "run_id", "align": "left"},
                         {"name": "period", "label": "Period", "field": "period", "align": "left"},
-                        {"name": "trades", "label": "Trades", "field": "trades", "align": "right"},
-                        {"name": "calmar", "label": "Calmar", "field": "calmar", "align": "right"},
+                        {
+                            "name": "trades",
+                            "label": "Trades",
+                            "field": "trades",
+                            "align": "right",
+                            "format": "int",
+                        },
+                        {
+                            "name": "calmar",
+                            "label": "Calmar",
+                            "field": "calmar",
+                            "align": "right",
+                            "format": "decimal:2",
+                        },
                     ],
                     rows=[
                         {
                             "run_id": (r.get("run_id") or "")[:12],
                             "period": f"{str(r.get('start_date', ''))[:7]} → {str(r.get('end_date', ''))[:7]}",
-                            "trades": f"{int(r.get('trade_count') or 0):,}",
-                            "calmar": f"{float(r.get('calmar') or 0):.2f}",
+                            "trades": int(r.get("trade_count") or 0),
+                            "calmar": round(float(r.get("calmar") or 0), 2),
                         }
                         for r in strat_runs
                     ],

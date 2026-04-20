@@ -492,7 +492,7 @@ def _render_coverage_tab(coverage_data: list[dict], date_cov: list[dict]) -> Non
                 "first_date": r["first_date"],
                 "last_date": r["last_date"],
                 "distinct_days": r["distinct_days"],
-                "coverage_pct": f"{r['coverage_pct']:.1f}",
+                "coverage_pct": round(float(r["coverage_pct"]), 1),
                 "gap_estimate": r["gap_estimate"],
             }
             for r in filtered
@@ -512,6 +512,7 @@ def _render_coverage_tab(coverage_data: list[dict], date_cov: list[dict]) -> Non
                 "label": "Coverage %",
                 "field": "coverage_pct",
                 "align": "right",
+                "format": "decimal:1",
             },
             {
                 "name": "gap_estimate",

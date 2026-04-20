@@ -611,11 +611,11 @@ def _tab_daily_summary(df: pl.DataFrame, colors: dict, theme: dict) -> None:
     rows = [
         {
             "date": str(row["trade_date"] or "")[:10],
-            "trades": str(int(row["trades"])),
-            "longs": str(int(row["longs"])),
-            "shorts": str(int(row["shorts"])),
-            "wins": str(int(row["wins"])),
-            "win_rate": f"{float(row['win_rate']):.1f}%",
+            "trades": int(row["trades"]),
+            "longs": int(row["longs"]),
+            "shorts": int(row["shorts"]),
+            "wins": int(row["wins"]),
+            "win_rate": round(float(row["win_rate"]), 1),
             "day_pnl": round(float(row["day_pnl"]), 2),
         }
         for row in daily.iter_rows(named=True)
@@ -623,11 +623,29 @@ def _tab_daily_summary(df: pl.DataFrame, colors: dict, theme: dict) -> None:
     paginated_table(
         columns=[
             {"name": "date", "label": "Date", "field": "date", "align": "left"},
-            {"name": "trades", "label": "Trades", "field": "trades", "align": "right"},
-            {"name": "longs", "label": "Long", "field": "longs", "align": "right"},
-            {"name": "shorts", "label": "Short", "field": "shorts", "align": "right"},
-            {"name": "wins", "label": "Wins", "field": "wins", "align": "right"},
-            {"name": "win_rate", "label": "Win %", "field": "win_rate", "align": "right"},
+            {
+                "name": "trades",
+                "label": "Trades",
+                "field": "trades",
+                "align": "right",
+                "format": "int",
+            },
+            {"name": "longs", "label": "Long", "field": "longs", "align": "right", "format": "int"},
+            {
+                "name": "shorts",
+                "label": "Short",
+                "field": "shorts",
+                "align": "right",
+                "format": "int",
+            },
+            {"name": "wins", "label": "Wins", "field": "wins", "align": "right", "format": "int"},
+            {
+                "name": "win_rate",
+                "label": "Win %",
+                "field": "win_rate",
+                "align": "right",
+                "format": "pct",
+            },
             {"name": "day_pnl", "label": "Day P/L", "field": "day_pnl", "align": "right"},
         ],
         rows=rows,

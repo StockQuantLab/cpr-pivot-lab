@@ -1297,16 +1297,25 @@ async def test_flatten_session_positions_uses_ist_closed_at_and_dispatches_per_t
 
 
 @pytest.mark.asyncio
-async def test_flatten_session_positions_eod_dedup_uses_full_session_id(
+async def test_flatten_session_positions_eod_dedup_in_memory(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Calling flatten_session_positions twice for the same session dispatches FLATTEN_EOD once.
+
+    The in-memory _flatten_eod_sent set is checked synchronously before dispatch, so even
+    two concurrent (near-simultaneous) callers cannot both pass the guard.
+    """
+    import engine.paper_runtime as _pm
     from engine.paper_runtime import (
         flatten_session_positions,
         set_alert_sink,
         set_alerts_suppressed,
     )
 
-    session_id = "CPR_LEVELS_SHORT-2026-04-13-RESUME-001"
+    session_id = "CPR_LEVELS_SHORT-2026-04-13-DEDUP-TEST"
+    # Clear in-memory dedup state from any previous test runs.
+    _pm._flatten_eod_sent.discard(session_id)
+
     session = SimpleNamespace(
         session_id=session_id,
         strategy="CPR_LEVELS",
@@ -1334,14 +1343,10 @@ async def test_flatten_session_positions_eod_dedup_uses_full_session_id(
         opened_by="CPR_LEVELS",
     )
 
-    execute_calls: list[tuple[str, list[object]]] = []
-
     async def fake_get_session(session_id_arg: str):
-        assert session_id_arg == session_id
         return session
 
     async def fake_get_session_positions(session_id_arg: str, *, symbol=None, statuses=None):
-        assert session_id_arg == session_id
         if statuses == ["OPEN"]:
             return [open_position]
         return []
@@ -1353,18 +1358,10 @@ async def test_flatten_session_positions_eod_dedup_uses_full_session_id(
         return None
 
     async def fake_update_session_state(session_id_arg: str, **kwargs):
-        assert session_id_arg == session_id
         return session
 
-    class _FakeCon:
-        def execute(self, sql: str, params: list[object]):
-            execute_calls.append((sql, list(params)))
-            if "FROM alert_log" in sql:
-                return SimpleNamespace(fetchone=lambda: (0,))
-            return SimpleNamespace(fetchone=lambda: None)
-
     class _FakeDB:
-        con = _FakeCon()
+        pass
 
     monkeypatch.setattr("engine.paper_runtime.get_session", fake_get_session)
     monkeypatch.setattr("engine.paper_runtime.get_session_positions", fake_get_session_positions)
@@ -1377,21 +1374,26 @@ async def test_flatten_session_positions_eod_dedup_uses_full_session_id(
     set_alerts_suppressed(False)
     set_alert_sink(lambda t, s, b: dispatched.append((t, s, b)))
     try:
-        result = await flatten_session_positions(
+        # First call — should dispatch FLATTEN_EOD.
+        result1 = await flatten_session_positions(
             session_id,
             notes="eod",
+            feed_state=SimpleNamespace(raw_state={"symbol_last_prices": {"SUKHJITS": 176.34}}),
+        )
+        # Second call (simulates async race / retry path) — must be suppressed by in-memory guard.
+        result2 = await flatten_session_positions(
+            session_id,
+            notes="eod duplicate",
             feed_state=SimpleNamespace(raw_state={"symbol_last_prices": {"SUKHJITS": 176.34}}),
         )
     finally:
         set_alert_sink(None)
         set_alerts_suppressed(False)
+        _pm._flatten_eod_sent.discard(session_id)
 
-    eod_calls = [entry for entry in execute_calls if "FROM alert_log" in entry[0]]
-    assert len(eod_calls) == 1
-    assert eod_calls[0][1] == [f"%{session_id}%"]
-
+    # Exactly one FLATTEN_EOD regardless of how many times flatten was called.
     eod_alerts = [d for d in dispatched if d[0].value == "FLATTEN_EOD"]
-    assert len(eod_alerts) == 1
+    assert len(eod_alerts) == 1, f"expected 1 FLATTEN_EOD, got {len(eod_alerts)}"
     assert session_id in eod_alerts[0][2]
 
-    assert result["closed_positions"] == 1
+    assert result1["closed_positions"] == 1

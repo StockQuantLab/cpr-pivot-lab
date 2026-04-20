@@ -1901,11 +1901,51 @@ def paginated_table(
         tbl.on("row-click", _handle_row_click)
 
 
-def set_table_mobile_labels(tbl: Any, columns: list[dict[str, Any]]) -> None:
-    """Attach mobile-friendly table cell templates with `data-label` values.
+def _vue_display_expr(fmt: str | None) -> str:
+    """Return a Vue JS expression for formatting ``props.value`` by format type.
 
-    Uses NiceGUI's add_slot("body-cell-{name}", ...) API with Quasar slot props.
-    v-html handles both plain-text and HTML-formatted cell values (e.g. pnl_cell()).
+    Format types:
+      ``"currency"``  — ₹X,XXX  (0 decimals, rupee prefix, comma grouping)
+      ``"pct"``       — XX.X%   (1 decimal + percent sign)
+      ``"pct:N"``     — XX.XX%  (N decimals + percent sign)
+      ``"int"``       — X,XXX   (0 decimals, comma grouping)
+      ``"decimal:N"`` — XX.XX   (N decimals)
+    """
+    if not fmt:
+        return "props.value"
+    if fmt == "currency":
+        return (
+            "props.value != null "
+            "? '₹' + Number(props.value).toLocaleString('en-IN', "
+            "{maximumFractionDigits:0,useGrouping:true}) "
+            ": ''"
+        )
+    if fmt == "pct":
+        return "props.value != null ? Number(props.value).toFixed(1) + '%' : ''"
+    if fmt.startswith("pct:"):
+        n = fmt.split(":", 1)[1]
+        return "props.value != null ? Number(props.value).toFixed(" + n + ") + '%' : ''"
+    if fmt == "int":
+        return "props.value != null ? Number(props.value).toLocaleString('en-IN') : ''"
+    if fmt.startswith("decimal:"):
+        n = fmt.split(":", 1)[1]
+        return (
+            "props.value != null "
+            "? Number(props.value).toLocaleString('en-IN', "
+            "{minimumFractionDigits:" + n + ",maximumFractionDigits:" + n + "}) "
+            ": ''"
+        )
+    return "props.value"
+
+
+def set_table_mobile_labels(tbl: Any, columns: list[dict[str, Any]]) -> None:
+    """Attach mobile-friendly table cell templates with ``data-label`` values.
+
+    Uses NiceGUI's ``add_slot("body-cell-{name}", ...)`` API with Quasar slot props.
+    When a column definition includes a ``"format"`` key, the slot renders the raw
+    numeric value with locale-aware formatting (currency, percent, integer, etc.).
+    This keeps Quasar's native sort comparing raw numbers instead of formatted strings.
+
     Custom slots added after this call (e.g. direction coloring) override as expected.
     """
     for col in columns:
@@ -1914,15 +1954,15 @@ def set_table_mobile_labels(tbl: Any, columns: list[dict[str, Any]]) -> None:
             continue
         label = html.escape(str(col.get("label") or name))
         extra_class = str(col.get("classes") or "").strip()
-        # Build Vue :class expression — alignment from slot props + optional static classes
         if extra_class:
-            class_val = f"'text-' + props.col.align + ' {extra_class}'"
+            class_val = "'text-' + props.col.align + ' " + extra_class + "'"
         else:
             class_val = "'text-' + props.col.align"
+        display_expr = _vue_display_expr(col.get("format"))
         tbl.add_slot(
-            f"body-cell-{name}",
-            f'<td data-label="{label}" :class="{class_val}">'
-            f'<span v-html="props.value"></span></td>',
+            "body-cell-" + name,
+            '<td data-label="' + label + '" :class="' + class_val + '">'
+            '<span v-html="' + display_expr + '"></span></td>',
         )
 
 

@@ -19,6 +19,8 @@ import time
 from dataclasses import dataclass, field
 from enum import StrEnum
 
+import httpx
+
 from db.paper_db import PaperDB
 from engine.notifiers.email import EmailNotifier
 from engine.notifiers.telegram import TelegramNotifier
@@ -178,6 +180,26 @@ class AlertDispatcher:
                 continue
             await self._send_with_retry(event)
 
+    @staticmethod
+    def _telegram_retry_after(exc: Exception) -> float | None:
+        """Return server-specified retry delay (seconds) for a 429 error, or None."""
+        if not isinstance(exc, httpx.HTTPStatusError) or exc.response.status_code != 429:
+            return None
+        # Telegram returns {"parameters": {"retry_after": N}} in the JSON body.
+        try:
+            body = exc.response.json()
+            return float(body.get("parameters", {}).get("retry_after") or 0) or None
+        except Exception:
+            pass
+        # Fall back to standard Retry-After header (seconds or HTTP-date).
+        header = exc.response.headers.get("Retry-After")
+        if header:
+            try:
+                return float(header)
+            except ValueError:
+                pass
+        return None
+
     async def _send_with_retry(self, event: AlertEvent) -> None:
         last_error: Exception | None = None
         telegram_ok = False
@@ -201,7 +223,19 @@ class AlertDispatcher:
             except Exception as exc:
                 last_error = exc
                 if attempt < self.MAX_RETRIES - 1:
-                    await asyncio.sleep(self.RETRY_BACKOFF[attempt])
+                    # Honour Telegram's retry_after on 429 — fixed backoff is too short.
+                    rate_limit_wait = self._telegram_retry_after(exc)
+                    if rate_limit_wait:
+                        logger.warning(
+                            "Telegram 429 rate-limit — waiting %.0fs before retry %d/%d: %s",
+                            rate_limit_wait,
+                            attempt + 1,
+                            self.MAX_RETRIES - 1,
+                            event.subject,
+                        )
+                        await asyncio.sleep(rate_limit_wait)
+                    else:
+                        await asyncio.sleep(self.RETRY_BACKOFF[attempt])
 
         # Determine overall channel status
         if telegram_ok and email_ok:

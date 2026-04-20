@@ -415,13 +415,14 @@ def _render_live_paper_sessions(active_sessions: list[dict], colors: dict) -> No
                         or getattr(position, "closed_by", None)
                         or ""
                     ),
-                    "qty": f"{float(getattr(position, 'quantity', 0.0) or 0.0):.0f}",
-                    "entry_price": f"{float(getattr(position, 'entry_price', 0.0) or 0.0):,.2f}",
-                    "last_price": f"{float(getattr(position, 'last_price', 0.0) or 0.0):,.2f}",
-                    "close_price": f"{float(getattr(position, 'close_price', 0.0) or 0.0):,.2f}",
-                    "realized_pnl": f"₹{float(getattr(position, 'realized_pnl', 0.0) or 0.0):,.0f}",
-                    "stop_loss": f"{float(getattr(position, 'stop_loss', 0.0) or 0.0):,.2f}",
-                    "target_price": f"{float(getattr(position, 'target_price', 0.0) or 0.0):,.2f}",
+                    "qty": float(getattr(position, "quantity", 0.0) or 0.0),
+                    "entry_price": float(getattr(position, "entry_price", 0.0) or 0.0),
+                    "last_price": float(getattr(position, "last_price", 0.0) or 0.0),
+                    "close_price": float(getattr(position, "close_price", 0.0) or 0.0),
+                    "realized_pnl": float(getattr(position, "realized_pnl", 0.0) or 0.0),
+                    "stop_loss": float(getattr(position, "stop_loss", 0.0) or 0.0),
+                    "target_price": float(getattr(position, "target_price", 0.0) or 0.0),
+                    "phase": (getattr(position, "trail_state", None) or {}).get("phase") or "",
                 }
                 for position in positions
             ]
@@ -434,9 +435,9 @@ def _render_live_paper_sessions(active_sessions: list[dict], colors: dict) -> No
                     "side": getattr(order, "side", ""),
                     "status": getattr(order, "status", ""),
                     "order_type": getattr(order, "order_type", ""),
-                    "requested_qty": f"{float(getattr(order, 'requested_qty', 0.0) or 0.0):.0f}",
-                    "fill_qty": f"{float(getattr(order, 'fill_qty', 0.0) or 0.0):.0f}",
-                    "fill_price": f"{float(getattr(order, 'fill_price', 0.0) or 0.0):,.2f}",
+                    "requested_qty": float(getattr(order, "requested_qty", 0.0) or 0.0),
+                    "fill_qty": float(getattr(order, "fill_qty", 0.0) or 0.0),
+                    "fill_price": float(getattr(order, "fill_price", 0.0) or 0.0),
                     "requested_at": _format_session_ts(getattr(order, "requested_at", None)),
                 }
                 for order in orders
@@ -460,18 +461,21 @@ def _render_live_paper_sessions(active_sessions: list[dict], colors: dict) -> No
                             "label": "Req Qty",
                             "field": "requested_qty",
                             "align": "right",
+                            "format": "int",
                         },
                         {
                             "name": "fill_qty",
                             "label": "Fill Qty",
                             "field": "fill_qty",
                             "align": "right",
+                            "format": "int",
                         },
                         {
                             "name": "fill_price",
                             "label": "Fill Px",
                             "field": "fill_price",
                             "align": "right",
+                            "format": "decimal:2",
                         },
                         {
                             "name": "requested_at",
@@ -899,6 +903,7 @@ def _colored_direction_table(rows: list[dict], colors: dict) -> None:
             "field": "qty",
             "align": "right",
             "classes": "hide-mobile",
+            "format": "int",
         },
         {
             "name": "entry_price",
@@ -906,6 +911,7 @@ def _colored_direction_table(rows: list[dict], colors: dict) -> None:
             "field": "entry_price",
             "align": "right",
             "classes": "hide-mobile",
+            "format": "decimal:2",
         },
         {
             "name": "last_price",
@@ -913,6 +919,7 @@ def _colored_direction_table(rows: list[dict], colors: dict) -> None:
             "field": "last_price",
             "align": "right",
             "classes": "hide-mobile",
+            "format": "decimal:2",
         },
         {
             "name": "close_price",
@@ -920,20 +927,36 @@ def _colored_direction_table(rows: list[dict], colors: dict) -> None:
             "field": "close_price",
             "align": "right",
             "classes": "hide-mobile",
+            "format": "decimal:2",
         },
-        {"name": "realized_pnl", "label": "Realized", "field": "realized_pnl", "align": "right"},
+        {
+            "name": "realized_pnl",
+            "label": "Realized",
+            "field": "realized_pnl",
+            "align": "right",
+            "format": "currency",
+        },
         {
             "name": "stop_loss",
             "label": "SL",
             "field": "stop_loss",
             "align": "right",
             "classes": "hide-mobile",
+            "format": "decimal:2",
         },
         {
             "name": "target_price",
             "label": "Target",
             "field": "target_price",
             "align": "right",
+            "classes": "hide-mobile",
+            "format": "decimal:2",
+        },
+        {
+            "name": "phase",
+            "label": "Phase",
+            "field": "phase",
+            "align": "left",
             "classes": "hide-mobile",
         },
         {"name": "exit_reason", "label": "Reason", "field": "exit_reason", "align": "left"},
@@ -1165,18 +1188,21 @@ async def daily_summary_page() -> None:
                         "label": "Ratio 5D",
                         "field": "ratio_5d",
                         "align": "right",
+                        "format": "decimal:2",
                     },
                     {
                         "name": "pct_above_40_dma",
                         "label": "% Above 40DMA",
                         "field": "pct_above_40_dma",
                         "align": "right",
+                        "format": "pct:2",
                     },
                     {
                         "name": "pct_above_ma20",
                         "label": "% Above MA20",
                         "field": "pct_above_ma20",
                         "align": "right",
+                        "format": "pct:2",
                     },
                 ],
                 rows=[
@@ -1186,15 +1212,15 @@ async def daily_summary_page() -> None:
                         "long_bias": int(row["long_bias"] or 0),
                         "short_bias": int(row["short_bias"] or 0),
                         "neutral_bias": int(row["neutral_bias"] or 0),
-                        "ratio_5d": _format_ratio_value(
+                        "ratio_5d": (
                             None if row.get("ratio_5d") is None else float(row["ratio_5d"])
                         ),
-                        "pct_above_40_dma": _format_pct_value(
+                        "pct_above_40_dma": (
                             None
                             if row.get("pct_above_40_dma") is None
                             else float(row["pct_above_40_dma"])
                         ),
-                        "pct_above_ma20": _format_pct_value(
+                        "pct_above_ma20": (
                             None
                             if row.get("pct_above_ma20") is None
                             else float(row["pct_above_ma20"])
@@ -1236,18 +1262,21 @@ async def daily_summary_page() -> None:
                         "label": "Avg OR/ATR",
                         "field": "avg_or_atr_5",
                         "align": "right",
+                        "format": "decimal:4",
                     },
                     {
                         "name": "avg_abs_gap_pct",
                         "label": "Avg |Gap| %",
                         "field": "avg_abs_gap_pct",
                         "align": "right",
+                        "format": "pct:2",
                     },
                     {
                         "name": "avg_cpr_width_pct",
                         "label": "Avg CPR %",
                         "field": "avg_cpr_width_pct",
                         "align": "right",
+                        "format": "pct:2",
                     },
                 ],
                 rows=[
@@ -1255,12 +1284,12 @@ async def daily_summary_page() -> None:
                         "trade_date": str(row["trade_date"] or ""),
                         "narrowing_symbols": int(row["narrowing_symbols"] or 0),
                         "avg_or_atr_5": round(float(row["avg_or_atr_5"] or 0.0), 4),
-                        "avg_abs_gap_pct": _format_pct_value(
+                        "avg_abs_gap_pct": (
                             None
                             if row.get("avg_abs_gap_pct") is None
                             else float(row["avg_abs_gap_pct"])
                         ),
-                        "avg_cpr_width_pct": _format_pct_value(
+                        "avg_cpr_width_pct": (
                             None
                             if row.get("avg_cpr_width_pct") is None
                             else float(row["avg_cpr_width_pct"])

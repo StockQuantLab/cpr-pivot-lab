@@ -1,5 +1,25 @@
 # Paper Trading Runbook
 
+## Daily Live Trading — Canonical Startup Command
+
+```bash
+PYTHONUNBUFFERED=1 doppler run -- uv run pivot-paper-trading daily-live \
+  --multi --strategy CPR_LEVELS --trade-date today --all-symbols \
+  >> .tmp_logs/live_YYYYMMDD.log 2>&1
+```
+
+**Rules — read before every session:**
+- `--multi` is the ONLY safe way to run LONG + SHORT concurrently on Windows. DuckDB
+  exclusive locking means two separate `daily-live` processes will always fail on the second.
+- `--multi` uses `PAPER_STANDARD_MATRIX` → `CPR_CANONICAL_PARAMS` (= `CPR_LEVELS_RISK_LONG`
+  overrides). Risk-based sizing is already baked in. Do NOT add `--preset` with `--multi`.
+- `PYTHONUNBUFFERED=1` is required for real-time log visibility when redirecting to a file.
+- Pre-market (8:30–9:10 AM): run `pivot-refresh --since <prev_trading_date>` then
+  `pivot-paper-trading daily-prepare --trade-date today --all-symbols` before starting live.
+- Do not run backtests while live is running — `market.duckdb` write lock will block startup.
+
+---
+
 ## Operating Model
 
 Run **2 primary paper sessions every trading day** (CPR_LEVELS LONG and SHORT).

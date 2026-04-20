@@ -133,12 +133,12 @@ def _render_symbols_content(df: pl.DataFrame, colors: dict, theme: dict) -> None
     rows = [
         {
             "symbol": r["symbol"],
-            "trades": str(r["trades"]),
-            "total_pnl": f"₹{int(r['total_pnl']):,}",
-            "avg_pnl": f"₹{int(r['avg_pnl']):,}",
-            "best": f"₹{int(r['best']):,}",
-            "worst": f"₹{int(r['worst']):,}",
-            "win_rate": f"{r['win_rate']:.1f}%",
+            "trades": int(r["trades"]),
+            "total_pnl": int(r["total_pnl"]),
+            "avg_pnl": int(r["avg_pnl"]),
+            "best": int(r["best"]),
+            "worst": int(r["worst"]),
+            "win_rate": round(float(r["win_rate"]), 1),
         }
         for r in sym_df.iter_rows(named=True)
     ]
@@ -157,6 +157,7 @@ def _render_symbols_content(df: pl.DataFrame, colors: dict, theme: dict) -> None
                 "field": "trades",
                 "align": "right",
                 "sortable": True,
+                "format": "int",
             },
             {
                 "name": "total_pnl",
@@ -164,11 +165,36 @@ def _render_symbols_content(df: pl.DataFrame, colors: dict, theme: dict) -> None
                 "field": "total_pnl",
                 "align": "right",
                 "sortable": True,
+                "format": "currency",
             },
-            {"name": "avg_pnl", "label": "Avg P/L", "field": "avg_pnl", "align": "right"},
-            {"name": "best", "label": "Best", "field": "best", "align": "right"},
-            {"name": "worst", "label": "Worst", "field": "worst", "align": "right"},
-            {"name": "win_rate", "label": "Win %", "field": "win_rate", "align": "right"},
+            {
+                "name": "avg_pnl",
+                "label": "Avg P/L",
+                "field": "avg_pnl",
+                "align": "right",
+                "format": "currency",
+            },
+            {
+                "name": "best",
+                "label": "Best",
+                "field": "best",
+                "align": "right",
+                "format": "currency",
+            },
+            {
+                "name": "worst",
+                "label": "Worst",
+                "field": "worst",
+                "align": "right",
+                "format": "currency",
+            },
+            {
+                "name": "win_rate",
+                "label": "Win %",
+                "field": "win_rate",
+                "align": "right",
+                "format": "pct",
+            },
         ],
         rows=rows,
         row_key="symbol",

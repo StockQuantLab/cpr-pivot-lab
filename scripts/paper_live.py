@@ -1165,7 +1165,7 @@ async def run_live_session(
                 # which previously caused the entire stale block to be skipped. A WebSocket
                 # that is "connected" but silent for >5 min is a zombie — detect it always.
                 if use_websocket and ticker_adapter is not None and ticker_adapter.is_connected:
-                    tick_age = (ticker_adapter.get_stats() or {}).get("last_tick_age_sec") or 0
+                    tick_age = (ticker_adapter.health_stats() or {}).get("last_tick_age_sec") or 0
                     if tick_age > 300:
                         # Zombie: socket alive but no ticks for 5+ min — treat as disconnected.
                         # 600s matches the stale_exit_sec threshold defined below.

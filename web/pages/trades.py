@@ -209,20 +209,44 @@ def _section_exit_reasons(df: pl.DataFrame, colors: dict, theme: dict) -> None:
     rows = [
         {
             "reason": r["exit_reason"],
-            "count": str(r["count"]),
-            "avg_pnl": f"₹{r['avg_pnl']:,.0f}",
-            "win_rate": f"{r['win_rate']:.1f}%",
-            "total_pnl": f"₹{int(r['total_pnl']):,}",
+            "count": int(r["count"]),
+            "avg_pnl": round(float(r["avg_pnl"]), 0),
+            "win_rate": round(float(r["win_rate"]), 1),
+            "total_pnl": round(float(r["total_pnl"]), 0),
         }
         for r in exit_df.iter_rows(named=True)
     ]
     paginated_table(
         columns=[
             {"name": "reason", "label": "Exit Reason", "field": "reason", "align": "left"},
-            {"name": "count", "label": "Count", "field": "count", "align": "right"},
-            {"name": "avg_pnl", "label": "Avg P/L", "field": "avg_pnl", "align": "right"},
-            {"name": "win_rate", "label": "Win %", "field": "win_rate", "align": "right"},
-            {"name": "total_pnl", "label": "Total P/L", "field": "total_pnl", "align": "right"},
+            {
+                "name": "count",
+                "label": "Count",
+                "field": "count",
+                "align": "right",
+                "format": "int",
+            },
+            {
+                "name": "avg_pnl",
+                "label": "Avg P/L",
+                "field": "avg_pnl",
+                "align": "right",
+                "format": "currency",
+            },
+            {
+                "name": "win_rate",
+                "label": "Win %",
+                "field": "win_rate",
+                "align": "right",
+                "format": "pct",
+            },
+            {
+                "name": "total_pnl",
+                "label": "Total P/L",
+                "field": "total_pnl",
+                "align": "right",
+                "format": "currency",
+            },
         ],
         rows=rows,
         row_key="reason",
@@ -277,20 +301,44 @@ def _section_monthly(df: pl.DataFrame, colors: dict, theme: dict) -> None:
     rows = [
         {
             "month": r["month"],
-            "trades": str(r["trades"]),
-            "total_pnl": f"₹{int(r['total_pnl']):,}",
-            "avg_pnl": f"₹{int(r['avg_pnl']):,}",
-            "win_rate": f"{r['win_rate']:.1f}%",
+            "trades": int(r["trades"]),
+            "total_pnl": round(float(r["total_pnl"]), 0),
+            "avg_pnl": round(float(r["avg_pnl"]), 0),
+            "win_rate": round(float(r["win_rate"]), 1),
         }
         for r in monthly.iter_rows(named=True)
     ]
     paginated_table(
         columns=[
             {"name": "month", "label": "Month", "field": "month", "align": "left"},
-            {"name": "trades", "label": "Trades", "field": "trades", "align": "right"},
-            {"name": "total_pnl", "label": "Total P/L", "field": "total_pnl", "align": "right"},
-            {"name": "avg_pnl", "label": "Avg P/L", "field": "avg_pnl", "align": "right"},
-            {"name": "win_rate", "label": "Win %", "field": "win_rate", "align": "right"},
+            {
+                "name": "trades",
+                "label": "Trades",
+                "field": "trades",
+                "align": "right",
+                "format": "int",
+            },
+            {
+                "name": "total_pnl",
+                "label": "Total P/L",
+                "field": "total_pnl",
+                "align": "right",
+                "format": "currency",
+            },
+            {
+                "name": "avg_pnl",
+                "label": "Avg P/L",
+                "field": "avg_pnl",
+                "align": "right",
+                "format": "currency",
+            },
+            {
+                "name": "win_rate",
+                "label": "Win %",
+                "field": "win_rate",
+                "align": "right",
+                "format": "pct",
+            },
         ],
         rows=rows,
         row_key="month",
@@ -319,12 +367,12 @@ def _section_symbols(df: pl.DataFrame, colors: dict, theme: dict) -> None:
     rows = [
         {
             "symbol": r["symbol"],
-            "trades": str(r["trades"]),
-            "total_pnl": f"₹{int(r['total_pnl']):,}",
-            "avg_pnl": f"₹{int(r['avg_pnl']):,}",
-            "best": f"₹{int(r['best']):,}",
-            "worst": f"₹{int(r['worst']):,}",
-            "win_rate": f"{r['win_rate']:.1f}%",
+            "trades": int(r["trades"]),
+            "total_pnl": round(float(r["total_pnl"]), 0),
+            "avg_pnl": round(float(r["avg_pnl"]), 0),
+            "best": round(float(r["best"]), 0),
+            "worst": round(float(r["worst"]), 0),
+            "win_rate": round(float(r["win_rate"]), 1),
         }
         for r in sym_df.iter_rows(named=True)
     ]
@@ -337,18 +385,49 @@ def _section_symbols(df: pl.DataFrame, colors: dict, theme: dict) -> None:
                 "align": "left",
                 "sortable": True,
             },
-            {"name": "trades", "label": "Trades", "field": "trades", "align": "right"},
+            {
+                "name": "trades",
+                "label": "Trades",
+                "field": "trades",
+                "align": "right",
+                "format": "int",
+            },
             {
                 "name": "total_pnl",
                 "label": "Total P/L",
                 "field": "total_pnl",
                 "align": "right",
                 "sortable": True,
+                "format": "currency",
             },
-            {"name": "avg_pnl", "label": "Avg P/L", "field": "avg_pnl", "align": "right"},
-            {"name": "best", "label": "Best", "field": "best", "align": "right"},
-            {"name": "worst", "label": "Worst", "field": "worst", "align": "right"},
-            {"name": "win_rate", "label": "Win %", "field": "win_rate", "align": "right"},
+            {
+                "name": "avg_pnl",
+                "label": "Avg P/L",
+                "field": "avg_pnl",
+                "align": "right",
+                "format": "currency",
+            },
+            {
+                "name": "best",
+                "label": "Best",
+                "field": "best",
+                "align": "right",
+                "format": "currency",
+            },
+            {
+                "name": "worst",
+                "label": "Worst",
+                "field": "worst",
+                "align": "right",
+                "format": "currency",
+            },
+            {
+                "name": "win_rate",
+                "label": "Win %",
+                "field": "win_rate",
+                "align": "right",
+                "format": "pct",
+            },
         ],
         rows=rows,
         row_key="symbol",
