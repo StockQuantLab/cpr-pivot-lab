@@ -229,11 +229,37 @@ def test_build_run_options_includes_rvol_state() -> None:
         "run-2 | 2026-04-11 18:15 | cpr-levels-short-daily-reset-rvoloff | 2025-01-01→2026-03-27 | "
         "TotRet 51.2% | P/L ₹511,200 | Trades 1,800"
     )
-    assert labels[2].startswith(
-        "run-3 | 2026-04-10 09:00 | fbr-long-daily-reset-rvol1.1-fw10 | 2025-01-01→2026-03-27 | "
-        "TotRet 18.2% | P/L ₹182,000 | Trades 900"
+
+
+def test_build_run_options_includes_paper_mode_and_feed() -> None:
+    options = web_state.build_run_options(
+        [
+            {
+                "run_id": "paper-1",
+                "strategy": "CPR_LEVELS",
+                "direction_filter": "LONG",
+                "updated_at": "2026-04-17 15:20:00",
+                "start_date": "2026-04-17",
+                "end_date": "2026-04-17",
+                "annual_return_pct": 8.5,
+                "total_return_pct": 10.2,
+                "total_pnl": 1010.0,
+                "trade_count": 22,
+                "rvol_threshold": 1.0,
+                "cpr_min_close_atr": 0.5,
+                "skip_rvol_check": False,
+                "execution_mode": "PAPER",
+                "params_json": ('{"paper_session_mode":"LIVE","paper_feed_source":"local"}'),
+            }
+        ]
     )
-    assert all("Calmar" not in label for label in labels)
+
+    label = next(iter(options))
+    assert "cpr-levels-long-daily-reset-rvol1-atr0.5-live-local" in label
+    assert label.startswith(
+        "paper-1 | 2026-04-17 15:20 | cpr-levels-long-daily-reset-rvol1-atr0.5-live-local | "
+        "2026-04-17→2026-04-17 | TotRet 10.2% | P/L ₹1,010 | Trades 22"
+    )
 
 
 @pytest.mark.asyncio

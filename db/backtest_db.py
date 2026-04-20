@@ -974,6 +974,7 @@ class BacktestDB:
                     __RISK_BASED_SIZING_SQL__,
                     __COMPOUND_EQUITY_SQL__,
                     rm.params_json,
+                    rm.symbols_json,
                     __UPDATED_AT_SQL__,
                     CASE
                         WHEN r.start_date IS NOT NULL AND r.end_date IS NOT NULL
@@ -1036,9 +1037,10 @@ class BacktestDB:
                 "risk_based_sizing": bool(r[22] or False),
                 "compound_equity": bool(r[23] or False),
                 "params_json": str(r[24] or ""),
-                "updated_at": str(r[25] or ""),
-                "run_span_days": int(r[26] or 0),
-                "fbr_setup_filter": str(r[27] or "BOTH").upper(),
+                "symbols_json": str(r[25] or ""),
+                "updated_at": str(r[26] or ""),
+                "run_span_days": int(r[27] or 0),
+                "fbr_setup_filter": str(r[28] or "BOTH").upper(),
             }
             for r in rows
         ]

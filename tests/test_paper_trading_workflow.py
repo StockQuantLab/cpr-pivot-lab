@@ -18,7 +18,7 @@ def test_default_session_id_includes_direction_for_daily_sessions() -> None:
             {"direction_filter": "LONG"},
             "live",
         )
-        == "paper-cpr_levels-long-2024-01-02-live"
+        == "paper-cpr_levels-long-2024-01-02-live-kite"
     )
     assert (
         paper_trading._default_session_id(
@@ -27,8 +27,19 @@ def test_default_session_id_includes_direction_for_daily_sessions() -> None:
             "FBR",
             {"direction_filter": "SHORT"},
             "live",
+            "local",
         )
-        == "paper-fbr-short-2024-01-02-live"
+        == "paper-fbr-short-2024-01-02-live-local"
+    )
+    assert (
+        paper_trading._default_session_id(
+            "paper",
+            "2024-01-02",
+            "CPR_LEVELS",
+            {"direction_filter": "SHORT"},
+            "replay",
+        )
+        == "paper-cpr_levels-short-2024-01-02-replay-historical"
     )
 
 
@@ -539,7 +550,7 @@ async def test_cmd_daily_live_resume_infers_session_id_from_preset(
     import scripts.paper_trading as pt
 
     session = SimpleNamespace(
-        session_id="paper-cpr_levels-short-2024-01-03-live",
+        session_id="paper-cpr_levels-short-2024-01-03-live-kite",
         status="FAILED",
         strategy="CPR_LEVELS",
     )
@@ -582,13 +593,13 @@ async def test_cmd_daily_live_resume_infers_session_id_from_preset(
         )
     )
 
-    assert calls["get_session"] == "paper-cpr_levels-short-2024-01-03-live"
+    assert calls["get_session"] == "paper-cpr_levels-short-2024-01-03-live-kite"
     assert calls["get_positions"] == {
-        "session_id": "paper-cpr_levels-short-2024-01-03-live",
+        "session_id": "paper-cpr_levels-short-2024-01-03-live-kite",
         "statuses": ["OPEN"],
         "symbol": None,
     }
-    assert calls["run"]["session_id"] == "paper-cpr_levels-short-2024-01-03-live"
+    assert calls["run"]["session_id"] == "paper-cpr_levels-short-2024-01-03-live-kite"
     assert calls["run"]["symbols"] == ["SBIN"]
     assert calls["run"]["poll_interval_sec"] == 1.5
     assert calls["run"]["candle_interval_minutes"] == 5

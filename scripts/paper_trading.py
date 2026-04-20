@@ -372,17 +372,36 @@ def _session_direction_suffix(strategy: str, strategy_params: dict[str, Any] | N
     return direction.lower()
 
 
+def _workflow_session_suffix(mode: str, feed_source: str | None = None) -> str:
+    mode_token = str(mode or "").strip().lower()
+    feed_token = str(feed_source or "").strip().lower()
+    if not feed_token:
+        if mode_token == "replay":
+            feed_token = "historical"
+        elif mode_token == "live":
+            feed_token = "kite"
+
+    tokens: list[str] = []
+    if mode_token:
+        tokens.append(mode_token)
+    if feed_token and feed_token != mode_token:
+        tokens.append(feed_token)
+    return f"-{'-'.join(tokens)}" if tokens else ""
+
+
 def _default_session_id(
     prefix: str,
     trade_date: str,
     strategy: str,
     strategy_params: dict[str, Any] | None = None,
     mode: str = "",
+    feed_source: str | None = None,
 ) -> str:
-    mode_tag = f"-{mode}" if mode and mode != "replay" else ""
+    strategy_feed_source = str((strategy_params or {}).get("feed_source") or "").strip().lower()
+    workflow_suffix = _workflow_session_suffix(mode, feed_source or strategy_feed_source)
     direction = _session_direction_suffix(strategy, strategy_params)
     direction_tag = f"-{direction}" if direction else ""
-    return f"{prefix}-{strategy.lower()}{direction_tag}-{trade_date}{mode_tag}"
+    return f"{prefix}-{strategy.lower()}{direction_tag}-{trade_date}{workflow_suffix}"
 
 
 async def _ensure_daily_session(
@@ -711,12 +730,14 @@ async def _cmd_daily_live_resume(args: argparse.Namespace) -> None:
     strategy_params = _resolve_paper_strategy_params(
         strategy, getattr(args, "strategy_params", None), args
     )
+    strategy_params = {**strategy_params, "feed_source": getattr(args, "feed_source", "kite")}
     session_id = args.session_id or _default_session_id(
         "paper",
         trade_date,
         strategy,
         strategy_params,
         "live",
+        getattr(args, "feed_source", None),
     )
 
     session = await get_session(session_id)
@@ -1132,6 +1153,28 @@ async def _cmd_daily_live_multi(args: argparse.Namespace) -> None:
     feed_source = getattr(args, "feed_source", "kite")
     suppress_alerts = bool(getattr(args, "no_alerts", False))
 
+    local_union_symbols: list[str] | None = None
+    if feed_source == "local":
+        strategy_upper = _assert_cpr_only_strategy(
+            getattr(args, "strategy", None) or _paper_default_strategy(get_settings()),
+            source="strategy",
+        ).upper()
+        raw_variants = [
+            (label, strat, params)
+            for label, strat, params in PAPER_STANDARD_MATRIX
+            if strat == strategy_upper
+        ]
+        variant_setup: list[tuple[str, str, dict[str, Any], list[str]]] = []
+        for label, strategy, base_params in raw_variants:
+            normalized_params = apply_paper_strategy_defaults(
+                strategy, normalize_strategy_params(base_params)
+            )
+            filtered = pre_filter_symbols_for_strategy(
+                trade_date, all_symbols, strategy, normalized_params
+            )
+            variant_setup.append((label, strategy, normalized_params, filtered))
+        local_union_symbols = sorted({s for _, _, _, syms in variant_setup for s in syms})
+
     if feed_source == "kite":
         await _wait_until_market_ready(trade_date)
 
@@ -1140,7 +1183,7 @@ async def _cmd_daily_live_multi(args: argparse.Namespace) -> None:
 
         shared_ticker: Any = LocalTickerAdapter(
             trade_date=trade_date,
-            symbols=all_symbols,
+            symbols=local_union_symbols or all_symbols,
             candle_interval_minutes=getattr(args, "candle_interval_minutes", None) or 5,
         )
     else:
@@ -1161,7 +1204,7 @@ async def _cmd_daily_live_multi(args: argparse.Namespace) -> None:
     async def _execute_variant(
         label: str, strategy: str, normalized_params: dict[str, Any], filtered: list[str]
     ) -> dict[str, Any]:
-        session_id = f"{label}-{trade_date}"
+        session_id = f"{label}-{trade_date}{_workflow_session_suffix('live', feed_source)}"
 
         if not filtered:
             return {
@@ -1173,8 +1216,7 @@ async def _cmd_daily_live_multi(args: argparse.Namespace) -> None:
 
         direction = (normalized_params.get("direction_filter") or "BOTH").upper()
         skip_rvol = normalized_params.get("skip_rvol_check", False)
-        if feed_source == "local":
-            normalized_params = {**normalized_params, "feed_source": "local"}
+        normalized_params = {**normalized_params, "feed_source": feed_source}
         rvol_tag = "rvol=OFF" if skip_rvol else "rvol=ON"
         print(
             f"  {label}: {len(all_symbols)} -> {len(filtered)} candidates"
@@ -1247,6 +1289,7 @@ async def _cmd_daily_replay_multi(args: argparse.Namespace) -> None:
         normalized_params = apply_paper_strategy_defaults(
             strategy, normalize_strategy_params(base_params)
         )
+        normalized_params = {**normalized_params, "feed_source": "historical"}
         filtered = pre_filter_symbols_for_strategy(
             trade_date, all_symbols, strategy, normalized_params
         )
@@ -1267,7 +1310,7 @@ async def _cmd_daily_replay_multi(args: argparse.Namespace) -> None:
         async def _execute_variant(
             label: str, strategy: str, normalized_params: dict[str, Any], filtered: list[str]
         ) -> dict[str, Any]:
-            session_id = f"{label}-{trade_date}"
+            session_id = f"{label}-{trade_date}{_workflow_session_suffix('replay', 'historical')}"
 
             if not filtered:
                 return {

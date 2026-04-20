@@ -80,25 +80,23 @@ Reference sets (Apr 2026):
 | Daily Reset Std SHORT | `1d6e5e93618e` | 2025-01-01 → 2026-04-09 | ₹1,041,450 |
 | Daily Reset Std LONG | `84a85d954f99` | 2025-01-01 → 2026-04-09 | ₹827,381 |
 
-- **Current v2 baselines (TrailingStop intraday-high fix — use these for all future comparisons):**
-- **Current v3 baselines (TrailingStop fix + SHORT trail tuning — use these for all future comparisons):**
+- **Current v4 baselines (2026-04-20 refresh on the current shared-exit code — use these for all future comparisons):**
 
 SHORT presets now use `short_trail_atr_multiplier = 1.25`. LONG keeps `trail_atr_multiplier = 1.0`.
 
 | Mode | Preset | Run ID | Start → End | P/L | Calmar |
 |------|--------|--------|-------------|-----|--------|
-| Daily Reset | `CPR_LEVELS_RISK_LONG` | `3898e767c6a9` | 2025-01-01 → 2026-04-17 | ₹893,968 | 143 |
-| Daily Reset | `CPR_LEVELS_RISK_SHORT` | `3c139d78214a` | 2025-01-01 → 2026-04-17 | ₹1,053,952 | 73 |
-| Daily Reset | `CPR_LEVELS_STANDARD_LONG` | `e4f3123e8ad7` | 2025-01-01 → 2026-04-17 | ₹905,186 | 145 |
-| Daily Reset | `CPR_LEVELS_STANDARD_SHORT` | `ab10eca1e9c9` | 2025-01-01 → 2026-04-17 | ₹1,057,696 | 66 |
-| Compound | `CPR_LEVELS_STANDARD_LONG` | `206283c94744` | 2025-01-01 → 2026-04-17 | ₹1,827,199 | 181 |
-| Compound | `CPR_LEVELS_STANDARD_SHORT` | `b7688096ded7` | 2025-01-01 → 2026-04-17 | ₹2,539,392 | 104 |
-| Compound | `CPR_LEVELS_RISK_LONG` | `dcb0f8fd2ddf` | 2025-01-01 → 2026-04-17 | ₹1,826,581 | 181 |
-| Compound | `CPR_LEVELS_RISK_SHORT` | `c2fcdfa605ef` | 2025-01-01 → 2026-04-17 | ₹2,536,852 | 104 |
+| Daily Reset | `CPR_LEVELS_RISK_LONG` | `f0bfbf9074ce` | 2025-01-01 → 2026-04-17 | ₹991,500 | 156 |
+| Daily Reset | `CPR_LEVELS_RISK_SHORT` | `be37c0ae2111` | 2025-01-01 → 2026-04-17 | ₹1,053,952 | 73 |
+| Daily Reset | `CPR_LEVELS_STANDARD_LONG` | `6d3635b36ca3` | 2025-01-01 → 2026-04-17 | ₹1,003,565 | 158 |
+| Daily Reset | `CPR_LEVELS_STANDARD_SHORT` | `3fba5456e120` | 2025-01-01 → 2026-04-17 | ₹1,057,696 | 66 |
+| Compound | `CPR_LEVELS_STANDARD_LONG` | `38a0b809d8a2` | 2025-01-01 → 2026-04-17 | ₹2,142,730 | 200 |
+| Compound | `CPR_LEVELS_STANDARD_SHORT` | `f1386c54ca7f` | 2025-01-01 → 2026-04-17 | ₹2,539,392 | 104 |
+| Compound | `CPR_LEVELS_RISK_LONG` | `99e9d2beca78` | 2025-01-01 → 2026-04-17 | ₹2,142,210 | 200 |
+| Compound | `CPR_LEVELS_RISK_SHORT` | `22d8ca089901` | 2025-01-01 → 2026-04-17 | ₹2,536,852 | 104 |
 
-The v2 fix (2026-04-19) makes TRAIL activate on intraday HIGH ≥ 2R (not just close).
-The v3 short-tuning step lifts SHORT by another ~₹42K daily-reset / ~₹173K compound.
-LONG still benefits strongly from the fix (+₹80K daily-reset, +₹234K compound). See
+The 2026-04-20 rerun refreshed the canonical baseline set on the current shared-exit code.
+LONG improved again versus the prior reference rows; SHORT stayed flat. See
 `docs/ISSUES.md` and `docs/trailing-stop-explained.md` for the full explanation.
 
 When extending the v2 set to a later end date, rerun these same eight presets and

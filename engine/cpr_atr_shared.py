@@ -10,12 +10,13 @@ import logging
 import threading
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 from engine.bar_orchestrator import minimum_trade_notional_for
-from engine.constants import SL_PHASE_TO_EXIT_REASON
+from engine.constants import SL_PHASE_TO_EXIT_REASON, SLPhase
 from engine.cpr_atr_utils import (
     TrailingStop,
+    advance_trailing_stop_for_completed_bar,
     calculate_gap_pct,
     calculate_or_atr_ratio,
     calculate_position_size,
@@ -49,6 +50,14 @@ class TradeLifecycleOutcome:
     reached_2r: bool = False
     max_r: float = 0.0
     exit_fills: tuple[tuple[float, float], ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class CompletedCandleDecision:
+    action: str
+    exit_reason: str | None = None
+    fills: tuple[tuple[float, float], ...] = ()
+    preemptive_trail_update: bool = False
 
 
 def get_cpr_entry_scan_start(or_minutes: int, cpr_entry_start: str | None) -> str:
@@ -359,6 +368,135 @@ def split_scale_out_quantity(position_size: int, scale_out_pct: float) -> tuple[
     return scale_out_qty, runner_qty
 
 
+def resolve_completed_candle_trade_step(
+    *,
+    ts: TrailingStop,
+    direction: str,
+    low: float,
+    high: float,
+    close: float,
+    time_str: str,
+    time_exit: str,
+    target_price: float,
+    current_qty: float,
+    candle_count: int,
+    candle_exit: int = 0,
+    runner_target_price: float | None = None,
+    scale_out_pct: float = 0.0,
+    scale_split: tuple[float, float] | None = None,
+    scaled_out: bool = False,
+) -> CompletedCandleDecision:
+    """Resolve the effect of one completed candle on a live trade lifecycle."""
+    direction = direction.upper()
+    preemptive_trail_update = runner_target_price is None or scale_out_pct <= 0
+    if preemptive_trail_update:
+        advance_trailing_stop_for_completed_bar(
+            ts,
+            close=close,
+            candle_high=high,
+            candle_low=low,
+        )
+
+    if ts.is_hit(low, high):
+        exit_reason = SL_PHASE_TO_EXIT_REASON.get(cast(SLPhase, ts.phase), "INITIAL_SL")
+        return CompletedCandleDecision(
+            action="CLOSE",
+            exit_reason=exit_reason,
+            fills=((float(current_qty), float(ts.current_sl)),),
+            preemptive_trail_update=preemptive_trail_update,
+        )
+
+    if runner_target_price is not None and scale_out_pct > 0 and scale_split is not None:
+        scale_qty = float(scale_split[0])
+        runner_qty = float(scale_split[1])
+        first_target_hit = (direction == "LONG" and high >= target_price) or (
+            direction == "SHORT" and low <= target_price
+        )
+        runner_target_hit = (direction == "LONG" and high >= runner_target_price) or (
+            direction == "SHORT" and low <= runner_target_price
+        )
+        if first_target_hit:
+            if runner_target_hit and not scaled_out:
+                return CompletedCandleDecision(
+                    action="CLOSE",
+                    exit_reason="TARGET",
+                    fills=(
+                        (scale_qty, float(target_price)),
+                        (runner_qty, float(runner_target_price)),
+                    ),
+                    preemptive_trail_update=preemptive_trail_update,
+                )
+            if not scaled_out:
+                ts.phase = "BREAKEVEN"
+                if direction == "LONG":
+                    ts.current_sl = max(float(ts.current_sl), float(ts.entry_price))
+                else:
+                    ts.current_sl = min(float(ts.current_sl), float(ts.entry_price))
+                advance_trailing_stop_for_completed_bar(
+                    ts,
+                    close=close,
+                    candle_high=high,
+                    candle_low=low,
+                )
+                return CompletedCandleDecision(
+                    action="PARTIAL",
+                    exit_reason="TARGET",
+                    fills=((scale_qty, float(target_price)),),
+                    preemptive_trail_update=preemptive_trail_update,
+                )
+        if scaled_out and runner_target_hit:
+            return CompletedCandleDecision(
+                action="CLOSE",
+                exit_reason="TARGET",
+                fills=((float(current_qty), float(runner_target_price)),),
+                preemptive_trail_update=preemptive_trail_update,
+            )
+    else:
+        if direction == "LONG" and high >= target_price:
+            return CompletedCandleDecision(
+                action="CLOSE",
+                exit_reason="TARGET",
+                fills=((float(current_qty), float(target_price)),),
+                preemptive_trail_update=preemptive_trail_update,
+            )
+        if direction == "SHORT" and low <= target_price:
+            return CompletedCandleDecision(
+                action="CLOSE",
+                exit_reason="TARGET",
+                fills=((float(current_qty), float(target_price)),),
+                preemptive_trail_update=preemptive_trail_update,
+            )
+
+    if candle_exit > 0 and candle_count >= candle_exit:
+        return CompletedCandleDecision(
+            action="CLOSE",
+            exit_reason="CANDLE_EXIT",
+            fills=((float(current_qty), float(close)),),
+            preemptive_trail_update=preemptive_trail_update,
+        )
+
+    if time_str >= time_exit:
+        return CompletedCandleDecision(
+            action="CLOSE",
+            exit_reason="TIME",
+            fills=((float(current_qty), float(close)),),
+            preemptive_trail_update=preemptive_trail_update,
+        )
+
+    if not preemptive_trail_update:
+        advance_trailing_stop_for_completed_bar(
+            ts,
+            close=close,
+            candle_high=high,
+            candle_low=low,
+        )
+
+    return CompletedCandleDecision(
+        action="HOLD",
+        preemptive_trail_update=preemptive_trail_update,
+    )
+
+
 def simulate_trade_lifecycle(
     *,
     day_pack: Any,
@@ -405,8 +543,6 @@ def simulate_trade_lifecycle(
         if runner_target_price is not None and scale_out_pct > 0
         else None
     )
-    scale_out_qty = float(scale_split[0]) if scale_split else 0.0
-    runner_qty = float(scale_split[1]) if scale_split else 0.0
 
     def _record_fill(qty: float, price: float) -> None:
         nonlocal remaining_qty, exit_price
@@ -443,81 +579,42 @@ def simulate_trade_lifecycle(
             adverse = high - entry_price
         max_favorable = max(max_favorable, favorable)
         max_adverse = max(max_adverse, adverse)
-
-        ts.update(close, candle_high=high, candle_low=low)
+        decision = resolve_completed_candle_trade_step(
+            ts=ts,
+            direction=direction,
+            low=low,
+            high=high,
+            close=close,
+            time_str=time_str,
+            time_exit=time_exit,
+            target_price=target_price,
+            current_qty=remaining_qty,
+            candle_count=candle_count,
+            candle_exit=candle_exit,
+            runner_target_price=runner_target_price,
+            scale_out_pct=scale_out_pct,
+            scale_split=scale_split,
+            scaled_out=scaled_out,
+        )
         final_phase = ts.phase
 
-        if ts.is_hit(low, high):
+        if decision.action == "PARTIAL":
+            for qty, price in decision.fills:
+                _record_fill(qty, price)
+            scaled_out = True
+            continue
+
+        if decision.action == "CLOSE":
             exit_time = time_str
-            exit_price = ts.current_sl
-            if ts.phase == "PROTECT":
-                exit_reason = SL_PHASE_TO_EXIT_REASON["PROTECT"]
-            elif ts.phase == "BREAKEVEN":
-                exit_reason = SL_PHASE_TO_EXIT_REASON["BREAKEVEN"]
-            elif ts.phase == "TRAIL":
-                exit_reason = SL_PHASE_TO_EXIT_REASON["TRAIL"]
-            else:
-                exit_reason = "SL"
-            _record_fill(remaining_qty, exit_price)
+            exit_reason = decision.exit_reason or "TIME"
+            if decision.fills:
+                for qty, price in decision.fills:
+                    _record_fill(qty, price)
+                exit_price = exit_price if exit_price is not None else decision.fills[-1][1]
             break
 
-        if runner_target_price is not None and scale_out_qty > 0 and runner_qty > 0:
-            first_target_hit = (direction == "LONG" and high >= target_price) or (
-                direction == "SHORT" and low <= target_price
-            )
-            runner_target_hit = (direction == "LONG" and high >= runner_target_price) or (
-                direction == "SHORT" and low <= runner_target_price
-            )
-            if first_target_hit:
-                exit_time = time_str
-                if runner_target_hit and not scaled_out:
-                    _record_fill(scale_out_qty, target_price)
-                    _record_fill(runner_qty, runner_target_price)
-                    exit_reason = "TARGET"
-                    break
-                if not scaled_out:
-                    _record_fill(scale_out_qty, target_price)
-                    scaled_out = True
-                    if direction == "LONG":
-                        ts.phase = "BREAKEVEN"
-                        ts.current_sl = max(ts.current_sl, entry_price)
-                    else:
-                        ts.phase = "BREAKEVEN"
-                        ts.current_sl = min(ts.current_sl, entry_price)
-                    final_phase = ts.phase
-                    continue
-            if scaled_out and runner_target_hit:
-                exit_time = time_str
-                _record_fill(remaining_qty, runner_target_price)
-                exit_reason = "TARGET"
-                break
-        else:
-            if direction == "LONG" and high >= target_price:
-                exit_time = time_str
-                exit_price = target_price
-                exit_reason = "TARGET"
-                _record_fill(remaining_qty, target_price)
-                break
-            if direction == "SHORT" and low <= target_price:
-                exit_time = time_str
-                exit_price = target_price
-                exit_reason = "TARGET"
-                _record_fill(remaining_qty, target_price)
-                break
-
-        if candle_exit > 0 and candle_count >= candle_exit:
-            exit_time = time_str
-            exit_price = close
-            exit_reason = "CANDLE_EXIT"
-            _record_fill(remaining_qty, close)
-            break
-
-        if time_str >= time_exit:
-            exit_time = time_str
-            exit_price = close
-            exit_reason = "TIME"
-            _record_fill(remaining_qty, close)
-            break
+        if decision.action != "HOLD":
+            raise ValueError(f"Unknown decision action: {decision.action}")
 
     if exit_price is None:
         if i0 < n:

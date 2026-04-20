@@ -698,18 +698,21 @@ so they reversed to entry. These are expected capital-protection outcomes.
 | Cmp-Risk LONG | ₹1,592,321 | ₹1,826,581 | +₹234K (+14.7%) | 145 | 181 |
 | Cmp-Risk SHORT | ₹2,354,156 | ₹2,536,852 | +₹183K (+7.8%) | 92 | 104 |
 
-### Current v3 baseline run IDs
+### Current v4 baseline run IDs
 
 | Preset | Run ID |
 |---|---|
-| DR-Risk LONG | `3898e767c6a9` |
-| DR-Risk SHORT | `3c139d78214a` |
-| DR-Std LONG | `e4f3123e8ad7` |
-| DR-Std SHORT | `ab10eca1e9c9` |
-| Cmp-Std LONG | `206283c94744` |
-| Cmp-Std SHORT | `b7688096ded7` |
-| Cmp-Risk LONG | `dcb0f8fd2ddf` |
-| Cmp-Risk SHORT | `c2fcdfa605ef` |
+| DR-Risk LONG | `f0bfbf9074ce` |
+| DR-Risk SHORT | `be37c0ae2111` |
+| DR-Std LONG | `6d3635b36ca3` |
+| DR-Std SHORT | `3fba5456e120` |
+| Cmp-Std LONG | `38a0b809d8a2` |
+| Cmp-Std SHORT | `f1386c54ca7f` |
+| Cmp-Risk LONG | `99e9d2beca78` |
+| Cmp-Risk SHORT | `22d8ca089901` |
+
+These rows replaced the retired v3 baselines in `backtest.duckdb` and are the only
+canonical CPR_LEVELS baseline rows now kept in the archive.
 
 ### Files Changed
 - `engine/cpr_atr_utils.py` — `TrailingStop.update()` rewrite
@@ -717,7 +720,43 @@ so they reversed to entry. These are expected capital-protection outcomes.
 - `engine/paper_runtime.py` — updated `ts.update()` call at line 1709
 - `tests/test_cpr_utils.py` — 4 new unit tests + 2 updated existing tests
 
----
+### 2026-04-19 RCA: LONG profit regression after trail-timing refactor
+
+After the intraday-high trail fix landed in `95ae448`, the morning LONG baselines
+(`e4f3123e8ad7`, `3898e767c6a9`, `206283c94744`, `dcb0f8fd2ddf`) no longer
+matched when rerun later in the day. The reruns were still directionally correct,
+but they shifted a large number of LONG winners from `TRAILING_SL` back to
+`TARGET`, which reduced profit and Calmar.
+
+On 2026-04-20, the baseline set was refreshed again after the shared exit helper
+centralization. The new canonical rows are:
+`6d3635b36ca3`, `3fba5456e120`, `f0bfbf9074ce`, `be37c0ae2111`,
+`38a0b809d8a2`, `f1386c54ca7f`, `99e9d2beca78`, `22d8ca089901`.
+These are the only baseline rows retained in `backtest.duckdb`.
+
+  The important nuance is not that intraday-high activation is wrong. The issue is
+  the timing of when the tightened stop becomes active relative to the completed
+  5-minute bar. The working recovery path is:
+
+  1. Let the completed bar arm TRAIL when its HIGH touches 2R.
+  2. Use that completed-bar HIGH as the LONG trail anchor.
+  3. Apply the tightened stop immediately after the bar closes.
+  4. Make that new stop affect only future bars, not the triggering candle itself.
+
+  That preserves the profit-improving LONG behavior while keeping the engine
+  conservative about same-bar OHLC ordering.
+
+  Operational note:
+  - Backtest runs can show `save_complete` in the logs and still hold the DuckDB
+    writer lock briefly afterwards. The dashboard replica sync is already done at
+    that point; the remaining delay is process cleanup / file-handle release.
+  - Treat that as a cleanup issue, not a data-sync issue. Investigate the lingering
+    writer lifecycle separately from the strategy parity work.
+  - The completed-candle exit ordering is now centralized in a shared helper used by
+    both backtest and paper/live so the bar-close trailing behavior stays aligned in
+    one place.
+
+  ---
 
 ## 2026-04-18 — Live WebSocket OR values differ from EOD parquet, causing symbol divergence
 
@@ -785,6 +824,35 @@ parquet values. This is an architectural limitation of MODE_QUOTE WebSocket feed
 - #7 (OHLCV drift) — same underlying cause, this issue is a specific manifestation
 - #1 (OR fields NULL → 0.0) — the Apr 16 fix enabled the live OR fallback
 - #8 (live candle OHLCV diverges from intraday_day_pack) — same architectural limitation
+
+---
+
+## Deferred Parity Follow-Ups
+
+**Status:** OPEN
+**Severity:** Medium
+
+These items are intentionally deferred until after the current market-open window. They are
+important for long-term parity hygiene, but they are not required to complete the immediate
+pre-open workflow.
+
+### 1) Shared daily candidate universe snapshot
+
+Backtest and paper/live still derive their candidate universes from different runtime flows.
+The long-term fix is to persist a daily candidate-universe snapshot and have all CPR runtimes
+consume the same dated list.
+
+### 2) Backtest vs paper parity re-check for 2026-04-17
+
+Current paper replay/local parity is stable, but the 2026-04-17 paper runs still differ from
+the backtest day slice. This needs a follow-up compare after the universe-source alignment is
+settled.
+
+### 3) Review lingering backtest writer-lock shutdown
+
+We observed that some long baseline reruns finish saving results before the DuckDB writer lock
+fully releases. That does not change results, but it is worth a later cleanup so baseline
+reruns exit more predictably.
 
 ---
 

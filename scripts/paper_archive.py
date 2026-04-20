@@ -117,9 +117,15 @@ def archive_completed_session(
         end_date = trade_date
     backtest_db = get_backtest_db()
     params = dict(session.strategy_params or {})
+    paper_session_mode = str(getattr(session, "mode", "") or "LIVE").upper()
+    paper_feed_source = str(params.get("feed_source") or "").strip().lower()
+    if not paper_feed_source:
+        paper_feed_source = "historical" if paper_session_mode == "REPLAY" else "kite"
     params.update(
         {
             "paper_session_id": session.session_id,
+            "paper_session_mode": paper_session_mode,
+            "paper_feed_source": paper_feed_source,
             "portfolio_value": getattr(session, "portfolio_value", None),
             "max_daily_loss_pct": session.max_daily_loss_pct,
             "max_positions": session.max_positions,

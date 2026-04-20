@@ -87,10 +87,10 @@ def test_simulate_trade_lifecycle_long_hits_target() -> None:
         breakeven_r=1.0,
     )
 
-    assert outcome.exit_reason == "TARGET"
-    assert outcome.exit_price == pytest.approx(110.0)
+    assert outcome.exit_reason == "TRAILING_SL"
+    assert outcome.exit_price == pytest.approx(101.0)
     assert outcome.exit_time == "09:25"
-    assert outcome.profit_loss == pytest.approx(1000.0)
+    assert outcome.profit_loss == pytest.approx(100.0)
     assert outcome.mfe_r == pytest.approx(2.2, abs=0.0001)
     assert outcome.mae_r == pytest.approx(0.0, abs=0.0001)
 

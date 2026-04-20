@@ -271,8 +271,9 @@ def _install_runtime_fakes(
         *,
         or_minutes: int = 5,
         allow_live_fallback: bool = True,
+        bar_end_offset=None,
     ):
-        _ = allow_live_fallback
+        _ = allow_live_fallback, bar_end_offset
         return setup_row if symbol == "SBIN" and trade_date == "2024-01-01" else None
 
     async def fake_open_position(**kwargs):
@@ -737,7 +738,13 @@ async def test_process_closed_candle_marks_pending_setups_for_pruning(
     monkeypatch.setattr("engine.paper_runtime.get_session_positions", fake_get_session_positions)
     monkeypatch.setattr(
         "engine.paper_runtime.load_setup_row",
-        lambda symbol, trade_date, live_candles=None, *, or_minutes=5, allow_live_fallback=True: {
+        lambda symbol,
+        trade_date,
+        live_candles=None,
+        *,
+        or_minutes=5,
+        allow_live_fallback=True,
+        bar_end_offset=None: {
             **_make_cpr_setup_row(),
             "direction": "NONE",
         },

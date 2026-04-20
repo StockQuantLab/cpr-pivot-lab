@@ -11,16 +11,16 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from datetime import time as dt_time
-from typing import Any, cast
+from typing import Any
 from zoneinfo import ZoneInfo
 
 from db.duckdb import get_dashboard_db
 from db.paper_db import FeedState, PaperPosition, PaperSession, get_paper_db
 from engine.alert_dispatcher import AlertDispatcher, AlertType, get_alert_config
 from engine.bar_orchestrator import SessionPositionTracker
-from engine.constants import SL_PHASE_TO_EXIT_REASON
 from engine.cpr_atr_shared import (
     normalize_stop_loss,
+    resolve_completed_candle_trade_step,
     scan_cpr_levels_entry,
     split_scale_out_quantity,
 )
@@ -112,7 +112,6 @@ async def shutdown_alert_dispatcher() -> None:
         _background_tasks.clear()
 
 
-SL_PHASE_EXIT_REASON_MAP = cast(dict[str, str], SL_PHASE_TO_EXIT_REASON)
 _PAPER_DB_IO_LOCK = threading.RLock()
 _MARKET_DB_READ_LOCK = (
     threading.RLock()
@@ -540,6 +539,7 @@ class PaperRuntimeState:
     session_params_key: str | None = None
     session_params: BacktestParams | None = None
     allow_live_setup_fallback: bool = True
+    bar_end_offset: timedelta | None = None
     skipped_setup_rows: int = 0
     invalid_setup_rows: int = 0
 
@@ -605,6 +605,7 @@ def _build_intraday_summary(
     candles: list[dict[str, Any]],
     *,
     or_minutes: int,
+    bar_end_offset: timedelta | None = None,
 ) -> dict[str, float | bool | None]:
     if not candles:
         return {
@@ -620,7 +621,11 @@ def _build_intraday_summary(
         first_bar_end.date(),
         dt_time(9, 15, tzinfo=getattr(first_bar_end, "tzinfo", None)),
     ) + timedelta(minutes=max(1, int(or_minutes or 5)))
-    window = [candle for candle in candles if candle["bar_end"] <= range_end]
+    # bar_end_offset corrects for pack-convention candles where bar_end stores bar_start
+    # time (e.g. "09:15" stored as bar_end for the 09:15-09:20 candle).  Live Kite candles
+    # already carry the true close time so offset defaults to zero.
+    _beo = bar_end_offset or timedelta(0)
+    window = [candle for candle in candles if candle["bar_end"] + _beo <= range_end]
     if not window:
         # Late-start continuity mode: when the process starts after OR completion
         # and early bars are unavailable in-memory, synthesize OR from first seen bar.
@@ -631,7 +636,7 @@ def _build_intraday_summary(
             "or_close_5": _float_or_none(first.get("close")),
             "or_proxy": True,
         }
-    if candles[-1]["bar_end"] < range_end:
+    if candles[-1]["bar_end"] + _beo < range_end:
         return {
             "open_915": _float_or_none(first.get("open")),
             "or_high_5": None,
@@ -655,6 +660,7 @@ def _load_live_setup_row(
     live_candles: list[dict[str, Any]],
     *,
     or_minutes: int,
+    bar_end_offset: timedelta | None = None,
 ) -> dict[str, Any] | None:
     if not live_candles:
         return None
@@ -736,7 +742,9 @@ def _load_live_setup_row(
         float(threshold_row[0]) if threshold_row and threshold_row[0] is not None else 2.0
     )
 
-    intraday = _build_intraday_summary(live_candles, or_minutes=or_minutes)
+    intraday = _build_intraday_summary(
+        live_candles, or_minutes=or_minutes, bar_end_offset=bar_end_offset
+    )
     open_915 = intraday["open_915"]
     or_high_5 = intraday["or_high_5"]
     or_low_5 = intraday["or_low_5"]
@@ -789,6 +797,7 @@ def load_setup_row(
     *,
     or_minutes: int = 5,
     allow_live_fallback: bool = True,
+    bar_end_offset: timedelta | None = None,
 ) -> dict[str, Any] | None:
     db = get_dashboard_db()
     with _MARKET_DB_READ_LOCK:
@@ -835,6 +844,7 @@ def load_setup_row(
             trade_date,
             live_candles or [],
             or_minutes=or_minutes,
+            bar_end_offset=bar_end_offset,
         )
 
     open_side = str(row[16] or "")
@@ -848,7 +858,9 @@ def load_setup_row(
     # available (or_close_5 NULL, strategy_day_state not yet built).  If live candles
     # have arrived, derive direction from them instead of falling back to _load_live_setup_row.
     if direction == "NONE" and live_candles:
-        intraday = _build_intraday_summary(live_candles, or_minutes=or_minutes)
+        intraday = _build_intraday_summary(
+            live_candles, or_minutes=or_minutes, bar_end_offset=bar_end_offset
+        )
         live_or_close_5 = intraday.get("or_close_5")
         if live_or_close_5 is not None:
             direction = resolve_cpr_direction(
@@ -928,6 +940,7 @@ def _hydrate_setup_row_from_market_row(
     row: tuple[Any, ...],
     live_candles: list[dict[str, Any]] | None = None,
     or_minutes: int = 5,
+    bar_end_offset: timedelta | None = None,
 ) -> dict[str, Any] | None:
     tc = float(row[3] or 0.0)
     bc = float(row[4] or 0.0)
@@ -940,7 +953,9 @@ def _hydrate_setup_row_from_market_row(
         direction = str(row[21] or "NONE")
     live_intraday: dict[str, Any] | None = None
     if direction == "NONE" and live_candles:
-        live_intraday = _build_intraday_summary(live_candles, or_minutes=or_minutes)
+        live_intraday = _build_intraday_summary(
+            live_candles, or_minutes=or_minutes, bar_end_offset=bar_end_offset
+        )
         live_or_close_5 = live_intraday.get("or_close_5")
         if live_or_close_5 is not None:
             direction = resolve_cpr_direction(live_or_close_5, tc, bc, fallback="NONE")
@@ -1082,6 +1097,7 @@ def refresh_pending_setup_rows_for_bar(
                     trade_date,
                     live_candles,
                     or_minutes=or_minutes,
+                    bar_end_offset=runtime_state.bar_end_offset,
                 )
                 if fallback_row is not None:
                     state.setup_row = fallback_row
@@ -1096,6 +1112,7 @@ def refresh_pending_setup_rows_for_bar(
             row=row,
             live_candles=live_candles,
             or_minutes=or_minutes,
+            bar_end_offset=runtime_state.bar_end_offset,
         )
         if setup_row is None:
             missing += 1
@@ -1522,18 +1539,6 @@ def _entry_candidate(
     }
 
 
-def _target_hit_price(position: PaperPosition, candle: dict[str, Any]) -> float | None:
-    if position.target_price is None:
-        return None
-    target_price = float(position.target_price)
-    direction = position.direction.upper()
-    if direction == "LONG" and float(candle["high"]) >= target_price:
-        return target_price
-    if direction == "SHORT" and float(candle["low"]) <= target_price:
-        return target_price
-    return None
-
-
 def _updated_trail_state(
     ts: TrailingStop, trail_state: dict[str, Any], candle: dict[str, Any]
 ) -> dict[str, Any]:
@@ -1545,25 +1550,6 @@ def _updated_trail_state(
         "lowest_since_entry": float(ts.lowest_since_entry),
         "last_candle_ts": _hhmm(candle["bar_end"]),
     }
-
-
-def _resolve_exit_decision(
-    position: PaperPosition,
-    candle: dict[str, Any],
-    params: BacktestParams,
-    ts: TrailingStop,
-) -> tuple[str | None, float]:
-    close_price = float(candle["close"])
-    if ts.is_hit(float(candle["low"]), float(candle["high"])):
-        exit_reason = SL_PHASE_EXIT_REASON_MAP.get(str(ts.phase), "INITIAL_SL")
-        return exit_reason, float(ts.current_sl)
-    bar_time = _hhmm(candle["bar_end"])
-    target_hit_price = _target_hit_price(position, candle)
-    if target_hit_price is not None:
-        return "TARGET", target_hit_price
-    if bar_time is not None and bar_time >= params.time_exit:
-        return "TIME", close_price
-    return None, close_price
 
 
 async def _open_position_from_candidate(
@@ -1712,10 +1698,27 @@ async def _advance_open_position(
     candle_count = int(trail_state.get("candle_count") or 0) + 1
 
     mark_price = float(candle["close"])
-    ts.update(mark_price, candle_high=float(candle["high"]), candle_low=float(candle["low"]))
-    next_trail_state = _updated_trail_state(ts, trail_state, candle)
-    next_trail_state["candle_count"] = candle_count
     direction = position.direction.upper()
+    decision = resolve_completed_candle_trade_step(
+        ts=ts,
+        direction=direction,
+        low=float(candle["low"]),
+        high=float(candle["high"]),
+        close=mark_price,
+        time_str=_hhmm(candle["bar_end"]) or "",
+        time_exit=params.time_exit,
+        target_price=first_target_price if scale_out_pct > 0 else final_target_price,
+        current_qty=current_qty,
+        candle_count=candle_count,
+        candle_exit=0,
+        runner_target_price=final_target_price if scale_out_pct > 0 else None,
+        scale_out_pct=scale_out_pct,
+        scale_split=scale_split,
+        scaled_out=scaled_out,
+    )
+
+    pre_update_trail_state = _updated_trail_state(ts, trail_state, candle)
+    pre_update_trail_state["candle_count"] = candle_count
 
     async def _record_exit_fill(qty: float, price: float, *, notes: str) -> float:
         realized = _realized_pnl_for_close(position, price, params=params, qty=qty)
@@ -1734,196 +1737,9 @@ async def _advance_open_position(
         )
         return realized
 
-    if ts.is_hit(float(candle["low"]), float(candle["high"])):
-        exit_reason = SL_PHASE_EXIT_REASON_MAP.get(str(ts.phase), "INITIAL_SL")
-        close_price = float(ts.current_sl)
-        realized = realized_so_far + await _record_exit_fill(
-            current_qty,
-            close_price,
-            notes=f"paper exit:{exit_reason}",
-        )
-        await update_position(
-            position.position_id,
-            status="CLOSED",
-            stop_loss=float(ts.current_sl),
-            trail_state={**next_trail_state, "exit_reason": exit_reason},
-            current_qty=0.0,
-            last_price=close_price,
-            close_price=close_price,
-            realized_pnl=realized,
-            exit_reason=exit_reason,
-            closed_by=exit_reason,
-            closed_at=candle.get("bar_end") if isinstance(candle, dict) else None,
-        )
-        logger.info(
-            "Paper trade close session_id=%s symbol=%s direction=%s time=%s reason=%s exit=%.2f pnl=%.2f bars=%d",
-            position.session_id,
-            position.symbol,
-            position.direction,
-            _format_event_time(candle.get("bar_end") if isinstance(candle, dict) else None),
-            exit_reason,
-            close_price,
-            realized,
-            candle_count,
-        )
-        try:
-            subject, body = _format_close_alert(
-                symbol=position.symbol,
-                direction=position.direction,
-                entry_price=float(position.entry_price),
-                close_price=close_price,
-                reason=exit_reason,
-                realized_pnl=realized,
-                duration_bars=candle_count,
-                strategy=str(getattr(position, "opened_by", "")),
-                session_id=position.session_id,
-                event_time=candle.get("bar_end") if isinstance(candle, dict) else None,
-            )
-            _dispatch_alert(
-                AlertType.SL_HIT if "SL" in exit_reason else AlertType.TRADE_CLOSED,
-                subject,
-                body,
-            )
-        except Exception:
-            logger.debug("Alert dispatch for SL hit failed (best-effort)", exc_info=True)
-        return {
-            "action": "CLOSE",
-            "position_id": position.position_id,
-            "symbol": position.symbol,
-            "reason": exit_reason,
-            "close_price": close_price,
-            "closed_qty": current_qty,
-            "exit_value": _exit_value_for_position(position, current_qty, close_price),
-        }
-
-    if scale_out_pct > 0 and not scaled_out and scale_split is not None:
-        scale_qty = float(scale_split[0])
-        runner_qty = float(scale_split[1])
-        first_hit = (direction == "LONG" and float(candle["high"]) >= first_target_price) or (
-            direction == "SHORT" and float(candle["low"]) <= first_target_price
-        )
-        final_hit = (direction == "LONG" and float(candle["high"]) >= final_target_price) or (
-            direction == "SHORT" and float(candle["low"]) <= final_target_price
-        )
-        if first_hit:
-            if final_hit:
-                partial_realized = await _record_exit_fill(
-                    scale_qty,
-                    first_target_price,
-                    notes="paper exit:scale_out",
-                )
-                runner_realized = await _record_exit_fill(
-                    runner_qty,
-                    final_target_price,
-                    notes="paper exit:runner_target",
-                )
-                realized = realized_so_far + partial_realized + runner_realized
-                await update_position(
-                    position.position_id,
-                    status="CLOSED",
-                    stop_loss=float(ts.current_sl),
-                    target_price=final_target_price,
-                    trail_state={**next_trail_state, "exit_reason": "TARGET", "scaled_out": True},
-                    current_qty=0.0,
-                    last_price=final_target_price,
-                    close_price=final_target_price,
-                    realized_pnl=realized,
-                    exit_reason="TARGET",
-                    closed_by="TARGET",
-                    closed_at=candle.get("bar_end") if isinstance(candle, dict) else None,
-                )
-                logger.info(
-                    "Paper trade close session_id=%s symbol=%s direction=%s time=%s reason=%s exit=%.2f pnl=%.2f bars=%d",
-                    position.session_id,
-                    position.symbol,
-                    position.direction,
-                    _format_event_time(candle.get("bar_end") if isinstance(candle, dict) else None),
-                    "TARGET",
-                    final_target_price,
-                    realized,
-                    candle_count,
-                )
-                try:
-                    subject, body = _format_close_alert(
-                        symbol=position.symbol,
-                        direction=position.direction,
-                        entry_price=float(position.entry_price),
-                        close_price=final_target_price,
-                        reason="TARGET (scaled out + runner)",
-                        realized_pnl=realized,
-                        duration_bars=candle_count,
-                        strategy=str(getattr(position, "opened_by", "")),
-                        session_id=position.session_id,
-                        event_time=candle.get("bar_end") if isinstance(candle, dict) else None,
-                    )
-                    _dispatch_alert(AlertType.TARGET_HIT, subject, body)
-                except Exception:
-                    logger.debug(
-                        "Alert dispatch for target hit failed (best-effort)", exc_info=True
-                    )
-                return {
-                    "action": "CLOSE",
-                    "position_id": position.position_id,
-                    "symbol": position.symbol,
-                    "reason": "TARGET",
-                    "close_price": final_target_price,
-                    "closed_qty": current_qty,
-                    "exit_value": _exit_value_for_position(
-                        position, current_qty, final_target_price
-                    ),
-                }
-
-            partial_realized = await _record_exit_fill(
-                scale_qty,
-                first_target_price,
-                notes="paper exit:scale_out",
-            )
-            remaining_qty = max(current_qty - scale_qty, 0.0)
-            realized = realized_so_far + partial_realized
-            runner_sl = float(position.entry_price)
-            if direction == "LONG":
-                ts.current_sl = max(float(ts.current_sl), runner_sl)
-            else:
-                ts.current_sl = min(float(ts.current_sl), runner_sl)
-            ts.phase = "BREAKEVEN"
-            next_trail_state = {
-                **next_trail_state,
-                "current_sl": float(ts.current_sl),
-                "phase": ts.phase,
-                "scaled_out": True,
-            }
-            await update_position(
-                position.position_id,
-                stop_loss=float(ts.current_sl),
-                target_price=final_target_price,
-                trail_state=next_trail_state,
-                current_qty=remaining_qty,
-                last_price=float(candle["close"]),
-                realized_pnl=realized,
-            )
-            logger.info(
-                "Paper trade partial session_id=%s symbol=%s direction=%s first_exit=%.2f runner_exit=%.2f pnl=%.2f bars=%d",
-                position.session_id,
-                position.symbol,
-                position.direction,
-                first_target_price,
-                final_target_price,
-                realized,
-                candle_count,
-            )
-            return {
-                "action": "PARTIAL",
-                "position_id": position.position_id,
-                "mark": float(candle["close"]),
-                "symbol": position.symbol,
-                "partial_qty": scale_qty,
-                "partial_exit_price": first_target_price,
-                "exit_value": float(scale_qty) * float(first_target_price),
-                "next_trail_state": next_trail_state,
-            }
-
-    resolved_exit_reason, close_price = _resolve_exit_decision(position, candle, params, ts)
-    if resolved_exit_reason is None:
+    if decision.action == "HOLD":
+        next_trail_state = _updated_trail_state(ts, trail_state, candle)
+        next_trail_state["candle_count"] = candle_count
         await update_position(
             position.position_id,
             stop_loss=float(ts.current_sl),
@@ -1938,36 +1754,73 @@ async def _advance_open_position(
             "next_trail_state": next_trail_state,
         }
 
-    realized = realized_so_far + _realized_pnl_for_close(
-        position,
-        close_price,
-        params=params,
-        qty=current_qty,
-    )
-    await append_order_event(
-        session_id=position.session_id,
-        symbol=position.symbol,
-        side="SELL" if position.direction.upper() == "LONG" else "BUY",
-        requested_qty=current_qty,
-        position_id=position.position_id,
-        order_type="MARKET",
-        request_price=close_price,
-        fill_qty=current_qty,
-        fill_price=close_price,
-        status="FILLED",
-        notes=f"paper exit:{resolved_exit_reason}",
-    )
+    fill_total_qty = 0.0
+    fill_total_value = 0.0
+    realized = realized_so_far
+    for qty, price in decision.fills:
+        realized += await _record_exit_fill(
+            qty, price, notes=f"paper exit:{decision.exit_reason or 'TIME'}"
+        )
+        fill_total_qty += float(qty)
+        fill_total_value += float(qty) * float(price)
+
+    close_price = round(fill_total_value / fill_total_qty, 4) if fill_total_qty > 0 else mark_price
+    exit_reason = decision.exit_reason or "TIME"
+    exit_payload = {
+        "exit_reason": exit_reason,
+        "scaled_out": decision.action == "PARTIAL",
+    }
+    if decision.action == "PARTIAL":
+        remaining_qty = max(current_qty - float(decision.fills[0][0]), 0.0)
+        next_trail_state = _updated_trail_state(ts, trail_state, candle)
+        next_trail_state["candle_count"] = candle_count
+        next_trail_state = {
+            **next_trail_state,
+            "current_sl": float(ts.current_sl),
+            "phase": ts.phase,
+            "scaled_out": True,
+        }
+        await update_position(
+            position.position_id,
+            stop_loss=float(ts.current_sl),
+            target_price=final_target_price,
+            trail_state=next_trail_state,
+            current_qty=remaining_qty,
+            last_price=float(candle["close"]),
+            realized_pnl=realized,
+        )
+        logger.info(
+            "Paper trade partial session_id=%s symbol=%s direction=%s first_exit=%.2f runner_exit=%.2f pnl=%.2f bars=%d",
+            position.session_id,
+            position.symbol,
+            position.direction,
+            decision.fills[0][1],
+            final_target_price,
+            realized,
+            candle_count,
+        )
+        return {
+            "action": "PARTIAL",
+            "position_id": position.position_id,
+            "mark": float(candle["close"]),
+            "symbol": position.symbol,
+            "partial_qty": float(decision.fills[0][0]),
+            "partial_exit_price": float(decision.fills[0][1]),
+            "exit_value": float(decision.fills[0][0]) * float(decision.fills[0][1]),
+            "next_trail_state": next_trail_state,
+        }
+
     await update_position(
         position.position_id,
         status="CLOSED",
         stop_loss=float(ts.current_sl),
-        trail_state={**next_trail_state, "exit_reason": resolved_exit_reason},
+        trail_state={**pre_update_trail_state, **exit_payload},
         current_qty=0.0,
         last_price=close_price,
         close_price=close_price,
         realized_pnl=realized,
-        exit_reason=resolved_exit_reason,
-        closed_by=resolved_exit_reason,
+        exit_reason=exit_reason,
+        closed_by=exit_reason,
         closed_at=candle.get("bar_end") if isinstance(candle, dict) else None,
     )
     logger.info(
@@ -1976,7 +1829,7 @@ async def _advance_open_position(
         position.symbol,
         position.direction,
         _format_event_time(candle.get("bar_end") if isinstance(candle, dict) else None),
-        resolved_exit_reason,
+        exit_reason,
         close_price,
         realized,
         candle_count,
@@ -1987,21 +1840,25 @@ async def _advance_open_position(
             direction=position.direction,
             entry_price=float(position.entry_price),
             close_price=close_price,
-            reason=resolved_exit_reason,
+            reason=exit_reason,
             realized_pnl=realized,
             duration_bars=candle_count,
             strategy=str(getattr(position, "opened_by", "")),
             session_id=position.session_id,
             event_time=candle.get("bar_end") if isinstance(candle, dict) else None,
         )
-        _dispatch_alert(AlertType.TRADE_CLOSED, subject, body)
+        _dispatch_alert(
+            AlertType.SL_HIT if "SL" in exit_reason else AlertType.TRADE_CLOSED,
+            subject,
+            body,
+        )
     except Exception:
         logger.debug("Alert dispatch for resolved exit failed (best-effort)", exc_info=True)
     return {
         "action": "CLOSE",
         "position_id": position.position_id,
         "symbol": position.symbol,
-        "reason": resolved_exit_reason,
+        "reason": exit_reason,
         "close_price": close_price,
         "closed_qty": current_qty,
         "exit_value": _exit_value_for_position(position, current_qty, close_price),
@@ -2034,6 +1891,7 @@ async def evaluate_candle(
             live_candles=state.candles,
             or_minutes=params.or_minutes,
             allow_live_fallback=runtime_state.allow_live_setup_fallback,
+            bar_end_offset=runtime_state.bar_end_offset,
         )
         if setup_row is not None:
             state.setup_row = setup_row

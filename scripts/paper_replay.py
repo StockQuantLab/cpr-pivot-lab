@@ -539,7 +539,9 @@ async def replay_session(
     stale_timeout = max(0, int(session.stale_feed_timeout_sec))
     last_bar_ts: datetime | None = None
     bars_replayed = 0
-    runtime_state = PaperRuntimeState(allow_live_setup_fallback=False)
+    runtime_state = PaperRuntimeState(
+        allow_live_setup_fallback=False, bar_end_offset=timedelta(minutes=5)
+    )
     symbol_last_prices: dict[str, float] = {}
     params = build_backtest_params(session)
     tracker = SessionPositionTracker(

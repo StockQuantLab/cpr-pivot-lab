@@ -103,7 +103,7 @@ advances through PROTECT → BREAKEVEN → TRAIL as price moves in your favour.
 | Phase | SL sits at | Advance condition |
 |---|---|---|
 | **PROTECT** | Original SL (CPR boundary ± ATR buffer) | Candle close ≥ entry + 1R |
-| **BREAKEVEN** | Entry price | Candle HIGH or CLOSE ≥ entry + 2R |
+| **BREAKEVEN** | Entry price | Candle HIGH or CLOSE ≥ entry + 2R (mirror rule for SHORT uses LOW) |
 | **TRAIL** | Highest close since entry − 1× ATR | Ratchet — only moves in your favour |
 
 **Key behaviours that operators should know:**
@@ -112,15 +112,20 @@ advances through PROTECT → BREAKEVEN → TRAIL as price moves in your favour.
   is at `BC − ATR buffer`, so 1R varies by symbol and day.
 - **2R** is twice the SL distance.  `min_effective_rr = 2.0` ensures the target (R1/S1) is
   always at least 2R away from entry, so TRAIL activation and the exit target are reachable.
-- When TRAIL activates, the SL does **not** tighten on the activation bar.  It tightens from
-  the next bar onward.  This avoids a modelling assumption about OHLC order within a single
-  5-minute candle (we cannot know whether the HIGH or the LOW happened first).
-- The trail anchor (`highest_since_entry`) tracks **closes only**.  An intrabar spike that
-  does not hold to the close does not move the trail level up.  This is intentional and
-  conservative — it benefits LONG continuation trades but means SHORT runners may exit the
-  trail earlier than the original fixed target would have.
-- Canonical CPR SHORT presets now use `short_trail_atr_multiplier = 1.25` so the trail has
-  a little more room before ratcheting. LONG keeps the default `trail_atr_multiplier = 1.0`.
+- LONG trail activation can use the candle HIGH to arm TRAIL once the bar closes.  SHORT uses
+  the mirror rule with LOW.  This is still bar-close processing, not intrabar execution: we only
+  know the full OHLC after the 5-minute candle completes.
+- When TRAIL activates, the stop is tightened after the 5-minute bar closes, but the triggering
+  candle itself is still evaluated against the pre-update stop. This avoids assuming whether the
+  2R touch happened before or after the reversal inside the candle.
+- The LONG trail anchor (`highest_since_entry`) tracks the **completed bar high** once the bar has
+  proven 2R. The stop still only becomes active after the bar closes, so the triggering candle is
+  never retroactively re-evaluated.
+- SHORT can use the same bar-touch logic, but the payoff profile is different: short selloffs
+  often snap back faster, so the same trigger tends to convert targets into trailing exits more
+  quickly.  When that happened, we tuned SHORT separately with `short_trail_atr_multiplier = 1.25`.
+- LONG keeps the default `trail_atr_multiplier = 1.0` because the high-aware trigger was the
+  profit-improving change we wanted to preserve for the morning baseline set.
 - TIME\_EXIT at 15:15 takes priority — any open position is force-closed regardless of phase.
 
 For candle-by-candle worked examples (including the April 2026 intraday-high bug and its fix)

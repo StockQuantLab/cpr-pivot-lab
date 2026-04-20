@@ -282,7 +282,11 @@ def _prefetch_setup_rows(
         if direction == "NONE" and live_candles:
             from engine.paper_runtime import _build_intraday_summary
 
-            intraday = _build_intraday_summary(live_candles, or_minutes=candle_interval_minutes)
+            intraday = _build_intraday_summary(
+                live_candles,
+                or_minutes=candle_interval_minutes,
+                bar_end_offset=runtime_state.bar_end_offset,
+            )
             live_or_close_5 = intraday.get("or_close_5")
             if live_or_close_5 is not None:
                 direction = resolve_cpr_direction(live_or_close_5, tc, bc, fallback="NONE")
@@ -395,6 +399,7 @@ def _prefetch_setup_rows(
                 live_candles=state.candles,
                 or_minutes=candle_interval_minutes,
                 allow_live_fallback=runtime_state.allow_live_setup_fallback,
+                bar_end_offset=runtime_state.bar_end_offset,
             )
             if setup_row is None:
                 missing_symbols.append(symbol)
@@ -769,7 +774,12 @@ async def run_live_session(
     params = build_backtest_params(params_session)
     direction_filter = str(getattr(params, "direction_filter", "BOTH") or "BOTH").upper()
 
-    runtime_state = PaperRuntimeState(allow_live_setup_fallback=allow_late_start_fallback)
+    runtime_state = PaperRuntimeState(
+        allow_live_setup_fallback=allow_late_start_fallback,
+        bar_end_offset=timedelta(minutes=5)
+        if getattr(ticker_adapter, "_local_feed", False)
+        else None,
+    )
     if deps is None:
         _prefetch_setup_rows(
             runtime_state=runtime_state,

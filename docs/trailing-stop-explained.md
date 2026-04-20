@@ -16,8 +16,8 @@ PROTECT  →  BREAKEVEN  →  TRAIL  →  exit
 | Phase | Stop Loss sits at | What triggers the advance |
 |---|---|---|
 | **PROTECT** | Original SL (e.g. BC − ATR buffer for LONG) | Candle **CLOSE** ≥ entry + 1R |
-| **BREAKEVEN** | Entry price — worst-case exit is ~₹0 | Candle **HIGH** or **CLOSE** ≥ entry + 2R (LONG) |
-| **TRAIL** | Highest close seen since entry − 1× ATR | Only moves in your favour; stops you out when price reverses |
+| **BREAKEVEN** | Entry price — worst-case exit is ~₹0 | Candle **HIGH** or **CLOSE** ≥ entry + 2R (LONG); SHORT uses the mirror rule with LOW |
+| **TRAIL** | Highest completed-bar high seen since entry − 1× ATR | Only moves in your favour; stops you out when price reverses |
 
 **Key numbers (typical CPR_LEVELS LONG trade):**
 
@@ -35,13 +35,19 @@ ATR          = ₹3
 ## Example 1 — LONG, price closes through 2R and keeps running
 
 Price closes above the 2R threshold so TRAIL activates on that bar.  
-SL is **deferred to the next bar** — see *What the engine can't know* below.
+The stop is tightened as soon as the bar closes, but the bar itself is still evaluated
+against the pre-update stop — see *What the engine can't know* below.
+
+> Note: the worked tables below were originally written against the close-only anchor.
+> The current LONG implementation uses the completed bar's high as the post-close
+> trailing anchor once 2R is proven, so real trailing exits can be tighter than the
+> close-only numbers shown in those tables.
 
 | Bar | Close | High | Phase | SL after bar | Note |
 |-----|-------|------|-------|--------------|------|
 | 1 | 102 | 104 | PROTECT | 95 | |
 | 2 | 106 | 108 | → **BREAKEVEN** | 100 | Close ≥ 105 (1R) |
-| 3 | 111 | 113 | → **TRAIL** | 100 | Close ≥ 110 (2R); SL deferred this bar |
+| 3 | 111 | 113 | → **TRAIL** | 100 | Close ≥ 110 (2R); stop is tightened after the bar closes |
 | 4 | 113 | 115 | TRAIL | 110 | highest\_close=113 → SL=113−3=110 |
 | 5 | 116 | 118 | TRAIL | 113 | highest\_close=116 → SL=116−3=113 |
 | 6 | 114 | 115 | TRAIL | 113 | Price dips; SL does **not** move down |
@@ -74,7 +80,7 @@ The intraday high of ₹114 was never seen by the engine.
 |-----|-------|------|-------|--------------|------|
 | 1 | 102 | 104 | PROTECT | 95 | |
 | 2 | 107 | 108 | → **BREAKEVEN** | 100 | |
-| 3 | 108 | **114** | → **TRAIL** | 100 | HIGH ≥ 110 triggers TRAIL; SL **deferred** this bar |
+| 3 | 108 | **114** | → **TRAIL** | 100 | HIGH ≥ 110 triggers TRAIL; stop tightens after the bar closes |
 | 4 | 109 | 111 | TRAIL | 106 | highest\_close=109 → SL=109−3=106 |
 | 5 | 111 | 113 | TRAIL | 108 | highest\_close=111 → SL=111−3=108 |
 | 6 | 106 | 108 | TRAIL | 108 | Dip; no change |
@@ -102,7 +108,7 @@ target (S1)  = ₹80
 |-----|-------|-----|-------|--------------|------|
 | 1 | 98 | 97 | PROTECT | 105 | |
 | 2 | 95 | 93 | → **BREAKEVEN** | 100 | Close ≤ 95 (1R for SHORT) |
-| 3 | 92 | **87** | → **TRAIL** | 100 | LOW ≤ 90 (2R); SL **deferred** |
+| 3 | 92 | **87** | → **TRAIL** | 100 | LOW ≤ 90 (2R); stop tightens after the bar closes |
 | 4 | 91 | 89 | TRAIL | 94 | lowest\_close=91 → SL=91+3=94 |
 | 5 | 93 | 91 | TRAIL | 94 | No move favourable |
 | 6 | 97 | 96 | TRAIL | 94 | Price moving against; SL stays |
@@ -116,13 +122,17 @@ Let me show a case where close stays just above 90:
 | 3 | **91** | **87** | → TRAIL | 100 | Close=91 > 90 (old code misses it); LOW=87 < 90 fixes it |
 
 Old code: SL stays BREAKEVEN at 100. Reversal to 101 → BREAKEVEN\_SL.  
-New code: TRAIL activates (low ≤ 90), SL deferred → subsequent bars exit profitably.
+New code: TRAIL activates (low ≤ 90), stop tightens after the close → subsequent bars exit profitably.
 
 **Why SHORT gains less from this fix than LONG:**  
-The trail anchor (`lowest_since_entry`) tracks closes only.  SL for SHORT = lowest_close + ATR.  
-Post-2R SHORT momentum tends to be weaker and shorter-lived, so the trailing SL clips earlier
-than the fixed target would have.  That converts some TARGET wins into TRAILING\_SL exits at
-lower profit.  This is expected and documented — see `docs/ISSUES.md` for the backtest numbers.
+SHORT already uses the mirror of the LONG touch rule: a bar whose LOW reaches 2R can arm TRAIL
+even if the close does not.  The difference is what happens after that:
+the short trail anchor (`lowest_since_entry`) still tracks closes only, and post-2R SHORT moves
+often reverse faster than LONG continuation trades. That means the trail frequently converts a
+TARGET into a TRAILING\_SL at a smaller gain, or even produces no extra gain at all if price snaps
+back quickly. In other words, the logic is symmetrical, but the market behavior is not.
+See `docs/ISSUES.md` for the measured backtest deltas and `docs/strategy-guide.md` for the operator
+summary.
 
 ---
 
@@ -150,24 +160,35 @@ A 5-minute candle gives you four numbers: **OPEN, HIGH, LOW, CLOSE**.
 
 | Situation | Engine decision | Reason |
 |---|---|---|
-| TRAIL activates via **candle HIGH** (close < 2R) | SL stays at entry for **this bar's** hit check | Can't know if the spike happened before or after any reversal |
-| TRAIL activates via **candle CLOSE** (close ≥ 2R) | SL also deferred to **next bar** | Same logic — tightening SL mid-bar is an optimistic assumption |
-| Trail SL anchor | Tracks **closes only**, not highs | Highs may be fleeting spikes; closes represent sustained price |
+| TRAIL activates via **candle HIGH** (close < 2R) | SL stays at entry for **this bar's** hit check, then tightens after the bar closes | Can't know if the spike happened before or after any reversal |
+| TRAIL activates via **candle CLOSE** (close ≥ 2R) | SL tightens after the bar closes | Same logic — tightening SL mid-bar is an optimistic assumption |
+| Trail SL anchor | Tracks the **completed bar high** for LONG | The bar high is known only after the candle completes, so it is safe to use as a post-close trailing anchor |
 | BREAKEVEN advancement | Requires candle **CLOSE** ≥ 1R | A close above 1R means price sustained that level; a mere intrabar touch does not |
+| LONG trail trigger | Can use candle **HIGH** to arm TRAIL | Lets a 5-minute candle that briefly touches 2R start protecting profit after it closes |
+| SHORT trail trigger | Can use candle **LOW** to arm TRAIL | Same mirror rule as LONG, but the post-2R continuation pattern is often weaker |
 
 ### Practical consequence
 
 A small number of trades will still exit BREAKEVEN\_SL after the fix:
 
-- Bar has HIGH ≥ 2R → TRAIL activates, SL deferred at entry.
-- **Same or next bar** has LOW below entry → exits at entry.
+- Bar has HIGH ≥ 2R → TRAIL activates, stop tightens after the bar closes.
+- A later bar may then hit the tighter stop and exit profitably.
 
 This is the correct conservative outcome.  The engine protected capital at the cost of not
 capturing the brief spike.  The candle data alone cannot prove the spike preceded the reversal.
 
 The fix captures the majority case: intraday 2R spike followed by a **gradual** reversal
-over one or more subsequent bars.  In those trades the trail SL rises above entry before
-the reversal hits, producing a positive exit instead of a breakeven.
+over one or more subsequent bars.  In those trades the trail SL rises above entry immediately
+after the candle closes, so the reversal hits a tighter stop on a later bar and produces a
+positive exit instead of a breakeven.
+
+### Why we do not expect the same profit lift on SHORT
+
+The trigger rule is symmetric, but the payoff profile is not.  SHORT trades often snap back
+faster after the 2R flush, so the trail has less room to ratchet before the reversal starts.
+That is why SHORT can show more `TRAILING_SL` exits without a matching jump in total P&L.
+We still keep the same bar-touch rule available, but we tune the SHORT trail distance
+separately instead of assuming the LONG result will transfer unchanged.
 
 ---
 
@@ -175,8 +196,8 @@ the reversal hits, producing a positive exit instead of a breakeven.
 
 | Scenario | Before April 2026 fix | After fix |
 |---|---|---|
-| Close ≥ 2R → TRAIL | SL tightened immediately (optimistic) | SL deferred to next bar |
-| High ≥ 2R, close < 2R → TRAIL | TRAIL **never** activated | TRAIL activates, SL deferred |
+| Close ≥ 2R → TRAIL | SL tightened immediately (optimistic) | SL tightened after bar close |
+| High ≥ 2R, close < 2R → TRAIL | TRAIL **never** activated | TRAIL activates, SL tightened after close |
 | Same bar: close crosses 1R AND high crosses 2R | Only BREAKEVEN activated | Both BREAKEVEN and TRAIL activate |
 | Post-2R gradual reversal over multiple bars | BREAKEVEN\_SL (~−₹83) | Profitable TRAILING\_SL exit |
 | Post-2R immediate reversal same/next bar | BREAKEVEN\_SL | BREAKEVEN\_SL (unchanged — no OHLC info to do better) |

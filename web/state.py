@@ -1522,6 +1522,31 @@ def build_run_options(runs: list[dict]) -> dict[str, str]:
         cpr_min_close_atr = float(r.get("cpr_min_close_atr") or 0.0)
         failure_window = int(r.get("failure_window") or 0)
         direction = str(r.get("direction_filter") or "BOTH").lower()
+        execution_mode = str(r.get("execution_mode") or "BACKTEST").upper()
+        params_json = str(r.get("params_json") or "")
+        paper_params: dict[str, object] = {}
+        if params_json:
+            try:
+                parsed_params = json.loads(params_json)
+                if isinstance(parsed_params, dict):
+                    paper_params = parsed_params
+            except (TypeError, ValueError):
+                paper_params = {}
+        paper_session_mode = (
+            str(r.get("paper_session_mode") or paper_params.get("paper_session_mode") or "")
+            .strip()
+            .lower()
+        )
+        paper_feed_source = (
+            str(
+                r.get("paper_feed_source")
+                or paper_params.get("paper_feed_source")
+                or paper_params.get("feed_source")
+                or ""
+            )
+            .strip()
+            .lower()
+        )
         symbols_json = str(r.get("symbols_json") or "")
         universe_size = 0
         if symbols_json:
@@ -1540,6 +1565,11 @@ def build_run_options(runs: list[dict]) -> dict[str, str]:
             parts.append(f"atr{cpr_min_close_atr:g}")
         if strategy == "fbr" and failure_window > 0:
             parts.append(f"fw{failure_window}")
+        if execution_mode == "PAPER":
+            if paper_session_mode:
+                parts.append(paper_session_mode)
+            if paper_feed_source:
+                parts.append(paper_feed_source)
         if universe_size > 0:
             parts.append(f"u{universe_size}")
         key = "-".join(parts)

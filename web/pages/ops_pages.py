@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import datetime
 
 import numpy as np
@@ -268,6 +269,11 @@ def _render_live_paper_sessions(active_sessions: list[dict], colors: dict) -> No
         session_id = str(getattr(session, "session_id", ""))
         name = getattr(session, "name", None) or session_id[:8]
         session_mode = str(getattr(session, "mode", "") or "replay").upper()
+        strategy_params = getattr(session, "strategy_params", {}) or {}
+        if session_mode == "REPLAY":
+            feed_source = "HISTORICAL"
+        else:
+            feed_source = str(strategy_params.get("feed_source") or "kite").upper()
         # Extract direction from session_id for sessions that pre-date the name fix
         # Session IDs follow patterns: CPR_LEVELS_LONG-2026-04-01-xxx, paper-cpr_levels-short-...
         sid_upper = session_id.upper()
@@ -283,6 +289,7 @@ def _render_live_paper_sessions(active_sessions: list[dict], colors: dict) -> No
             f"{name} · "
             f"{getattr(session, 'strategy', '')} · "
             f"{session_mode} · "
+            f"{feed_source} · "
             f"{summary.get('status') or getattr(session, 'status', '')}"
         )
         labels.append(label)
@@ -619,8 +626,28 @@ def _render_ledger_content(
     run_meta: dict,
     colors: dict,
 ) -> None:
+    run_row = next((r for r in runs if r.get("run_id") == run_id), {})
+
+    def _setup_count() -> int:
+        if isinstance(run_meta, dict):
+            symbols = run_meta.get("symbols") or []
+            if isinstance(symbols, list) and symbols:
+                return len(symbols)
+        symbols_json = str(run_row.get("symbols_json") or "")
+        if symbols_json:
+            try:
+                parsed = json.loads(symbols_json)
+                if isinstance(parsed, list):
+                    return len(parsed)
+            except (TypeError, ValueError):
+                pass
+        try:
+            return int(run_row.get("symbol_count") or 0)
+        except (TypeError, ValueError):
+            return 0
+
     if ledger_df.is_empty():
-        setup_count = len(run_meta.get("symbols") or []) if isinstance(run_meta, dict) else 0
+        setup_count = _setup_count()
         if setup_count > 0:
             empty_state(
                 "0 trades",
@@ -635,10 +662,9 @@ def _render_ledger_content(
             )
         return
 
-    setup_count = len(run_meta.get("symbols") or []) if isinstance(run_meta, dict) else 0
+    setup_count = _setup_count()
     trade_count = len(ledger_df)
 
-    run_row = next((r for r in runs if r.get("run_id") == run_id), {})
     params = run_meta.get("params") if isinstance(run_meta, dict) else {}
     params = params if isinstance(params, dict) else {}
     portfolio_base = float(params.get("portfolio_value") or run_row.get("allocated_capital") or 0.0)
@@ -741,44 +767,6 @@ def _render_ledger_content(
         ],
         columns=4,
     )
-
-    # Equity curve with drawdown overlay — matches Run Results page pattern
-    def _rgba(hex_c: str, a: float = 0.18) -> str:
-        h = hex_c.lstrip("#")
-        r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
-        return f"rgba({r},{g},{b},{a})"
-
-    fig = go.Figure()
-    fig.add_trace(
-        go.Scatter(
-            x=ledger_df["trade_date"].to_list(),
-            y=drawdown_arr.tolist(),
-            fill="tozeroy",
-            fillcolor=_rgba(colors["error"], 0.15),
-            line=dict(color=colors["error"], width=1),
-            name="Drawdown (₹)",
-            hovertemplate="%{x}<br>DD: ₹%{y:,.0f}<extra></extra>",
-        )
-    )
-    fig.add_trace(
-        go.Scatter(
-            x=ledger_df["trade_date"].to_list(),
-            y=equity_arr.tolist(),
-            mode="lines",
-            line=dict(color=colors["primary"], width=2),
-            name="Equity (₹)",
-            fill="tozeroy",
-            fillcolor=_rgba(colors["primary"], 0.07),
-            hovertemplate="%{x}<br>Equity: ₹%{y:,.0f}<extra></extra>",
-        )
-    )
-    fig.update_layout(
-        title="Ledger Equity Curve with Drawdown",
-        xaxis_title="Date",
-        yaxis_title="₹",
-    )
-    apply_chart_theme(fig)
-    ui.plotly(fig).classes("w-full h-72 mb-4")
 
     rows = []
     for i, row in enumerate(ledger_df.iter_rows(named=True)):
