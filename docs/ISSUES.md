@@ -112,6 +112,8 @@ Direction is resolved at 09:15 from `or_close_5`. On a strongly trending day, th
 **Experiment**: add a Nifty trend gate — skip SHORT entries when Nifty is already up >0.3% from open
 by 09:30. This is a market-regime filter, not an individual-stock filter.
 Backtest required before any live use. Risk of data-mining; validate out-of-sample.
+The same idea could be mirrored for LONG as a down-day gate in principle, but that is a separate
+hypothesis. The current note is SHORT-only because the observed bleed happened on an up-day.
 
 ### Pattern 4: BREAKEVEN protection is working correctly — but reveals choppy session
 
@@ -119,9 +121,9 @@ Backtest required before any live use. Risk of data-mining; validate out-of-samp
 This pattern indicates a **choppy, mean-reverting session** — initial momentum faded for most trades.
 Indistinguishable from a real move in real-time; no change recommended here.
 
-### Backtest Outcomes (SQL analysis on DR-Risk baselines, 2025-01-01 → 2026-04-20)
+### Backtest Outcomes (SQL analysis on DR-Risk baselines, 2025-01-01 → 2026-04-21)
 
-Baselines: LONG `6eb4ea65763f` (3,146 trades, ₹992,762), SHORT `b5da636ec81a` (4,663 trades, ₹1,059,120)
+Baselines: LONG `c543038a648a` (3,165 trades, ₹992,935), SHORT `804f589a2fc7` (4,669 trades, ₹1,060,744)
 
 #### Pattern 1 — min_sl_distance_pct = 0.5% → REJECTED
 
@@ -156,6 +158,10 @@ direction was simply wrong — not a structural noise problem with first-bar ent
 No code or backtest run for this. It requires Nifty index data as a filter input, which is not
 currently in the backtest engine. Deferred; consider only if SHORT continues underperforming in
 live sessions on strongly trending days over a multi-month window.
+Current local market data only covers the equity universe; there are no NIFTY/NTM symbols in
+`market_day_state` or `strategy_day_state` yet, so this remains blocked on index ingestion.
+Recommendation for when we do add it: start with `NIFTY 500` as the market proxy, then test
+mirrored LONG and SHORT gates separately. Treat `NTM` as a follow-up comparison, not the default.
 
 #### Pattern 4 — BREAKEVEN protection → No change needed
 

@@ -86,6 +86,8 @@ PARQUET_5MIN_SCHEMA: dict[str, pl.DataType] = {
 IngestionMode = Literal["daily", "5min"]
 UniverseMode = Literal["local-first", "current-master"]
 
+MAJOR_NSE_INDEX_SYMBOLS: tuple[str, ...] = ("NIFTY 50", "NIFTY 100", "NIFTY 500")
+
 
 class KiteIngestionError(RuntimeError):
     """Raised when a Kite ingestion operation cannot complete."""
@@ -651,6 +653,22 @@ def resolve_target_symbols(
             for symbol in instrument_df.get_column("tradingsymbol").drop_nulls().to_list()
         }
     )
+
+
+def resolve_major_index_symbols(exchange: str = "NSE") -> list[str]:
+    """Return the major NSE index symbols available in the current instrument master.
+
+    These are intentionally separate from the tradeable equity universe. They are used as
+    market-regime inputs, not tradable symbols.
+    """
+    instrument_df = load_instrument_master(exchange=exchange)
+    wanted = {normalize_symbol(symbol) for symbol in MAJOR_NSE_INDEX_SYMBOLS}
+    resolved = {
+        normalize_symbol(symbol)
+        for symbol in instrument_df.get_column("tradingsymbol").drop_nulls().to_list()
+        if normalize_symbol(symbol) in wanted
+    }
+    return [symbol for symbol in MAJOR_NSE_INDEX_SYMBOLS if symbol in resolved]
 
 
 def filter_already_ingested(
@@ -1433,13 +1451,18 @@ def run_ingestion(
     )
 
 
-def refresh_runtime_tables(force: bool = True) -> None:
-    """Rebuild local DuckDB runtime tables after parquet ingestion."""
+def refresh_runtime_tables(force: bool = True, symbols: list[str] | None = None) -> None:
+    """Rebuild local DuckDB runtime tables after parquet ingestion.
+
+    When symbols are provided, only that symbol subset is rebuilt. This keeps
+    incremental ingest refreshes fast and lets index backfills rebuild just the
+    affected symbols.
+    """
     from db.duckdb import close_db, get_db
 
     close_db()
     db = get_db()
-    db.build_all(force=force)
+    db.build_all(force=force, symbols=sorted(set(symbols)) if symbols else None)
 
 
 def summarize_result(result: KiteIngestionResult) -> str:

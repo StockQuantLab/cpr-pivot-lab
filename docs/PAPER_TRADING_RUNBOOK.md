@@ -79,10 +79,10 @@ change the date window when extending baselines.
 Canonical rerun commands (only change `--start`/`--end`):
 
 ```bash
-uv run pivot-backtest --all --universe-size 0 --yes-full-run --start 2025-01-01 --end 2026-04-09 --preset CPR_LEVELS_STANDARD_LONG  --save --quiet
-uv run pivot-backtest --all --universe-size 0 --yes-full-run --start 2025-01-01 --end 2026-04-09 --preset CPR_LEVELS_STANDARD_SHORT --save --quiet
-uv run pivot-backtest --all --universe-size 0 --yes-full-run --start 2025-01-01 --end 2026-04-09 --preset CPR_LEVELS_RISK_LONG      --save --quiet
-uv run pivot-backtest --all --universe-size 0 --yes-full-run --start 2025-01-01 --end 2026-04-09 --preset CPR_LEVELS_RISK_SHORT     --save --quiet
+uv run pivot-backtest --all --universe-size 0 --yes-full-run --start 2025-01-01 --end 2026-04-21 --preset CPR_LEVELS_STANDARD_LONG  --save --quiet
+uv run pivot-backtest --all --universe-size 0 --yes-full-run --start 2025-01-01 --end 2026-04-21 --preset CPR_LEVELS_STANDARD_SHORT --save --quiet
+uv run pivot-backtest --all --universe-size 0 --yes-full-run --start 2025-01-01 --end 2026-04-21 --preset CPR_LEVELS_RISK_LONG      --save --quiet
+uv run pivot-backtest --all --universe-size 0 --yes-full-run --start 2025-01-01 --end 2026-04-21 --preset CPR_LEVELS_RISK_SHORT     --save --quiet
 ```
 
 Reference sets (Apr 2026):
@@ -100,22 +100,22 @@ Reference sets (Apr 2026):
 | Daily Reset Std SHORT | `1d6e5e93618e` | 2025-01-01 → 2026-04-09 | ₹1,041,450 |
 | Daily Reset Std LONG | `84a85d954f99` | 2025-01-01 → 2026-04-09 | ₹827,381 |
 
-- **Current v4 baselines (2026-04-20 refresh on the current shared-exit code — use these for all future comparisons):**
+- **Current CPR baselines (2026-04-21 refresh on the current shared-exit code — use these for all future comparisons):**
 
 SHORT presets now use `short_trail_atr_multiplier = 1.25`. LONG keeps `trail_atr_multiplier = 1.0`.
 
 | Mode | Preset | Run ID | Start → End | P/L | Calmar |
 |------|--------|--------|-------------|-----|--------|
-| Daily Reset | `CPR_LEVELS_RISK_LONG` | `f0bfbf9074ce` | 2025-01-01 → 2026-04-17 | ₹991,500 | 156 |
-| Daily Reset | `CPR_LEVELS_RISK_SHORT` | `be37c0ae2111` | 2025-01-01 → 2026-04-17 | ₹1,053,952 | 73 |
-| Daily Reset | `CPR_LEVELS_STANDARD_LONG` | `6d3635b36ca3` | 2025-01-01 → 2026-04-17 | ₹1,003,565 | 158 |
-| Daily Reset | `CPR_LEVELS_STANDARD_SHORT` | `3fba5456e120` | 2025-01-01 → 2026-04-17 | ₹1,057,696 | 66 |
-| Compound | `CPR_LEVELS_STANDARD_LONG` | `38a0b809d8a2` | 2025-01-01 → 2026-04-17 | ₹2,142,730 | 200 |
-| Compound | `CPR_LEVELS_STANDARD_SHORT` | `f1386c54ca7f` | 2025-01-01 → 2026-04-17 | ₹2,539,392 | 104 |
-| Compound | `CPR_LEVELS_RISK_LONG` | `99e9d2beca78` | 2025-01-01 → 2026-04-17 | ₹2,142,210 | 200 |
-| Compound | `CPR_LEVELS_RISK_SHORT` | `22d8ca089901` | 2025-01-01 → 2026-04-17 | ₹2,536,852 | 104 |
+| Daily Reset | `CPR_LEVELS_RISK_LONG` | `c543038a648a` | 2025-01-01 → 2026-04-21 | ₹992,935 | 167.84 |
+| Daily Reset | `CPR_LEVELS_RISK_SHORT` | `804f589a2fc7` | 2025-01-01 → 2026-04-21 | ₹1,060,744 | 72.83 |
+| Daily Reset | `CPR_LEVELS_STANDARD_LONG` | `ed2a43f23bde` | 2025-01-01 → 2026-04-21 | ₹1,005,080 | 170.15 |
+| Daily Reset | `CPR_LEVELS_STANDARD_SHORT` | `14d160199314` | 2025-01-01 → 2026-04-21 | ₹1,064,488 | 65.91 |
+| Compound | `CPR_LEVELS_STANDARD_LONG` | `f2bf97b2dc70` | 2025-01-01 → 2026-04-21 | ₹2,148,464 | 216.73 |
+| Compound | `CPR_LEVELS_STANDARD_SHORT` | `cf4efe1d53c5` | 2025-01-01 → 2026-04-21 | ₹2,563,469 | 103.33 |
+| Compound | `CPR_LEVELS_RISK_LONG` | `4707f7fe5585` | 2025-01-01 → 2026-04-21 | ₹2,147,635 | 216.63 |
+| Compound | `CPR_LEVELS_RISK_SHORT` | `5bb7df6e7c0c` | 2025-01-01 → 2026-04-21 | ₹2,603,192 | 104.75 |
 
-The 2026-04-20 rerun refreshed the canonical baseline set on the current shared-exit code.
+The 2026-04-21 rerun refreshed the canonical baseline set on the current shared-exit code.
 LONG improved again versus the prior reference rows; SHORT stayed flat. See
 `docs/ISSUES.md` and `docs/trailing-stop-explained.md` for the full explanation.
 

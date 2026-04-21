@@ -14,6 +14,17 @@ For a quick high-level read, use:
 - [docs/strategy-guide.md](docs/strategy-guide.md) — side-by-side behavior (long/short) and execution flow
 - Run-level inspection in dashboard (`/backtest`) for per-trade evidence (`Run Details → click trade row`)
 
+## Documentation Map
+
+Use these docs in this order when you need a clean mental model:
+
+- [docs/strategy-guide.md](docs/strategy-guide.md) — operator-level overview of CPR_LEVELS vs FBR
+- [docs/trailing-stop-explained.md](docs/trailing-stop-explained.md) — canonical exit lifecycle, same-bar edge cases, and scale-out behavior
+- [docs/ISSUES.md](docs/ISSUES.md) — dated experiment log for accepted/rejected ideas and incident notes
+- [docs/PAPER_TRADING_RUNBOOK.md](docs/PAPER_TRADING_RUNBOOK.md) — canonical presets and live/replay operating commands
+- [docs/PROGRESSIVE_TRAIL_RATCHET_PLAN.md](docs/PROGRESSIVE_TRAIL_RATCHET_PLAN.md) — closed history of the rejected pre-target ratchet hypothesis
+- [docs/LIVE_TRADING_PARITY_REWORK_PLAN.md](docs/LIVE_TRADING_PARITY_REWORK_PLAN.md) — parity work, not strategy tuning
+
 ## Data and Signal Source
 
 - Data source: NSE 5-minute candles and daily bars in `data/parquet`

@@ -272,8 +272,9 @@ def _install_runtime_fakes(
         or_minutes: int = 5,
         allow_live_fallback: bool = True,
         bar_end_offset=None,
+        **kwargs,
     ):
-        _ = allow_live_fallback, bar_end_offset
+        _ = allow_live_fallback, bar_end_offset, kwargs
         return setup_row if symbol == "SBIN" and trade_date == "2024-01-01" else None
 
     async def fake_open_position(**kwargs):
@@ -744,7 +745,8 @@ async def test_process_closed_candle_marks_pending_setups_for_pruning(
         *,
         or_minutes=5,
         allow_live_fallback=True,
-        bar_end_offset=None: {
+        bar_end_offset=None,
+        **kwargs: {
             **_make_cpr_setup_row(),
             "direction": "NONE",
         },

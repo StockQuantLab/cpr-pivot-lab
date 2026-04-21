@@ -257,6 +257,7 @@ def _prefetch_setup_rows(
     symbols: list[str],
     trade_date: str,
     candle_interval_minutes: int,
+    regime_index_symbol: str = "",
 ) -> None:
     missing_symbols: list[str] = []
     invalid_symbols: list[tuple[str, float, float, float]] = []
@@ -293,8 +294,8 @@ def _prefetch_setup_rows(
                 direction = resolve_cpr_direction(live_or_close_5, tc, bc, fallback="NONE")
                 or_close_5 = live_or_close_5
         rvol_baseline: list[float | None] | None = None
-        if row[24]:
-            rvol_baseline = [float(v) if v is not None else None for v in row[24]]
+        if row[25]:
+            rvol_baseline = [float(v) if v is not None else None for v in row[25]]
         setup_row = {
             "trade_date": str(row[1] or trade_date),
             "prev_day_close": float(row[2]) if row[2] is not None else None,
@@ -319,6 +320,7 @@ def _prefetch_setup_rows(
             "direction": direction,
             "is_narrowing": bool(row[22]),
             "cpr_shift": str(row[23] or "OVERLAP"),
+            "regime_move_pct": float(row[24]) if row[24] is not None else None,
             "rvol_baseline": rvol_baseline,
             "setup_source": "market_day_state",
         }
@@ -358,6 +360,11 @@ def _prefetch_setup_rows(
                     s.direction_5,
                     m.is_narrowing,
                     m.cpr_shift,
+                    CASE
+                        WHEN reg.open_915 > 0 AND reg.or_close_30 IS NOT NULL
+                        THEN ((reg.or_close_30 - reg.open_915) / reg.open_915) * 100.0
+                        ELSE NULL
+                    END AS regime_move_pct,
                     p.rvol_baseline_arr
                 FROM market_day_state m
                 LEFT JOIN strategy_day_state s
@@ -366,11 +373,17 @@ def _prefetch_setup_rows(
                 LEFT JOIN intraday_day_pack p
                   ON p.symbol = m.symbol
                  AND p.trade_date = m.trade_date
+                LEFT JOIN market_day_state reg
+                  ON reg.symbol = ?
+                 AND reg.trade_date = m.trade_date
                 WHERE m.trade_date = ?::DATE
                   AND m.symbol IN ({placeholders})
             """
             with _MARKET_DB_READ_LOCK:
-                rows = db.con.execute(query, [trade_date, *unique_symbols]).fetchall()
+                rows = db.con.execute(
+                    query,
+                    [regime_index_symbol, trade_date, *unique_symbols],
+                ).fetchall()
             batch_rows = {str(row[0]): row for row in rows}
         except Exception:
             logger.exception("Batch setup prefetch failed; falling back to serial loading")
@@ -387,6 +400,8 @@ def _prefetch_setup_rows(
             setup_row = _hydrate_setup_row(symbol=symbol, row=row, live_candles=state.candles)
             if setup_row is None:
                 continue
+            if row[24] is not None:
+                setup_row["regime_move_pct"] = float(row[24])
             state.setup_row = _normalize_setup_row_direction(setup_row)
             _log_setup_row_parity(symbol, trade_date, state.setup_row)
     else:
@@ -401,6 +416,7 @@ def _prefetch_setup_rows(
                 or_minutes=candle_interval_minutes,
                 allow_live_fallback=runtime_state.allow_live_setup_fallback,
                 bar_end_offset=runtime_state.bar_end_offset,
+                regime_index_symbol=regime_index_symbol,
             )
             if setup_row is None:
                 missing_symbols.append(symbol)
@@ -813,6 +829,7 @@ async def run_live_session(
             symbols=active_symbols,
             trade_date=trade_date,
             candle_interval_minutes=candle_interval,
+            regime_index_symbol=str(strategy_params.get("regime_index_symbol") or ""),
         )
     direction_readiness = _log_direction_readiness(
         session_id=session_id,

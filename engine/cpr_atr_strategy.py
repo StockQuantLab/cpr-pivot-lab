@@ -234,6 +234,12 @@ class StrategyConfig:
     # Price filter — skip symbols with prev_close below this threshold (eliminates penny stocks)
     min_price: float = 0.0  # 0 = no filter; 50 = skip stocks trading below Rs.50
 
+    # Optional market-regime gate:
+    # When enabled, use a broad index snapshot at 09:30 to skip LONG trades on weak days and
+    # SHORT trades on strong days. Leave disabled by default until a regime hypothesis is proven.
+    regime_index_symbol: str = ""
+    regime_min_move_pct: float = 0.0
+
     # Strategy selection: "CPR_LEVELS" | "FBR" | "VIRGIN_CPR"
     strategy: str = "CPR_LEVELS"
 
@@ -1199,6 +1205,24 @@ class CPRATRBacktest:
         if strategy == "CPR_LEVELS":
             shift_clause = "($cpr_shift_filter = 'ALL' OR cpr_shift = $cpr_shift_filter)"
 
+        regime_move_expr = (
+            "CASE WHEN reg.open_915 > 0 AND reg.or_close_30 IS NOT NULL "
+            "THEN ((reg.or_close_30 - reg.open_915) / reg.open_915) * 100.0 END"
+        )
+        regime_gate_sql = f"""
+                     AND (
+                         $regime_index_symbol = ''
+                         OR $regime_min_move_pct <= 0
+                         OR (
+                             {regime_move_expr} IS NOT NULL
+                             AND NOT (
+                                 (s.{direction_col} = 'SHORT' AND {regime_move_expr} >= $regime_min_move_pct)
+                                 OR (s.{direction_col} = 'LONG' AND {regime_move_expr} <= -$regime_min_move_pct)
+                             )
+                         )
+                     )
+        """
+
         query = f"""
             SELECT
                 COUNT(*) AS universe_count,
@@ -1222,6 +1246,7 @@ class CPRATRBacktest:
                      AND s.{direction_col} IN ('LONG', 'SHORT')
                      AND ($direction_filter = 'BOTH' OR s.{direction_col} = $direction_filter)
                      AND ($min_price <= 0 OR m.prev_close >= $min_price)
+{regime_gate_sql}
                     THEN 1 ELSE 0
                 END) AS after_min_price,
                 SUM(CASE
@@ -1230,6 +1255,7 @@ class CPRATRBacktest:
                      AND ($direction_filter = 'BOTH' OR s.{direction_col} = $direction_filter)
                      AND ($min_price <= 0 OR m.prev_close >= $min_price)
                      AND s.gap_abs_pct <= $max_gap
+{regime_gate_sql}
                     THEN 1 ELSE 0
                 END) AS after_gap,
                 SUM(CASE
@@ -1240,6 +1266,7 @@ class CPRATRBacktest:
                      AND s.gap_abs_pct <= $max_gap
                      AND s.{or_atr_col} >= $or_atr_min
                      AND s.{or_atr_col} <= $or_atr_max
+{regime_gate_sql}
                     THEN 1 ELSE 0
                 END) AS after_or_atr,
                 SUM(CASE
@@ -1251,6 +1278,7 @@ class CPRATRBacktest:
                      AND s.{or_atr_col} >= $or_atr_min
                      AND s.{or_atr_col} <= $or_atr_max
                      AND (NOT $use_narrowing OR CAST(m.is_narrowing AS INTEGER) = 1)
+{regime_gate_sql}
                     THEN 1 ELSE 0
                 END) AS after_narrowing,
                 SUM(CASE
@@ -1263,11 +1291,15 @@ class CPRATRBacktest:
                      AND s.{or_atr_col} <= $or_atr_max
                      AND (NOT $use_narrowing OR CAST(m.is_narrowing AS INTEGER) = 1)
                      AND ({shift_clause})
+{regime_gate_sql}
                     THEN 1 ELSE 0
                 END) AS after_shift
             FROM market_day_state m
             JOIN strategy_day_state s
               ON s.symbol = m.symbol AND s.trade_date = m.trade_date
+            LEFT JOIN market_day_state reg
+              ON reg.symbol = $regime_index_symbol
+             AND reg.trade_date = m.trade_date
             WHERE list_contains($symbols, m.symbol)
               AND m.trade_date >= $start::DATE
               AND m.trade_date <= $end::DATE
@@ -1284,6 +1316,8 @@ class CPRATRBacktest:
             "or_atr_max": p.or_atr_max,
             "use_narrowing": use_narrowing,
             "symbols": sym_param,
+            "regime_index_symbol": str(p.regime_index_symbol or "").upper(),
+            "regime_min_move_pct": float(p.regime_min_move_pct or 0.0),
         }
         if strategy == "CPR_LEVELS":
             params_dict["cpr_shift_filter"] = cpr_cfg.cpr_shift_filter
@@ -1404,11 +1438,19 @@ class CPRATRBacktest:
                     m.{close_col} AS close_915,
                     s.{direction_col} AS direction_915,
                     s.{or_atr_col} AS or_atr_915,
-                    s.gap_abs_pct
+                    s.gap_abs_pct,
+                    CASE
+                        WHEN reg.open_915 > 0 AND reg.or_close_30 IS NOT NULL
+                        THEN ((reg.or_close_30 - reg.open_915) / reg.open_915) * 100.0
+                        ELSE NULL
+                    END AS regime_move_pct
                 FROM market_day_state m
                 JOIN strategy_day_state s
                   ON s.symbol = m.symbol
                  AND s.trade_date = m.trade_date
+                LEFT JOIN market_day_state reg
+                  ON reg.symbol = $regime_index_symbol
+                 AND reg.trade_date = m.trade_date
                 WHERE list_contains($symbols, m.symbol)
                   AND m.trade_date >= $start::DATE
                   AND m.trade_date <= $end::DATE
@@ -1444,7 +1486,8 @@ class CPRATRBacktest:
                 atr,
                 prev_day_close,
                 open_to_cpr_atr,
-                direction
+                direction,
+                regime_move_pct
             FROM with_direction
             WHERE direction IN ('LONG', 'SHORT')
               AND ($direction_filter = 'BOTH' OR direction = $direction_filter)
@@ -1453,6 +1496,17 @@ class CPRATRBacktest:
               AND or_atr_915 >= $or_atr_min
               AND or_atr_915 <= $or_atr_max
               AND (NOT $use_narrowing OR CAST(is_narrowing AS INTEGER) = 1){strategy_filter_sql}
+              AND (
+                  $regime_index_symbol = ''
+                  OR $regime_min_move_pct <= 0
+                  OR (
+                      regime_move_pct IS NOT NULL
+                      AND NOT (
+                          (direction = 'SHORT' AND regime_move_pct >= $regime_min_move_pct)
+                          OR (direction = 'LONG' AND regime_move_pct <= -$regime_min_move_pct)
+                      )
+                  )
+              )
             ORDER BY symbol, trade_date
         """
 
@@ -1471,6 +1525,8 @@ class CPRATRBacktest:
             if strategy == "CPR_LEVELS"
             else fbr_cfg.use_narrowing_filter,
             "symbols": sym_param,
+            "regime_index_symbol": str(p.regime_index_symbol or "").upper(),
+            "regime_min_move_pct": float(p.regime_min_move_pct or 0.0),
         }
         if strategy == "CPR_LEVELS":
             params_dict["cpr_shift_filter"] = cpr_cfg.cpr_shift_filter

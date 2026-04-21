@@ -7,13 +7,13 @@ from engine.cli_setup import configure_windows_stdio
 from engine.kite_ingestion import (
     KiteIngestionError,
     KiteIngestionRequest,
-    UniverseMode,
     compact_daily_overlays,
     parse_symbols_csv,
     parse_symbols_file,
     refresh_instrument_master,
     refresh_runtime_tables,
     resolve_date_window,
+    resolve_major_index_symbols,
     resolve_missing_ingest_symbols,
     resolve_target_symbols,
     run_ingestion,
@@ -40,6 +40,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--exchange", default="NSE", help="Exchange code for instrument refresh/load"
+    )
+    parser.add_argument(
+        "--major-indexes-only",
+        action="store_true",
+        help=(
+            "Limit ingestion to the major NSE market indexes only (NIFTY 50, NIFTY 100, NIFTY 500)."
+        ),
     )
 
     sym_group = parser.add_mutually_exclusive_group()
@@ -138,6 +145,56 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _resolve_ingest_symbols(args: argparse.Namespace) -> list[str]:
+    """Resolve the ingestion symbol list for the requested command shape."""
+
+    if args.major_indexes_only and any([args.symbols, args.symbols_file, args.missing]):
+        raise KiteIngestionError(
+            "--major-indexes-only cannot be combined with --symbols, --symbols-file, or --missing."
+        )
+
+    if args.major_indexes_only:
+        return resolve_major_index_symbols(exchange=args.exchange)
+
+    explicit_symbols: list[str] = []
+    if args.symbols:
+        explicit_symbols = parse_symbols_csv(args.symbols)
+    elif args.symbols_file:
+        explicit_symbols = parse_symbols_file(args.symbols_file)
+    elif args.missing:
+        mode = "5min" if args.five_min else "daily"
+        explicit_symbols = resolve_missing_ingest_symbols(exchange=args.exchange, mode=mode)
+        if not explicit_symbols:
+            print("No missing symbols detected — all tradeable symbols already have local parquet.")
+            return []
+        print(f"Missing symbols detected: {len(explicit_symbols)}")
+
+    if explicit_symbols:
+        return resolve_target_symbols(
+            explicit_symbols=explicit_symbols,
+            exchange=args.exchange,
+            tradeable_only=not args.no_filter_tradeable,
+            universe=args.universe,
+        )
+
+    resolved = resolve_target_symbols(
+        explicit_symbols=None,
+        exchange=args.exchange,
+        tradeable_only=not args.no_filter_tradeable,
+        universe=args.universe,
+    )
+    if not args.missing:
+        seen: set[str] = set()
+        ordered: list[str] = []
+        for symbol in [*resolved, *resolve_major_index_symbols(exchange=args.exchange)]:
+            if symbol in seen:
+                continue
+            seen.add(symbol)
+            ordered.append(symbol)
+        resolved = ordered
+    return resolved
+
+
 def main() -> int:
     configure_windows_stdio(line_buffering=True, write_through=True)
     parser = build_parser()
@@ -152,17 +209,7 @@ def main() -> int:
         if args.compact_daily:
             if args.missing:
                 raise KiteIngestionError("--compact-daily does not support --missing.")
-            explicit_symbols: list[str] = []
-            if args.symbols:
-                explicit_symbols = parse_symbols_csv(args.symbols)
-            elif args.symbols_file:
-                explicit_symbols = parse_symbols_file(args.symbols_file)
-            requested_symbols = resolve_target_symbols(
-                explicit_symbols=explicit_symbols or None,
-                exchange=args.exchange,
-                tradeable_only=not args.no_filter_tradeable,
-                universe=args.universe,
-            )
+            requested_symbols = _resolve_ingest_symbols(args)
             if not requested_symbols:
                 raise KiteIngestionError("No symbols resolved for daily overlay compaction.")
             result = compact_daily_overlays(requested_symbols)
@@ -181,29 +228,7 @@ def main() -> int:
             end_date=args.end_date,
         )
 
-        # Resolve symbol list — explicit symbols bypass universe resolution entirely
-        explicit_symbols: list[str] = []
-        if args.symbols:
-            explicit_symbols = parse_symbols_csv(args.symbols)
-        elif args.symbols_file:
-            explicit_symbols = parse_symbols_file(args.symbols_file)
-        elif args.missing:
-            mode = "5min" if args.five_min else "daily"
-            explicit_symbols = resolve_missing_ingest_symbols(exchange=args.exchange, mode=mode)
-            if not explicit_symbols:
-                print(
-                    "No missing symbols detected — all tradeable symbols already have local parquet."
-                )
-                return 0
-            print(f"Missing symbols detected: {len(explicit_symbols)}")
-
-        universe: UniverseMode = args.universe
-        requested_symbols = resolve_target_symbols(
-            explicit_symbols=explicit_symbols or None,
-            exchange=args.exchange,
-            tradeable_only=not args.no_filter_tradeable,
-            universe=universe,
-        )
+        requested_symbols = _resolve_ingest_symbols(args)
         if not requested_symbols:
             raise KiteIngestionError("No symbols resolved for ingestion.")
 
@@ -221,7 +246,7 @@ def main() -> int:
             else Path(args.checkpoint_file).expanduser(),
             five_min_chunk_days=args.chunk_days,
             daily_chunk_days=args.daily_chunk_days,
-            universe=universe,
+            universe=args.universe,
         )
         print(
             f"Starting Kite {request.mode} ingestion for {len(requested_symbols)} symbols "
@@ -288,7 +313,7 @@ def main() -> int:
 
         if args.update_features and not result.errors and not result.missing_instruments:
             print("\nRebuilding local DuckDB runtime tables from parquet...")
-            refresh_runtime_tables(force=True)
+            refresh_runtime_tables(force=True, symbols=result.completed_symbols)
 
         if result.errors or result.missing_instruments:
             return 1

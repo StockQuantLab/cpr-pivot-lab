@@ -483,6 +483,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="Skip symbols with prev_close below this Rs. threshold (default 0 = no filter, 50 = skip penny stocks)",
     )
     parser.add_argument(
+        "--regime-index-symbol",
+        default="",
+        help=(
+            "Optional broad index symbol for the market-regime gate "
+            "(for example NIFTY 500). Leave empty to disable."
+        ),
+    )
+    parser.add_argument(
+        "--regime-min-move-pct",
+        type=float,
+        default=0.0,
+        help=(
+            "Skip LONG when the regime index is down at least this %% and skip SHORT when "
+            "it is up at least this %% (default 0.0 = off)."
+        ),
+    )
+    parser.add_argument(
         "--or-minutes",
         type=int,
         default=5,
@@ -812,6 +829,8 @@ def _run_with_lock(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
         "max_gap_pct": args.max_gap_pct,
         "long_max_gap_pct": args.long_max_gap_pct,
         "min_price": args.min_price,
+        "regime_index_symbol": args.regime_index_symbol,
+        "regime_min_move_pct": args.regime_min_move_pct,
         "or_minutes": args.or_minutes,
         "strategy": args.strategy,
         "commission_model": args.commission_model,
@@ -864,6 +883,10 @@ def _run_with_lock(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
             preset_cli_overrides["skip_rvol_check"] = True
         if args.min_price > 0.0:
             preset_cli_overrides["min_price"] = args.min_price
+        if args.regime_index_symbol:
+            preset_cli_overrides["regime_index_symbol"] = args.regime_index_symbol
+        if args.regime_min_move_pct > 0.0:
+            preset_cli_overrides["regime_min_move_pct"] = args.regime_min_move_pct
         if args.direction != "BOTH":
             preset_cli_overrides["direction_filter"] = args.direction
         if args.trail_atr_multiplier is not None:

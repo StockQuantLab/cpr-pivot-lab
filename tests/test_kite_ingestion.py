@@ -7,7 +7,9 @@ from pathlib import Path
 import polars as pl
 import pytest
 
+import db.duckdb as duckdb_module
 import engine.kite_ingestion as kite_ingestion
+import scripts.kite_ingest as kite_ingest_cli
 from engine.kite_ingestion import (
     KiteIngestionRequest,
     KitePaths,
@@ -20,6 +22,7 @@ from engine.kite_ingestion import (
     detect_repo_process_conflicts,
     filter_already_ingested,
     resolve_date_window,
+    resolve_major_index_symbols,
     resolve_missing_ingest_symbols,
     resolve_target_symbols,
     run_ingestion,
@@ -300,6 +303,129 @@ def _make_instrument_csv(path: Path, symbols: list[str], segment: str = "NSE") -
         lines.append(f"NSE,{i},,{100000 + i},EQ,100,1,{sym},{segment},0,0.05,{sym}")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines) + "\n")
+
+
+def test_resolve_major_index_symbols_filters_to_major_indexes_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = _tmp_kite_paths(tmp_path)
+    monkeypatch.setattr(kite_ingestion, "get_kite_paths", lambda: paths)
+    _make_instrument_csv(
+        paths.instrument_dir / "NSE.csv",
+        ["NIFTY 50", "NIFTY 100", "NIFTY BANK", "NIFTY 500"],
+    )
+
+    result = resolve_major_index_symbols(exchange="NSE")
+
+    assert result == ["NIFTY 50", "NIFTY 100", "NIFTY 500"]
+
+
+class TestKiteIngestCliIndexResolution:
+    def test_default_scope_appends_major_indexes(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        paths = _tmp_kite_paths(tmp_path)
+        monkeypatch.setattr(kite_ingestion, "get_kite_paths", lambda: paths)
+        monkeypatch.setattr(kite_ingestion, "_load_nse_equity_allowlist", lambda: None)
+        _make_instrument_csv(
+            paths.instrument_dir / "NSE.csv",
+            ["SBIN", "NIFTY 50", "NIFTY 100", "NIFTY 500"],
+        )
+        daily_dir = paths.parquet_root / "daily" / "SBIN"
+        daily_dir.mkdir(parents=True, exist_ok=True)
+        (daily_dir / "all.parquet").write_bytes(b"fake")
+
+        args = kite_ingest_cli.build_parser().parse_args([])
+        result = kite_ingest_cli._resolve_ingest_symbols(args)
+
+        assert result == ["SBIN", "NIFTY 50", "NIFTY 100", "NIFTY 500"]
+
+    def test_major_indexes_only_returns_only_major_indexes(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        paths = _tmp_kite_paths(tmp_path)
+        monkeypatch.setattr(kite_ingestion, "get_kite_paths", lambda: paths)
+        _make_instrument_csv(
+            paths.instrument_dir / "NSE.csv",
+            ["SBIN", "NIFTY 50", "NIFTY 100", "NIFTY 500"],
+        )
+
+        args = kite_ingest_cli.build_parser().parse_args(["--major-indexes-only"])
+        result = kite_ingest_cli._resolve_ingest_symbols(args)
+
+        assert result == ["NIFTY 50", "NIFTY 100", "NIFTY 500"]
+
+    def test_explicit_symbols_do_not_auto_append_indexes(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        paths = _tmp_kite_paths(tmp_path)
+        monkeypatch.setattr(kite_ingestion, "get_kite_paths", lambda: paths)
+        monkeypatch.setattr(kite_ingestion, "_load_nse_equity_allowlist", lambda: None)
+        _make_instrument_csv(
+            paths.instrument_dir / "NSE.csv",
+            ["SBIN", "NIFTY 50", "NIFTY 100", "NIFTY 500"],
+        )
+
+        args = kite_ingest_cli.build_parser().parse_args(["--symbols", "SBIN"])
+        result = kite_ingest_cli._resolve_ingest_symbols(args)
+
+        assert result == ["SBIN"]
+
+    def test_missing_symbols_path_does_not_auto_append_indexes(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        paths = _tmp_kite_paths(tmp_path)
+        monkeypatch.setattr(kite_ingestion, "get_kite_paths", lambda: paths)
+        monkeypatch.setattr(
+            kite_ingestion, "resolve_missing_ingest_symbols", lambda **kwargs: ["SBIN"]
+        )
+        _make_instrument_csv(
+            paths.instrument_dir / "NSE.csv",
+            ["SBIN", "NIFTY 50", "NIFTY 100", "NIFTY 500"],
+        )
+
+        args = kite_ingest_cli.build_parser().parse_args(["--missing"])
+        result = kite_ingest_cli._resolve_ingest_symbols(args)
+
+        assert result == ["SBIN"]
+
+    def test_compact_daily_uses_major_indexes_when_no_symbols(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        paths = _tmp_kite_paths(tmp_path)
+        monkeypatch.setattr(kite_ingestion, "get_kite_paths", lambda: paths)
+        monkeypatch.setattr(kite_ingestion, "_load_nse_equity_allowlist", lambda: None)
+        _make_instrument_csv(
+            paths.instrument_dir / "NSE.csv",
+            ["SBIN", "NIFTY 50", "NIFTY 100", "NIFTY 500"],
+        )
+        daily_dir = paths.parquet_root / "daily" / "SBIN"
+        daily_dir.mkdir(parents=True, exist_ok=True)
+        (daily_dir / "all.parquet").write_bytes(b"fake")
+
+        args = kite_ingest_cli.build_parser().parse_args(["--compact-daily"])
+        result = kite_ingest_cli._resolve_ingest_symbols(args)
+
+        assert result == ["SBIN", "NIFTY 50", "NIFTY 100", "NIFTY 500"]
+
+
+def test_refresh_runtime_tables_limits_rebuild_to_requested_symbols(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class _FakeDB:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def build_all(self, *, force: bool, symbols: list[str] | None = None) -> None:
+            self.calls.append({"force": force, "symbols": symbols})
+
+    fake_db = _FakeDB()
+    monkeypatch.setattr(duckdb_module, "close_db", lambda: None)
+    monkeypatch.setattr(duckdb_module, "get_db", lambda: fake_db)
+
+    kite_ingestion.refresh_runtime_tables(force=True, symbols=["NIFTY 500", "SBIN", "SBIN"])
+
+    assert fake_db.calls == [{"force": True, "symbols": ["NIFTY 500", "SBIN"]}]
 
 
 class TestResolveTargetSymbolsCurrentMaster:

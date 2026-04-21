@@ -100,6 +100,10 @@ The promoted long default is `rvol_threshold = 1.0`.
 Both strategies use the same three-phase `TrailingStop` engine.  After entry a trade
 advances through PROTECT → BREAKEVEN → TRAIL as price moves in your favour.
 
+For candle-by-candle examples, same-bar edge cases, and the full exit matrix, see
+[`docs/trailing-stop-explained.md`](docs/trailing-stop-explained.md). The summary below is
+the operator-level version.
+
 | Phase | SL sits at | Advance condition |
 |---|---|---|
 | **PROTECT** | Original SL (CPR boundary ± ATR buffer) | Candle close ≥ entry + 1R |

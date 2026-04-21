@@ -12,6 +12,19 @@ Use this workflow to keep `cpr-pivot-lab` self-contained after March 9, 2026 wit
   - 5-minute historical ingestion
   - `pivot-paper-trading daily-live`
 
+## Major NSE indexes
+
+The daily ingest pipeline now auto-includes the three broad market indexes used for regime checks:
+
+- `NIFTY 50`
+- `NIFTY 100`
+- `NIFTY 500`
+
+These are ingested alongside the normal NSE stock universe when you run `pivot-kite-ingest` without an explicit symbol list.
+
+Use `--major-indexes-only` when you want to backfill or refresh just those index series.
+This keeps index data available for market-direction gates without pulling every other NSE index into the default workflow.
+
 ## Files written
 
 - Instrument cache: `data/raw/kite/instruments/NSE.csv`

@@ -826,8 +826,10 @@ def load_setup_row(
     or_minutes: int = 5,
     allow_live_fallback: bool = True,
     bar_end_offset: timedelta | None = None,
+    regime_index_symbol: str | None = None,
 ) -> dict[str, Any] | None:
     db = get_dashboard_db()
+    regime_symbol = str(regime_index_symbol or "").strip().upper()
     with _MARKET_DB_READ_LOCK:
         row = db.con.execute(
             """
@@ -854,15 +856,22 @@ def load_setup_row(
                 s.or_atr_5,
                 s.direction_5,
                 m.is_narrowing,
-                m.cpr_shift
+                m.cpr_shift,
+                CASE
+                    WHEN reg.open_915 > 0 AND reg.or_close_30 IS NOT NULL
+                    THEN ((reg.or_close_30 - reg.open_915) / reg.open_915) * 100.0
+                    ELSE NULL
+                END AS regime_move_pct
             FROM market_day_state m
             LEFT JOIN strategy_day_state s
               ON s.symbol = m.symbol
              AND s.trade_date = m.trade_date
+            LEFT JOIN market_day_state reg
+              ON reg.symbol = ? AND reg.trade_date = m.trade_date
             WHERE m.symbol = ? AND m.trade_date = ?::DATE
             LIMIT 1
             """,
-            [symbol, trade_date],
+            [regime_symbol, symbol, trade_date],
         ).fetchone()
     if not row:
         if not allow_live_fallback:
@@ -935,6 +944,7 @@ def load_setup_row(
         "direction_pending": direction not in {"LONG", "SHORT"},
         "is_narrowing": bool(row[21]),
         "cpr_shift": str(row[22] or "OVERLAP"),
+        "regime_move_pct": float(row[23]) if row[23] is not None else None,
         "rvol_baseline": rvol_baseline,
         "setup_source": "market_day_state",
     }
@@ -1910,6 +1920,7 @@ async def evaluate_candle(
             or_minutes=params.or_minutes,
             allow_live_fallback=runtime_state.allow_live_setup_fallback,
             bar_end_offset=runtime_state.bar_end_offset,
+            regime_index_symbol=getattr(params, "regime_index_symbol", ""),
         )
         if setup_row is not None:
             state.setup_row = setup_row

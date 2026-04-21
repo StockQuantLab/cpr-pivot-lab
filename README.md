@@ -170,6 +170,10 @@ Daily parquet now uses a baseline + overlay layout per symbol:
 `pivot-kite-ingest` writes recent daily catch-up rows into `kite.parquet`; DuckDB `v_daily`
 dedupes and prefers that overlay automatically.
 
+When run without an explicit symbol list, `pivot-kite-ingest` also refreshes the three major NSE
+indexes used for regime checks: `NIFTY 50`, `NIFTY 100`, and `NIFTY 500`. Use
+`--major-indexes-only` if you want only those index series.
+
 The rebuild and validation steps below work against whatever local parquet history is already on
 disk. They do not start a new Kite backfill from a fixed year like 2015.
 

@@ -138,6 +138,8 @@ def build_strategy_config_from_overrides(
         "max_gap_pct",
         "long_max_gap_pct",
         "min_price",
+        "regime_index_symbol",
+        "regime_min_move_pct",
         "strategy",
     }
     overrides.pop("version", None)

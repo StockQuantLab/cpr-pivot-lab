@@ -586,6 +586,7 @@ async def replay_session(
                 live_candles=state.candles,
                 or_minutes=params.or_minutes,
                 allow_live_fallback=False,
+                regime_index_symbol=getattr(params, "regime_index_symbol", ""),
             )
             if setup_row is None:
                 runtime_state.skipped_setup_rows += 1

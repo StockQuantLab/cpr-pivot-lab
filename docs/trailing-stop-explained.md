@@ -3,6 +3,12 @@
 How the CPR Pivot Lab engine protects and maximises profit after entry.  
 Written for operators, analysts, and developers.
 
+## Read This With
+
+- [docs/strategy-guide.md](docs/strategy-guide.md) for the higher-level CPR_LEVELS vs FBR overview
+- [docs/ISSUES.md](docs/ISSUES.md) for the experiment history and rejected alternatives
+- [docs/PAPER_TRADING_RUNBOOK.md](docs/PAPER_TRADING_RUNBOOK.md) for the current canonical presets and live commands
+
 ---
 
 ## The Three Phases
@@ -15,20 +21,56 @@ PROTECT  →  BREAKEVEN  →  TRAIL  →  exit
 
 | Phase | Stop Loss sits at | What triggers the advance |
 |---|---|---|
-| **PROTECT** | Original SL (e.g. BC − ATR buffer for LONG) | Candle **CLOSE** ≥ entry + 1R |
-| **BREAKEVEN** | Entry price — worst-case exit is ~₹0 | Candle **HIGH** or **CLOSE** ≥ entry + 2R (LONG); SHORT uses the mirror rule with LOW |
-| **TRAIL** | Highest completed-bar high seen since entry − 1× ATR | Only moves in your favour; stops you out when price reverses |
+| **PROTECT** | Original SL (CPR edge + ATR buffer) | Candle **CLOSE** ≥ entry + 1R |
+| **BREAKEVEN** | Entry price — worst-case exit is ~₹0 (commission only) | Candle **HIGH** (LONG) or **LOW** (SHORT) ≥ R1/S1 |
+| **TRAIL** | Highest completed-bar high − 1× ATR (LONG) or lowest low + 1× ATR (SHORT) | Only moves in your favour; stops you out when price reverses |
 
-**Key numbers (typical CPR_LEVELS LONG trade):**
+### The dead zone
+
+```
+Entry ────── 1R ──────────────────────── R1/S1 ────── ATR trail ─────
+             ↑                               ↑
+       SL → entry                  Trail activates here
+       (BREAKEVEN)                 Exit fires here (TARGET or TRAILING_SL)
+             ←──── stop flat at entry in this entire range ────────→
+```
+
+Between **1R** and **R1/S1** the stop sits flat at entry regardless of how far price moves.
+A trade that reaches 1.5R and reverses exits at entry (BREAKEVEN\_SL, ~−₹83 commission).
+This is by design — the ATR trail needs a meaningful move to anchor without being too tight.
+
+### Why "2R" appears in the code
+
+`TrailingStop` is initialised with `rr_ratio = effective_rr` where
+`effective_rr = |R1 − entry| / sl_distance`.  That means
+`TrailingStop.target_price = entry + effective_rr × sl_distance = R1`.
+
+The internal `target_price` of the `TrailingStop` object **is R1/S1**, not a fixed 2× multiple.
+On narrow-CPR days R1 can be only 1.5R away; on wide-CPR days it can be 5R or more.
+The `rr_ratio` default of `2.0` in the class signature is just a fallback — in production it
+is always overridden by the actual trade's effective R:R at entry.
+
+**Key numbers (CPR_LEVELS LONG trade, narrow CPR day):**
 
 ```
 entry        = ₹100
-sl           = ₹95     →  SL distance (1R) = ₹5
-1R level     = ₹105    →  breakeven trigger
-2R level     = ₹110    →  trail trigger
-target (R1)  = ₹120    →  exit if trail never fires
-ATR          = ₹3
+sl           = ₹97     →  SL distance (1R) = ₹3
+1R level     = ₹103    →  breakeven trigger (close ≥ 103)
+R1 (target)  = ₹109    →  trail activates here AND exit fires here  (= ~2R in this example)
+ATR          = ₹2
 ```
+
+**Key numbers (CPR_LEVELS LONG trade, wide CPR day):**
+
+```
+entry        = ₹100
+sl           = ₹97     →  SL distance (1R) = ₹3
+1R level     = ₹103    →  breakeven trigger
+R1 (target)  = ₹120    →  trail activates here AND exit fires here  (= 6.7R in this example)
+ATR          = ₹2
+```
+
+On the wide-CPR trade the dead zone spans 5.7R of price movement with the stop flat at entry.
 
 ---
 
@@ -192,12 +234,68 @@ separately instead of assuming the LONG result will transfer unchanged.
 
 ---
 
+## All Possible Exit Scenarios (no scale-out)
+
+Every trade ends in exactly one of these ways.
+
+### Losing exits
+
+| Exit reason | When it fires | Exit price | What happened |
+|---|---|---|---|
+| `INITIAL_SL` | Low ≤ initial SL (PROTECT phase) | CPR edge + ATR buffer | Price never moved in your favour |
+| `BREAKEVEN_SL` | Low ≤ entry (BREAKEVEN phase) | ~Entry (~−₹83 commission) | Price reached 1R then fully reversed; intraday high never crossed R1 |
+| `TIME` (loss) | 15:15, position still open at a loss | 15:15 candle close | Price never reached 1R; SL not hit either |
+
+### Winning exits
+
+| Exit reason | When it fires | Exit price | What happened |
+|---|---|---|---|
+| `TARGET` | Bar HIGH ≥ R1/S1, trail SL not hit first | Exactly R1/S1 | Standard clean win — price hit the CPR pivot target |
+| `TRAILING_SL` (at R1) | Bar HIGH ≥ R1; trail SL set to `HIGH − ATR`; bar LOW ≤ trail SL | `HIGH − ATR` (≤ R1) | Spiked to R1 then reversed sharply within same bar; exits slightly below R1 |
+| `TRAILING_SL` (above R1) | Bar HIGH > R1 + ATR; trail SL = `HIGH − ATR` > R1; bar LOW ≤ trail SL | `HIGH − ATR` (> R1) | Spiked well above R1 then reversed within same bar; exits above R1 — better than TARGET |
+| `TIME` (win) | 15:15, position profitable but R1 never hit | 15:15 candle close | Price moved in favour but stalled below R1 the whole day; breakeven was held |
+
+### Code ordering that determines TARGET vs TRAILING_SL
+
+Per bar, the engine runs in this exact order:
+
+```
+1. trail_update(close, high, low)   — activates TRAIL if high ≥ R1; sets SL = highest − ATR
+2. ts.is_hit(low, high)             — if new SL is hit → TRAILING_SL (exits here, never reaches step 3)
+3. if high ≥ R1 → TARGET            — if step 2 didn't fire → exits at exactly R1
+```
+
+`TRAILING_SL` only beats `TARGET` when the bar's high ran **more than 1 ATR above R1** before
+reversing back (so `HIGH − ATR > R1`).  If the bar barely touched R1 (`HIGH = R1 + ε`),
+the trail SL = `R1 + ε − ATR < R1`, and the exit is slightly below R1.
+
+---
+
+## Scale-out: the only way to run past R1 without code changes
+
+`--cpr-scale-out-pct 0.5` splits the position: exit 50% at R1 (TARGET), trail the remaining
+50% toward R2/S2 with ATR.  The runner target = R2 (already stored in `cpr_daily`).
+
+```
+             R1/S1        R2/S2
+Entry ────── BREAK ──── TARGET ──── RUNNER ────
+                          50% exits  50% trails ATR
+                          at R1/S1   toward R2/S2
+```
+
+This is the only mechanism in the current engine for capturing moves past R1 without an SL
+being in the 1R→R1 dead zone.  The ratchet (progressive SL ladder) was tested and regressed
+SHORT by −16.4%; scale-out does not move the SL before R1 so it avoids that problem.
+See `docs/ISSUES.md` and `docs/PROGRESSIVE_TRAIL_RATCHET_PLAN.md` for the full history.
+
+---
+
 ## Summary
 
 | Scenario | Before April 2026 fix | After fix |
 |---|---|---|
-| Close ≥ 2R → TRAIL | SL tightened immediately (optimistic) | SL tightened after bar close |
-| High ≥ 2R, close < 2R → TRAIL | TRAIL **never** activated | TRAIL activates, SL tightened after close |
-| Same bar: close crosses 1R AND high crosses 2R | Only BREAKEVEN activated | Both BREAKEVEN and TRAIL activate |
-| Post-2R gradual reversal over multiple bars | BREAKEVEN\_SL (~−₹83) | Profitable TRAILING\_SL exit |
-| Post-2R immediate reversal same/next bar | BREAKEVEN\_SL | BREAKEVEN\_SL (unchanged — no OHLC info to do better) |
+| Close ≥ R1 → TRAIL + TARGET | SL tightened immediately (optimistic) | SL tightened after bar close |
+| High ≥ R1, close < R1 → TRAIL | TRAIL **never** activated | TRAIL activates, SL tightened after close |
+| Same bar: close crosses 1R AND high crosses R1 | Only BREAKEVEN activated | Both BREAKEVEN and TRAIL activate |
+| Post-R1 gradual reversal over multiple bars | BREAKEVEN\_SL (~−₹83) | Profitable TRAILING\_SL exit |
+| Post-R1 immediate reversal same bar | BREAKEVEN\_SL | BREAKEVEN\_SL or small win (depends on how far above R1 the spike ran) |

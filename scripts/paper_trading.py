@@ -261,6 +261,12 @@ def _collect_strategy_cli_overrides(
     min_price = getattr(args, "min_price", None)
     if min_price is not None:
         overrides["min_price"] = float(min_price)
+    regime_index_symbol = getattr(args, "regime_index_symbol", None)
+    if regime_index_symbol:
+        overrides["regime_index_symbol"] = str(regime_index_symbol).strip().upper()
+    regime_min_move_pct = getattr(args, "regime_min_move_pct", None)
+    if regime_min_move_pct is not None:
+        overrides["regime_min_move_pct"] = float(regime_min_move_pct)
     cpr_min_close_atr = getattr(args, "cpr_min_close_atr", None)
     if cpr_min_close_atr is not None:
         overrides["cpr_min_close_atr"] = float(cpr_min_close_atr)
@@ -1864,6 +1870,23 @@ def build_parser() -> argparse.ArgumentParser:
             type=float,
             default=None,
             help="Minimum previous close required for symbol eligibility.",
+        )
+        sp.add_argument(
+            "--regime-index-symbol",
+            default=None,
+            help=(
+                "Optional broad-index symbol for the market-regime gate "
+                "(for example NIFTY 500). Leave empty to disable."
+            ),
+        )
+        sp.add_argument(
+            "--regime-min-move-pct",
+            type=float,
+            default=None,
+            help=(
+                "Skip LONG when the regime index is down at least this %% and skip SHORT when "
+                "it is up at least this %% (default off)."
+            ),
         )
         sp.add_argument(
             "--cpr-min-close-atr",

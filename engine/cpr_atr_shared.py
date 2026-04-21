@@ -190,6 +190,11 @@ def find_cpr_levels_entry(
             _last_reject_reason.value = "SHORT_OPEN_TO_CPR_ATR"
             return None
 
+    skip_regime, regime_reason = should_skip_for_regime(setup_row=setup_row, params=params)
+    if skip_regime:
+        _last_reject_reason.value = regime_reason or "REGIME"
+        return None
+
     entry_start = get_cpr_entry_scan_start(params.or_minutes, cpr_cfg.cpr_entry_start)
     scan_start_idx, scan_end_idx = day_pack.range_indices(entry_start, params.entry_window_end)
     if scan_start_idx < 0 or current_idx < scan_start_idx or current_idx > scan_end_idx:
@@ -321,6 +326,7 @@ def find_cpr_levels_entry(
         "gap_pct": gap_pct,
         "cpr_width_pct": cpr_width_pct,
         "cpr_threshold": cpr_threshold,
+        "regime_move_pct": _regime_move_pct(setup_row),
     }
 
 
@@ -353,6 +359,45 @@ def scan_cpr_levels_entry(
         if candidate is not None:
             return candidate
     return None
+
+
+def _regime_move_pct(setup_row: Mapping[str, Any]) -> float | None:
+    move = setup_row.get("regime_move_pct")
+    if move is None:
+        return None
+    try:
+        return float(move)
+    except (TypeError, ValueError):
+        return None
+
+
+def should_skip_for_regime(
+    *,
+    setup_row: Mapping[str, Any],
+    params: Any,
+) -> tuple[bool, str | None]:
+    """Return whether the optional market-regime gate blocks a CPR entry.
+
+    The current experiment uses a fixed 09:30 snapshot of a broad index:
+    skip SHORT when the index is up at least `regime_min_move_pct` from its open,
+    and skip LONG when it is down at least that much.
+    """
+
+    index_symbol = str(getattr(params, "regime_index_symbol", "") or "").strip().upper()
+    min_move_pct = float(getattr(params, "regime_min_move_pct", 0.0) or 0.0)
+    if not index_symbol or min_move_pct <= 0:
+        return False, None
+
+    regime_move_pct = _regime_move_pct(setup_row)
+    if regime_move_pct is None:
+        return True, "REGIME_DATA"
+
+    direction = str(setup_row.get("direction") or "").upper()
+    if direction == "SHORT" and regime_move_pct >= min_move_pct:
+        return True, "REGIME_SHORT_UP"
+    if direction == "LONG" and regime_move_pct <= -min_move_pct:
+        return True, "REGIME_LONG_DOWN"
+    return False, None
 
 
 def split_scale_out_quantity(position_size: int, scale_out_pct: float) -> tuple[int, int] | None:

@@ -7,7 +7,12 @@ import polars as pl
 import pytest
 
 from db.duckdb import MarketDB
-from engine.cpr_atr_shared import scan_cpr_levels_entry
+from engine.cpr_atr_shared import (
+    _last_reject_reason,
+    find_cpr_levels_entry,
+    scan_cpr_levels_entry,
+    should_skip_for_regime,
+)
 from engine.cpr_atr_strategy import (
     STRATEGY_VERSION,
     BacktestParams,
@@ -75,6 +80,8 @@ class TestBacktestParams:
         assert p.short_open_to_cpr_atr_min == 0.0
         assert p.runtime_batch_size == 512
         assert p.long_max_gap_pct is None
+        assert p.regime_index_symbol == ""
+        assert p.regime_min_move_pct == 0.0
 
     def test_runtime_batch_size_default(self):
         p = BacktestParams()
@@ -161,6 +168,8 @@ class TestBacktestParams:
             strategy="FBR",
             rr_ratio=1.5,
             runtime_batch_size=8,
+            regime_index_symbol="NIFTY 500",
+            regime_min_move_pct=0.3,
         ).apply_strategy_configs(
             cpr_levels=CPRLevelsParams(
                 cpr_shift_filter="HIGHER",
@@ -180,6 +189,8 @@ class TestBacktestParams:
         assert p.cpr_levels.cpr_min_close_atr == 0.1
         assert p.cpr_levels.scale_out_pct == 0.8
         assert p.runtime_batch_size == 8
+        assert p.regime_index_symbol == "NIFTY 500"
+        assert p.regime_min_move_pct == 0.3
 
     def test_apply_strategy_configs_merges_grouped_values(self):
         p = BacktestParams().apply_strategy_configs(
@@ -230,6 +241,85 @@ class TestBacktestParams:
         assert p.virgin_cpr.vcpr_scan_start == "09:45"
         assert p.virgin_cpr.vcpr_scan_end == "12:00"
         assert p.virgin_cpr.vcpr_min_open_dist_atr == 0.5
+
+    def test_regime_fields_round_trip_through_preset_overrides(self):
+        cfg = build_strategy_config_from_preset(
+            "CPR_LEVELS_RISK_LONG",
+            {
+                "regime_index_symbol": "NIFTY 500",
+                "regime_min_move_pct": 0.3,
+            },
+        )
+
+        assert cfg.regime_index_symbol == "NIFTY 500"
+        assert cfg.regime_min_move_pct == 0.3
+
+    def test_regime_gate_is_disabled_by_default(self):
+        setup_row = {
+            "direction": "SHORT",
+            "regime_move_pct": 0.8,
+        }
+        params = BacktestParams()
+
+        skip_regime, reason = should_skip_for_regime(setup_row=setup_row, params=params)
+
+        assert skip_regime is False
+        assert reason is None
+
+    @pytest.mark.parametrize(
+        ("direction", "regime_move_pct", "expected_reason"),
+        [
+            ("SHORT", 0.4, "REGIME_SHORT_UP"),
+            ("LONG", -0.4, "REGIME_LONG_DOWN"),
+        ],
+    )
+    def test_regime_gate_blocks_mirrored_long_short_days(
+        self,
+        direction: str,
+        regime_move_pct: float,
+        expected_reason: str,
+    ) -> None:
+        setup_row = {
+            "direction": direction,
+            "tc": 103.0,
+            "bc": 101.0,
+            "atr": 1.0,
+            "or_high_5": 101.5,
+            "or_low_5": 100.0,
+            "open_915": 100.5,
+            "prev_day_close": 100.5,
+            "cpr_width_pct": 0.2,
+            "cpr_threshold": 2.0,
+            "r1": 110.0,
+            "s1": 98.0,
+            "r2": 112.0,
+            "s2": 96.0,
+            "is_narrowing": True,
+            "regime_move_pct": regime_move_pct,
+        }
+        day_pack = DayPack(
+            time_str=["09:20"],
+            opens=[100.0],
+            highs=[100.2],
+            lows=[99.8],
+            closes=[100.0],
+            volumes=[1000.0],
+            rvol_baseline=[1000.0],
+        )
+        params = BacktestParams(
+            regime_index_symbol="NIFTY 500",
+            regime_min_move_pct=0.3,
+        )
+
+        candidate = find_cpr_levels_entry(
+            day_pack=day_pack,
+            setup_row=setup_row,
+            params=params,
+            current_idx=0,
+        )
+
+        assert candidate is None
+        assert getattr(_last_reject_reason, "value", None) == expected_reason
 
     def test_long_gap_override_applies_only_to_longs(self):
         p = BacktestParams(max_gap_pct=1.5, long_max_gap_pct=1.0)
