@@ -7,6 +7,279 @@ Supersedes: `docs/PARITY_INCIDENT_LOG.md` (contents migrated below).
 
 ---
 
+## 2026-04-21 — BUG: `flatten` command drops alerts and leaves sessions at STOPPING/CANCELLED
+
+**Status:** FIXED — `scripts/paper_trading.py`
+**Severity:** Medium — positions close correctly but operator had no confirmation; sessions not COMPLETED
+
+### Context
+2026-04-21 early-close test: both live sessions were hard-killed (taskkill /F) then
+`pivot-paper-trading flatten` was run on each session to close 8 remaining open positions.
+
+### Bugs Found
+
+**1. TRADE_CLOSED alerts not sent for MANUAL_FLATTEN positions**
+`flatten_session_positions()` calls `_dispatch_alert(AlertType.TRADE_CLOSED, ...)` for each
+position but the `_cmd_flatten` handler exits immediately after without calling
+`maybe_shutdown_alert_dispatcher()`. The async dispatcher never flushes — all 8 alerts dropped.
+Fix: call `await maybe_shutdown_alert_dispatcher()` at the end of `_cmd_flatten` in `scripts/paper_trading.py`.
+
+**2. FLATTEN_EOD alert not sent**
+Same root cause — the EOD summary is queued by `flatten_session_positions()` but the process
+exits before the dispatcher flushes. Operator has no Telegram confirmation the session is done.
+Fix: same as above — `maybe_shutdown_alert_dispatcher()` at end of `_cmd_flatten`.
+
+**3. Sessions stuck at STOPPING/CANCELLED instead of COMPLETED**
+`flatten_session_positions()` sets status to STOPPING but never transitions to COMPLETED.
+Hard kill left LONG as ACTIVE → startup cleanup in the next `flatten` call marked it CANCELLED.
+SHORT remains STOPPING permanently.
+Fix: `_cmd_flatten` should call `complete_session(session_id)` after `flatten_session_positions()`.
+
+### UX Gap: No single "close all and exit" command
+Current early-close procedure requires 3 manual steps:
+1. Find and kill the live process PID
+2. `pivot-paper-trading flatten --session-id LONG`
+3. `pivot-paper-trading flatten --session-id SHORT`
+
+The delay executing these steps cost ~₹2,400 vs the projected close-now price (market moved against positions while researching the mechanism).
+
+**Required:** Add `pivot-paper-trading flatten-all --trade-date today` command that:
+- Flattens all ACTIVE/STOPPING sessions for the given trade date in one call
+- Calls `maybe_shutdown_alert_dispatcher()` before exit
+- Marks all sessions COMPLETED
+- Works even while the live process is still running (or documents that kill is required first)
+
+### Root Cause (found in fix)
+`_cmd_flatten` did not call `register_session_start()` + `_start_alert_dispatcher()`. The alert
+consumer task was never started, so `_dispatch_alert()` queued items that nothing processed.
+`maybe_shutdown_alert_dispatcher()` drained an empty queue — alerts silently dropped.
+
+### Files Changed
+- `scripts/paper_trading.py` — `_cmd_flatten`: added `register_session_start()`, `_start_alert_dispatcher()`, `update_session_state(COMPLETED)`, `maybe_shutdown_alert_dispatcher()`
+- `scripts/paper_trading.py` — added `flatten-all` subcommand + `_cmd_flatten_all()` with same dispatcher wiring
+
+### Test Results (2026-04-21)
+- Positions: all 8 closed correctly at last-known feed price ✅
+- TRADE_CLOSED alerts: 0 of 8 delivered ❌
+- FLATTEN_EOD alert: not sent ❌
+- Session status: LONG=CANCELLED, SHORT=STOPPING (neither COMPLETED) ❌
+- Final P&L: LONG +₹3,856 / SHORT −₹2,748 / Combined +₹1,108
+
+---
+
+## 2026-04-21 — ANALYSIS: Losing trade patterns — tight SLs, early entries, SHORT bias on up-day
+
+**Status:** ANALYSIS COMPLETE — 3 backtest experiments identified
+**Severity:** Informational — no live bug; trading outcome review for strategy refinement
+
+### Session Summary
+- 28 closed positions: LONG 16, SHORT 12
+- **All 5 wins were LONG. Zero SHORT wins.**
+- 14 INITIAL_SL hits, 9 BREAKEVEN_SL exits (−₹83 each), 5 TRAILING_SL wins
+
+### Pattern 1: Tight SLs stopped by opening-range noise (strongest signal)
+
+| Group | Avg SL distance | Min | Max |
+|-------|----------------|-----|-----|
+| Winners | 1.16% | 0.45% | 1.56% |
+| Losers | 0.38% | 0.16% | 0.83% |
+
+Winners had ~3× wider SLs than losers. Every trade with SL < 0.45% was stopped out.
+NSE opening-range noise is ~0.3–0.5% on mid-caps — SLs inside that band have no survival room.
+SL distance is determined by the CPR zone width + ATR buffer; naturally narrow CPR days produce the tightest SLs.
+
+**Experiment**: add `min_sl_distance_pct = 0.5%` filter — skip entries where `|entry − SL| / entry < 0.005`.
+Estimated impact: ~10 of today's 14 INITIAL_SL losses would have been skipped.
+
+### Pattern 2: 64% of losses entered at 09:20–09:25 (first two bars)
+
+9 of 14 INITIAL_SL hits entered at 09:20 or 09:25 — the most volatile period post-open.
+All 5 winning trades entered at 09:30 or later.
+CPR_LEVELS entry scan starts at 09:15, so first-bar TC/BC touches carry the highest noise-to-signal ratio.
+
+**Experiment**: test `entry_window_start = 09:30` — defer first-bar entries.
+Risk: may reduce trade count; backtest to confirm Calmar impact before applying.
+
+### Pattern 3: SHORT side completely failed — market trended up all day
+
+NIFTY climbed steadily from open. Every SHORT entry was against the day's trend:
+- MANGLMCEM, GLAND, SAREGAMA, ADVANCE, RAMAPHO, BHEL → all INITIAL_SL
+- 6 more SHORTs → BREAKEVEN_SL (brief move right, then reversed with market)
+
+Direction is resolved at 09:15 from `or_close_5`. On a strongly trending day, the initial
+9:15 bar can still print below BC (triggering SHORT direction) before the trend is established.
+
+**Experiment**: add a Nifty trend gate — skip SHORT entries when Nifty is already up >0.3% from open
+by 09:30. This is a market-regime filter, not an individual-stock filter.
+Backtest required before any live use. Risk of data-mining; validate out-of-sample.
+
+### Pattern 4: BREAKEVEN protection is working correctly — but reveals choppy session
+
+9 trades reached +1R (BE trigger), then reversed to entry. The system behaved correctly.
+This pattern indicates a **choppy, mean-reverting session** — initial momentum faded for most trades.
+Indistinguishable from a real move in real-time; no change recommended here.
+
+### Experiments to Run (in order of expected impact)
+
+1. `min_sl_distance_pct = 0.5%` — skip trades with tiny SL; estimate: cuts noise entries, small win-rate lift
+2. `entry_window_start = 09:30` — defer first-bar entries
+3. Nifty trend gate for SHORT direction — skip on strongly up-trending days
+
+All experiments are backtest-only. Do not apply to live sessions until validated on gold_51 × 10yr with Calmar comparison against current baseline (CPR_LEVELS_RISK_SHORT: Calmar currently not yet re-benchmarked post-Apr-18 baseline).
+
+---
+
+## 2026-04-21 — BUG: SESSION_STARTED alert never dispatched on daily-live startup
+
+**Status:** FIXED — `engine/paper_runtime.py`, `scripts/paper_live.py`
+**Severity:** Low — no trading impact; operator receives no confirmation that sessions are live
+
+### Root Cause
+`AlertType.SESSION_STARTED` was defined in the enum (alongside `SESSION_COMPLETED`,
+`FEED_STALE`, etc.) but no dispatch function existed for it and no call site wired it.
+Operators received `TRADE_OPENED` alerts at 09:20 as the first sign the session was alive,
+with no upfront confirmation that both LONG and SHORT sessions had subscribed to the feed.
+
+### Fix
+1. Added `dispatch_session_started_alert()` to `engine/paper_runtime.py` following the
+   same pattern as `dispatch_feed_stale_alert` / `dispatch_session_error_alert`.
+2. Called it in `scripts/paper_live.py` inside `run_live_session()` immediately after
+   `direction_filter` is resolved (after session is confirmed ACTIVE and symbols filtered),
+   so the alert includes strategy, direction, symbol count, and trade date.
+
+Alert format:
+```
+Subject : SESSION_STARTED CPR_LEVELS LONG 2026-04-21
+Body    : Session: CPR_LEVELS_LONG-2026-04-21
+          Strategy: CPR_LEVELS  Direction: LONG
+          Symbols: 615  Date: 2026-04-21
+```
+
+### Files Changed
+- `engine/paper_runtime.py` — `dispatch_session_started_alert()`
+- `scripts/paper_live.py` — import + call after session goes ACTIVE
+
+---
+
+## 2026-04-21 — ENHANCEMENT: Dashboard shows no session until 09:16 IST
+
+**Status:** FIXED — `scripts/paper_trading.py`, `db/paper_db.py`
+**Severity:** Low — cosmetic; sessions appear as soon as the WebSocket subscribes
+
+### Observation
+When `daily-live --multi` starts before market open (e.g. 09:05 IST), it waits ~435s in
+`_wait_until_market_ready()` before subscribing to Kite WebSocket. Session rows were only
+written to `paper_sessions` inside `_ensure_daily_session()`, which is called *after* the
+wait ends. The dashboard therefore showed no sessions for today until 09:16 IST.
+
+### Fix Applied
+Pre-create sessions with `status="PLANNING"` in `_cmd_daily_live_multi` before
+`_wait_until_market_ready()`. Sessions transition PLANNING → ACTIVE automatically when
+`run_live_session` starts (`if session.status != "ACTIVE": update to ACTIVE` at paper_live.py:766).
+`get_active_sessions()` in `db/paper_db.py` updated to include PLANNING status so the dashboard
+renders them immediately. Dashboard shows all zeros (no positions yet) with status="PLANNING".
+
+### Files Changed
+- `scripts/paper_trading.py` — pre-compute `variant_setup` and pre-create sessions with PLANNING
+  before kite wait; skips pre-creation if session already exists (safe for resume/restart)
+- `db/paper_db.py` — `get_active_sessions()` query now includes PLANNING in status filter
+
+---
+
+## 2026-04-21 — BUG: paper.duckdb startup lock from stale Python process
+
+**Status:** FIXED — `db/paper_db.py`
+**Severity:** Medium — blocks `daily-live` session start; requires manual kill
+
+### Root Cause
+On Windows, DuckDB acquires an exclusive write lock on `paper.duckdb` for the process
+lifetime. Any stale Python process (failed startup, Codex test run, killed session that
+was not reaped) that had the file open blocks the next `daily-live` start with an
+`IOException`. The error message included the holding PID, but it was buried deep in the
+traceback with no actionable guidance.
+
+Observed: Codex ran a `daily-live` test as part of the ingestion improvement plan and left
+PID 32004 running. Next morning's fresh start failed silently because PID 32004 held the
+lock. Required manual `tasklist` → `taskkill` cycle before the session could start.
+
+### Symptom
+```
+_duckdb.IOException: IO Error: Cannot open file "data/paper.duckdb": The process cannot
+access the file because it is being used by another process.
+File is already open in python.exe (PID XXXXX)
+```
+
+### Fix
+`PaperDB.__init__` now wraps `duckdb.connect()` in a `try/except duckdb.IOException`.
+On failure it calls `_diagnose_paper_db_lock()` which:
+1. Extracts the holding PID and executable from DuckDB's own error text via regex
+2. Runs a PowerShell one-liner to resolve the full command line for that PID
+3. Prints a `[STARTUP BLOCKED]` banner with the exact `taskkill` fix command
+4. Re-raises so the caller still sees the error (no silent swallow)
+
+### Files Changed
+- `db/paper_db.py` — `_diagnose_paper_db_lock()` + try/except in `PaperDB.__init__`
+
+### Prevention
+Before starting `daily-live`, kill any stale paper-trading processes:
+```powershell
+Get-CimInstance Win32_Process | Where-Object {$_.CommandLine -like "*pivot-paper-trading*"} | ForEach-Object { taskkill //F //PID $_.ProcessId }
+```
+
+---
+
+## 2026-04-20 — BUG: Apr 20 parity drift across backtest, local-live, and live-kite
+
+**Status:** INVESTIGATING
+**Severity:** High — the same CPR_LEVELS preset does not produce the same symbol set, trade count,
+or P/L across backtest, local-live, and live-kite
+
+### Symptoms
+On 2026-04-20 the archived runs diverged materially:
+
+- Backtest SHORT (`b5da636ec81a`): 12 trades, `INR 5,168.24`
+- Paper local-live SHORT (`CPR_LEVELS_SHORT-2026-04-20-live-local`): 14 trades, `INR 7,318.53`
+- Paper live-kite SHORT (`CPR_LEVELS_SHORT-2026-04-20-live-kite`): 38 trades, `INR 461.00`
+- Backtest LONG (`6eb4ea65763f`): 5 trades, `INR 1,261.50`
+- Paper local-live LONG (`CPR_LEVELS_LONG-2026-04-20-live-local`): 5 trades, `INR 1,261.53`
+- Paper live-kite LONG (`CPR_LEVELS_LONG-2026-04-20-live-kite`): 30 trades, `INR 13,520.00`
+
+LONG is effectively in parity with local-live on the Apr 20 slice, but SHORT and live-kite drift
+remain large.
+
+### Evidence
+- Backtest archived with a 2043-symbol universe for the Apr 20 run.
+- The paper sessions were archived with a prefiltered `u844` universe.
+- SHORT trade differences are mostly symbol-set drift:
+  - Paper-local had `EXCELINDUS`, `HINDCOMPOS`, `THEINVEST`
+  - Backtest had `VIYASH`
+- Shared trade keys are mostly matched, and the mismatches are small on matching rows.
+- Stored feed audit rows differ by source and bar window:
+  - live-local LONG: 843 symbols, 4,776 rows, `09:15` -> `10:15`
+  - live-kite LONG: 844 symbols, 4,975 rows, `09:20` -> `13:25`
+  - live-local SHORT: 843 symbols, 7,995 rows, `09:20` -> `15:05`
+  - live-kite SHORT: 844 symbols, 9,193 rows, `09:20` -> `15:15`
+
+### Root Cause Hypothesis
+1. The candidate universe is not frozen as a first-class artifact per trade date.
+2. `pre_filter_symbols_for_strategy()` is shared, but the inputs are not identical across modes
+   because the tradeable universe, CPR snapshot, and feed-source timing are resolved at runtime.
+3. `live-kite` and `live-local` use different transports and bar-finalization timing, so the feed
+   tape itself can diverge even when the strategy engine is shared.
+4. The current compare flow validates output rows, but it does not enforce equality of the
+   upstream universe manifest or feed-audit tape.
+
+### Required Fix
+- Define one deterministic symbol-resolution contract for a trade date and parameter bundle, then
+  make backtest, replay, local-live, and live-kite call that same resolver.
+- Record the resolver inputs and outputs for audit, but do not hand-maintain a separate symbol list.
+- Compare feed-audit rows by `symbol + bar_end` as part of the parity gate.
+- Treat differences in `feed_source`, `candle_interval`, resolution hash, or bar window as parity
+  drift unless they are explicitly documented and accepted.
+- Re-run Apr 20 comparisons after the manifest and feed-tape checks are in place.
+
+---
+
 ## 2026-04-20 — BUG: Telegram 429 rate-limit drops alert permanently at burst open
 
 **Status:** FIXED — `engine/alert_dispatcher.py`
@@ -58,7 +331,7 @@ so cross-session dedup also works (e.g., resume sessions).
 
 ## 2026-04-20 — FEATURE: Progressive trail stop between 1R and T1 (pre-target ratchet)
 
-**Status:** PENDING — backtest analysis required
+**Status:** ANALYSIS COMPLETE — candidate; strong uplift on both retained backtest baselines
 **Severity:** Enhancement — prevents giving back unrealised gains when position stalls before target
 
 ### Problem
@@ -91,12 +364,40 @@ Entry 241.16, risk = 2.28/share
 ```
 
 ### Implementation Plan
-1. **SQL analysis first**: query baseline SHORT run (`23376249a6ca`, 2025-01-01→2026-04-17).
-   For each trade that closed BREAKEVEN_SL: check max_excursion vs 1R. Count how many
-   reached 1.5R+ before reversing. Estimate P&L improvement with ratchet.
+1. **SQL analysis first**: query retained baselines and estimate the P&L delta under candidate
+   ratchet levels.
 2. **Backtest flag**: `--trail-after-r 1.5` on `pivot-backtest` (default disabled).
 3. **Sweep**: test 1.0 / 1.25 / 1.5 / 2.0 thresholds. Check Calmar vs baseline.
 4. **Paper parity**: add to both engines before enabling in live.
+
+### Backtest analysis results
+
+Retained SHORT baseline `b5da636ec81a`:
+- Baseline: `4,663` trades, `INR 10,59,120.49`, win rate `33.5%`, Calmar `72.85`
+- `1.25R` ratchet: `INR 14,82,238.20` (`+INR 4,23,117.71`), win rate `71.9%`, Calmar `132.58`
+- `1.50R` ratchet: `INR 15,16,694.71` (`+INR 4,57,574.22`), win rate `65.0%`, Calmar `144.19`
+- `1.75R` ratchet: `INR 15,10,311.90` (`+INR 4,51,191.41`), win rate `58.9%`, Calmar `134.25`
+- `2.00R` ratchet: `INR 15,03,583.80` (`+INR 4,44,463.31`), win rate `54.3%`, Calmar `139.81`
+
+Retained LONG baseline `6eb4ea65763f`:
+- Baseline: `3,146` trades, `INR 9,92,761.59`, win rate `35.2%`, Calmar `155.01`
+- `1.25R` ratchet: `INR 13,00,600.11` (`+INR 3,07,838.52`), win rate `75.9%`, Calmar `549.21`
+- `1.50R` ratchet: `INR 13,37,541.16` (`+INR 3,44,779.57`), win rate `70.0%`, Calmar `534.53`
+- `1.75R` ratchet: `INR 13,47,552.80` (`+INR 3,54,791.21`), win rate `64.2%`, Calmar `535.64`
+- `2.00R` ratchet: `INR 13,36,494.18` (`+INR 3,43,732.59`), win rate `58.7%`, Calmar `500.49`
+
+Combined ladder policy `1.25R -> 1.50R -> 1.75R -> 2.00R -> ATR`:
+- SHORT: `INR 12,28,167.76` (`+INR 1,69,047.27`), win rate `72.0%`, Calmar `179.46`
+- LONG: `INR 13,11,379.06` (`+INR 3,18,617.47`), win rate `75.9%`, Calmar `615.46`
+
+### Interpretation
+- The ratchet is not just a SHORT-only fix; it also materially improves the LONG baseline.
+- `1.50R` remains the best SHORT P/L candidate, while `1.75R` is the best LONG P/L candidate.
+- Across both retained baselines combined, `1.75R` is the best raw P/L rung by a small margin.
+- `1.25R` has the best profit factor on both baselines if we care more about win quality than raw P/L.
+- The full ladder is the actual feature, and it improves both retained baselines while keeping the
+  ATR phase intact after `2.0R`.
+- This analysis is still counterfactual. It uses archived trade rows plus the stored market tape, but it is not an engine implementation.
 
 ### Notes
 - Only affects trades that pass BREAKEVEN but don't reach T1 (the "stalled" trades)
@@ -108,7 +409,7 @@ Entry 241.16, risk = 2.28/share
 
 ## 2026-04-20 — FEATURE: 10:15 intraday win-rate checkpoint to flatten losing sessions early
 
-**Status:** PENDING — implement at EOD
+**Status:** ANALYSIS COMPLETE — regresses retained SHORT baseline; small uplift on retained LONG baseline
 **Severity:** Enhancement — reduces drawdown on bad market days
 
 ### Problem
@@ -163,6 +464,30 @@ else:
 - Default = disabled (current behavior preserved)
 - Backtest parity required before enabling in live — do not add paper-only
 - Only valid at entry window close (10:15) — not a rolling intraday check
+
+### Backtest analysis results
+
+Retained SHORT baseline `b5da636ec81a`:
+- Baseline: `4,663` trades, `INR 10,59,120.49`, win rate `33.5%`, Calmar `72.85`
+- Threshold `0.20`: `INR 10,17,894.58` (`-INR 41,225.91`)
+- Threshold `0.25`: `INR 10,06,680.35` (`-INR 52,440.14`)
+- Threshold `0.30`: `INR 9,84,806.00` (`-INR 74,314.49`)
+- Threshold `0.33`: `INR 9,81,797.50` (`-INR 77,322.99`)
+- Threshold `0.40`: `INR 9,69,820.02` (`-INR 89,300.47`)
+- Result: every tested threshold regressed profit on the retained SHORT baseline.
+
+Retained LONG baseline `6eb4ea65763f`:
+- Baseline: `3,146` trades, `INR 9,92,761.59`, win rate `35.2%`, Calmar `155.01`
+- Threshold `0.20`: `INR 10,12,523.73` (`+INR 19,762.14`)
+- Threshold `0.25`: `INR 10,14,938.82` (`+INR 22,177.23`)
+- Threshold `0.30`: `INR 9,96,853.27` (`+INR 4,091.68`)
+- Threshold `0.33`: `INR 10,00,576.54` (`+INR 7,814.95`)
+- Threshold `0.40`: `INR 10,18,446.01` (`+INR 25,684.42`)
+- Result: the checkpoint is mildly positive on the retained LONG baseline, but it is not a SHORT fix.
+
+### Interpretation
+- The checkpoint should not be prioritized as a generic profit fix for the current SHORT bleed.
+- If we revisit it later, it should be framed as a possible LONG-side drawdown control with tighter gating, not a universal rule.
 
 ---
 
@@ -975,11 +1300,76 @@ These are the only baseline rows retained in `backtest.duckdb`.
     that point; the remaining delay is process cleanup / file-handle release.
   - Treat that as a cleanup issue, not a data-sync issue. Investigate the lingering
     writer lifecycle separately from the strategy parity work.
-  - The completed-candle exit ordering is now centralized in a shared helper used by
-    both backtest and paper/live so the bar-close trailing behavior stays aligned in
-    one place.
+- The completed-candle exit ordering is now centralized in a shared helper used by
+  both backtest and paper/live so the bar-close trailing behavior stays aligned in
+  one place.
 
-  ---
+---
+
+## 2026-04-20 — Backtest vs live-paper drift on Apr 20 needs follow-up compare
+
+**Status:** OPEN
+**Severity:** High
+
+### Symptom
+
+On Apr 20, the backtest slice for CPR_LEVELS reports far fewer trades than the live
+sessions, even though the same date is being compared:
+
+- Backtest daily-reset risk: `6eb4ea65763f` on `2026-04-20` shows only `5` trades for the day
+- Backtest daily-reset standard: `4d1f4e1b7873` on `2026-04-20` shows only `12` trades for the day
+- Archived paper live-kite on Apr 20: `CPR_LEVELS_LONG-2026-04-20-live-kite` shows `30` trades
+- Archived paper live-kite on Apr 20: `CPR_LEVELS_SHORT-2026-04-20-live-kite` shows `38` trades
+
+The current working hypothesis is that the live universe / ordering / feed path is still
+materially different from the historical backtest slice. The universe counts also differ:
+
+- backtest run label: `u2043`
+- live-kite run label: `u844`
+
+### Follow-up
+
+After the 20-Apr baseline reruns complete, run `daily-live --feed-source local` for
+`2026-04-20` and compare the paper-local slice against the matching Apr 20 backtest
+slice first. Once that is pinned down, compare live-kite separately and analyze the
+remaining delta.
+
+### Notes
+
+This is a long-run parity item, not a pre-open blocker. The backtest behavior should be
+understood against live over time, but the immediate next step is to get the 20-Apr
+backtest slice and the 20-Apr paper-local slice compared cleanly.
+
+---
+
+## 2026-04-20 — Dashboard crash: Quasar formatter TypeError on Daily Summary
+
+**Status:** OPEN
+**Severity:** Medium
+
+### Symptom
+
+The dashboard emits a client-side render error:
+
+```text
+vue.esm-browser.prod.js:5 TypeError: oe.format is not a function
+    at te (quasar.umd.prod.js:17:210112)
+    at Object.value (quasar.umd.prod.js:17:209671)
+    at Proxy.render (eval at us (vue.esm-browser.prod.js:12:318), <anonymous>:15:56)
+```
+
+### Impact
+
+The Daily Summary view loses its expected rendering behavior and can hide the per-day
+summary fields until the page is refreshed or the offending component is corrected.
+
+### Follow-up
+
+Inspect the Daily Summary / run-detail component props being passed into Quasar so the
+formatter receives a function or a supported value type. This is likely a dashboard-only
+render regression and is separate from the trading engine parity work.
+
+---
 
 ## 2026-04-18 — Live WebSocket OR values differ from EOD parquet, causing symbol divergence
 
@@ -1076,6 +1466,14 @@ settled.
 We observed that some long baseline reruns finish saving results before the DuckDB writer lock
 fully releases. That does not change results, but it is worth a later cleanup so baseline
 reruns exit more predictably.
+
+### 4) DuckDB RAM / thread tuning for ingestion and baseline reruns
+
+Current tuning uses a conservative DuckDB memory cap and default thread heuristic. On the
+96 GB / 16-core host, it may be worth benchmarking a higher-memory, moderate-thread profile
+(for example 8 threads / 36 GB) to see whether build and rerun wall time improves without
+creating additional spill or contention issues. This is a performance follow-up only and does
+not change strategy behavior.
 
 ---
 

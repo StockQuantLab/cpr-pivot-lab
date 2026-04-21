@@ -1381,7 +1381,7 @@ async def test_flatten_session_positions_eod_dedup_in_memory(
             feed_state=SimpleNamespace(raw_state={"symbol_last_prices": {"SUKHJITS": 176.34}}),
         )
         # Second call (simulates async race / retry path) — must be suppressed by in-memory guard.
-        result2 = await flatten_session_positions(
+        await flatten_session_positions(
             session_id,
             notes="eod duplicate",
             feed_state=SimpleNamespace(raw_state={"symbol_last_prices": {"SUKHJITS": 176.34}}),
@@ -1397,3 +1397,36 @@ async def test_flatten_session_positions_eod_dedup_in_memory(
     assert session_id in eod_alerts[0][2]
 
     assert result1["closed_positions"] == 1
+
+
+def test_dispatch_session_started_alert_dedups_per_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import engine.paper_runtime as _pm
+
+    dispatched: list[tuple] = []
+    _pm.set_alerts_suppressed(False)
+    _pm.set_alert_sink(lambda t, s, b: dispatched.append((t, s, b)))
+    try:
+        _pm.dispatch_session_started_alert(
+            session_id="paper-live-1",
+            strategy="CPR_LEVELS",
+            direction="LONG",
+            symbol_count=12,
+            trade_date="2026-04-21",
+        )
+        _pm.dispatch_session_started_alert(
+            session_id="paper-live-1",
+            strategy="CPR_LEVELS",
+            direction="LONG",
+            symbol_count=12,
+            trade_date="2026-04-21",
+        )
+    finally:
+        _pm.set_alert_sink(None)
+        _pm.set_alerts_suppressed(False)
+        _pm._session_started_sent.discard("paper-live-1")
+
+    started_alerts = [d for d in dispatched if d[0].value == "SESSION_STARTED"]
+    assert len(started_alerts) == 1
+    assert started_alerts[0][1].startswith("SESSION_STARTED CPR_LEVELS LONG 2026-04-21")

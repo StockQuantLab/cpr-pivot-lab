@@ -13,6 +13,8 @@ from __future__ import annotations
 import atexit
 import json
 import logging
+import re as _re
+import subprocess as _subprocess
 import threading
 import uuid
 from dataclasses import dataclass, field
@@ -172,6 +174,65 @@ class FeedAudit:
 
 
 # ---------------------------------------------------------------------------
+# Lock diagnostic
+# ---------------------------------------------------------------------------
+
+
+def _diagnose_paper_db_lock(db_path: Path, exc: Exception) -> None:
+    """Print an actionable banner when paper.duckdb is locked by another process.
+
+    DuckDB embeds the holding PID in its IOException message:
+      "File is already open in <exe> (PID N)"
+    We extract it, resolve the command line via PowerShell, and tell the user
+    exactly which taskkill command to run before retrying.
+    """
+    msg = str(exc)
+    pid_match = _re.search(r"\(PID\s+(\d+)\)", msg)
+    exe_match = _re.search(r"already open in\s*\n?\s*(.+?)\s*\(PID", msg, _re.DOTALL)
+
+    pid = pid_match.group(1) if pid_match else None
+    exe = (exe_match.group(1).strip() if exe_match else None) or "unknown"
+
+    cmd_line = ""
+    if pid:
+        try:
+            result = _subprocess.run(
+                [
+                    "powershell",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    f"(Get-CimInstance Win32_Process -Filter 'ProcessId={pid}').CommandLine",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            cmd_line = result.stdout.strip()
+        except Exception:
+            pass
+
+    kill_cmd = f"taskkill //F //PID {pid}" if pid else "tasklist — PID not found in error"
+    logger.error(
+        "[STARTUP BLOCKED] %s is locked by PID %s. Fix: %s",
+        db_path.name,
+        pid or "unknown",
+        kill_cmd,
+    )
+    print(
+        f"\n{'=' * 60}\n"
+        f"[STARTUP BLOCKED] {db_path.name} is locked!\n"
+        f"  Holding PID : {pid or 'unknown'}\n"
+        f"  Executable  : {exe}\n"
+        f"  Command     : {cmd_line or '(could not determine)'}\n"
+        f"  Fix         : {kill_cmd}\n"
+        f"  Then retry  : doppler run -- uv run pivot-paper-trading daily-live ...\n"
+        f"{'=' * 60}\n",
+        flush=True,
+    )
+
+
+# ---------------------------------------------------------------------------
 # PaperDB
 # ---------------------------------------------------------------------------
 
@@ -193,7 +254,12 @@ class PaperDB:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._sync = replica_sync
         self.read_only = read_only
-        self.con = duckdb.connect(str(db_path), read_only=read_only)
+        try:
+            self.con = duckdb.connect(str(db_path), read_only=read_only)
+        except duckdb.IOException as exc:
+            if "being used by another process" in str(exc):
+                _diagnose_paper_db_lock(db_path, exc)
+            raise
         if not read_only:
             self._ensure_all_tables()
 
@@ -446,7 +512,7 @@ class PaperDB:
             "max_position_pct, flatten_time, daily_pnl_used, total_pnl, "
             "latest_candle_ts, stale_feed_at, started_at, ended_at, notes, mode, "
             "created_at, updated_at "
-            "FROM paper_sessions WHERE status IN ('ACTIVE', 'PAUSED', 'STOPPING') "
+            "FROM paper_sessions WHERE status IN ('PLANNING', 'ACTIVE', 'PAUSED', 'STOPPING') "
             "ORDER BY created_at DESC"
         ).fetchall()
         return [self._row_to_session(r) for r in rows]

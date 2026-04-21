@@ -19,6 +19,228 @@ Hard requirements:
 - no cash-release timing differences between paper and backtest
 - if the same candle stream is replayed, the outcome must be identical
 
+## Apr 20 Parity Drift Follow-up
+
+The Apr 20 runs showed that shared engine code is necessary but not sufficient for parity.
+The strategy logic is shared, but parity also depends on identical runtime inputs and an
+idempotent symbol-resolution path.
+
+### Goal
+
+Make `pivot-backtest`, `daily-replay`, `daily-live --feed-source local`, and
+`daily-live --feed-source kite` comparable on the same trade date by ensuring they all resolve the
+same candidate symbols from the same inputs, then compare the resulting feed audit and trade
+outputs.
+
+### What the Apr 20 audit showed
+
+- Backtest SHORT: 12 trades, `INR 5,168.24`
+- Local-live SHORT: 14 trades, `INR 7,318.53`
+- Kite-live SHORT: 38 trades, `INR 461.00`
+- Local-live LONG: 5 trades, `INR 1,261.53`
+- Kite-live LONG: 30 trades, `INR 13,520.00`
+
+Stored feed audit rows are available and should be treated as the canonical tape for transport
+comparison:
+
+- live-local LONG: 843 symbols, 4,776 rows, `09:15` -> `10:15`
+- live-kite LONG: 844 symbols, 4,975 rows, `09:20` -> `13:25`
+- live-local SHORT: 843 symbols, 7,995 rows, `09:20` -> `15:05`
+- live-kite SHORT: 844 symbols, 9,193 rows, `09:20` -> `15:15`
+
+### Remediation Plan
+
+#### Phase 1: Define the idempotent resolution contract
+
+Create one symbol-resolution contract that all modes must use for a given `trade_date` and
+parameter bundle. The contract should be dynamic, not hardcoded, but must return the same ordered
+symbol list when the inputs are the same.
+
+Contract inputs to record:
+
+- `trade_date`
+- `strategy`
+- preset and direction
+- full strategy parameters after preset expansion
+- `min_price`
+- CPR snapshot date chosen for prefiltering
+- tradeable-universe source
+- data-quality exclusions
+- feed source and candle interval
+
+Contract outputs to record:
+
+- resolved symbol list
+- symbol count
+- stable resolution hash
+- source rows used to resolve the list
+
+The output is not a hand-maintained list. It is a deterministic result of the same inputs.
+
+#### Phase 2: Make every mode call the same resolver
+
+Backtest, replay, local-live, and kite-live should all resolve symbols through the same contract
+instead of each mode assembling its own near-equivalent list.
+
+- Backtest should not choose a separate universe path just because it is batch mode.
+- Replay should not silently diverge from live-prefilter behavior.
+- Local-live and kite-live should log the exact inputs that produced their symbol list.
+- If the tradeable universe or CPR tables differ, that is an input drift problem, not a strategy
+  change.
+
+This keeps the behavior dynamic while still being idempotent for a given day and parameter set.
+
+#### Phase 3: Canonicalize feed/tape comparison
+
+Use the stored feed audit table as the bar-level compare surface:
+
+- compare by `session_id`, `symbol`, and `bar_end`
+- require identical OHLCV rows for replay/local-live parity
+- allow only explicitly documented transport timing differences for kite-live
+- treat missing, duplicated, or late bars as a feed regression, not a strategy regression
+
+The compare contract should key on `bar_end` only. Wall-clock arrival time is an audit field,
+not the canonical candle identity.
+
+#### Phase 4: Extend the parity checker
+
+Update the compare flow to fail fast when any of the following differ:
+
+- resolution hash or symbol count
+- `feed_source`
+- candle interval
+- preset-derived parameters
+- CPR snapshot date
+- bar coverage window
+
+After those gates pass, compare:
+
+1. run-level metrics
+2. trade keys
+3. setup funnel
+4. feed-audit rows
+
+#### Phase 5: Re-run and validate Apr 20
+
+Re-run the Apr 20 backtest slice and the archived paper sessions after the resolver change.
+Acceptance criteria:
+
+- local-live and backtest match on LONG and SHORT trade keys
+- local-live and backtest match on P/L within normal rounding tolerance
+- kite-live is either equal or has a documented transport exception with a proven feed-audit cause
+- no mode is allowed to silently choose a different symbol universe
+
+## Pre-Market Profit Analysis
+
+The two profit-related issues in `docs/ISSUES.md` are analysis-first items for the next two hours.
+They are not code-change tasks yet. The goal is to estimate whether either one is likely to
+improve realized profit and drawdown before we spend time implementing anything.
+
+### Issue A: SHORT regime bleed
+
+Documented in `docs/ISSUES.md` as the 10:15 intraday win-rate checkpoint.
+
+Observed problem:
+- SHORT sessions keep taking trades even after they are clearly losing intraday edge.
+- The session keeps bleeding while the market continues to whipsaw.
+- The same behavior is less harmful on good LONG days because the trailing phase later in the day
+  can still recover profit.
+
+Analysis-only questions to answer before any implementation:
+- What was the SHORT intraday win rate at 10:15 on the recent losing days?
+- If we flatten all open SHORT positions at 10:15 on those days, how much P/L do we preserve?
+- Does the checkpoint improve Calmar without materially hurting strong SHORT days?
+- Is there a threshold band where the checkpoint is clearly beneficial, or is the effect too noisy?
+
+Backtest-only evidence needed:
+- per-day SHORT equity curve up to 10:15
+- closed-trade win rate by 10:15
+- remaining open P/L at 10:15
+- projected end-of-day P/L with and without checkpoint flattening
+- effect on LONG when the same checkpoint logic is evaluated separately
+
+Decision rule:
+- If the checkpoint consistently reduces drawdown and improves risk-adjusted return on bad SHORT
+  days without destroying good LONG/SHORT days, it is a candidate for implementation.
+- If the effect is mixed or only helps one isolated day, keep it as an investigation note only.
+
+Backtest analysis results from the retained baselines:
+- SHORT baseline `b5da636ec81a` regressed at every tested threshold:
+  - `0.20`: `-INR 41,225.91`
+  - `0.25`: `-INR 52,440.14`
+  - `0.30`: `-INR 74,314.49`
+  - `0.33`: `-INR 77,322.99`
+  - `0.40`: `-INR 89,300.47`
+- LONG baseline `6eb4ea65763f` improved modestly:
+  - `0.20`: `+INR 19,762.14`
+  - `0.25`: `+INR 22,177.23`
+  - `0.30`: `+INR 4,091.68`
+  - `0.33`: `+INR 7,814.95`
+  - `0.40`: `+INR 25,684.42`
+- Conclusion: the checkpoint is not a good SHORT fix on the retained backtest set. If revisited at all,
+  it should be treated as a possible LONG-side risk-off filter, not a general profit lever.
+
+### Issue B: Trailing stop activates too late
+
+Documented in `docs/ISSUES.md` as the progressive trail stop between 1R and T1.
+
+Observed problem:
+- The current trail leaves a dead zone between breakeven and target.
+- Winning trades can give back a large unrealized gain before the ATR trail actually starts.
+- This is especially visible when price moves strongly, stalls before T1, and then reverses.
+
+Analysis-only questions to answer before any implementation:
+- For the recent profitable trades, how many reached 1.5R or 2.0R before reversing?
+- How many exited at breakeven or initial SL after briefly becoming meaningful winners?
+- Would a 1.5R or 2.0R ratchet have locked more profit on the losing-to-flat reversals?
+- Does the ratchet help SHORT more than LONG, or is the benefit symmetric?
+
+Backtest-only evidence needed:
+- max favorable excursion by trade
+- time spent between 1R and T1
+- count of trades that would have benefited from earlier trail activation
+- estimated P/L delta under candidate ratchet levels:
+  - 1.25R
+  - 1.5R
+  - 2.0R
+- impact on Calmar and profit factor versus the current baseline
+
+Decision rule:
+- If the ratchet improves profit capture on stalled winners without cutting off the best trend
+  trades, it becomes a candidate for implementation.
+- If the improvement comes mostly from hindsight on one or two sessions, defer it.
+
+Backtest analysis results from the retained baselines:
+- SHORT baseline `b5da636ec81a` improved materially at every tested level:
+  - `1.25R`: `+INR 4,23,117.71`, Calmar `132.58`
+  - `1.50R`: `+INR 4,57,574.22`, Calmar `144.19`
+  - `1.75R`: `+INR 4,51,191.41`, Calmar `134.25`
+  - `2.00R`: `+INR 4,44,463.31`, Calmar `139.81`
+- LONG baseline `6eb4ea65763f` also improved materially:
+  - `1.25R`: `+INR 3,07,838.52`, Calmar `549.21`
+  - `1.50R`: `+INR 3,44,779.57`, Calmar `534.53`
+  - `1.75R`: `+INR 3,54,791.21`, Calmar `535.64`
+  - `2.00R`: `+INR 3,43,732.59`, Calmar `500.49`
+- Conclusion: the ratchet is the stronger candidate of the two. `1.50R` is the best SHORT raw P/L point,
+  `1.75R` is the best LONG raw P/L point, and `1.75R` is the best combined raw P/L rung across the two
+  retained baselines by a small margin. `1.25R` remains strongest on profit factor / win-rate.
+
+Full ladder policy simulation (`1.25R -> 1.50R -> 1.75R -> 2.00R -> ATR`):
+- SHORT: `INR 12,28,167.76` (`+INR 1,69,047.27`), win rate `72.0%`, Calmar `179.46`
+- LONG: `INR 13,11,379.06` (`+INR 3,18,617.47`), win rate `75.9%`, Calmar `615.46`
+- Conclusion: the full ladder is the feature we should talk about, not a single rung. It improves both
+  retained baselines and preserves the current ATR trail after `2.0R`.
+
+### Pre-market execution order
+
+1. Run the SHORT checkpoint analysis first, because it addresses the current bleeding problem.
+2. Run the trail-ratchet analysis second, because it is about profit protection rather than trade
+   admission.
+3. Keep both analysis runs separate from parity work so we do not confuse regime questions with
+   feed/universe questions.
+4. If both show a clear uplift, write the implementation plan later. Do not code before the market
+   starts.
+
 ## Current State
 
 ### What is shared (DONE)

@@ -364,10 +364,7 @@ def print_trade_date_readiness_report(report: dict[str, Any]) -> None:
     print("\nReadiness:")
     print(f"  {'Ready':<10} {'YES' if ready else 'NO'}")
     if not ready:
-        print(
-            "  Suggested fix: doppler run -- uv run pivot-build --refresh-since "
-            f"{trade_date} --batch-size 64"
-        )
+        print(f"  Suggested fix: doppler run -- uv run pivot-build --refresh-since {trade_date}")
 
 
 def _print_trade_date_report(trade_date: str) -> bool:

@@ -352,7 +352,7 @@ class TestRuntimeValidation:
         assert "market_day_state missing 1 symbol(s): SBIN" in msg
         assert "strategy_day_state missing 1 symbol(s): INFY" in msg
         assert "intraday_day_pack missing 1 symbol(s): TCS" in msg
-        assert "uv run pivot-build --force --batch-size 64" in msg
+        assert "uv run pivot-build --force --batch-size 128" in msg
         assert db.last_symbols == ["SBIN", "TCS"]
 
         event_names = [str(e["event"]) for e in events]

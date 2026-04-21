@@ -1133,7 +1133,7 @@ class CPRATRBacktest:
             )
         lines.append(
             "Run full runtime materialization before backtesting: "
-            "`uv run pivot-build --force --batch-size 64`"
+            "`uv run pivot-build --force --batch-size 128`"
         )
         return "\n".join(lines)
 

@@ -40,10 +40,10 @@ doppler secrets set POSTGRES_PASSWORD "your-password"
 doppler run -- uv run pivot-convert
 
 # Build core runtime tables from full local history (explicit full-history confirmation required)
-doppler run -- uv run pivot-build --force --full-history --staged-full-rebuild --duckdb-threads 4 --duckdb-max-memory 24GB --batch-size 64
+doppler run -- uv run pivot-build --force --full-history --staged-full-rebuild --duckdb-threads 4 --duckdb-max-memory 24GB --batch-size 128
 
 # Rebuild intraday pack only for a recent catch-up window
-doppler run -- uv run pivot-build --table pack --refresh-since 2026-03-21 --batch-size 64 --pack-lookback 10
+doppler run -- uv run pivot-build --table pack --refresh-since 2026-03-21 --pack-lookback 10
 
 # Refresh the issue registry and gate a specific trade date after rebuild
 doppler run -- uv run pivot-data-quality --refresh
@@ -184,7 +184,7 @@ doppler run -- uv run pivot-kite-ingest --refresh-instruments --exchange NSE
 # First validation catch-up window: Tuesday, March 10, 2026 through Friday, March 20, 2026
 doppler run -- uv run pivot-kite-ingest --from 2026-03-10 --to 2026-03-20 --symbols SBIN,RELIANCE
 doppler run -- uv run pivot-kite-ingest --from 2026-03-10 --to 2026-03-20 --symbols SBIN,RELIANCE --5min --resume
-doppler run -- uv run pivot-build --table pack --refresh-since 2026-03-10 --batch-size 64
+doppler run -- uv run pivot-build --table pack --refresh-since 2026-03-10
 ```
 
 ```bash

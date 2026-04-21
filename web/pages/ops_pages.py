@@ -961,7 +961,13 @@ def _colored_direction_table(rows: list[dict], colors: dict) -> None:
         },
         {"name": "exit_reason", "label": "Reason", "field": "exit_reason", "align": "left"},
     ]
-    resolved = [{**c, "sortable": c.get("sortable", True)} for c in columns]
+    resolved = []
+    for c in columns:
+        col = {**c, "sortable": c.get("sortable", True)}
+        fmt = col.pop("format", None)
+        if fmt is not None:
+            col["display_format"] = fmt
+        resolved.append(col)
     tbl = ui.table(
         columns=resolved,
         rows=rows,

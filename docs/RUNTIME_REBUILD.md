@@ -118,7 +118,7 @@ print(f.column('candle_time')[0].as_py())  # must be: 2015-04-01 09:15:00  (not 
 ### Step 4 — Build recent tables first (fast, usable in minutes)
 
 ```bash
-doppler run -- uv run pivot-build --refresh-since 2025-01-01 --batch-size 64
+doppler run -- uv run pivot-build --refresh-since 2025-01-01 --batch-size 128
 ```
 
 Expected tables after this step: all 8 tables built for dates ≥ 2025-01-01.
@@ -142,7 +142,7 @@ doppler run -- uv run pivot-build --status
 ### Step 7 — Schedule full-history rebuild (optional, background)
 
 ```bash
-doppler run -- uv run pivot-build --force --full-history --staged-full-rebuild --batch-size 64 ^
+doppler run -- uv run pivot-build --force --full-history --staged-full-rebuild --batch-size 128 ^
   2>&1 | Tee-Object ".tmp_logs\full_rebuild.log"
 ```
 
@@ -172,7 +172,7 @@ Remove-Item "data\market.duckdb.tmp" -Force -ErrorAction SilentlyContinue
 ### Step 3 — Rebuild recent tables
 
 ```bash
-doppler run -- uv run pivot-build --refresh-since 2025-01-01 --batch-size 64
+doppler run -- uv run pivot-build --refresh-since 2025-01-01 --batch-size 128
 ```
 
 ### Step 4 — Refresh virgin flags
@@ -196,7 +196,7 @@ ingestion, and you need to extend all runtime tables to cover them.
 
 ```bash
 # Replace YYYY-MM-DD with the first new trade date
-doppler run -- uv run pivot-build --refresh-since YYYY-MM-DD --batch-size 64
+doppler run -- uv run pivot-build --refresh-since YYYY-MM-DD --batch-size 128
 
 # Refresh virgin flags after pack is updated
 doppler run -- uv run pivot-build --table state --refresh-since YYYY-MM-DD
@@ -210,7 +210,7 @@ Rebuild one table without touching others:
 
 ```bash
 # Available table names: cpr, atr, thresholds, virgin, or, state, strategy, pack, meta
-doppler run -- uv run pivot-build --table <name> --refresh-since YYYY-MM-DD --batch-size 64
+doppler run -- uv run pivot-build --table <name> --refresh-since YYYY-MM-DD --batch-size 128
 ```
 
 Examples:
@@ -221,7 +221,7 @@ doppler run -- uv run pivot-build --table cpr --refresh-since 2025-01-01
 
 # Rebuild only intraday_day_pack for gold_51 symbols
 doppler run -- uv run pivot-build --table pack --refresh-since 2025-01-01 \
-  --universe-name gold_51 --batch-size 64
+  --universe-name gold_51 --batch-size 128
 
 # Rebuild only market_day_state after virgin_cpr_flags was updated
 doppler run -- uv run pivot-build --table state --refresh-since 2025-01-01
@@ -253,7 +253,7 @@ doppler run -- uv run pivot-build \
   --force \
   --full-history \
   --staged-full-rebuild \
-  --batch-size 64 \
+  --batch-size 128 \
   2>&1 | Tee-Object ".tmp_logs\full_rebuild.log"
 ```
 
@@ -265,7 +265,7 @@ doppler run -- uv run pivot-build \
   --full-history \
   --staged-full-rebuild \
   --resume-from pack \
-  --batch-size 64 \
+  --batch-size 128 \
   2>&1 | Tee-Object ".tmp_logs\full_rebuild_resume.log"
 ```
 

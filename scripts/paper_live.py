@@ -39,6 +39,7 @@ from engine.paper_runtime import (
     dispatch_feed_recovered_alert,
     dispatch_feed_stale_alert,
     dispatch_session_error_alert,
+    dispatch_session_started_alert,
     enforce_session_risk_controls,
     evaluate_candle,
     execute_entry,
@@ -526,6 +527,32 @@ def _log_ticker_health(
     return {"stats": stats, "coverage": coverage}
 
 
+def _ticker_last_tick_age_sec(ticker_adapter: Any) -> float | None:
+    """Return last-tick age from either the live or replay adapter API."""
+    if ticker_adapter is None:
+        return None
+
+    stats_fn = getattr(ticker_adapter, "health_stats", None)
+    if callable(stats_fn):
+        try:
+            stats = stats_fn() or {}
+        except Exception:
+            logger.debug("ticker health_stats failed for stale probe", exc_info=True)
+            return None
+        return float(stats.get("last_tick_age_sec") or 0)
+
+    stats_fn = getattr(ticker_adapter, "get_stats", None)
+    if callable(stats_fn):
+        try:
+            stats = stats_fn() or {}
+        except Exception:
+            logger.debug("ticker get_stats failed for stale probe", exc_info=True)
+            return None
+        return float(stats.get("last_tick_age_sec") or 0)
+
+    return None
+
+
 def _log_direction_readiness(
     *,
     session_id: str,
@@ -831,6 +858,14 @@ async def run_live_session(
     else:
         market_adapter = market_adapter or KiteQuoteAdapter()
         builder = FiveMinuteCandleBuilder(interval_minutes=candle_interval)
+
+    dispatch_session_started_alert(
+        session_id=session_id,
+        strategy=strategy,
+        direction=direction_filter,
+        symbol_count=len(active_symbols),
+        trade_date=trade_date,
+    )
 
     stale_timeout = max(0, int(getattr(session, "stale_feed_timeout_sec", 0) or 0))
     poll_interval = _resolve_poll_interval(settings, poll_interval_sec, candle_interval)
@@ -1165,7 +1200,7 @@ async def run_live_session(
                 # which previously caused the entire stale block to be skipped. A WebSocket
                 # that is "connected" but silent for >5 min is a zombie — detect it always.
                 if use_websocket and ticker_adapter is not None and ticker_adapter.is_connected:
-                    tick_age = (ticker_adapter.health_stats() or {}).get("last_tick_age_sec") or 0
+                    tick_age = _ticker_last_tick_age_sec(ticker_adapter) or 0
                     if tick_age > 300:
                         # Zombie: socket alive but no ticks for 5+ min — treat as disconnected.
                         # 600s matches the stale_exit_sec threshold defined below.

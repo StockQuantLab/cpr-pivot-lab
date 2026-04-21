@@ -443,7 +443,7 @@ def main():
 
     if args.only_5min:
         print("Daily skipped by --only-5min")
-        print("\nAll done. Next step: pivot-build --refresh-since 2025-01-01 --batch-size 64")
+        print("\nAll done. Next step: pivot-build --refresh-since 2025-01-01")
         return
 
     # --- daily copy ---
@@ -464,7 +464,7 @@ def main():
             print(f"  [{i}/{len(source_symbols)}] last: {result.strip()}")
 
     print(f"\nDaily done: {dok} extended, {dskip} skipped, {derr} errors")
-    print("\nAll done. Next step: pivot-build --refresh-since 2025-04-01 --batch-size 64")
+    print("\nAll done. Next step: pivot-build --refresh-since 2025-04-01")
 
 
 if __name__ == "__main__":

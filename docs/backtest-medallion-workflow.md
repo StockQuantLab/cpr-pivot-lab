@@ -22,7 +22,7 @@ Outputs:
 - Commands:
 
 ```bash
-uv run pivot-build --force --full-history --staged-full-rebuild --duckdb-threads 4 --duckdb-max-memory 24GB --batch-size 64
+uv run pivot-build --force --full-history --staged-full-rebuild --duckdb-threads 4 --duckdb-max-memory 24GB --batch-size 128
 uv run pivot-data-quality --refresh --limit 50
 uv run pivot-data-quality --date 2026-03-27
 ```

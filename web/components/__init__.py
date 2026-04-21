@@ -1858,6 +1858,9 @@ def paginated_table(
     resolved_columns = []
     for col in columns:
         c = {**col, "sortable": col.get("sortable", True)}
+        display_format = c.pop("format", None)
+        if display_format is not None:
+            c["display_format"] = display_format
         if col.get("name") in hidden:
             c["classes"] = (col.get("classes", "") + " hide-mobile").strip()
         resolved_columns.append(c)
@@ -1942,13 +1945,16 @@ def set_table_mobile_labels(tbl: Any, columns: list[dict[str, Any]]) -> None:
     """Attach mobile-friendly table cell templates with ``data-label`` values.
 
     Uses NiceGUI's ``add_slot("body-cell-{name}", ...)`` API with Quasar slot props.
-    When a column definition includes a ``"format"`` key, the slot renders the raw
+    When a column definition includes a ``"display_format"`` key (or legacy
+    ``"format"`` key), the slot renders the raw
     numeric value with locale-aware formatting (currency, percent, integer, etc.).
     This keeps Quasar's native sort comparing raw numbers instead of formatted strings.
 
     Custom slots added after this call (e.g. direction coloring) override as expected.
     """
     for col in columns:
+        if "format" in col and "display_format" not in col:
+            col["display_format"] = col.pop("format")
         name = str(col.get("name") or "").strip()
         if not name:
             continue
@@ -1958,7 +1964,7 @@ def set_table_mobile_labels(tbl: Any, columns: list[dict[str, Any]]) -> None:
             class_val = "'text-' + props.col.align + ' " + extra_class + "'"
         else:
             class_val = "'text-' + props.col.align"
-        display_expr = _vue_display_expr(col.get("format"))
+        display_expr = _vue_display_expr(col.get("display_format") or col.get("format"))
         tbl.add_slot(
             "body-cell-" + name,
             '<td data-label="' + label + '" :class="' + class_val + '">'

@@ -26,6 +26,7 @@ from engine.cpr_atr_strategy import BacktestResult, CPRATRBacktest
 from engine.kite_ticker_adapter import KiteTickerAdapter
 from engine.live_market_data import IST
 from engine.paper_runtime import (
+    _start_alert_dispatcher,
     apply_paper_strategy_defaults,
     build_backtest_params_from_overrides,
     dispatch_session_state_alert,
@@ -361,7 +362,7 @@ def _build_runtime_coverage_fix_lines(missing_counts: dict[str, Any]) -> list[st
     if int(missing_counts.get("strategy_day_state") or 0) > 0:
         lines.append("doppler run -- uv run pivot-build --table strategy --force")
     if int(missing_counts.get("intraday_day_pack") or 0) > 0:
-        lines.append("doppler run -- uv run pivot-build --table pack --force --batch-size 64")
+        lines.append("doppler run -- uv run pivot-build --table pack --force")
     return lines or ["doppler run -- uv run pivot-data-quality --date <trade-date>"]
 
 
@@ -1154,28 +1155,51 @@ async def _cmd_daily_live_multi(args: argparse.Namespace) -> None:
     suppress_alerts = bool(getattr(args, "no_alerts", False))
 
     local_union_symbols: list[str] | None = None
+    strategy_upper = _assert_cpr_only_strategy(
+        getattr(args, "strategy", None) or _paper_default_strategy(get_settings()),
+        source="strategy",
+    ).upper()
+    raw_variants = [
+        (label, strat, params)
+        for label, strat, params in PAPER_STANDARD_MATRIX
+        if strat == strategy_upper
+    ]
+    variant_setup: list[tuple[str, str, dict[str, Any], list[str]]] = []
+    for label, strategy, base_params in raw_variants:
+        normalized_params = apply_paper_strategy_defaults(
+            strategy, normalize_strategy_params(base_params)
+        )
+        filtered = pre_filter_symbols_for_strategy(
+            trade_date, all_symbols, strategy, normalized_params
+        )
+        variant_setup.append((label, strategy, normalized_params, filtered))
+
     if feed_source == "local":
-        strategy_upper = _assert_cpr_only_strategy(
-            getattr(args, "strategy", None) or _paper_default_strategy(get_settings()),
-            source="strategy",
-        ).upper()
-        raw_variants = [
-            (label, strat, params)
-            for label, strat, params in PAPER_STANDARD_MATRIX
-            if strat == strategy_upper
-        ]
-        variant_setup: list[tuple[str, str, dict[str, Any], list[str]]] = []
-        for label, strategy, base_params in raw_variants:
-            normalized_params = apply_paper_strategy_defaults(
-                strategy, normalize_strategy_params(base_params)
-            )
-            filtered = pre_filter_symbols_for_strategy(
-                trade_date, all_symbols, strategy, normalized_params
-            )
-            variant_setup.append((label, strategy, normalized_params, filtered))
         local_union_symbols = sorted({s for _, _, _, syms in variant_setup for s in syms})
 
     if feed_source == "kite":
+        # Pre-create sessions with PLANNING status so the dashboard shows them
+        # immediately at startup, before the 09:16 market-open wait completes.
+        for label, strategy, normalized_params, filtered in variant_setup:
+            if not filtered:
+                continue
+            session_id = f"{label}-{trade_date}{_workflow_session_suffix('live', feed_source)}"
+            existing = await get_session(session_id)
+            if existing is None:
+                direction = str(normalized_params.get("direction_filter", "BOTH") or "BOTH").upper()
+                direction_label = f" {direction}" if direction != "BOTH" else ""
+                await create_paper_session(
+                    session_id=session_id,
+                    name=f"{strategy}{direction_label} {trade_date}",
+                    strategy=strategy,
+                    symbols=filtered,
+                    status="PLANNING",
+                    strategy_params={**normalized_params, "feed_source": feed_source},
+                    trade_date=trade_date,
+                    mode="live",
+                    notes="Waiting for 09:16 market open",
+                )
+                print(f"  [pre-create] {session_id} (PLANNING)", flush=True)
         await _wait_until_market_ready(trade_date)
 
     if feed_source == "local":
@@ -1593,10 +1617,58 @@ async def _cmd_stop(args: argparse.Namespace) -> None:
 
 
 async def _cmd_flatten(args: argparse.Namespace) -> None:
-    payload = await flatten_session_positions(args.session_id, notes=args.notes)
-    session = _pdb().get_session(args.session_id)
-    payload["session"] = asdict(session) if session else None
-    print(json.dumps(payload, default=str, indent=2))
+    # Start the alert consumer so TRADE_CLOSED and FLATTEN_EOD alerts actually deliver.
+    register_session_start()
+    _start_alert_dispatcher()
+    try:
+        payload = await flatten_session_positions(args.session_id, notes=args.notes)
+        # Mark session COMPLETED so it leaves STOPPING/FAILED limbo and appears
+        # correctly in the dashboard and archive queries.
+        await update_session_state(args.session_id, status="COMPLETED", notes=args.notes)
+        session = _pdb().get_session(args.session_id)
+        payload["session"] = asdict(session) if session else None
+        print(json.dumps(payload, default=str, indent=2))
+    finally:
+        # Drain the alert dispatcher before exiting, even if flatten/archive fails.
+        await maybe_shutdown_alert_dispatcher()
+
+
+async def _cmd_flatten_all(args: argparse.Namespace) -> None:
+    """Flatten all ACTIVE/STOPPING/FAILED sessions for a trade date in one command."""
+    trade_date = resolve_trade_date(args.trade_date)
+    db = _pdb()
+    rows = db.con.execute(
+        "SELECT session_id, status FROM paper_sessions "
+        "WHERE trade_date = ? AND status IN ('ACTIVE','PAUSED','STOPPING','FAILED','CANCELLED') "
+        "ORDER BY created_at",
+        [trade_date],
+    ).fetchall()
+    if not rows:
+        print(f"No active/stopping/failed sessions to flatten for {trade_date}.")
+        return
+    # Start alert consumer once for all sessions in this batch.
+    register_session_start()
+    _start_alert_dispatcher()
+    try:
+        print(f"Flattening {len(rows)} session(s) for {trade_date}...")
+        results = []
+        for session_id, status in rows:
+            print(f"  {session_id} (status={status})...")
+            payload = await flatten_session_positions(session_id, notes=args.notes)
+            await update_session_state(session_id, status="COMPLETED", notes=args.notes)
+            n = payload.get("closed_positions", 0)
+            # Archive into backtest.duckdb so session appears in dashboard archived view.
+            try:
+                archive_result = archive_completed_session(session_id)
+                archived = bool(archive_result and archive_result.get("trade_count", 0) > 0)
+            except Exception as exc:
+                archived = False
+                print(f"    WARNING: archive failed — {exc}")
+            results.append({"session_id": session_id, "closed": n, "archived": archived})
+            print(f"    -> closed {n} position(s), status -> COMPLETED, archived={archived}")
+        print(json.dumps({"trade_date": trade_date, "sessions": results}, indent=2))
+    finally:
+        await maybe_shutdown_alert_dispatcher()
 
 
 async def _cmd_order(args: argparse.Namespace) -> None:
@@ -1970,6 +2042,13 @@ def build_parser() -> argparse.ArgumentParser:
     flatten.add_argument("--session-id", required=True, help="Session to flatten")
     flatten.add_argument("--notes", default=None, help="Optional free-text annotation")
     flatten.set_defaults(handler=_cmd_flatten)
+
+    flatten_all = sub.add_parser(
+        "flatten-all", help="Flatten all active sessions for a trade date (emergency exit)"
+    )
+    flatten_all.add_argument("--trade-date", default="today", help="Trade date (default: today)")
+    flatten_all.add_argument("--notes", default=None, help="Optional free-text annotation")
+    flatten_all.set_defaults(handler=_cmd_flatten_all)
 
     order = sub.add_parser("order", help="Append a paper order event")
     order.add_argument("--session-id", required=True, help="Session for the order")

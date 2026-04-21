@@ -15,7 +15,7 @@
 
 ```bash
 doppler run -- uv run pivot-convert
-doppler run -- uv run pivot-build --force --full-history --staged-full-rebuild --duckdb-threads 4 --duckdb-max-memory 24GB --batch-size 64
+doppler run -- uv run pivot-build --force --full-history --staged-full-rebuild --duckdb-threads 4 --duckdb-max-memory 24GB --batch-size 128
 doppler run -- uv run pivot-data-quality --refresh
 doppler run -- uv run pivot-data-quality --date 2026-03-27
 doppler run -- uv run pivot-backtest --strategy CPR_LEVELS --universe-name gold_51 --start 2015-01-01 --end 2025-12-31 --save
@@ -24,7 +24,7 @@ doppler run -- uv run pivot-dashboard
 doppler run -- uv run pivot-kite-ingest --refresh-instruments --exchange NSE
 doppler run -- uv run pivot-kite-ingest --from 2026-03-10 --to 2026-03-20 --symbols SBIN,RELIANCE
 doppler run -- uv run pivot-kite-ingest --from 2026-03-10 --to 2026-03-20 --symbols SBIN,RELIANCE --5min --resume
-doppler run -- uv run pivot-build --table pack --refresh-since 2026-03-10 --batch-size 64
+doppler run -- uv run pivot-build --table pack --refresh-since 2026-03-10
 doppler run -- uv run pivot-paper-trading daily-replay --trade-date 2026-03-10 --symbols SBIN,RELIANCE --strategy CPR_LEVELS
 doppler run -- uv run pivot-paper-trading daily-live --trade-date 2026-03-23 --symbols SBIN,RELIANCE --strategy CPR_LEVELS
 doppler run -- uv run pivot-paper-trading daily-live --trade-date 2026-03-23 --symbols SBIN,RELIANCE --strategy CPR_LEVELS

@@ -30,7 +30,7 @@ Usage:
                                                                   # explicit full-history staged rebuild
     doppler run -- uv run pivot-build --table pack --universe-name gold_51 --force
     doppler run -- uv run pivot-build --table pack --symbols SBIN,TCS --force
-    doppler run -- uv run pivot-build --table pack --since 2026-03-21 --batch-size 64
+    doppler run -- uv run pivot-build --table pack --since 2026-03-21
     doppler run -- uv run pivot-build --status                       # show table stats
 
 Symbol-level rebuild (state + strategy + pack for specific symbols only):
@@ -99,7 +99,7 @@ def main() -> None:
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=64,
+        default=128,
         help="Symbol batch size for ATR and intraday_day_pack batched rebuilds (used by --table atr/pack and staged/full builds)",
     )
     parser.add_argument(

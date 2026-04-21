@@ -354,7 +354,7 @@ async def test_run_daily_workflow_skips_when_coverage_is_not_ready(
     assert calls == ["prepare"]
     assert "Runtime coverage incomplete" in str(exc.value)
     assert "pivot-build --table strategy --force" in str(exc.value)
-    assert "pivot-build --table pack --force --batch-size 64" in str(exc.value)
+    assert "pivot-build --table pack --force" in str(exc.value)
 
 
 @pytest.mark.asyncio
@@ -643,6 +643,32 @@ async def test_pause_and_resume_commands_emit_state_alerts(
 
     assert alerts and alerts[0]["state"] == expected_state
     assert alerts[0]["session_id"] == "paper-live-1"
+
+
+@pytest.mark.asyncio
+async def test_cmd_flatten_shuts_down_dispatcher_on_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import scripts.paper_trading as pt
+
+    calls: list[str] = []
+
+    async def fake_flatten_session_positions(session_id: str, *, notes: str | None = None):
+        calls.append("flatten")
+        raise RuntimeError("boom")
+
+    async def fake_shutdown():
+        calls.append("shutdown")
+
+    monkeypatch.setattr(pt, "flatten_session_positions", fake_flatten_session_positions)
+    monkeypatch.setattr(pt, "maybe_shutdown_alert_dispatcher", fake_shutdown)
+    monkeypatch.setattr(pt, "register_session_start", lambda: calls.append("register"))
+    monkeypatch.setattr(pt, "_start_alert_dispatcher", lambda: calls.append("start"))
+
+    with pytest.raises(RuntimeError, match="boom"):
+        await pt._cmd_flatten(SimpleNamespace(session_id="paper-live-1", notes="manual"))
+
+    assert calls == ["register", "start", "flatten", "shutdown"]
 
 
 @pytest.mark.asyncio

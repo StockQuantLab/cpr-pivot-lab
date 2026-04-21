@@ -262,7 +262,7 @@ The lock is command-level only. Read-only commands still run without it.
 doppler run -- uv run pivot-kite-ingest --refresh-instruments --exchange NSE
 doppler run -- uv run pivot-kite-ingest --from 2026-03-30 --to 2026-03-30
 doppler run -- uv run pivot-kite-ingest --from 2026-03-30 --to 2026-03-30 --5min --resume
-doppler run -- uv run pivot-build --refresh-since 2026-03-30 --batch-size 64
+doppler run -- uv run pivot-build --refresh-since 2026-03-30
 ```
 
 ### 1b. Pre-market setup and readiness check (8:30–9:10 AM)
@@ -604,7 +604,7 @@ Single-symbol gaps can also be expected on suspended or non-trading names for a 
 do not rerun the ingestion pipeline just because one symbol is absent if the daily readiness
 check is otherwise green.
 Fix:
-  doppler run -- uv run pivot-build --table pack --force --batch-size 64
+  doppler run -- uv run pivot-build --table pack --force
 ```
 
 They do **not** build tables automatically — that is an intentional separation so that
@@ -671,11 +671,38 @@ doppler run -- uv run pivot-paper-trading pause --session-id paper-001
 doppler run -- uv run pivot-paper-trading resume --session-id paper-001
 ```
 
-### Flatten All Positions
+### Early Exit / Emergency Close (market conditions)
+
+Use when you need to close all open positions immediately due to market conditions or end-of-day.
+
+**Step 1 — kill the live process:**
+```powershell
+Get-CimInstance Win32_Process | Where-Object {$_.CommandLine -like "*pivot-paper-trading*"} | ForEach-Object { taskkill //F //PID $_.ProcessId }
+```
+
+**Step 2 — flatten all sessions for today:**
+```bash
+doppler run -- uv run pivot-paper-trading flatten-all --trade-date today --notes "market_conditions"
+```
+
+This single command:
+- Closes all OPEN positions at last feed price (exit_reason = MANUAL_FLATTEN)
+- Sends TRADE_CLOSED Telegram alert per position
+- Sends FLATTEN_EOD summary per session
+- Marks all sessions COMPLETED
+
+To flatten a single specific session:
+```bash
+doppler run -- uv run pivot-paper-trading flatten --session-id CPR_LEVELS_SHORT-2026-04-21-live-kite
+```
+
+> **Note:** The live process must be killed first — DuckDB does not allow concurrent writers.
+> The `flatten` / `flatten-all` commands fail with a lock error if the live session is still running.
+
+### Flatten All Positions (legacy single-session)
 
 ```bash
 doppler run -- uv run pivot-paper-trading flatten --session-id paper-001
-doppler run -- uv run pivot-paper-trading stop --session-id paper-001 --complete
 ```
 
 ### Session Recovery After Crash

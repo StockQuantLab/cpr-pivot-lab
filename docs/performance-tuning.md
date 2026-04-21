@@ -31,7 +31,7 @@ After redesign:
 ### 1) Full Materialization (once per data refresh)
 
 ```bash
-uv run pivot-build --force --full-history --staged-full-rebuild --duckdb-threads 4 --duckdb-max-memory 24GB --batch-size 64
+uv run pivot-build --force --full-history --staged-full-rebuild --duckdb-threads 4 --duckdb-max-memory 24GB --batch-size 128
 uv run pivot-data-quality --refresh --limit 50
 
 uv run pivot-gold prepare \

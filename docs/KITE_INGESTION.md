@@ -214,7 +214,7 @@ doppler run -- uv run pivot-build \
   --force \
   --full-history \
   --staged-full-rebuild \
-  --batch-size 64
+  --batch-size 128
 ```
 
 `pivot-build --force` alone is no longer sufficient -- it also requires
@@ -242,7 +242,7 @@ call Kite and they do not assume a fixed start year like 2015; the effective dat
 whatever local parquet exists at the time you run them.
 
 ```bash
-doppler run -- uv run pivot-build --table pack --refresh-since 2026-03-21 --batch-size 64
+doppler run -- uv run pivot-build --table pack --refresh-since 2026-03-21
 ```
 
 Only use a full-history rebuild when runtime state is inconsistent. That rebuild scans all local
@@ -258,7 +258,7 @@ doppler run -- uv run pivot-build \
   --allow-full-history-rebuild \
   --duckdb-threads 4 \
   --duckdb-max-memory 24GB \
-  --batch-size 64
+  --batch-size 128
 ```
 
 If you are running the daily ingestion wrapper (`pivot-refresh`) for paper/live prep, it now
@@ -320,7 +320,7 @@ New-Item -ItemType Directory -Force -Path $logDir | Out-Null
 $out = Join-Path $logDir 'pack_rebuild.out.log'
 $err = Join-Path $logDir 'pack_rebuild.err.log'
 Start-Process -FilePath 'C:\Program Files\PowerShell\7\pwsh.exe' `
-  -ArgumentList '-Command', 'Set-Location ''C:\Users\kanna\github\cpr-pivot-lab''; uv run pivot-build --table pack --refresh-since 2026-03-21 --batch-size 64' `
+  -ArgumentList '-Command', 'Set-Location ''C:\Users\kanna\github\cpr-pivot-lab''; uv run pivot-build --table pack --refresh-since 2026-03-21' `
   -RedirectStandardOutput $out `
   -RedirectStandardError $err
 ```
@@ -344,7 +344,7 @@ Get-Content .tmp_logs\pack_rebuild.err.log -Tail 40
 doppler run -- uv run pivot-kite-ingest --compact-daily
 ```
 
-6. Refresh local runtime tables with `pivot-build --refresh-since <window-start> --batch-size 64`.
+6. Refresh local runtime tables with `pivot-build --refresh-since <window-start>`.
 7. Run `pivot-data-validate`.
 8. Run `pivot-data-quality --refresh --full` to update the DQ issue table.
 9. Pre-filter symbols for the next trading day's live paper session:

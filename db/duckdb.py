@@ -792,16 +792,26 @@ class MarketDB:
         self._require_data("v_5min")
 
         since_date_iso, until_date_iso = _prepare_date_window(since_date, until_date)
-        target_symbols = (
-            sorted(_validate_symbols(symbols))
-            if symbols
-            else [
-                row[0]
-                for row in self.con.execute(
-                    "SELECT DISTINCT symbol FROM v_5min ORDER BY symbol"
-                ).fetchall()
-            ]
-        )
+
+        if symbols:
+            target_symbols = sorted(_validate_symbols(symbols))
+            manifest: dict[str, list[str]] | None = None
+        else:
+            # Build file manifest once — avoids 16K-file glob discovery per batch.
+            manifest = self._build_5min_file_manifest()
+            if manifest:
+                # Use manifest keys instead of querying v_5min (avoids glob scan).
+                target_symbols = sorted(manifest.keys())
+            else:
+                # Manifest empty — fall back to v_5min symbol discovery.
+                logger.warning("Manifest empty; falling back to v_5min symbol discovery")
+                target_symbols = [
+                    r[0]
+                    for r in self.con.execute(
+                        "SELECT DISTINCT symbol FROM v_5min ORDER BY symbol"
+                    ).fetchall()
+                ]
+
         if not target_symbols:
             print("atr_intraday: no symbols resolved; nothing to build.")
             return 0
@@ -858,7 +868,9 @@ class MarketDB:
             *,
             trade_date_since: str | None = None,
             trade_date_until: str | None = None,
+            source_from: str | None = None,
         ) -> str:
+            source = source_from or "v_5min"
             symbol_list = ",".join(f"'{s}'" for s in _validate_symbols(batch_symbols))
             symbol_filter = f"AND symbol IN ({symbol_list})"
             # For incremental mode, filter the final output to trade_date >= since
@@ -871,7 +883,7 @@ class MarketDB:
                 ranked AS (
                     SELECT symbol, date, true_range,
                         ROW_NUMBER() OVER (PARTITION BY symbol, date ORDER BY candle_time DESC) AS rn
-                    FROM v_5min
+                    FROM {source}
                     WHERE true_range IS NOT NULL {symbol_filter}
                 ),
                 day_atr AS (
@@ -887,7 +899,7 @@ class MarketDB:
                 candles AS (
                     SELECT symbol, date, candle_time, high, low, close,
                         LAG(close) OVER (PARTITION BY symbol, date ORDER BY candle_time) AS prev_close
-                    FROM v_5min
+                    FROM {source}
                     WHERE 1=1 {symbol_filter}
                 ),
                 true_ranges AS (
@@ -980,8 +992,16 @@ class MarketDB:
             )
             for idx, batch in enumerate(batches, start=1):
                 batch_started = time.time()
+                batch_source = (
+                    self._build_manifest_source_sql(batch, manifest)
+                    if manifest is not None
+                    else self._build_parquet_source_sql(batch)
+                )
                 batch_sql = _build_batch_sql(
-                    batch, trade_date_since=since_date_iso, trade_date_until=until_date_iso
+                    batch,
+                    trade_date_since=since_date_iso,
+                    trade_date_until=until_date_iso,
+                    source_from=batch_source,
                 )
                 self.con.execute(f"INSERT INTO atr_intraday {batch_sql}")
                 done = min(idx * batch_size, len(target_symbols))
@@ -993,8 +1013,16 @@ class MarketDB:
                     flush=True,
                 )
         else:
+            batch_source = (
+                self._build_manifest_source_sql(target_symbols, manifest)
+                if manifest is not None
+                else self._build_parquet_source_sql(target_symbols)
+            )
             batch_sql = _build_batch_sql(
-                target_symbols, trade_date_since=since_date_iso, trade_date_until=until_date_iso
+                target_symbols,
+                trade_date_since=since_date_iso,
+                trade_date_until=until_date_iso,
+                source_from=batch_source,
             )
             self.con.execute(f"INSERT INTO atr_intraday {batch_sql}")
 
@@ -2091,10 +2119,60 @@ class MarketDB:
         """Escape a string for safe single-quoted SQL literal usage."""
         return value.replace("'", "''")
 
-    def _build_parquet_source_sql(self, symbols: list[str], *, prefer_view: bool = False) -> str:
+    def _build_5min_file_manifest(self) -> dict[str, list[str]]:
+        """Build a mapping of {symbol: [file_paths]} from the 5-min parquet directory.
+
+        Uses pathlib for filesystem traversal instead of DuckDB's glob discovery,
+        which re-scans ~16K files on every SQL query referencing v_5min.
+        Takes ~1-2s vs ~5s per DuckDB glob per batch.
+        """
+        five_min_root = self._parquet_dir / "5min"
+        if not five_min_root.is_dir():
+            raise FileNotFoundError(f"5-min parquet directory not found: {five_min_root}")
+        manifest: dict[str, list[str]] = {}
+        for symbol_dir in sorted(five_min_root.iterdir()):
+            if not symbol_dir.is_dir():
+                continue
+            parquet_files = sorted(symbol_dir.glob("*.parquet"))
+            if parquet_files:
+                manifest[symbol_dir.name] = [f.as_posix() for f in parquet_files]
+        logger.info(
+            "5-min file manifest: %d symbols, %d total files",
+            len(manifest),
+            sum(len(v) for v in manifest.values()),
+        )
+        return manifest
+
+    def _build_manifest_source_sql(
+        self,
+        batch_symbols: list[str],
+        manifest: dict[str, list[str]],
+    ) -> str:
+        """Build read_parquet() SQL using explicit file lists from the manifest."""
+        all_paths: list[str] = []
+        for symbol in batch_symbols:
+            if symbol in manifest:
+                all_paths.extend(manifest[symbol])
+            else:
+                glob_path = (self._parquet_dir / "5min" / symbol / "*.parquet").as_posix()
+                all_paths.append(glob_path)
+        if not all_paths:
+            raise RuntimeError(f"No parquet files found for batch symbols: {batch_symbols[:5]}...")
+        escaped = ",".join(f"'{self._escape_sql_literal(p)}'" for p in all_paths)
+        return f"read_parquet([{escaped}], hive_partitioning=false)"
+
+    def _build_parquet_source_sql(
+        self,
+        symbols: list[str],
+        *,
+        prefer_view: bool = False,
+        manifest: dict[str, list[str]] | None = None,
+    ) -> str:
         """Build a batch source SQL for intraday_day_pack."""
         if not symbols:
             raise RuntimeError("No symbols resolved for intraday_day_pack batch")
+        if manifest is not None:
+            return self._build_manifest_source_sql(symbols, manifest)
 
         if prefer_view:
             symbol_list = ",".join(f"'{self._escape_sql_literal(symbol)}'" for symbol in symbols)
@@ -2183,6 +2261,9 @@ class MarketDB:
             _log("intraday_day_pack: no symbols with 5-min parquet found; nothing to build.")
             self._publish_replica(force=True)
             return 0
+
+        # Build file manifest once — avoids 16K-file glob discovery per batch
+        manifest = self._build_5min_file_manifest() if symbols is None else None
 
         # ── Resume mode ─────────────────────────────────────────────────────
         # Skip symbols already present in the table.  Used to continue a
@@ -2292,12 +2373,11 @@ class MarketDB:
         total_batches = len(batches)
         log_every = 1 if total_batches <= 2 else 2
         started = time.time()
-        prefer_view_source = symbols is None
         _log(
             "intraday_day_pack build start:"
             f" symbols={len(build_symbols):,} lookback={lookback}"
             f" batch_size={batch_size} batches={total_batches}"
-            f" source={'v_5min' if prefer_view_source else 'parquet_globs'}"
+            f" source={'manifest' if manifest is not None else 'parquet_globs'}"
         )
 
         phase_times = {
@@ -2335,7 +2415,11 @@ class MarketDB:
                         )
                     phase_times["delete"] += time.time() - delete_started
 
-                source_sql = self._build_parquet_source_sql(batch, prefer_view=prefer_view_source)
+                source_sql = (
+                    self._build_parquet_source_sql(batch, manifest=manifest)
+                    if manifest is not None
+                    else self._build_parquet_source_sql(batch)
+                )
                 insert_started = time.time()
                 if use_compact_schema:
                     self.con.execute(
@@ -2523,6 +2607,11 @@ class MarketDB:
                 since_date=effective_since,
                 until_date=effective_until,
             )
+            # Flush WAL after ATR build (largest batch-insert stage)
+            try:
+                self.con.execute("CHECKPOINT")
+            except Exception as e:
+                logger.debug("Post-ATR CHECKPOINT failed (best-effort): %s", e)
             self.build_cpr_thresholds(
                 percentile=cpr_percentile,
                 force=force,
@@ -2547,6 +2636,11 @@ class MarketDB:
                 since_date=effective_since,
                 until_date=effective_until,
             )
+            # Flush WAL after pack build (second largest batch-insert stage)
+            try:
+                self.con.execute("CHECKPOINT")
+            except Exception as e:
+                logger.debug("Post-pack CHECKPOINT failed (best-effort): %s", e)
             # Build virgin_cpr_flags AFTER intraday_day_pack so it can use materialized arrays
             # instead of scanning 175M v_5min rows (15-30 min faster on full builds)
             self.build_virgin_cpr_flags(

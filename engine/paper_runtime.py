@@ -55,6 +55,9 @@ _alert_sink: Callable[[AlertType, str, str], Any] | None = None
 # In-memory dedup guard: session IDs that have already dispatched FLATTEN_EOD.
 # Checked and set synchronously before dispatch so no async race with alert_log writes.
 _flatten_eod_sent: set[str] = set()
+# In-memory dedup guard for session-start notifications. A retry/restart inside the same
+# process should not spam duplicate "session started" alerts for the same session_id.
+_session_started_sent: set[str] = set()
 
 
 def set_alerts_suppressed(suppress: bool) -> None:
@@ -378,6 +381,28 @@ def dispatch_feed_recovered_alert(
     if details:
         body += f"\n{details}"
     _dispatch_alert(AlertType.FEED_RECOVERED, subject, body)
+
+
+def dispatch_session_started_alert(
+    *,
+    session_id: str,
+    strategy: str,
+    direction: str,
+    symbol_count: int,
+    trade_date: str,
+) -> None:
+    """Emit a SESSION_STARTED alert when a live session becomes ACTIVE."""
+    if session_id in _session_started_sent:
+        return
+    session_tag = str(session_id or "")[:20]
+    subject = f"SESSION_STARTED {strategy} {direction} {trade_date}"
+    body = (
+        f"Session: <code>{session_tag}</code>\n"
+        f"Strategy: {strategy}  Direction: {direction}\n"
+        f"Symbols: {symbol_count}  Date: {trade_date}"
+    )
+    _dispatch_alert(AlertType.SESSION_STARTED, subject, body)
+    _session_started_sent.add(session_id)
 
 
 def _hhmm(value: datetime | None) -> str | None:
@@ -1380,9 +1405,7 @@ async def flatten_session_positions(
         elif session_id in _flatten_eod_sent:
             # Synchronous in-memory dedup — set before dispatch so concurrent callers
             # can't race past the check before alert_log is written.
-            logger.debug(
-                "FLATTEN_EOD already sent for session %s — skipping duplicate", session_id
-            )
+            logger.debug("FLATTEN_EOD already sent for session %s — skipping duplicate", session_id)
         else:
             _flatten_eod_sent.add(session_id)
             subject, body = _format_risk_alert(
@@ -2189,6 +2212,7 @@ __all__ = [
     "build_backtest_params_from_overrides",
     "build_summary_feed_state",
     "dispatch_session_error_alert",
+    "dispatch_session_started_alert",
     "dispatch_session_state_alert",
     "enforce_session_risk_controls",
     "evaluate_candle",
