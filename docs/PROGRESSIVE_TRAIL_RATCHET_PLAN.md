@@ -10,17 +10,35 @@ Goal:
 
 ## Current Status
 
-This feature is paused pending a post-close retest.
+**CLOSED — single-rung ratchet tested and rejected on 2026-04-21.**
 
-What we learned:
-- archived retained-baseline counterfactuals looked positive for both LONG and SHORT
-- the full `2025-01-01 -> 2026-04-20` daily-reset-risk rerun improved LONG but regressed SHORT
-- the code was reverted back to the pre-ratchet ATR trail before market open
+### Actual engine rerun results
 
-Decision:
-- do not ship the ratchet yet
-- keep the old behavior for today's session
-- revisit after market close with a narrower experiment, likely starting from the live-risk daily-reset pair only
+The pre-target ratchet was re-implemented as a single rung and tested with `--trail-after-r 1.5`
+on the retained CPR-LEVELS baselines.
+
+| | Baseline | With single-rung ratchet | Delta |
+|---|---|---|---|
+| LONG run_id | `da2fc76e9461` | `ad6d9c9c5dfe` | — |
+| LONG P&L | ₹1,039,592 (104.0% return) | ₹1,024,616 (102.5% return) | −₹14,976 |
+| LONG trades | 3,262 | 3,260 | −2 |
+| SHORT run_id | `b5da636ec81a` | `3ef3a651f811` | — |
+| SHORT P&L | ₹1,059,120 (105.9% return) | ₹840,252 (84.0% return) | −₹218,868 |
+| SHORT trades | 4,663 | 4,931 | +268 |
+
+### Why the idea was rejected
+
+The single-rung ratchet did not improve either side:
+- LONG lost a small amount of P&L and did not meaningfully change trade count
+- SHORT regressed materially and added a large number of extra trades
+
+The earlier counterfactual looked promising, but the real engine rerun showed that the actual
+trade sequence and capital recycling were enough to negate the hypothesized benefit.
+
+### Decision
+
+Do not pursue the pre-target ratchet further for this strategy.
+Move on to a different hypothesis, such as entry-quality filters or a separate SHORT-side gate.
 
 ## Problem Summary
 
@@ -55,11 +73,11 @@ stored market tape.
 
 ### Readout
 
-- The ratchet improves both directions materially.
-- `1.50R` is the best raw P/L point on the retained SHORT baseline.
-- `1.75R` is the best raw P/L point on the retained LONG baseline.
-- `1.75R` is the best combined raw P/L rung across the two retained baselines by a small margin.
-- `1.25R` is the strongest profit-factor / win-quality rung.
+- The counterfactual showed the ratchet could improve both directions in isolation.
+- The live engine rerun did not confirm that result.
+- `1.50R` was the conservative SHORT-first choice.
+- `1.75R` was the strongest combined counterfactual rung.
+- Neither rung survived the real engine rerun.
 
 ### Combined ladder policy
 
@@ -240,9 +258,8 @@ Test matrix:
 
 ## Recommendation
 
-If we need one initial rung-specific fallback for comparison, `1.75R` is the best balanced single
-threshold, but the ladder itself is the correct feature. `1.50R` remains the conservative SHORT-first
-choice if we ever need a narrower pilot.
+Close the ratchet experiment. Keep the baseline strategy unchanged and evaluate a different
+optimization path.
 
 ## Open Questions
 
