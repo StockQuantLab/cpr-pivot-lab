@@ -7,6 +7,31 @@ Supersedes: `docs/PARITY_INCIDENT_LOG.md` (contents migrated below).
 
 ---
 
+## 2026-04-21 — EXPERIMENT: CPR_LEVELS `scale_out_pct=0.5` rerun on daily-reset baselines → REJECTED
+
+**Status:** REJECTED — explicit `--cpr-scale-out-pct 0.5` reruns underperformed the current daily-reset baselines
+**Severity:** Informational — exit-side hypothesis only; no engine bug
+
+### Context
+We reran only the two daily-reset CPR_LEVELS baselines with an explicit 50% scale-out override:
+
+- LONG: `--strategy CPR_LEVELS --direction LONG --risk-based-sizing --min-price 50 --narrowing-filter --cpr-min-close-atr 0.5 --cpr-scale-out-pct 0.5`
+- SHORT: `--strategy CPR_LEVELS --direction SHORT --risk-based-sizing --skip-rvol --min-price 50 --narrowing-filter --cpr-min-close-atr 0.5 --short-trail-atr-multiplier 1.25 --cpr-scale-out-pct 0.5`
+
+The reruns were valid after the explicit-override path was used, but they did not improve the baseline set enough to keep as a candidate.
+
+### Backtest Outcomes
+
+| Side | Scale-out run | Baseline | Delta |
+|---|---:|---:|---:|
+| LONG | ₹891,256.62 | ₹992,934.74 | −₹101,678.12 |
+| SHORT | ₹813,562.37 | ₹1,060,744.05 | −₹247,181.68 |
+
+### Conclusion
+Scale-out at `0.5` is knocked off for now. Keep `scale_out_pct = 0.0` in the canonical baselines unless a later experiment provides a materially better result.
+
+---
+
 ## 2026-04-21 — BUG: `flatten` command drops alerts and leaves sessions at STOPPING/CANCELLED
 
 **Status:** FIXED — `scripts/paper_trading.py`

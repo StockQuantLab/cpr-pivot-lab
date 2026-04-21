@@ -287,6 +287,8 @@ This is the only mechanism in the current engine for capturing moves past R1 wit
 being in the 1R→R1 dead zone.  The ratchet (progressive SL ladder) was tested and regressed
 SHORT by −16.4%; scale-out does not move the SL before R1 so it avoids that problem.
 See `docs/ISSUES.md` and `docs/PROGRESSIVE_TRAIL_RATCHET_PLAN.md` for the full history.
+As of 2026-04-21, an explicit daily-reset rerun with `--cpr-scale-out-pct 0.5` also underperformed
+the current baselines, so treat scale-out as a rejected experiment for now rather than a default.
 
 ---
 

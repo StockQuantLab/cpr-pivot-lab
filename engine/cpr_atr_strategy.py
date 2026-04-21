@@ -1203,7 +1203,7 @@ class CPRATRBacktest:
         # Build the CPR shift clause — only applies to CPR_LEVELS
         shift_clause = "1"  # always true for FBR
         if strategy == "CPR_LEVELS":
-            shift_clause = "($cpr_shift_filter = 'ALL' OR cpr_shift = $cpr_shift_filter)"
+            shift_clause = "($cpr_shift_filter = 'ALL' OR m.cpr_shift = $cpr_shift_filter)"
 
         regime_move_expr = (
             "CASE WHEN reg.open_915 > 0 AND reg.or_close_30 IS NOT NULL "
@@ -1227,22 +1227,22 @@ class CPRATRBacktest:
             SELECT
                 COUNT(*) AS universe_count,
                 SUM(CASE
-                    WHEN cpr_width_pct < LEAST(cpr_threshold_pct, $max_width)
+                    WHEN m.cpr_width_pct < LEAST(m.cpr_threshold_pct, $max_width)
                     THEN 1 ELSE 0
                 END) AS after_cpr_width,
                 SUM(CASE
-                    WHEN cpr_width_pct < LEAST(cpr_threshold_pct, $max_width)
+                    WHEN m.cpr_width_pct < LEAST(m.cpr_threshold_pct, $max_width)
                      AND s.{direction_col} IN ('LONG', 'SHORT')
                     THEN 1 ELSE 0
                 END) AS after_direction,
                 SUM(CASE
-                    WHEN cpr_width_pct < LEAST(cpr_threshold_pct, $max_width)
+                    WHEN m.cpr_width_pct < LEAST(m.cpr_threshold_pct, $max_width)
                      AND s.{direction_col} IN ('LONG', 'SHORT')
                      AND ($direction_filter = 'BOTH' OR s.{direction_col} = $direction_filter)
                     THEN 1 ELSE 0
                 END) AS after_dir_filter,
                 SUM(CASE
-                    WHEN cpr_width_pct < LEAST(cpr_threshold_pct, $max_width)
+                    WHEN m.cpr_width_pct < LEAST(m.cpr_threshold_pct, $max_width)
                      AND s.{direction_col} IN ('LONG', 'SHORT')
                      AND ($direction_filter = 'BOTH' OR s.{direction_col} = $direction_filter)
                      AND ($min_price <= 0 OR m.prev_close >= $min_price)
@@ -1250,7 +1250,7 @@ class CPRATRBacktest:
                     THEN 1 ELSE 0
                 END) AS after_min_price,
                 SUM(CASE
-                    WHEN cpr_width_pct < LEAST(cpr_threshold_pct, $max_width)
+                    WHEN m.cpr_width_pct < LEAST(m.cpr_threshold_pct, $max_width)
                      AND s.{direction_col} IN ('LONG', 'SHORT')
                      AND ($direction_filter = 'BOTH' OR s.{direction_col} = $direction_filter)
                      AND ($min_price <= 0 OR m.prev_close >= $min_price)
@@ -1259,7 +1259,7 @@ class CPRATRBacktest:
                     THEN 1 ELSE 0
                 END) AS after_gap,
                 SUM(CASE
-                    WHEN cpr_width_pct < LEAST(cpr_threshold_pct, $max_width)
+                    WHEN m.cpr_width_pct < LEAST(m.cpr_threshold_pct, $max_width)
                      AND s.{direction_col} IN ('LONG', 'SHORT')
                      AND ($direction_filter = 'BOTH' OR s.{direction_col} = $direction_filter)
                      AND ($min_price <= 0 OR m.prev_close >= $min_price)
@@ -1270,7 +1270,7 @@ class CPRATRBacktest:
                     THEN 1 ELSE 0
                 END) AS after_or_atr,
                 SUM(CASE
-                    WHEN cpr_width_pct < LEAST(cpr_threshold_pct, $max_width)
+                    WHEN m.cpr_width_pct < LEAST(m.cpr_threshold_pct, $max_width)
                      AND s.{direction_col} IN ('LONG', 'SHORT')
                      AND ($direction_filter = 'BOTH' OR s.{direction_col} = $direction_filter)
                      AND ($min_price <= 0 OR m.prev_close >= $min_price)
@@ -1282,7 +1282,7 @@ class CPRATRBacktest:
                     THEN 1 ELSE 0
                 END) AS after_narrowing,
                 SUM(CASE
-                    WHEN cpr_width_pct < LEAST(cpr_threshold_pct, $max_width)
+                    WHEN m.cpr_width_pct < LEAST(m.cpr_threshold_pct, $max_width)
                      AND s.{direction_col} IN ('LONG', 'SHORT')
                      AND ($direction_filter = 'BOTH' OR s.{direction_col} = $direction_filter)
                      AND ($min_price <= 0 OR m.prev_close >= $min_price)
