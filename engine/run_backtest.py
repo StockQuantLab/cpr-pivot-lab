@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import logging
+import os
 import sys
 import time
 import uuid
@@ -424,6 +425,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Number of symbols fetched/simulated per runtime chunk (default 512)",
     )
     parser.add_argument(
+        "--duckdb-threads",
+        type=int,
+        default=12,
+        help="DuckDB thread count for this backtest run (default 12)",
+    )
+    parser.add_argument(
+        "--duckdb-max-memory",
+        default="36GB",
+        help="DuckDB memory cap for this backtest run (default 36GB)",
+    )
+    parser.add_argument(
         "--direction",
         "--trade-direction-filter",
         dest="direction",
@@ -627,6 +639,10 @@ def _run_with_lock(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
         parser.error("--short-open-to-cpr-atr-min must be >= 0.0")
     if args.runtime_batch_size < 1:
         parser.error("--runtime-batch-size must be >= 1")
+    if args.duckdb_threads < 1:
+        parser.error("--duckdb-threads must be >= 1")
+    if not str(args.duckdb_max_memory).strip():
+        parser.error("--duckdb-max-memory must be a non-empty value")
     if args.max_positions < 1:
         parser.error("--max-positions must be >= 1")
     if args.portfolio_value <= 0:
@@ -651,6 +667,11 @@ def _run_with_lock(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
         parser.error("--risk-pct must be > 0")
     if args.cpr_max_width_pct < 0:
         parser.error("--cpr-max-width-pct must be >= 0")
+
+    # Tune DuckDB only for this backtest process. Both market and backtest DB
+    # connections read these env vars during initialization.
+    os.environ["DUCKDB_THREADS"] = str(args.duckdb_threads)
+    os.environ["DUCKDB_MAX_MEMORY"] = str(args.duckdb_max_memory)
 
     if args.progress_file:
         append_progress_event(

@@ -103,6 +103,16 @@ class TestCLIArgParsing:
         )
         assert "--runtime-batch-size" in result.stdout
 
+    def test_duckdb_tuning_flags_present(self):
+        """Backtest should expose DuckDB runtime tuning flags."""
+        result = subprocess.run(
+            [sys.executable, "-m", "engine.run_backtest", "--help"],
+            capture_output=True,
+            text=True,
+        )
+        assert "--duckdb-threads" in result.stdout
+        assert "--duckdb-max-memory" in result.stdout
+
     def test_cpr_soft_filter_flags_present(self):
         """Soft CPR entry filters should be exposed in CLI."""
         result = subprocess.run(
