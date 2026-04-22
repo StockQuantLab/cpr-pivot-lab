@@ -178,15 +178,43 @@ Even skipping 09:25 alone costs −12.8% LONG and −13.6% SHORT.
 The Apr 21 pattern (early entries all losing) was a single strongly-trending up-day where SHORT
 direction was simply wrong — not a structural noise problem with first-bar entries.
 
-#### Pattern 3 — Nifty trend gate for SHORT → Not yet backtested
+#### Pattern 3 — Nifty trend gate for SHORT / mirrored LONG gate → BACKTESTED
 
-No code or backtest run for this. It requires Nifty index data as a filter input, which is not
-currently in the backtest engine. Deferred; consider only if SHORT continues underperforming in
-live sessions on strongly trending days over a multi-month window.
-Current local market data only covers the equity universe; there are no NIFTY/NTM symbols in
-`market_day_state` or `strategy_day_state` yet, so this remains blocked on index ingestion.
-Recommendation for when we do add it: start with `NIFTY 500` as the market proxy, then test
-mirrored LONG and SHORT gates separately. Treat `NTM` as a follow-up comparison, not the default.
+This was the next live hypothesis after the Apr 21 session review: use a broad market proxy to
+skip new entries on strong one-sided index days rather than forcing an immediate liquidation rule.
+The regime gate is still an entry filter only; it does **not** close open trades on reversal.
+
+We first ran SQL sweeps on `NIFTY 500` daily moves from `2025-01-01` to `2026-04-21`:
+
+| Threshold | Up days | Down days | Abs days |
+|---|---:|---:|---:|
+| 0.10% | 60 | 86 | 146 |
+| 0.20% | 23 | 31 | 54 |
+| 0.30% | 51 | 75 | 126 |
+| 0.50% | 23 | 31 | 54 |
+| 1.00% | 4 | 2 | 6 |
+| 2.00% | 1 | 0 | 1 |
+| 3.00% | 0 | 0 | 0 |
+
+Takeaway: `1%+` is too sparse to be a useful day filter here. `2%` and `3%` are basically dead
+thresholds for this dataset. The useful search space is closer to `0.3%`-`0.5%`.
+
+We then ran the actual full-universe daily-reset risk baselines with
+`--regime-index-symbol 'NIFTY 500' --regime-min-move-pct 0.5`:
+
+| Side | Baseline run | Gate run | Trades | PnL | WR | PF | Calmar |
+|---|---|---|---:|---:|---:|---:|---:|
+| LONG | `c543038a648a` | `4655d9f75806` | 3165 → 3027 | ₹992,934.74 → ₹967,311.25 | 35.1% → 35.6% | 2.70 → 2.77 | 167.84 → 161.43 |
+| SHORT | `804f589a2fc7` | `fc0ae028635c` | 4669 → 4459 | ₹1,060,744.05 → ₹1,089,065.18 | 33.5% → 34.4% | 2.12 → 2.24 | 72.83 → 79.13 |
+
+### Conclusion
+The symmetric `0.5%` gate helps SHORT and hurts LONG. That means NIFTY 500 is useful, but not as a
+forced long/short mirror at the same threshold. The most plausible next deployment is SHORT-only
+at `0.5%`, with LONG left ungated until a separate long-side threshold proves itself.
+
+For live use, keep the gate as an extra opt-in parameter and do **not** turn it into a default
+liquidation rule. If we want earlier influence on the first entry window, that should be a separate
+snapshot-time experiment, not a reversal-close rule.
 
 #### Pattern 4 — BREAKEVEN protection → No change needed
 
