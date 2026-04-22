@@ -9,6 +9,7 @@ import os
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -21,6 +22,7 @@ from engine.bar_orchestrator import (
     select_entries_for_bar,
     should_process_symbol,
 )
+from engine.cpr_atr_shared import regime_snapshot_close_col
 from engine.kite_ticker_adapter import KiteTickerAdapter
 from engine.live_market_data import (
     IST,
@@ -258,10 +260,12 @@ def _prefetch_setup_rows(
     trade_date: str,
     candle_interval_minutes: int,
     regime_index_symbol: str = "",
+    regime_snapshot_minutes: int = 30,
 ) -> None:
     missing_symbols: list[str] = []
     invalid_symbols: list[tuple[str, float, float, float]] = []
     unique_symbols = list(dict.fromkeys(symbols))
+    regime_close_col = regime_snapshot_close_col(regime_snapshot_minutes)
 
     def _hydrate_setup_row(
         *,
@@ -361,8 +365,8 @@ def _prefetch_setup_rows(
                     m.is_narrowing,
                     m.cpr_shift,
                     CASE
-                        WHEN reg.open_915 > 0 AND reg.or_close_30 IS NOT NULL
-                        THEN ((reg.or_close_30 - reg.open_915) / reg.open_915) * 100.0
+                        WHEN reg.open_915 > 0 AND reg.{regime_close_col} IS NOT NULL
+                        THEN ((reg.{regime_close_col} - reg.open_915) / reg.open_915) * 100.0
                         ELSE NULL
                     END AS regime_move_pct,
                     p.rvol_baseline_arr
@@ -417,6 +421,7 @@ def _prefetch_setup_rows(
                 allow_live_fallback=runtime_state.allow_live_setup_fallback,
                 bar_end_offset=runtime_state.bar_end_offset,
                 regime_index_symbol=regime_index_symbol,
+                regime_snapshot_minutes=regime_snapshot_minutes,
             )
             if setup_row is None:
                 missing_symbols.append(symbol)
@@ -807,6 +812,7 @@ async def run_live_session(
     _start_alert_dispatcher()  # start consumer eagerly so first alerts are not delayed
     if session.status != "ACTIVE":
         session = await _update_session(session_id, deps, status="ACTIVE", notes=notes)
+        force_paper_db_sync(get_paper_db())
 
     params_session = session
     if not hasattr(session, "strategy_params"):
@@ -830,6 +836,7 @@ async def run_live_session(
             trade_date=trade_date,
             candle_interval_minutes=candle_interval,
             regime_index_symbol=str(strategy_params.get("regime_index_symbol") or ""),
+            regime_snapshot_minutes=int(strategy_params.get("regime_snapshot_minutes") or 30),
         )
     direction_readiness = _log_direction_readiness(
         session_id=session_id,
@@ -1201,6 +1208,24 @@ async def run_live_session(
                     if stop_requested:
                         break
                 if stop_requested:
+                    break
+
+                # Sentinel-file flatten: operator creates .tmp_logs/flatten_<session_id>.signal
+                # to close all open positions for this session while the sibling keeps running.
+                _signal_file = Path(".tmp_logs") / f"flatten_{session_id}.signal"
+                if _signal_file.exists():
+                    logger.info(
+                        "[%s] Flatten signal detected — closing all positions and completing session",
+                        session_id,
+                    )
+                    try:
+                        _signal_file.unlink()
+                    except OSError:
+                        pass
+                    final_status = "COMPLETED"
+                    terminal_reason = "manual_flatten_signal"
+                    complete_on_exit = True
+                    stop_requested = True
                     break
 
                 if local_feed and local_feed_exhausted:

@@ -500,6 +500,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--regime-snapshot-minutes",
+        type=int,
+        choices=[5, 10, 15, 30],
+        default=30,
+        help=(
+            "Regime snapshot window in minutes from the open (default 30 = 09:45 close). "
+            "Use 5 for 09:20 or 10 for 09:25."
+        ),
+    )
+    parser.add_argument(
         "--or-minutes",
         type=int,
         default=5,
@@ -831,6 +841,7 @@ def _run_with_lock(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
         "min_price": args.min_price,
         "regime_index_symbol": args.regime_index_symbol,
         "regime_min_move_pct": args.regime_min_move_pct,
+        "regime_snapshot_minutes": args.regime_snapshot_minutes,
         "or_minutes": args.or_minutes,
         "strategy": args.strategy,
         "commission_model": args.commission_model,
@@ -887,6 +898,8 @@ def _run_with_lock(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
             preset_cli_overrides["regime_index_symbol"] = args.regime_index_symbol
         if args.regime_min_move_pct > 0.0:
             preset_cli_overrides["regime_min_move_pct"] = args.regime_min_move_pct
+        if args.regime_snapshot_minutes != 30:
+            preset_cli_overrides["regime_snapshot_minutes"] = args.regime_snapshot_minutes
         if args.direction != "BOTH":
             preset_cli_overrides["direction_filter"] = args.direction
         if args.trail_atr_multiplier is not None:

@@ -500,6 +500,7 @@ async def test_process_closed_candle_loads_setup_row_from_runtime_path(
     assert called["trade_date"] == "2024-01-01"
     assert called["kwargs"]["or_minutes"] == 5
     assert called["kwargs"]["allow_live_fallback"] is True
+    assert called["kwargs"]["regime_snapshot_minutes"] == 30
     assert result["reason"] == "setup_pending"
     assert result["setup_status"] == "pending"
 
@@ -551,6 +552,7 @@ async def test_process_closed_candle_refreshes_pending_setup_row_from_runtime_pa
     )
 
     assert called and called[0]["symbol"] == "SBIN"
+    assert called[0]["kwargs"]["regime_snapshot_minutes"] == 30
     assert result["setup_status"] == "candidate"
     assert result["reason"] == "setup_ready"
 

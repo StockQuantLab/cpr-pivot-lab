@@ -140,6 +140,7 @@ def build_strategy_config_from_overrides(
         "min_price",
         "regime_index_symbol",
         "regime_min_move_pct",
+        "regime_snapshot_minutes",
         "strategy",
     }
     overrides.pop("version", None)

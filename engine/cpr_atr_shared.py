@@ -69,6 +69,21 @@ def get_cpr_entry_scan_start(or_minutes: int, cpr_entry_start: str | None) -> st
     return f"{entry_start_min // 60:02d}:{entry_start_min % 60:02d}"
 
 
+def regime_snapshot_close_col(snapshot_minutes: int) -> str:
+    """Return the market_day_state closing column used for regime snapshots."""
+
+    mapping = {
+        5: "or_close_5",
+        10: "or_close_10",
+        15: "or_close_15",
+        30: "or_close_30",
+    }
+    try:
+        return mapping[int(snapshot_minutes)]
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"Unsupported regime snapshot minutes: {snapshot_minutes!r}") from exc
+
+
 def normalize_stop_loss(
     *,
     entry_price: float,
@@ -378,7 +393,7 @@ def should_skip_for_regime(
 ) -> tuple[bool, str | None]:
     """Return whether the optional market-regime gate blocks a CPR entry.
 
-    The current experiment uses a fixed 09:30 snapshot of a broad index:
+    The current experiment uses a fixed opening-window snapshot of a broad index:
     skip SHORT when the index is up at least `regime_min_move_pct` from its open,
     and skip LONG when it is down at least that much.
     """

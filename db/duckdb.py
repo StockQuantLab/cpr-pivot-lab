@@ -609,6 +609,19 @@ class MarketDB:
         if target_symbols:
             symbol_filter_sql = f"AND symbol IN ({_sql_symbol_list(target_symbols)})"
         window_filter_sql = _date_window_clause("trade_date", since_date_iso, until_date_iso)
+
+        # For incremental builds, push a lower-bound date filter into raw_daily so DuckDB
+        # only scans Parquet rows near the target window instead of the full 10-year history.
+        # LAG in with_shift only needs one prior row per symbol, so a 7-calendar-day lookback
+        # (covers weekends + holidays) is sufficient: we get date=T-1 (OHLC → trade_date T
+        # via LEAD) and date=T-2 (provides LAG prev_tc for trade_date T).
+        # Not applied on full rebuilds (force=True / no since_date) where all history is needed.
+        parquet_date_filter_sql = ""
+        if since_date_iso and not force:
+            parquet_date_filter_sql = (
+                f"AND date::DATE >= ('{since_date_iso}'::DATE - INTERVAL '7 days')"
+            )
+
         table_exists = self._table_exists("cpr_daily")
         insert_sql = f"""
             WITH raw_daily AS (
@@ -626,6 +639,7 @@ class MarketDB:
                 FROM v_daily
                 WHERE 1=1
                 {symbol_filter_sql}
+                {parquet_date_filter_sql}
             ),
             daily AS (
                 SELECT
@@ -1546,11 +1560,13 @@ class MarketDB:
                     o.h0940, o.l0940, o.c0940
                 FROM cpr_daily c
                 -- ASOF JOIN: finds the most recent ATR row with trade_date <= c.trade_date.
-                -- For historical dates this resolves to same-day ATR.
-                -- For today (pre-market, when today's bars don't yet exist) it resolves to
-                -- the prior trading day's ATR, allowing market_day_state to be built
-                -- pre-market by pivot-refresh without requiring the day's 5-min bars.
-                ASOF JOIN atr_intraday a
+                -- atr_intraday is forward-shifted at build time (LEAD): the row keyed by
+                -- trade_date=T stores ATR computed from prev_date=T-1 candles. So for any
+                -- given trade date T, matching on <= correctly finds the T row whose ATR
+                -- represents yesterday's volatility — exactly what is available pre-market.
+                -- Zero-ATR rows (circuit filter, no trades) are excluded so the join
+                -- reaches back to the nearest valid prior-day ATR instead.
+                ASOF JOIN (SELECT * FROM atr_intraday WHERE atr > 0) a
                   ON a.symbol = c.symbol AND a.trade_date <= c.trade_date
                 LEFT JOIN cpr_thresholds t
                   ON t.symbol = c.symbol AND t.trade_date = c.trade_date

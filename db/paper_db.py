@@ -418,6 +418,17 @@ class PaperDB:
             self._sync.mark_dirty()
             self._sync.maybe_sync(self.con)
 
+    def force_sync(self) -> None:
+        """Bypass the debounce and publish a replica snapshot immediately.
+
+        Use after a batch of startup writes (e.g. pre-creating PLANNING sessions)
+        where the 5-second debounce would otherwise leave the dashboard with a
+        partial view until the first trading event fires.
+        """
+        if self._sync:
+            self._sync.mark_dirty()
+            self._sync.force_sync(self.con)
+
     # ------------------------------------------------------------------
     # Sessions
     # ------------------------------------------------------------------

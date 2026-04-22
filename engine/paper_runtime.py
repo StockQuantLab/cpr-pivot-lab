@@ -20,6 +20,7 @@ from engine.alert_dispatcher import AlertDispatcher, AlertType, get_alert_config
 from engine.bar_orchestrator import SessionPositionTracker
 from engine.cpr_atr_shared import (
     normalize_stop_loss,
+    regime_snapshot_close_col,
     resolve_completed_candle_trade_step,
     scan_cpr_levels_entry,
     split_scale_out_quantity,
@@ -827,12 +828,14 @@ def load_setup_row(
     allow_live_fallback: bool = True,
     bar_end_offset: timedelta | None = None,
     regime_index_symbol: str | None = None,
+    regime_snapshot_minutes: int = 30,
 ) -> dict[str, Any] | None:
     db = get_dashboard_db()
     regime_symbol = str(regime_index_symbol or "").strip().upper()
+    regime_close_col = regime_snapshot_close_col(regime_snapshot_minutes)
     with _MARKET_DB_READ_LOCK:
         row = db.con.execute(
-            """
+            f"""
             SELECT
                 m.trade_date::VARCHAR,
                 m.prev_close,
@@ -858,8 +861,8 @@ def load_setup_row(
                 m.is_narrowing,
                 m.cpr_shift,
                 CASE
-                    WHEN reg.open_915 > 0 AND reg.or_close_30 IS NOT NULL
-                    THEN ((reg.or_close_30 - reg.open_915) / reg.open_915) * 100.0
+                    WHEN reg.open_915 > 0 AND reg.{regime_close_col} IS NOT NULL
+                    THEN ((reg.{regime_close_col} - reg.open_915) / reg.open_915) * 100.0
                     ELSE NULL
                 END AS regime_move_pct
             FROM market_day_state m
@@ -1921,6 +1924,7 @@ async def evaluate_candle(
             allow_live_fallback=runtime_state.allow_live_setup_fallback,
             bar_end_offset=runtime_state.bar_end_offset,
             regime_index_symbol=getattr(params, "regime_index_symbol", ""),
+            regime_snapshot_minutes=int(getattr(params, "regime_snapshot_minutes", 30) or 30),
         )
         if setup_row is not None:
             state.setup_row = setup_row

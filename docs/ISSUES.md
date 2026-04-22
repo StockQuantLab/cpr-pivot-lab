@@ -7,7 +7,512 @@ Supersedes: `docs/PARITY_INCIDENT_LOG.md` (contents migrated below).
 
 ---
 
-## 2026-04-21 — EXPERIMENT: CPR_LEVELS `scale_out_pct=0.5` rerun on daily-reset baselines → REJECTED
+## 2026-04-23 — PERF: CPR incremental build scans full 10-year Parquet history
+
+**Status:** FIXED — `db/duckdb.py` `build_cpr_table()`
+**Severity:** Medium — EOD pipeline Step 4 (CPR refresh) takes ~5 min for a single-date refresh instead of ~5s
+
+### Root Cause
+`build_cpr_table()` builds a CTE chain: `raw_daily → daily → base → with_levels → with_shift → SELECT`.
+The date filter (`window_filter_sql`) was only applied on the final `SELECT`. All inner CTEs
+(especially `raw_daily FROM v_daily` and the `LAG/LEAD` window functions in `with_shift`) scanned
+the full 10-year Parquet history (~3.9M daily rows, ~2035 symbols) even for a single-date incremental refresh.
+
+### Fix Applied
+`db/duckdb.py` `build_cpr_table()` — added `parquet_date_filter_sql` pushed into `raw_daily`:
+
+```python
+if since_date_iso and not force:
+    parquet_date_filter_sql = (
+        f"AND date::DATE >= ('{since_date_iso}'::DATE - INTERVAL '7 days')"
+    )
+```
+
+The 7-day calendar lookback covers weekends + holidays. For `trade_date = T`:
+- `raw_daily.date = T-1` provides the OHLC → via LEAD becomes trade_date T
+- `raw_daily.date = T-2` provides the LAG prev_tc/prev_bc for the T row
+
+DuckDB now reads ~4K rows (2 per symbol) instead of 3.9M for a single-date refresh.
+Not applied when `force=True` or no `since_date` (full rebuild needs all history).
+
+### Expected Impact
+CPR step in EOD pipeline: ~5 min → ~5–10 s for a single-date incremental refresh.
+
+### Related Notes
+- `cpr_thresholds`: genuinely needs 252 prior rows (rolling quantile), reads from `cpr_daily`
+  (materialized, fast) — no further optimization possible there
+- `atr_intraday`: batched by symbol groups, already reasonably fast
+- `market_day_state` / `strategy_day_state`: already have early date filters, not affected
+
+---
+
+## 2026-04-22 — FEATURE: Need ability to flatten one session while keeping the other live
+
+**Status:** FIXED — `scripts/paper_live.py` (sentinel file IPC, Option A)
+**Severity:** Medium — operator cannot surgically stop SHORT on an up-day without also killing LONG
+
+### Observation
+On up-days (Apr 21, Apr 22) SHORT bleeds while LONG produces trailing winners. Ideal response
+is to flatten all open SHORT positions mid-session and let LONG continue uninterrupted.
+Currently not possible because both sessions share one process and one DuckDB exclusive lock —
+killing the process kills both.
+
+### Required Capability
+A way to close all open positions for one session_id while the sibling session keeps running,
+without requiring a process kill. Options:
+
+**Option A — in-process signal/command**
+Add a lightweight IPC mechanism (e.g. a sentinel file or named pipe) that the running process
+polls each bar. If `.tmp_logs/flatten_<session_id>.signal` exists, flatten that session and
+mark it COMPLETED, then delete the signal file. The sibling session continues unaffected.
+
+**Option B — separate writer process with DuckDB WAL**
+Allow a secondary process to write position closes to `paper.duckdb` while the primary holds
+the write lock — not feasible with DuckDB exclusive locking on Windows.
+
+**Option C — kill + flatten SHORT + resume LONG (current workaround)**
+1. `taskkill //F //PID <live_pid>`
+2. `doppler run -- uv run pivot-paper-trading flatten --session-id CPR_LEVELS_SHORT-<date>-live-kite`
+3. `doppler run -- uv run pivot-paper-trading daily-live --resume --session-id CPR_LEVELS_LONG-<date>-live-kite`
+Downside: `--resume` mode takes no new LONG entries after restart.
+
+**Recommendation:** Option A (sentinel file) is the cleanest — zero new dependencies,
+consistent with the existing single-writer model, and reversible.
+
+### Fix Applied
+`scripts/paper_live.py` — bar loop now checks for `.tmp_logs/flatten_<session_id>.signal`
+after each bar group. If the file exists: log the event, delete the file, set
+`final_status=COMPLETED / complete_on_exit=True`, break the loop. The normal exit path then
+calls `flatten_session_positions()` to close all open positions and sends FLATTEN_EOD alert.
+The sibling session's bar loop is unaffected (different `session_id`, different signal file).
+
+**Usage:**
+```bash
+# Flatten SHORT session while LONG keeps running:
+touch .tmp_logs/flatten_CPR_LEVELS_SHORT-2026-04-23-live-kite.signal
+# Engine picks it up at the next bar boundary (~5 sec), closes all SHORT positions, exits cleanly.
+```
+
+### Context
+First identified: 2026-04-22. Two consecutive up-days (Apr 21, Apr 22) where SHORT lost
+while LONG won. The need became clear when manual intervention was desired at 09:50 IST
+but the mechanism didn't exist.
+
+---
+
+## 2026-04-22 — BUG: PLANNING→ACTIVE transition also lost in replica debounce
+
+**Status:** FIXED — `scripts/paper_live.py`
+**Severity:** Low — cosmetic; sessions are genuinely ACTIVE; dashboard shows stale PLANNING label
+
+### Symptom
+After both sessions go ACTIVE at 09:16, the dashboard continued to show `SHORT = PLANNING`
+and `Feed = UNKNOWN` until the first 9:20 candle triggered a replica sync. `LONG` transitioned
+visibly first (its ACTIVE write happened to land in the sync window); `SHORT` did not.
+
+### Root Cause
+Same 5-second debounce as the pre-create race. `LONG.update(ACTIVE)` → `_after_write()` →
+sync fires (v4526, SHORT still PLANNING). `SHORT.update(ACTIVE)` milliseconds later →
+`_after_write()` → debounce blocks. No events fire for ~3 min until first candle.
+
+Replica v4526 confirmed: `LONG=ACTIVE (09:16 IST)`, `SHORT=PLANNING (03:04 IST stale)`.
+
+### Fix
+`paper_live.py` `run_live_session()` should call `_pdb().force_sync()` after setting
+`status=ACTIVE`, OR the periodic-sync Option B from the pre-create issue would cover both
+cases automatically.
+
+### Fix Applied
+`scripts/paper_live.py` — added `force_paper_db_sync(get_paper_db())` immediately after
+`_update_session(status="ACTIVE")`. Both LONG and SHORT sessions now publish a consistent
+replica snapshot as they go ACTIVE, so the dashboard reflects ACTIVE status before the
+first candle arrives.
+
+---
+
+## 2026-04-22 — WARN: GILLANDERS skipped every session — ATR=0.0000
+
+**Status:** FIXED — `db/duckdb.py`
+**Severity:** Low — single symbol excluded; no trading impact
+
+### Symptom
+Both LONG and SHORT sessions emit on every startup:
+```
+Setup prefetch skipped 1 invalid rows on 2026-04-22 (critical fields <= 0):
+GILLANDERS(tc=92.7767, bc=92.5300, atr=0.0000)
+```
+CPR levels are present but ATR is zero, so the symbol is correctly excluded from trading.
+
+### Root Cause (hypothesis)
+`atr_intraday` for GILLANDERS on 2026-04-22 is either missing or computed as zero.
+Likely cause: symbol had no 5-min trades on the reference date used for ATR calculation
+(suspended, circuit-filtered, or very thin liquidity day).
+
+### Root Cause (confirmed)
+`atr_intraday` for GILLANDERS on 2026-04-21 is 0.0 (circuit filter / no trades). The ASOF JOIN
+in `market_day_state` was joining to `atr_intraday` without filtering zero-ATR rows, so it
+found Apr 21 (atr=0.0) as the "most recent" row for Apr 22 instead of looking further back to
+Apr 20 (atr=0.245).
+
+### Fix Applied
+`db/duckdb.py` line 1553 — changed ASOF JOIN target from `atr_intraday` to
+`(SELECT * FROM atr_intraday WHERE atr > 0)` so zero-ATR circuit-filter days are skipped and
+the join reaches back to the nearest valid ATR. Takes effect on next `pivot-build --refresh-since`.
+
+---
+
+## 2026-04-22 — WARN: SUMIT missing from Kite instrument token map (recurring)
+
+**Status:** FIXED — symbol purged via `pivot-hygiene --purge --confirm`
+**Severity:** Low — symbol silently excluded from WebSocket subscription; no trading impact
+
+### Symptom
+Every `daily-live` session startup logs:
+```
+Instrument tokens not found for 1 symbols: ['SUMIT']
+Instrument tokens missing for 1 symbols (not in cached map): ['SUMIT']
+```
+Appears on both LONG and SHORT adapter instances.
+
+### Root Cause
+`SUMIT` is in the strategy candidate universe (passes CPR/ATR filters) but is absent from
+the Kite instrument master (`--refresh-instruments` map). Likely suspended, renamed, or
+moved to a different exchange segment since the last instrument refresh.
+
+### Fix Applied
+`pivot-kite-ingest --refresh-instruments --exchange NSE` ran — SUMIT confirmed absent from
+current Kite master (genuinely delisted). `pivot-hygiene --purge --confirm` removed SUMIT
+and 72 other dead symbols (107 MB freed, 867K rows deleted).
+
+---
+
+## 2026-04-22 — BUG: Monitor grep too broad — Telegram HTTP lines flood notifications
+
+**Status:** FIXED (same session) — tighter pattern applied; CLAUDE.md + AGENTS.md updated
+**Severity:** Low — cosmetic; no trading impact; just noisy during 9:20 trade-open burst
+
+### Symptom
+The live session monitor uses a grep pattern that matches `session` and general log lines,
+which causes every `httpx: HTTP Request: POST ...sendMessage "HTTP/1.1 200 OK"` line to
+fire a notification during the Telegram alert burst at 9:20 open (~15–20 alerts back-to-back).
+Makes it hard to spot actual trades and errors in the notification stream.
+
+### Fix
+Tighten the monitor grep to exclude raw `httpx`/`HTTP Request` lines and focus on:
+- Trade opens/closes: `paper trade open|paper trade close|TRADE|TARGET|SL_HIT|TRAIL|PARTIAL`
+- Bar heartbeat: `LIVE_BAR|TICKER_HEALTH`
+- Errors: `STALE|ERROR|Exception|Traceback|WARNING scripts.paper`
+
+Updated pattern (already applied to current session monitor):
+```
+tail -f .tmp_logs/live_20260422.log | grep --line-buffered -E \
+  "trade open|trade close|TRADE|TARGET|SL_HIT|TRAIL|PARTIAL|LIVE_BAR|TICKER_HEALTH|STALE|ERROR|Exception|Traceback|WARNING scripts.paper"
+```
+
+---
+
+## 2026-04-22 — BUG: SHORT session missing from dashboard during pre-market PLANNING phase
+
+**Status:** FIXED — `scripts/paper_trading.py` (`_pdb().force_sync()` after pre-create loop, line 1215)
+**Severity:** Low — operator may think SHORT session failed to start
+
+### Symptom
+After `daily-live --multi --strategy CPR_LEVELS` starts before market open, the dashboard
+shows only `CPR_LEVELS LONG` in PLANNING. `CPR_LEVELS SHORT` is absent until the WebSocket
+connects and the first candle event fires at or just after 09:16.
+
+Observed: 2026-04-22 pre-market. Log confirmed both sessions pre-created:
+```
+[pre-create] CPR_LEVELS_LONG-2026-04-22-live-kite  (PLANNING)
+[pre-create] CPR_LEVELS_SHORT-2026-04-22-live-kite (PLANNING)
+```
+Paper replica `v4524` had zero Apr 22 sessions; `v4525` had only LONG. SHORT was in
+`paper.duckdb` but the replica sync landed in the ~millisecond gap between the two
+sequential `INSERT` calls.
+
+### Root Cause
+The replica sync (`maybe_sync()`) is **event-driven** — it fires on meaningful trading
+events (candle processed, position opened, etc.). During the pre-market wait (~40 min),
+no events fire after session pre-creation. If the sync happens to execute between the LONG
+and SHORT `INSERT` calls, the dashboard gets an incomplete snapshot and sees no further
+update until 09:16.
+
+### Proposed Fix (two options — pick one)
+
+**Option A — explicit post-create sync (simplest)**
+After all sessions are pre-created in `_cmd_daily_live_multi` (before `_wait_until_market_ready`),
+call `paper_db.maybe_sync(source_conn=paper_db.con)` once to guarantee a consistent
+snapshot of all sessions.
+
+**Option B — periodic background sync**
+Add a lightweight background thread in `PaperDB` (or `ReplicaSync`) that publishes a new
+replica snapshot every 30 s regardless of trading events. Keeps dashboard live during any
+future quiet periods (e.g., between trades on a slow day). Slightly more complex but
+eliminates the whole class of "stale dashboard" issues.
+
+### Files to Change
+- `scripts/paper_trading.py` — Option A: add `maybe_sync` call after pre-create loop
+- `db/replica.py` / `db/paper_db.py` — Option B: periodic sync thread
+
+---
+
+## 2026-04-22 — EXPERIMENT (HIGH PRIORITY): Backtest `entry_window_start_short=09:35`
+
+**Status:** PENDING — queue after EOD; gold_51 × 15-month window
+**Severity:** Informational — strategy improvement candidate
+
+### Motivation
+Two consecutive live days (Apr 21 up-day, Apr 22 down-day) show the same pattern:
+- SHORT entries at 9:20–9:30 disproportionately hit INITIAL_SL or BREAKEVEN_SL within 1–3 bars
+- The culprit is **gap-open + intraday bounce**: market gaps down, SHORT entry triggers at 9:20,
+  then a recovery move into 9:30–9:35 sweeps the SL
+- Entries at 9:35+ (post-bounce) on both days had materially better hit rates
+
+Apr 22 evidence:
+| Entry time | SHORT outcomes |
+|------------|----------------|
+| 9:20 | 10 opened → 7 BREAKEVEN or INITIAL_SL, 1 TARGET (DMART), 2 still open at that point |
+| 9:25–9:30 | 5 opened → 4 SL, 0 targets in window |
+| 9:35–9:45 | 9 opened → CANTABIL TARGET, LT TARGET, VERANDA TARGET, FEDFINA TARGET; others mostly BREAKEVEN |
+
+Apr 21 (same pattern): early shorts reversed by 9:35 bounce; SHORT P&L dragged positive by later entries.
+
+### Hypothesis
+Delaying the SHORT entry window to 09:35 eliminates the bounce-SL cluster while retaining
+entries into confirmed intraday down-moves. The 9:20 bar (OR open) still sets direction —
+we just wait for the bounce to exhaust before entering.
+
+### Backtest Command
+```bash
+PYTHONUNBUFFERED=1 doppler run -- uv run pivot-backtest \
+  --universe-name gold_51 --start 2024-10-01 --end 2026-03-31 \
+  --preset CPR_LEVELS_RISK_SHORT \
+  --strategy-params '{"entry_window_start_short": "09:35"}' \
+  --save --quiet --progress-file .tmp_logs/bt_short_entry35.jsonl
+```
+
+### Accept Criteria
+- SHORT trade count stays ≥ 70% of baseline (some early trades lost is acceptable)
+- SHORT Calmar holds or improves vs baseline `23376249a6ca`
+- Win rate improves (fewer early SL hits)
+
+### Risk
+If the 09:35 window also misses the real downward continuation (market falls early, bounces
+by 09:35 then stalls), we may lose both ends. Check: does LONG benefit from the same delay?
+(Probably not — LONG entries benefit from early momentum.)
+
+---
+
+## 2026-04-22 — OBSERVATION: Gap-open reversal kills early SHORT entries (2-day pattern)
+
+**Status:** INFORMATIONAL — informs `entry_window_start_short` experiment above
+**Severity:** Low — expected market behaviour; not a bug
+
+### Pattern
+On both Apr 21 (up-day) and Apr 22 (down-day by NIFTY close), the same intraday structure:
+1. **09:15–09:20**: CPR direction fires SHORT for many symbols (gap-down open or intraday weakness)
+2. **09:20–09:30**: Sharp reversal / bounce off day lows. Early SHORT entries get swept.
+3. **09:35+**: Bounce exhausts, move resumes in original direction. Later entries profitable.
+
+This pattern is NOT visible in daily-reset backtests because backtests use vectorised 5-min
+bars that don't capture the 09:15–09:25 tick-level bounce that triggers intraday SL sweeps.
+Paper live replay captures it because candle-by-candle SL evaluation uses OHLC intra-bar.
+
+### Implication
+The strategy's 09:15 entry window (first bar after open) is aggressive for SHORT. The SL at
+`BC + ATR_buffer` is narrow enough that a 1-bar bounce can sweep it even on a genuine down-day.
+LONG is less affected because up-gaps tend to hold in the first few bars more often than
+down-gaps (buying-dip-fast is a common institutional pattern).
+
+### Action
+Backtest `entry_window_start_short=09:35`. See experiment above.
+
+---
+
+## 2026-04-22 — INFO: WebSocket watchdog auto-recovery validated in live session
+
+**Status:** INFORMATIONAL — system behaved correctly; no fix needed
+**Severity:** Low
+
+### Incident (10:20 IST)
+TCP connection dropped with error 1006 (`peer dropped TCP without WebSocket closing handshake`).
+Feed had been degrading: `last_tick_age=170s`, `stale=22` before the drop.
+
+### Recovery sequence
+1. `KiteTicker` fired `on_close` → internal reconnect initiated
+2. Watchdog fired ~21s post-drop → attempted reconnect, got `connect_failed` (Kite side not ready)
+3. ~35s later: `KiteTicker` internal reconnect succeeded
+4. Post-recovery: only subscribed to symbols with open positions (`active=10, subs=20`)
+   — reduced subscription mode is correct behaviour, not a bug
+5. Total gap: ~52s. Neither LONG nor SHORT had any position or SL/target events in the gap window.
+
+### Key validation
+- Both sessions recovered seamlessly with `connected=True, stale=0, coverage=100%` within 2 bars
+- No orphaned positions, no double-triggers, no missed exits
+- The `closes=1` counter accurately tracked the single disconnect event throughout the session
+
+### Note for future debugging
+`closes > 0` is a normal counter — it does not mean the session is unhealthy now.
+Only `connected=False` or persistent `stale > 5` across multiple bars warrants action.
+
+---
+
+## 2026-04-22 — OBSERVATION: BREAKEVEN_SL commission drain on slow trending days
+
+**Status:** PENDING EXPERIMENT — `breakeven_r=1.5` backtest queued (lower priority than `entry_window_start_short`)
+**Severity:** Low
+
+### Observation
+Apr 22 session had 28 BREAKEVEN_SL closes (15 SHORT + 13 LONG) at ~-₹83 each = ~-₹2,324 in
+commission drain. Each represents a position that moved to +1R (breakeven SL moved to entry)
+then reversed back to entry. Net: paid commission on both legs with zero directional gain.
+
+### Why it happens
+The breakeven rule (`breakeven_r=1.0`) is aggressive — SL moves to entry as soon as +1R is
+reached. On choppy mid-session bars the position oscillates between entry and +1R, eventually
+stopping out at entry. This is by design: the alternative (not moving SL to entry) risks
+converting a +1R position into a full SL loss if the move reverses sharply.
+
+### Potential improvement
+Test `breakeven_r=1.5` on the 15-month gold_51 window: does higher breakeven threshold reduce
+commission drain while not materially increasing full-SL losses? The trade-off: fewer BREAKEVEN
+exits but each breakeven failure costs more.
+
+Command (future experiment, lower priority than `entry_window_start_short`):
+```bash
+doppler run -- uv run pivot-backtest \
+  --universe-name gold_51 --start 2024-10-01 --end 2026-03-31 \
+  --preset CPR_LEVELS_RISK_SHORT \
+  --breakeven-r 1.5 --save
+```
+
+---
+
+## 2026-04-22 — EXPERIMENT: Time-stop for slow-bleed INITIAL_SL trades
+
+**Status:** PENDING — queue after `entry_window_start_short` experiment; gold_51 × 15-month window
+**Severity:** Informational — strategy improvement candidate; reduces capital locked in dead trades
+
+### Observation
+Apr 22 live session had 3 trades that held the original INITIAL_SL for 30+ bars with no
+meaningful progress, eventually stopping out for a full loss:
+- BHAGYANGR: 37 bars at INITIAL_SL, −₹1,010
+- ICIL: 44 bars at INITIAL_SL, −₹804
+- GANECOS: 53 bars at INITIAL_SL, −₹946
+
+These "slow-bleed" trades entered on a valid signal, never triggered breakeven (+1R), but also
+never hit SL quickly. They tied up position slots for hours on stocks that effectively went flat
+post-entry, eventually leaking to a loss via spread/commission or tiny adverse drift.
+
+### Hypothesis
+A time-stop rule — exit if price has not reached +0.5R within N bars after entry — would cut
+these dead-money trades early and free the slot for other entries. The cost: occasionally exiting
+a trade that would have eventually moved in the desired direction.
+
+### Backtest Command
+```bash
+PYTHONUNBUFFERED=1 doppler run -- uv run pivot-backtest \
+  --universe-name gold_51 --start 2024-10-01 --end 2026-03-31 \
+  --preset CPR_LEVELS_RISK_SHORT \
+  --strategy-params '{"time_stop_bars": 12}' \
+  --save --quiet --progress-file .tmp_logs/bt_timestop_12.jsonl
+```
+
+### Accept Criteria
+- INITIAL_SL trade count reduces
+- Calmar holds or improves vs baseline
+- Trade count does not drop by more than 10% (time-stop exits do not reduce new entries)
+
+---
+
+## 2026-04-22 — EXPERIMENT: Momentum confirmation filter (early exit if no direction in bar 1)
+
+**Status:** PENDING — queue after `entry_window_start_short` experiment; companion to time-stop above
+**Severity:** Informational — strategy improvement candidate; addresses commission drain from rapid BREAKEVEN_SL losses
+
+### Observation (from Apr 21 + Apr 22 paper data)
+
+Queried all SHORT positions across both live days (52 trades):
+
+**By entry bar — win rate:**
+| Entry bar | Apr 21 trades | Apr 21 WR | Apr 22 trades | Apr 22 WR |
+|-----------|---------------|-----------|---------------|-----------|
+| 09:20 | 4 | 25% | 10 | 10% |
+| 09:25 | 6 | 0% | 2 | 0% |
+| 09:30 | 2 | 0% | 3 | 0% |
+| 09:35 | 1 | 0% | 5 | 40% |
+| 09:40+ | 9 | ~33% | 10 | ~30% |
+
+The 09:20–09:30 cluster (27 of 52 trades, 52%) produced a combined ~7% win rate and accounted
+for nearly all the session losses. Entries at 09:35+ had materially better outcomes on both days.
+
+**Loss anatomy (Apr 21 + Apr 22 combined):**
+- **BREAKEVEN_SL**: ~25 trades at −₹83 each ≈ −₹2,075 — rapid entry → first bar moves to +1R →
+  immediately reverses, stopped at entry. Commission drain on zero directional progress.
+- **INITIAL_SL (fast, 1–3 bars)**: ~15 trades at −₹250 to −₹700 — price moved hard against entry
+  within 1–3 bars (gap reversal, morning auction bounce).
+- **INITIAL_SL (slow bleed, 30+ bars)**: 4 trades (GANECOS −₹946, ICIL −₹804, INDOTHAI −₹541,
+  SPLPETRO −₹590) — stock went flat post-entry, held all day, finally stopped out.
+
+### Two distinct problems, two filters
+
+**Problem 1 — Gap bounce SL sweep (fast, bars 1–3):** Market opens with SHORT setup, but a
+recovery move in the first 1–2 bars sweeps the SL before price continues down. Fix: delay entry
+window (`entry_window_start_short=09:35`) so the bounce has exhausted. Already queued above.
+
+**Problem 2 — Dead-money entries (no momentum):** After entry, price neither confirms direction
+(doesn't reach +0.5R within N bars) nor hits SL quickly. Stock drifts flat for 30–50 bars,
+eventually leaking to a loss. Fix: time-stop or momentum confirmation exit. Queued above.
+
+**Problem 3 — BREAKEVEN_SL commission drain (mid-speed, bars 1–10):** Entry confirms briefly
+(moves to +1R, SL moves to entry) then reverses. Stopped at entry for −₹83 commission cost.
+This is the dominant volume loss: 25 trades × −₹83 = −₹2,075 across 2 days.
+
+### Momentum confirmation filter concept
+
+After entry, if the next bar's close is **adverse** (i.e. moves against the trade direction
+relative to entry), exit at the bar after that — do not wait for SL or breakeven.
+
+Rule: `if close_bar1 < entry_price` (for SHORT: `close_bar1 > entry_price`), exit at
+`open_bar2`. Rationale: a genuine short signal should have bar 1 closing below entry.
+An adverse bar 1 close is the earliest signal that the entry was a false positive.
+
+Alternative framing (threshold-based): exit at bar 2 open if favorable excursion in bar 1
+did not reach a minimum of `+0.25R`. Requires less strict filtering than full reversal.
+
+### Why this is distinct from time-stop
+
+The time-stop checks momentum over N bars (12 bars = 1 hour) and exits if +0.5R not reached.
+It targets Problem 2 (slow bleed over hours).
+
+The momentum confirmation filter checks **bar 1 only** and exits within 10 minutes of entry.
+It targets Problem 3 (BREAKEVEN_SL cluster) and the fast-SL-sweep trades from Problem 1
+that are NOT caught by the delayed entry window.
+
+### What a backtest test would look like
+
+The momentum confirmation filter requires bar-level candle access after entry — the vectorised
+backtest engine does not currently support intra-trade candle inspection after entry. It would
+need to be implemented in the engine before a backtest can be run.
+
+**Implementation sketch** (not yet built):
+```python
+# In the trade lifecycle, after entry bar:
+if direction == "SHORT" and bar1_close > entry_price + 0.1 * atr:
+    exit_at_bar2_open = True  # momentum did not confirm, exit early
+```
+
+### Priority and sequencing
+
+1. Run `entry_window_start_short=09:35` backtest first (delayed window — no code changes needed)
+2. Run time-stop backtest second (N=12 bars)
+3. If both of those are insufficient, design and implement momentum confirmation filter
+
+The momentum filter requires engine changes, so it is lowest priority. Document here for later.
+
+---
+
+## 2026-04-22 — EXPERIMENT: CPR_LEVELS `scale_out_pct=0.5` rerun on daily-reset baselines → REJECTED
 
 **Status:** REJECTED — explicit `--cpr-scale-out-pct 0.5` reruns underperformed the current daily-reset baselines
 **Severity:** Informational — exit-side hypothesis only; no engine bug
@@ -29,6 +534,43 @@ The reruns were valid after the explicit-override path was used, but they did no
 
 ### Conclusion
 Scale-out at `0.5` is knocked off for now. Keep `scale_out_pct = 0.0` in the canonical baselines unless a later experiment provides a materially better result.
+
+---
+
+## 2026-04-22 — ANALYSIS: ATR look-ahead claim — INCORRECT, reverted
+
+**Status:** CLOSED — no code change needed; original `<=` join was correct
+**Severity:** Informational — incorrect diagnosis investigated and retracted
+
+### Claim (incorrect)
+Hypothesis raised 2026-04-22: the ASOF JOIN `a.trade_date <= c.trade_date` in `market_day_state`
+causes look-ahead bias because post-EOD it finds same-day ATR computed from same-day 5-min bars,
+while live pre-market uses only prev-day ATR.
+
+`<=` was briefly changed to `<` in `db/duckdb.py`. This was wrong and immediately reverted.
+
+### Why the claim was wrong
+
+`atr_intraday` is **forward-shifted at build time** (`db/duckdb.py` line 928):
+
+```sql
+LEAD(date) OVER (PARTITION BY symbol ORDER BY date) AS trade_date
+SELECT symbol, trade_date, date AS prev_date, atr
+```
+
+The row keyed by `trade_date = T` stores ATR computed from `prev_date = T-1` candles. It does NOT
+store same-day (T) ATR. So the `<=` join on `trade_date` is correct in all modes:
+
+- **Pre-market live**: today's `atr_intraday[T]` row is present (built by yesterday's EOD); join lands on it — prev-day ATR ✓
+- **Post-EOD backtest**: same `atr_intraday[T]` row is present; join lands on same row — same prev-day ATR ✓
+
+Changing to `<` would skip the intended row and use `atr_intraday[T-1]` — ATR from T-2, an extra unintended lag.
+
+### Actual parity risk (confirmed by existing ISSUES.md)
+ATR is consistent across modes. The real divergence source is **first-bar OR values**:
+- Live uses WebSocket-built 9:15/9:20 OHLC before EOD Parquet exists
+- Replay/backtest after EOD use authoritative packed candles from `intraday_day_pack`
+- Any binary filter that depends on `or_atr_5`, `or_close_5`, or direction is susceptible to this drift
 
 ---
 
@@ -215,6 +757,22 @@ at `0.5%`, with LONG left ungated until a separate long-side threshold proves it
 For live use, keep the gate as an extra opt-in parameter and do **not** turn it into a default
 liquidation rule. If we want earlier influence on the first entry window, that should be a separate
 snapshot-time experiment, not a reversal-close rule.
+
+### Follow-up: early snapshots for SHORT at `0.5%`
+
+Because most CPR trades enter at `09:20` and `09:25`, we tested the SHORT gate again using earlier
+regime snapshots:
+
+| Snapshot | Run ID | Trades | PnL | WR | PF | Calmar |
+|---|---|---:|---:|---:|---:|---:|
+| 09:20 | `6d5b0009115e` | 4614 | ₹1,058,358.25 | 33.66% | 2.13 | 75.66 |
+| 09:25 | `619bb64aaa70` | 4605 | ₹1,058,921.19 | 33.72% | 2.13 | 75.78 |
+| Baseline SHORT | `804f589a2fc7` | 4669 | ₹1,060,744.05 | 33.50% | 2.12 | 72.83 |
+
+### Follow-up conclusion
+The earlier snapshots improved the SHORT gate slightly versus the 09:30 version, but they still
+did not beat the daily-reset SHORT baseline. Keep the market-direction gate disabled for today's
+live session and revisit later only if we want another threshold/search pass.
 
 #### Pattern 4 — BREAKEVEN protection → No change needed
 
@@ -424,7 +982,7 @@ so cross-session dedup also works (e.g., resume sessions).
 
 ## 2026-04-20 — FEATURE: Progressive trail stop between 1R and T1 (pre-target ratchet)
 
-**Status:** ANALYSIS COMPLETE — candidate; strong uplift on both retained backtest baselines
+**Status:** REJECTED — single-rung ratchet (`--trail-after-r 1.5`) tested on retained baselines 2026-04-21: SHORT −₹218K, LONG −₹15K. See `docs/PROGRESSIVE_TRAIL_RATCHET_PLAN.md`.
 **Severity:** Enhancement — prevents giving back unrealised gains when position stalls before target
 
 ### Problem
@@ -502,7 +1060,7 @@ Combined ladder policy `1.25R -> 1.50R -> 1.75R -> 2.00R -> ATR`:
 
 ## 2026-04-20 — FEATURE: 10:15 intraday win-rate checkpoint to flatten losing sessions early
 
-**Status:** ANALYSIS COMPLETE — regresses retained SHORT baseline; small uplift on retained LONG baseline
+**Status:** REJECTED — regresses SHORT baseline at all thresholds tested; marginal LONG uplift not worth the added complexity
 **Severity:** Enhancement — reduces drawdown on bad market days
 
 ### Problem
@@ -873,7 +1431,7 @@ of subject (subject is date-only and doesn't contain the session_id).
 
 ## 2026-04-16 — Apr 15 Telegram alerts all failed (error_msg='None')
 
-**Status:** PARTIALLY ADDRESSED
+**Status:** CLOSED — root cause was missing Doppler secret (operational); AlertDispatcher startup logging added to make this detectable going forward
 **Severity:** Medium — no operational impact on Apr 15 but alert system is critical
 
 ### Symptom
@@ -955,7 +1513,7 @@ ensuring the 9:15 candle is closed before direction resolution runs.
 
 ## 2026-04-13 — MANOMAY live vs replay fill divergence
 
-**Status:** PARTIALLY ADDRESSED — feed audit implemented, deeper analysis pending
+**Status:** CLOSED — architectural; root cause fully documented in 2026-04-15/16 OHLC drift entry. Residual ~15–25% OHLC divergence between WebSocket (MODE_QUOTE) and historical pack is inherent — not fixable without polling Kite historical candles.
 **Severity:** High — same symbol, same session, different PnL outcome
 
 ### Summary

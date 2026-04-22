@@ -53,6 +53,7 @@ from engine.cpr_atr_shared import (
     TradeLifecycleOutcome,
     get_cpr_entry_scan_start,
     normalize_stop_loss,
+    regime_snapshot_close_col,
     scan_cpr_levels_entry,
     simulate_trade_lifecycle,
 )
@@ -235,10 +236,11 @@ class StrategyConfig:
     min_price: float = 0.0  # 0 = no filter; 50 = skip stocks trading below Rs.50
 
     # Optional market-regime gate:
-    # When enabled, use a broad index snapshot at 09:30 to skip LONG trades on weak days and
+    # When enabled, use a broad index snapshot to skip LONG trades on weak days and
     # SHORT trades on strong days. Leave disabled by default until a regime hypothesis is proven.
     regime_index_symbol: str = ""
     regime_min_move_pct: float = 0.0
+    regime_snapshot_minutes: int = 30
 
     # Strategy selection: "CPR_LEVELS" | "FBR" | "VIRGIN_CPR"
     strategy: str = "CPR_LEVELS"
@@ -1199,6 +1201,7 @@ class CPRATRBacktest:
         or_atr_min = (
             max(p.or_atr_min, fbr_cfg.fbr_min_or_atr) if strategy == "FBR" else p.or_atr_min
         )
+        regime_close_col = regime_snapshot_close_col(p.regime_snapshot_minutes)
 
         # Build the CPR shift clause — only applies to CPR_LEVELS
         shift_clause = "1"  # always true for FBR
@@ -1206,8 +1209,8 @@ class CPRATRBacktest:
             shift_clause = "($cpr_shift_filter = 'ALL' OR m.cpr_shift = $cpr_shift_filter)"
 
         regime_move_expr = (
-            "CASE WHEN reg.open_915 > 0 AND reg.or_close_30 IS NOT NULL "
-            "THEN ((reg.or_close_30 - reg.open_915) / reg.open_915) * 100.0 END"
+            f"CASE WHEN reg.open_915 > 0 AND reg.{regime_close_col} IS NOT NULL "
+            f"THEN ((reg.{regime_close_col} - reg.open_915) / reg.open_915) * 100.0 END"
         )
         regime_gate_sql = f"""
                      AND (
@@ -1403,6 +1406,7 @@ class CPRATRBacktest:
 
         high_col, low_col, close_col = self._or_columns_for_minutes(p.or_minutes)
         direction_col, or_atr_col = self._strategy_columns_for_minutes(p.or_minutes)
+        regime_close_col = regime_snapshot_close_col(p.regime_snapshot_minutes)
 
         strategy_filter_sql = ""
         if strategy == "CPR_LEVELS":
@@ -1440,8 +1444,8 @@ class CPRATRBacktest:
                     s.{or_atr_col} AS or_atr_915,
                     s.gap_abs_pct,
                     CASE
-                        WHEN reg.open_915 > 0 AND reg.or_close_30 IS NOT NULL
-                        THEN ((reg.or_close_30 - reg.open_915) / reg.open_915) * 100.0
+                        WHEN reg.open_915 > 0 AND reg.{regime_close_col} IS NOT NULL
+                        THEN ((reg.{regime_close_col} - reg.open_915) / reg.open_915) * 100.0
                         ELSE NULL
                     END AS regime_move_pct
                 FROM market_day_state m

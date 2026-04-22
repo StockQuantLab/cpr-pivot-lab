@@ -125,6 +125,7 @@ def test_paper_trading_parser_supports_daily_commands() -> None:
     assert daily_live_args.min_price is None
     assert daily_live_args.regime_index_symbol is None
     assert daily_live_args.regime_min_move_pct is None
+    assert daily_live_args.regime_snapshot_minutes == 30
     assert daily_live_args.cpr_min_close_atr is None
     assert daily_live_args.cpr_scale_out_pct is None
     assert daily_live_args.narrowing_filter is False
@@ -178,6 +179,8 @@ def test_paper_trading_parser_supports_daily_commands() -> None:
             "NIFTY 500",
             "--regime-min-move-pct",
             "0.3",
+            "--regime-snapshot-minutes",
+            "10",
             "--cpr-min-close-atr",
             "0.35",
             "--cpr-scale-out-pct",
@@ -190,6 +193,7 @@ def test_paper_trading_parser_supports_daily_commands() -> None:
     assert tuned_live_args.min_price == 50.0
     assert tuned_live_args.regime_index_symbol == "NIFTY 500"
     assert tuned_live_args.regime_min_move_pct == 0.3
+    assert tuned_live_args.regime_snapshot_minutes == 10
     assert tuned_live_args.cpr_min_close_atr == 0.35
     assert tuned_live_args.cpr_scale_out_pct == 0.8
     assert tuned_live_args.narrowing_filter is True

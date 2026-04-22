@@ -267,6 +267,9 @@ def _collect_strategy_cli_overrides(
     regime_min_move_pct = getattr(args, "regime_min_move_pct", None)
     if regime_min_move_pct is not None:
         overrides["regime_min_move_pct"] = float(regime_min_move_pct)
+    regime_snapshot_minutes = getattr(args, "regime_snapshot_minutes", None)
+    if regime_snapshot_minutes is not None:
+        overrides["regime_snapshot_minutes"] = int(regime_snapshot_minutes)
     cpr_min_close_atr = getattr(args, "cpr_min_close_atr", None)
     if cpr_min_close_atr is not None:
         overrides["cpr_min_close_atr"] = float(cpr_min_close_atr)
@@ -1206,6 +1209,10 @@ async def _cmd_daily_live_multi(args: argparse.Namespace) -> None:
                     notes="Waiting for 09:16 market open",
                 )
                 print(f"  [pre-create] {session_id} (PLANNING)", flush=True)
+        # Force a single replica sync after all sessions are written so the
+        # dashboard sees every PLANNING session immediately, bypassing the
+        # 5-second debounce that otherwise only captures the first session.
+        _pdb().force_sync()
         await _wait_until_market_ready(trade_date)
 
     if feed_source == "local":
@@ -1886,6 +1893,16 @@ def build_parser() -> argparse.ArgumentParser:
             help=(
                 "Skip LONG when the regime index is down at least this %% and skip SHORT when "
                 "it is up at least this %% (default off)."
+            ),
+        )
+        sp.add_argument(
+            "--regime-snapshot-minutes",
+            type=int,
+            choices=[5, 10, 15, 30],
+            default=30,
+            help=(
+                "Regime snapshot window in minutes from the open (default 30 = 09:45 close). "
+                "Use 5 for 09:20 or 10 for 09:25."
             ),
         )
         sp.add_argument(

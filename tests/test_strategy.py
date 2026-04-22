@@ -82,6 +82,7 @@ class TestBacktestParams:
         assert p.long_max_gap_pct is None
         assert p.regime_index_symbol == ""
         assert p.regime_min_move_pct == 0.0
+        assert p.regime_snapshot_minutes == 30
 
     def test_runtime_batch_size_default(self):
         p = BacktestParams()
@@ -170,6 +171,7 @@ class TestBacktestParams:
             runtime_batch_size=8,
             regime_index_symbol="NIFTY 500",
             regime_min_move_pct=0.3,
+            regime_snapshot_minutes=10,
         ).apply_strategy_configs(
             cpr_levels=CPRLevelsParams(
                 cpr_shift_filter="HIGHER",
@@ -191,6 +193,7 @@ class TestBacktestParams:
         assert p.runtime_batch_size == 8
         assert p.regime_index_symbol == "NIFTY 500"
         assert p.regime_min_move_pct == 0.3
+        assert p.regime_snapshot_minutes == 10
 
     def test_apply_strategy_configs_merges_grouped_values(self):
         p = BacktestParams().apply_strategy_configs(
