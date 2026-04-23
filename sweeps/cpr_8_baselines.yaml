@@ -1,0 +1,32 @@
+name: cpr-8-baselines-2025-2026apr23
+strategy: CPR_LEVELS
+base_params:
+  start: "2025-01-01"
+  end: "2026-04-23"
+  all: true
+  universe_size: 0
+  min_price: 50.0
+  cpr_percentile: 33.0
+sweep:
+  - param: preset
+    values:
+      - CPR_LEVELS_STANDARD_LONG
+      - CPR_LEVELS_STANDARD_SHORT
+      - CPR_LEVELS_RISK_LONG
+      - CPR_LEVELS_RISK_SHORT
+  - param: compound_equity
+    values: [true, false]
+compare:
+  metric: total_pnl
+  sort: desc
+  top_n: 8
+compare_against:
+  STD_LONG: 0aced40ca3f4
+  STD_SHORT: e9da715e087e
+  STD_LONG_CMP: 44370d92e125
+  STD_SHORT_CMP: e6d1d41a527d
+  RISK_LONG: b6476255aa1c
+  RISK_SHORT: 64c1ded4f9f0
+  RISK_LONG_CMP: 6ab24d47344d
+  RISK_SHORT_CMP: 11295c7f0237
+tags: [baseline, cpr-levels, daily-refresh]

@@ -20,6 +20,7 @@ _CONTROL_FLAGS = frozenset(
     {
         "save",
         "quiet",
+        "yes_full_run",
         "progress_file",
         "chunk_by",
     }
@@ -120,6 +121,7 @@ class SweepConfig:
     base_params: dict[str, Any] = field(default_factory=dict)
     sweep: list[SweepAxis] = field(default_factory=list)
     compare: SweepCompare = field(default_factory=SweepCompare)
+    compare_against: dict[str, str] = field(default_factory=dict)
     tags: list[str] = field(default_factory=list)
 
     @classmethod
@@ -147,12 +149,18 @@ class SweepConfig:
         compare_raw = raw.get("compare", {})
         compare = SweepCompare(**compare_raw) if compare_raw else SweepCompare()
 
+        # Baseline comparison: map of label → run_id
+        compare_against = raw.get("compare_against", {})
+        if not isinstance(compare_against, dict):
+            raise ValueError("compare_against must be a mapping of label → run_id")
+
         return cls(
             name=raw["name"],
             strategy=strategy,
             base_params=base_params,
             sweep=sweep_axes,
             compare=compare,
+            compare_against=compare_against,
             tags=raw.get("tags", []),
         )
 

@@ -19,7 +19,131 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("config", type=str, help="Path to sweep YAML config")
     parser.add_argument("--dry-run", action="store_true", help="Show combinations without running")
     parser.add_argument("--json", action="store_true", help="Output results as JSON")
+    parser.add_argument(
+        "--resume",
+        type=str,
+        default=None,
+        metavar="MANIFEST",
+        help="Path to a previous sweep manifest JSON to resume from",
+    )
+    parser.add_argument(
+        "--notify",
+        action="store_true",
+        help="Send Telegram/email notification on sweep completion",
+    )
     return parser
+
+
+def _send_sweep_notification(sweep_name: str, results: list, ranked: list) -> None:
+    """Best-effort Telegram notification for sweep completion."""
+    try:
+        from config.settings import get_settings
+
+        settings = get_settings()
+        token = settings.telegram_bot_token
+        chat_ids = settings.telegram_chat_ids
+        if not token or not chat_ids:
+            logger.info("No Telegram config — skipping sweep notification.")
+            return
+
+        completed = sum(1 for r in results if r.exit_code == 0)
+        failed = sum(1 for r in results if r.exit_code != 0)
+        lines = [
+            f"<b>Sweep Complete: {sweep_name}</b>",
+            f"Runs: {completed} OK, {failed} failed",
+        ]
+        if ranked:
+            lines.append("")
+            for i, s in enumerate(ranked[:5], 1):
+                lines.append(
+                    f"{i}. {s.label}: Calmar={s.calmar:.2f} WR={s.win_rate:.1f}% "
+                    f"P/L=₹{s.total_pnl:,.0f} Trades={s.trade_count}"
+                )
+
+        import requests  # type: ignore[import-untyped]
+
+        for chat_id in chat_ids:
+            try:
+                requests.post(
+                    f"https://api.telegram.org/bot{token}/sendMessage",
+                    data={
+                        "chat_id": chat_id,
+                        "text": "\n".join(lines),
+                        "parse_mode": "HTML",
+                    },
+                    timeout=10,
+                )
+            except Exception:
+                pass
+        logger.info("Sweep notification sent.")
+    except Exception as exc:
+        logger.warning("Sweep notification failed: %s", exc)
+
+
+def _sql_quote(value: str) -> str:
+    """Return a SQL string literal for a trusted run_id."""
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _build_baseline_delta(results: list, compare_against: dict) -> str:
+    """Build a delta comparison table between new runs and baseline run IDs."""
+    from db.duckdb import get_db
+
+    new_by_label = {r.label: r.run_id for r in results if r.exit_code == 0}
+    baseline_ids = {v for v in compare_against.values() if isinstance(v, str)}
+    if not baseline_ids or not new_by_label:
+        return ""
+
+    db = get_db()
+    ids_sql = ", ".join(
+        _sql_quote(rid) for rid in sorted(baseline_ids | set(new_by_label.values()))
+    )
+    rows = db.con.execute(
+        f"""
+        SELECT run_id, trade_count, win_rate, total_pnl, calmar,
+               annual_return_pct, max_dd_pct
+        FROM run_metrics
+        WHERE run_id IN ({ids_sql})
+        """,
+    ).pl()
+
+    baseline_map: dict[str, dict] = {}
+    for row in rows.to_dicts():
+        baseline_map[row["run_id"]] = row
+
+    lines = []
+    lines.append(f"\n{'=' * 70}")
+    lines.append("Baseline Delta (new vs compare_against)")
+    lines.append(f"{'=' * 70}")
+
+    for label, baseline_id in compare_against.items():
+        baseline = baseline_map.get(baseline_id, {})
+        if not baseline:
+            lines.append(f"  {label}: baseline {baseline_id} not found in DB")
+            continue
+
+        new_id = new_by_label.get(label)
+        if not new_id:
+            lines.append(f"  {label}: no matching new run found")
+            continue
+
+        new_run = baseline_map.get(new_id, {})
+        if not new_run:
+            lines.append(f"  {label}: new run {new_id} not found in DB")
+            continue
+
+        pnl_delta = new_run.get("total_pnl", 0) - baseline.get("total_pnl", 0)
+        wr_delta = new_run.get("win_rate", 0) - baseline.get("win_rate", 0)
+        trades_delta = new_run.get("trade_count", 0) - baseline.get("trade_count", 0)
+
+        lines.append(
+            f"  {label}:"
+            f"  P/L ₹{new_run.get('total_pnl', 0):,.0f} (Δ{pnl_delta:+,.0f})"
+            f"  WR {new_run.get('win_rate', 0):.1f}% (Δ{wr_delta:+.1f}%)"
+            f"  Trades {int(new_run.get('trade_count', 0) or 0)} (Δ{int(trades_delta):+d})"
+        )
+
+    return "\n".join(lines)
 
 
 def main() -> None:
@@ -43,7 +167,8 @@ def main() -> None:
         config.strategy,
     )
 
-    results = run_sweep(config, dry_run=args.dry_run)
+    resume_path = Path(args.resume) if args.resume else None
+    results = run_sweep(config, dry_run=args.dry_run, resume_from=resume_path)
 
     # Fetch metrics from DuckDB for non-dry-run results
     ranked = []
@@ -102,6 +227,12 @@ def main() -> None:
             print(f"{'=' * 60}")
             print(format_comparison_table(ranked))
 
+    # Baseline delta comparison
+    if not args.dry_run and hasattr(config, "compare_against") and config.compare_against:
+        delta_text = _build_baseline_delta(results, config.compare_against)
+        if delta_text:
+            print(delta_text)
+
     # Write JSON manifest
     from engine.sweep_runner import PROJECT_ROOT
 
@@ -113,6 +244,10 @@ def main() -> None:
     with open(manifest_path, "w") as f:
         json.dump(manifest, f, indent=2)
     print(f"\nManifest: {manifest_path}")
+
+    # Send notification if requested
+    if args.notify and not args.dry_run:
+        _send_sweep_notification(config.name, results, ranked)
 
 
 if __name__ == "__main__":

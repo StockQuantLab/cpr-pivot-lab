@@ -42,7 +42,7 @@ def fetch_summaries(db: Any, run_ids: list[str]) -> list[SweepSummary]:
     rows = db.con.execute(
         f"""
         SELECT
-            run_id, trade_count, win_rate, total_pnl,
+            run_id, COALESCE(NULLIF(label, ''), run_id) AS label, trade_count, win_rate, total_pnl,
             profit_factor, max_dd_pct, annual_return_pct, calmar
         FROM run_metrics
         WHERE run_id IN ({ids})
@@ -54,7 +54,7 @@ def fetch_summaries(db: Any, run_ids: list[str]) -> list[SweepSummary]:
         results.append(
             SweepSummary(
                 run_id=row["run_id"],
-                label=row["run_id"],
+                label=row.get("label") or row["run_id"],
                 trade_count=row["trade_count"],
                 win_rate=row["win_rate"],
                 total_pnl=row["total_pnl"],

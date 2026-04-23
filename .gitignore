@@ -28,6 +28,13 @@ logs/
 .tmp_logs/
 *.log
 
+# Generated sweep / baseline artifacts
+sweeps/.baselines/
+sweeps/*.json
+sweeps/*.jsonl
+sweeps/*.stdout.log
+sweeps/*.stderr.log
+
 # Secrets — never commit (use Doppler)
 .env
 *.env

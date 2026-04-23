@@ -121,10 +121,11 @@ def test_run_sweep_dry_run():
     assert all(r.run_id == "(dry-run)" for r in results)
 
 
-def test_run_sweep_calls_subprocess():
+def test_run_sweep_calls_subprocess(monkeypatch, tmp_path):
     from engine.sweep_runner import run_sweep
 
     config = _make_config(sweep=[{"param": "cpr_percentile", "values": [25]}])
+    monkeypatch.setattr("engine.sweep_runner.PROJECT_ROOT", tmp_path)
 
     mock_completed = subprocess.CompletedProcess(
         args=[], returncode=0, stdout="run_id: abc123\n", stderr=""
@@ -143,13 +144,15 @@ def test_run_sweep_calls_subprocess():
     call_args = mock_run.call_args[0][0]
     assert "engine.run_backtest" in call_args
     assert "--save" in call_args
+    assert "--progress-file" in call_args
     assert "--force-rerun" not in call_args
 
 
-def test_run_sweep_failure_continues():
+def test_run_sweep_failure_continues(monkeypatch, tmp_path):
     from engine.sweep_runner import run_sweep
 
     config = _make_config(sweep=[{"param": "cpr_percentile", "values": [25, 33]}])
+    monkeypatch.setattr("engine.sweep_runner.PROJECT_ROOT", tmp_path)
 
     mock_failed = subprocess.CompletedProcess(
         args=[], returncode=1, stdout="", stderr="some error\n"
@@ -171,10 +174,11 @@ def test_run_sweep_failure_continues():
     assert results[1].exit_code == 0
 
 
-def test_run_sweep_timeout():
+def test_run_sweep_timeout(monkeypatch, tmp_path):
     from engine.sweep_runner import run_sweep
 
     config = _make_config(sweep=[{"param": "cpr_percentile", "values": [25]}])
+    monkeypatch.setattr("engine.sweep_runner.PROJECT_ROOT", tmp_path)
 
     with (
         patch("db.duckdb.close_db"),
@@ -190,10 +194,11 @@ def test_run_sweep_timeout():
     assert results[0].exit_code == -1
 
 
-def test_run_sweep_parses_run_id_from_stdout():
+def test_run_sweep_parses_run_id_from_stdout(monkeypatch, tmp_path):
     from engine.sweep_runner import run_sweep
 
     config = _make_config(sweep=[{"param": "cpr_percentile", "values": [25]}])
+    monkeypatch.setattr("engine.sweep_runner.PROJECT_ROOT", tmp_path)
 
     for stdout_line, expected in [
         ("run_id: abc123def", "abc123def"),
@@ -225,6 +230,21 @@ def test_build_subprocess_args():
     assert "CPR_LEVELS" in args
     assert "--cpr-percentile" in args
     assert "--force-rerun" not in args
+
+
+def test_build_subprocess_args_includes_progress_file(tmp_path):
+    from engine.sweep_runner import _build_subprocess_args
+
+    config = _make_config(base_params={"start": "2020-01-01", "end": "2020-12-31"})
+    progress_file = tmp_path / "run.jsonl"
+    args = _build_subprocess_args(
+        config,
+        {"cpr_percentile": 25},
+        progress_file=progress_file,
+    )
+
+    assert "--progress-file" in args
+    assert str(progress_file) in args
 
 
 def test_build_subprocess_args_store_true_presence_only():

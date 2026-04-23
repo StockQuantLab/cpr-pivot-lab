@@ -46,6 +46,8 @@ dependencies = [
 pivot-agent = "agent.llm_agent:main"
 # One-shot backtest runner
 pivot-backtest = "engine.run_backtest:main"
+# Daily 8-baseline refresh (CPR presets x equity modes, auto-compare)
+pivot-baselines = "engine.baselines_cli:main"
 # YAML-driven parameter sweep with auto-comparison
 pivot-sweep = "engine.sweep_cli:main"
 # CSV → Parquet converter (run once after downloading data)
