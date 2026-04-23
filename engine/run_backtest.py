@@ -427,8 +427,12 @@ def build_parser() -> argparse.ArgumentParser:
             "(none|year|month). Each chunk gets a unique run_id."
         ),
     )
-    parser.add_argument(
-        "--skip-rvol", action="store_true", help="Skip RVOL check for faster testing"
+    rvol_group = parser.add_mutually_exclusive_group()
+    rvol_group.add_argument("--skip-rvol", action="store_true", help="Skip RVOL check for this run")
+    rvol_group.add_argument(
+        "--no-skip-rvol",
+        action="store_true",
+        help="Force RVOL checking on, even when the selected preset disables it",
     )
     parser.add_argument(
         "--runtime-batch-size",
@@ -924,6 +928,10 @@ def _run_with_lock(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
             preset_cli_overrides["risk_based_sizing"] = True
         if args.skip_rvol:
             preset_cli_overrides["skip_rvol_check"] = True
+        elif args.no_skip_rvol:
+            preset_cli_overrides["skip_rvol_check"] = False
+        if args.rvol != 1.0:
+            preset_cli_overrides["rvol_threshold"] = args.rvol
         if args.min_price > 0.0:
             preset_cli_overrides["min_price"] = args.min_price
         if args.regime_index_symbol:
@@ -942,6 +950,10 @@ def _run_with_lock(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
             preset_cli_overrides["breakeven_r"] = args.breakeven_r
         if args.rr_ratio != 2.0:
             preset_cli_overrides["rr_ratio"] = args.rr_ratio
+        if args.min_sl_atr_ratio != 0.5:
+            preset_cli_overrides["min_sl_atr_ratio"] = args.min_sl_atr_ratio
+        if args.max_sl_atr_ratio != 2.0:
+            preset_cli_overrides["max_sl_atr_ratio"] = args.max_sl_atr_ratio
         if args.time_stop_bars > 0:
             preset_cli_overrides["time_stop_bars"] = args.time_stop_bars
         if args.momentum_confirm:

@@ -258,6 +258,21 @@ def test_paper_trading_parser_supports_feed_audit_pack_source() -> None:
     assert timed_live_args.time_exit == "15:00"
     assert timed_live_args.cpr_entry_start == "14:00"
 
+    no_skip_rvol_args = parser.parse_args(
+        [
+            "daily-live",
+            "--trade-date",
+            "2024-01-03",
+            "--symbols",
+            "SBIN",
+            "--preset",
+            "CPR_LEVELS_RISK_SHORT",
+            "--no-skip-rvol",
+        ]
+    )
+    assert no_skip_rvol_args.no_skip_rvol is True
+    assert no_skip_rvol_args.skip_rvol is False
+
 
 class _DummyLock:
     def __enter__(self):
@@ -370,6 +385,26 @@ def test_resolve_paper_strategy_params_standard_preset_not_clobbered_by_default(
     assert params["risk_based_sizing"] is False, (
         "STANDARD preset risk_based_sizing=False was overridden by CLI default True"
     )
+
+
+def test_resolve_paper_strategy_params_preset_accepts_no_skip_rvol_override() -> None:
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "daily-live",
+            "--trade-date",
+            "2024-01-03",
+            "--symbols",
+            "SBIN",
+            "--preset",
+            "CPR_LEVELS_RISK_SHORT",
+            "--no-skip-rvol",
+        ]
+    )
+
+    params = _resolve_paper_strategy_params("CPR_LEVELS", None, args)
+    assert params["direction_filter"] == "SHORT"
+    assert params["skip_rvol_check"] is False
 
 
 def test_resolve_paper_strategy_params_rejects_fbr_preset() -> None:

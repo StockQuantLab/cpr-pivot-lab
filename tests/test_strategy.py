@@ -276,6 +276,15 @@ class TestBacktestParams:
         assert cfg.regime_index_symbol == "NIFTY 500"
         assert cfg.regime_min_move_pct == 0.3
 
+    def test_skip_rvol_preset_override_can_be_forced_false(self):
+        cfg = build_strategy_config_from_preset(
+            "CPR_LEVELS_RISK_SHORT",
+            {"skip_rvol_check": False},
+        )
+
+        assert cfg.direction_filter == "SHORT"
+        assert cfg.skip_rvol_check is False
+
     def test_regime_gate_is_disabled_by_default(self):
         setup_row = {
             "direction": "SHORT",

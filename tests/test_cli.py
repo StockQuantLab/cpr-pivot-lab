@@ -76,6 +76,15 @@ class TestCLIArgParsing:
         )
         assert "--progress-file" in result.stdout
 
+    def test_no_skip_rvol_flag_present(self):
+        """Backtest CLI should expose the symmetric RVOL override."""
+        result = subprocess.run(
+            [sys.executable, "-m", "engine.run_backtest", "--help"],
+            capture_output=True,
+            text=True,
+        )
+        assert "--no-skip-rvol" in result.stdout
+
     def test_quiet_flag_present(self):
         """--quiet should be available for compact/non-noisy output."""
         result = subprocess.run(
@@ -530,6 +539,140 @@ class TestCLIArgParsing:
         assert calls["params"].strategy == "FBR"
         assert calls["run_kwargs"]["symbols"] == ["SBIN"]
         assert calls["make_run_id"] == (["SBIN"], "2025-01-01", "2025-01-02")
+
+    def test_run_backtest_preset_respects_no_skip_rvol_override(self, monkeypatch, capsys):
+        """Explicit --no-skip-rvol must clear preset skip_rvol_check=True."""
+        calls: dict[str, object] = {}
+
+        class _FakeDB:
+            pass
+
+        class _LockCtx:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        class _FakeResult:
+            run_id = "run-1"
+            df = pl.DataFrame()
+
+            def save_to_db(self, db):
+                return 0
+
+            def summary(self):
+                return "summary"
+
+        class _FakeBT:
+            def __init__(self, params, db):
+                calls["params"] = params
+
+            def _make_run_id(self, symbols, start, end):
+                return "umbrella-1"
+
+            def run(self, **kwargs):
+                return _FakeResult()
+
+        monkeypatch.setattr(run_backtest, "get_db", lambda: _FakeDB())
+        monkeypatch.setattr(run_backtest, "CPRATRBacktest", _FakeBT)
+        monkeypatch.setattr(
+            command_lock_module,
+            "acquire_command_lock",
+            lambda *args, **kwargs: _LockCtx(),
+        )
+        monkeypatch.setattr(
+            run_backtest.sys,
+            "argv",
+            [
+                "engine.run_backtest",
+                "--symbol",
+                "SBIN",
+                "--start",
+                "2025-01-01",
+                "--end",
+                "2025-01-02",
+                "--preset",
+                "CPR_LEVELS_RISK_SHORT",
+                "--no-skip-rvol",
+                "--quiet",
+            ],
+        )
+
+        run_backtest.main()
+
+        out = capsys.readouterr().out
+        assert "Compact summary: run_id=" in out
+        assert calls["params"].direction_filter == "SHORT"
+        assert calls["params"].skip_rvol_check is False
+
+    def test_run_backtest_preset_respects_rvol_override(self, monkeypatch, capsys):
+        """Explicit --rvol must override preset/default rvol_threshold."""
+        calls: dict[str, object] = {}
+
+        class _FakeDB:
+            pass
+
+        class _LockCtx:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        class _FakeResult:
+            run_id = "run-1"
+            df = pl.DataFrame()
+
+            def save_to_db(self, db):
+                return 0
+
+            def summary(self):
+                return "summary"
+
+        class _FakeBT:
+            def __init__(self, params, db):
+                calls["params"] = params
+
+            def _make_run_id(self, symbols, start, end):
+                return "umbrella-1"
+
+            def run(self, **kwargs):
+                return _FakeResult()
+
+        monkeypatch.setattr(run_backtest, "get_db", lambda: _FakeDB())
+        monkeypatch.setattr(run_backtest, "CPRATRBacktest", _FakeBT)
+        monkeypatch.setattr(
+            command_lock_module,
+            "acquire_command_lock",
+            lambda *args, **kwargs: _LockCtx(),
+        )
+        monkeypatch.setattr(
+            run_backtest.sys,
+            "argv",
+            [
+                "engine.run_backtest",
+                "--symbol",
+                "SBIN",
+                "--start",
+                "2025-01-01",
+                "--end",
+                "2025-01-02",
+                "--preset",
+                "CPR_LEVELS_RISK_SHORT",
+                "--rvol",
+                "0.5",
+                "--quiet",
+            ],
+        )
+
+        run_backtest.main()
+
+        out = capsys.readouterr().out
+        assert "Compact summary: run_id=" in out
+        assert calls["params"].direction_filter == "SHORT"
+        assert calls["params"].rvol_threshold == pytest.approx(0.5)
+        assert calls["params"].skip_rvol_check is True
 
     def test_run_backtest_single_window_emits_heartbeat(self, monkeypatch):
         """Single-window runs should emit explicit progress heartbeats."""

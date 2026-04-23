@@ -252,6 +252,8 @@ def _collect_strategy_cli_overrides(
         overrides["direction_filter"] = str(direction).upper()
     if getattr(args, "skip_rvol", False):
         overrides["skip_rvol_check"] = True
+    elif getattr(args, "no_skip_rvol", False):
+        overrides["skip_rvol_check"] = False
     if getattr(args, "standard_sizing", False):
         overrides["risk_based_sizing"] = False
     elif not has_preset and getattr(args, "risk_based_sizing", False):
@@ -1959,10 +1961,16 @@ def build_parser() -> argparse.ArgumentParser:
             default=None,
             help="Trade direction filter.",
         )
-        sp.add_argument(
+        rvol = sp.add_mutually_exclusive_group()
+        rvol.add_argument(
             "--skip-rvol",
             action="store_true",
             help="Skip RVOL filtering for this run/session.",
+        )
+        rvol.add_argument(
+            "--no-skip-rvol",
+            action="store_true",
+            help="Force RVOL filtering on, even when the selected preset disables it.",
         )
         sp.add_argument(
             "--min-price",

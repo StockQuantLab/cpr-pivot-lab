@@ -155,49 +155,121 @@ Three compounding factors:
 2. **Hair-trigger SL** (`min_sl_atr_ratio=0.5`): At 0.1%–0.3% distance, any tick noise hits stop
 3. **Index magnitude too small**: -0.5% Nifty 500 → individual stocks are not in sustained downtrend
 
+### 2026-04-23 follow-up: common factor in the last 3 live SHORT sessions
+
+Directly querying the live-kite paper sessions for `2026-04-21`, `2026-04-22`, and
+`2026-04-23` shows the same repeatable shape across the losing SHORT trades:
+
+- losers are concentrated in the opening window (`09:20`–`09:30`)
+- they carry very tight stops (median SL distance ~`0.30%`)
+- they tend to have high effective RR (median ~`4.1R`)
+- they fail quickly as `INITIAL_SL` or recycle to `BREAKEVEN_SL`
+
+Aggregated over the 3 sessions:
+
+| Bucket | Trades | PnL | WR | Median SL % | Median RR | Avg candles |
+|--|--|--|--|--|--|--|
+| Losers | 69 | `-₹17,604` | — | `0.298%` | `4.076R` | `6.97` |
+| Winners | 13 | `+₹11,870` | — | `0.281%` | `3.325R` | `14.62` |
+
+Early-entry concentration is the strongest signal:
+
+- `60.9%` of losers were entered at `09:20` / `09:25` / `09:30`
+- only `23.1%` of winners were that early
+
+By day, the early SHORT book was consistently the problem:
+
+| Date | Early (`09:20`–`09:30`) | Late (`09:35+`) |
+|--|--|--|
+| `2026-04-21` | `12` trades, `-₹1,276`, WR `8.3%` | `10` trades, `-₹1,472`, WR `20.0%` |
+| `2026-04-22` | `15` trades, `-₹2,275`, WR `6.7%` | `15` trades, `-₹173`, WR `26.7%` |
+| `2026-04-23` | `18` trades, `-₹2,621`, WR `5.6%` | `12` trades, `+₹2,082`, WR `33.3%` |
+
+Interpretation:
+
+- the issue is not simply "SHORT on up days"
+- the repeatable failure mode is **early opening-breakdown SHORTs with tiny stops that do not
+  get continuation**
+- even on days that later offer downside, the first 1–3 bars are the unreliable part of the
+  SHORT book
+- this could still be amplified by live-vs-backtest first-bar feed drift, so any eventual fix
+  must be validated against parity constraints before it is promoted
+
 ### Experiments to Run (Post-Market)
 
-**Exp 1 — Single-date backtest Apr 23 (calibration check):**
-```bash
-doppler run -- uv run pivot-backtest --all --universe-size 0 \
-  --start 2026-04-23 --end 2026-04-23 \
-  --preset CPR_LEVELS_RISK_SHORT --save
-```
-Expected: INITIAL_SL rate ~50%+ if today is genuinely a bad regime day. This rules out
-tick/candle divergence as the cause.
+**Exp 1 — Single-date backtest Apr 23 (calibration check) — ✅ COMPLETED**
 
-**Exp 2 — Re-enable RVOL for SHORT:**
+Queried Apr 23 slice from RISK_SHORT baseline `64c1ded4f9f0` (run already covered this date).
+- Backtest SHORT INITIAL_SL rate on Apr 23: **32%** (8/25 trades)
+- Live SHORT INITIAL_SL rate on Apr 23: **50%** (15/30 trades)
+- Backtest combined PnL Apr 23: +₹16,166 | Live combined PnL: +₹16,917 (nearly identical)
+- Entry-time breakdown: 09:20–09:25 = 0% WR (12 trades), 09:30–10:10 = 54% WR (13 trades)
+- Conclusion: Mildly bad regime day in backtest (32% vs 21.8% avg). Live gap (50% vs 32%)
+  is real — tick/OHLCV divergence amplified the damage but did not cause the regime problem.
+
+**Exp 2 — Re-enable RVOL for SHORT — ✅ REJECTED (2026-04-23)**
 ```bash
-doppler run -- uv run pivot-backtest --universe-name gold_51 \
-  --start 2023-01-01 --end 2025-12-31 \
-  --preset CPR_LEVELS_RISK_SHORT \
-  --strategy-params '{"skip_rvol_check":false}' --save
+doppler run -- uv run pivot-backtest --all --universe-size 0 --yes-full-run \
+  --start 2025-01-01 --end 2026-04-23 \
+  --preset CPR_LEVELS_RISK_SHORT --no-skip-rvol --save
 ```
 Hypothesis: Volume confirmation filters low-momentum breakdowns that reverse quickly.
 Risk: fewer trades, but higher quality. Key metric: INITIAL_SL rate reduction.
 
-**Exp 3 — Raise min_sl_atr_ratio for SHORT:**
-```bash
-doppler run -- uv run pivot-backtest --universe-name gold_51 \
-  --start 2023-01-01 --end 2025-12-31 \
-  --preset CPR_LEVELS_RISK_SHORT \
-  --strategy-params '{"min_sl_atr_ratio":1.0}' --save
-```
-Hypothesis: Wider minimum SL distance absorbs tick noise and brief reversals.
-Risk: larger loss per stop hit, but fewer false stops. Check Calmar vs P1/P2.
+Implementation notes:
+- Added `--no-skip-rvol` so preset-backed SHORT runs can re-enable RVOL.
+- Fixed a follow-on preset override bug where `--rvol X` was silently ignored under `--preset`;
+  only the boolean skip flag was propagating. This made the first `0.5` test invalid.
 
-**Exp 4 — Combined RVOL + wider SL:**
-Run both together and compare trade count, WR, and Calmar vs baseline `9f0e916bbff0`.
+Results vs current SHORT baseline `64c1ded4f9f0`:
 
-**Exp 5 — Regime gate for SHORT (if Exp 1–4 insufficient):**
+| Variant | Trades | WR | PF | PnL | Calmar |
+|--|--|--|--|--|--|
+| Baseline (`skip_rvol_check=true`) | 4,927 | 31.3% | 2.245 | ₹1,092,472 | 99.51 |
+| RVOL ON @ `1.0` | 2,427 | 36.8% | 3.043 | ₹773,021 | 126.15 |
+| RVOL ON @ `0.5` | 3,632 | 35.3% | 2.689 | ₹1,013,119 | 78.67 |
+
+Interpretation:
+- RVOL confirmation improves trade quality, but it cuts too much of the profitable SHORT book.
+- `1.0` is far too strict.
+- `0.5` is materially better than `1.0`, but still underperforms the baseline on both PnL and Calmar.
+- Conclusion: keep `skip_rvol_check=True` for the SHORT baseline.
+
+**Exp 3 — Raise min_sl_atr_ratio for SHORT — ✅ REJECTED (2026-04-23)**
 ```bash
-doppler run -- uv run pivot-backtest --universe-name gold_51 \
-  --start 2023-01-01 --end 2025-12-31 \
-  --preset CPR_LEVELS_RISK_SHORT \
-  --strategy-params '{"regime_index_symbol":"NIFTY 500","regime_min_move_pct":0.5}' --save
+doppler run -- uv run pivot-backtest --all --universe-size 0 --yes-full-run \
+  --start 2025-01-01 --end 2026-04-23 \
+  --preset CPR_LEVELS_RISK_SHORT --min-sl-atr-ratio 1.0 --save
 ```
-Skip SHORT when Nifty 500 is flat or up at 9:45 snapshot. Prior test (commit `4b09c39`)
-was on gold_51 universe — rerun on same universe/date range as Exp 1–4 for fair comparison.
+Results vs baseline `64c1ded4f9f0` / `b6476255aa1c`:
+
+| | SHORT baseline | SHORT min_sl=1.0 | LONG baseline | LONG min_sl=1.0 |
+|--|--|--|--|--|
+| Trades | 4,927 | 4,497 (−9%) | 3,216 | 2,899 (−10%) |
+| WR | 31.3% | 32.9% | 34.0% | 34.1% |
+| PF | 2.25 | 2.10 | 3.00 | 2.62 |
+| PnL | ₹1,092,472 | ₹1,012,516 | ₹1,036,948 | ₹889,595 |
+| Calmar | 99.5 | 77.8 (−22%) | 203 | 140 (−31%) |
+| MaxDD | 0.76% | 0.91% | 0.36% | 0.45% |
+
+Tight SL (0.5×ATR) is doing real work — removing it loses net-positive trades. Wider SL
+is not the fix; the Apr 23 problem is regime-specific, not SL-distance. **Keep 0.5**.
+Stale runs deleted: `c30d95b013d0` (preset-bug duplicate), `f966f4703bfb` (SHORT), `6eb80f21f6b2` (LONG).
+
+Also fixed: `--min-sl-atr-ratio` / `--max-sl-atr-ratio` were silently ignored when using
+`--preset` (same bug class as the Apr 22 `--breakeven-r` fix). Fixed in `engine/run_backtest.py`.
+
+**Exp 4 — Combined RVOL + wider SL — SKIPPED** (Exp 3 already rejected wider SL)
+
+**Exp 5 — Regime gate for SHORT — NEXT**
+```bash
+doppler run -- uv run pivot-backtest --all --universe-size 0 --yes-full-run \
+  --start 2025-01-01 --end 2026-04-23 \
+  --preset CPR_LEVELS_RISK_SHORT \
+  --regime-index-symbol "NIFTY 500" --regime-min-move-pct 0.5 --save
+```
+Skip SHORT when Nifty 500 is flat or up at 9:45 snapshot. Prior test was on gold_51 —
+must rerun on full universe / same date range as baselines for fair comparison.
 
 ### Do NOT
 - Change the canonical preset without running the backtest comparison first
