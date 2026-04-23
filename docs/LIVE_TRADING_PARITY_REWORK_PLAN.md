@@ -48,6 +48,135 @@ comparison:
 - live-local SHORT: 843 symbols, 7,995 rows, `09:20` -> `15:05`
 - live-kite SHORT: 844 symbols, 9,193 rows, `09:20` -> `15:15`
 
+### What the Apr 22 symbol compare proved
+
+The Apr 20 audit suggested a feed-input problem. A direct symbol-by-symbol compare on
+`2026-04-20` and `2026-04-21` confirmed the dominant failure mode:
+
+- replay/local-live remain close to the retained baselines
+- kite-live is the outlier
+- the divergence is mostly not later-bar execution logic
+- the divergence is mostly **entry qualification drift on the first 5-minute bar**
+
+Observed daily counts:
+
+- `2026-04-17` replay:
+  - LONG `26` vs `25`
+  - SHORT `5` vs `5`
+- `2026-04-20` local-live:
+  - LONG `5` vs `5`
+  - SHORT `12` vs `14`
+- `2026-04-20` kite-live:
+  - LONG `5` vs `30`
+  - SHORT `12` vs `38`
+- `2026-04-21` kite-live:
+  - LONG `21` vs `29`
+  - SHORT `6` vs `22`
+
+Across the two kite-live dates:
+
+- `99` symbols were paper-only relative to the baselines
+- `79 / 99` (`79.8%`) were explained by setup-filter flips
+- the dominant flip was `OR_ATR_RATIO`: the WebSocket-built `09:15` candle was smaller than
+  the packed candle, so symbols that should fail `or_atr_ratio <= 2.5` passed in kite-live
+
+Examples:
+
+- `2026-04-20 SHORT 20MICRONS`: packed `10.627`, kite-live `1.117`
+- `2026-04-20 LONG ACUTAAS`: packed `6.976`, kite-live `1.831`
+- `2026-04-21 SHORT BAJAJHLDNG`: packed `3.426`, kite-live `1.325`
+
+The drift also removed valid baseline trades:
+
+- `24` symbols were baseline-only relative to kite-live
+- `9 / 24` (`37.5%`) were again setup-filter flips
+- some kite-live first bars collapsed to zero range (`KRITI`, `VHL`, `CONTROLPR`)
+
+This sharpens the parity contract:
+
+- replay/local-live parity proves the candle-based engine is shared correctly
+- kite-live parity is currently blocked by the **first-bar candle source**, not by ATR semantics
+- if live money is the acceptance standard, then the live entry path must be reproducible from a
+  persisted input source after the fact
+
+In practical terms:
+
+- WebSocket is still acceptable for transport and LTP monitoring
+- `MODE_QUOTE` WebSocket snapshots are not acceptable as the sole authoritative source for
+  binary first-bar setup filters
+- parity can only be closed by either:
+  1. qualifying entries from an authoritative candle source, or
+  2. replaying against the exact captured live feed instead of `intraday_day_pack`
+
+### What the Apr 22 exact-feed replay compare proved
+
+The exact-feed source path was then used on both replay and backtest for the archived
+live-kite sessions on `2026-04-20`, `2026-04-21`, and `2026-04-22`.
+
+That changed the conclusion materially:
+
+- replay and backtest still do **not** match, even when both consume the same
+  `paper_feed_audit` bars
+- replay is a strict subset of backtest on all six tested sessions
+- therefore WebSocket candle construction is only one layer of the parity problem
+
+Observed replay vs exact-feed backtest counts:
+
+- `2026-04-20 LONG`: replay `23` vs backtest `26`
+- `2026-04-20 SHORT`: replay `22` vs backtest `28`
+- `2026-04-21 LONG`: replay `7` vs backtest `17`
+- `2026-04-21 SHORT`: replay `14` vs backtest `21`
+- `2026-04-22 LONG`: replay `11` vs backtest `19`
+- `2026-04-22 SHORT`: replay `17` vs backtest `23`
+
+Replay-vs-backtest overlap:
+
+- `2026-04-20 LONG`: shared `23`, replay-only `0`, backtest-only `3`
+- `2026-04-20 SHORT`: shared `22`, replay-only `0`, backtest-only `6`
+- `2026-04-21 LONG`: shared `7`, replay-only `0`, backtest-only `10`
+- `2026-04-21 SHORT`: shared `14`, replay-only `0`, backtest-only `7`
+- `2026-04-22 LONG`: shared `11`, replay-only `0`, backtest-only `8`
+- `2026-04-22 SHORT`: shared `17`, replay-only `0`, backtest-only `6`
+
+Implication:
+
+- do not treat “rebuild live WebSocket candles” as the sole next task
+- the higher-priority parity gap is now replay/runtime orchestration vs batch backtest
+- the next engineering compare should be inside shared CPR evaluation, not just at the
+  feed-ingestion boundary
+
+### Exact-feed replay resolution
+
+That replay-vs-backtest gap is now closed.
+
+The root cause was not candidate generation. Replay was opening the same missing trades,
+but some of those symbols had sparse archived feed coverage because the live session had
+already shrunk its active symbol list. Replay left those positions `OPEN` at end-of-tape,
+while batch backtest already fell back to a `TIME` exit at `15:15` using the last available
+captured close.
+
+Replay now applies the same terminal rule:
+
+- if the tape ends and positions are still open
+- synthesize one terminal candle at `params.time_exit`
+- use the symbol's last known captured close
+- resolve the close through the normal paper exit path as `TIME`
+
+Validated result on all six archived live-kite sessions:
+
+- `2026-04-20 LONG`: replay `26` == backtest `26`
+- `2026-04-20 SHORT`: replay `28` == backtest `28`
+- `2026-04-21 LONG`: replay `17` == backtest `17`
+- `2026-04-21 SHORT`: replay `21` == backtest `21`
+- `2026-04-22 LONG`: replay `19` == backtest `19`
+- `2026-04-22 SHORT`: replay `23` == backtest `23`
+
+So the next parity focus moves back where it belongs:
+
+- live-kite first-bar feed drift
+- live-session symbol/tape sparsity
+- whether the archived live tape is full-universe enough for exact-feed counterfactuals
+
 ### Remediation Plan
 
 #### Phase 1: Define the idempotent resolution contract

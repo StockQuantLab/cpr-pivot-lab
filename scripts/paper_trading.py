@@ -270,6 +270,12 @@ def _collect_strategy_cli_overrides(
     regime_snapshot_minutes = getattr(args, "regime_snapshot_minutes", None)
     if regime_snapshot_minutes is not None:
         overrides["regime_snapshot_minutes"] = int(regime_snapshot_minutes)
+    pack_source = getattr(args, "pack_source", None)
+    if pack_source:
+        overrides["pack_source"] = str(pack_source)
+    pack_source_session_id = getattr(args, "pack_source_session_id", None)
+    if pack_source_session_id:
+        overrides["pack_source_session_id"] = str(pack_source_session_id)
     cpr_min_close_atr = getattr(args, "cpr_min_close_atr", None)
     if cpr_min_close_atr is not None:
         overrides["cpr_min_close_atr"] = float(cpr_min_close_atr)
@@ -681,6 +687,14 @@ async def _cmd_daily_prepare(args: argparse.Namespace) -> None:
 
 async def _cmd_daily_replay(args: argparse.Namespace) -> None:
     with acquire_command_lock("runtime-writer", detail="runtime writer"):
+        if (
+            str(getattr(args, "pack_source", "intraday_day_pack")).strip().lower()
+            == "paper_feed_audit"
+            and not str(getattr(args, "pack_source_session_id", "") or "").strip()
+        ):
+            raise SystemExit(
+                "--pack-source paper_feed_audit requires --pack-source-session-id for daily-replay."
+            )
         if getattr(args, "multi", False):
             await _cmd_daily_replay_multi(args)
             return
@@ -1302,6 +1316,11 @@ async def _cmd_daily_live_multi(args: argparse.Namespace) -> None:
 
 async def _cmd_daily_replay_multi(args: argparse.Namespace) -> None:
     """Replay multiple paper variants concurrently in a single process."""
+    if str(getattr(args, "pack_source", "intraday_day_pack")).strip().lower() == "paper_feed_audit":
+        raise SystemExit(
+            "--multi does not support --pack-source paper_feed_audit yet. "
+            "Replay one archived session at a time."
+        )
     trade_date = resolve_trade_date(args.trade_date)
     all_symbols = _resolve_cli_symbols(build_parser(), args, read_only=True)
 
@@ -1903,6 +1922,23 @@ def build_parser() -> argparse.ArgumentParser:
             help=(
                 "Regime snapshot window in minutes from the open (default 30 = 09:45 close). "
                 "Use 5 for 09:20 or 10 for 09:25."
+            ),
+        )
+        sp.add_argument(
+            "--pack-source",
+            choices=["intraday_day_pack", "paper_feed_audit"],
+            default="intraday_day_pack",
+            help=(
+                "Intraday candle source for replay/backtest-style sessions. "
+                "Default uses intraday_day_pack; paper_feed_audit replays one archived session exactly."
+            ),
+        )
+        sp.add_argument(
+            "--pack-source-session-id",
+            default=None,
+            help=(
+                "Required with --pack-source paper_feed_audit: archived paper session_id whose "
+                "captured bars should drive replay."
             ),
         )
         sp.add_argument(

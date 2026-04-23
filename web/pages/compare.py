@@ -745,7 +745,7 @@ async def compare_page() -> None:
                         colors=colors,
                     )
 
-        # ── Selectors ────────────────────────────────────────────────────────
+        # ── Selectors (ABOVE comparison content) ─────────────────────────────
         with ui.row().classes("w-full gap-4 items-end mb-4 flex-wrap"):
             sel_a: Any | None = None
             sel_b: Any | None = None

@@ -1224,6 +1224,52 @@ async def aget_compare_breakdown(run_a: str, run_b: str) -> dict:
     return await loop.run_in_executor(_executor, _go)
 
 
+async def aget_setup_funnel(run_id: str) -> list[dict]:
+    """Return setup funnel steps for a run: [{filter_step, count}]."""
+    loop = asyncio.get_running_loop()
+
+    def _go() -> list[dict]:
+        db = get_dashboard_backtest_db()
+        if not db:
+            return []
+        try:
+            rows = db.con.execute(
+                "SELECT filter_step, count FROM setup_funnel WHERE run_id = ? ORDER BY count DESC",
+                [run_id],
+            ).fetchall()
+            return [{"filter_step": r[0], "count": int(r[1])} for r in rows]
+        except Exception:
+            return []
+
+    return await loop.run_in_executor(_executor, _go)
+
+
+async def aget_cross_run_trades(runs: list[dict]) -> pl.DataFrame:
+    """Aggregate trades across all BACKTEST runs (excludes PAPER). Returns combined Polars DF."""
+    loop = asyncio.get_running_loop()
+
+    def _go() -> pl.DataFrame:
+        db = get_dashboard_backtest_db()
+        if not db:
+            return pl.DataFrame()
+        bt_runs = [r for r in runs if str(r.get("execution_mode") or "BACKTEST").upper() != "PAPER"]
+        if not bt_runs:
+            return pl.DataFrame()
+        ids = [r["run_id"] for r in bt_runs if r.get("run_id")]
+        if not ids:
+            return pl.DataFrame()
+        placeholders = ",".join(["?"] * len(ids))
+        try:
+            return db.con.execute(
+                f"SELECT * FROM backtest_results WHERE run_id IN ({placeholders})",
+                ids,
+            ).pl()
+        except Exception:
+            return pl.DataFrame()
+
+    return await loop.run_in_executor(_executor, _go)
+
+
 async def aget_symbols(force: bool = False) -> list[str]:
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(_executor, lambda: _fetch_symbols_sync(force))
@@ -1506,80 +1552,58 @@ def _format_run_updated_at(value: object) -> str:
     return text[:16]
 
 
+def _universe_size_from_json(symbols_json: object) -> int:
+    """Extract universe size from symbols_json array (total symbols, not just traded)."""
+    text = str(symbols_json or "").strip()
+    if not text or text == "None":
+        return 0
+    try:
+        import json
+
+        symbols = json.loads(text)
+        return len(symbols) if isinstance(symbols, list) else 0
+    except (json.JSONDecodeError, ValueError):
+        return 0
+
+
 def build_run_options(runs: list[dict]) -> dict[str, str]:
-    """Build label -> run_id mapping for dropdowns (most recent first)."""
+    """Build label -> run_id mapping for dropdowns (most recent first).
+
+    Uses the DB label from run_metadata when available (has correct universe
+    size), falling back to a reconstructed label from individual fields.
+    """
     options: dict[str, str] = {}
     for r in runs:
         rid = str(r.get("run_id") or "")
-        strategy = (r.get("strategy") or "").split("|")[0].strip().lower().replace("_", "-")
-        trades = int(r.get("trade_count") or 0)
-        total_return = float(r.get("total_return_pct") or 0.0)
+        ts = _format_run_updated_at(r.get("updated_at"))
+        tot_ret = float(r.get("total_return_pct") or 0.0)
         total_pnl = float(r.get("total_pnl") or 0.0)
-        rvol_threshold = float(r.get("rvol_threshold") or 1.0)
-        skip_rvol_check = _as_bool(r.get("skip_rvol_check"))
-        risk_based_sizing = _as_bool(r.get("risk_based_sizing"))
-        compound_equity = _as_bool(r.get("compound_equity"))
-        cpr_min_close_atr = float(r.get("cpr_min_close_atr") or 0.0)
-        failure_window = int(r.get("failure_window") or 0)
-        direction = str(r.get("direction_filter") or "BOTH").lower()
-        execution_mode = str(r.get("execution_mode") or "BACKTEST").upper()
-        params_json = str(r.get("params_json") or "")
-        paper_params: dict[str, object] = {}
-        if params_json:
-            try:
-                parsed_params = json.loads(params_json)
-                if isinstance(parsed_params, dict):
-                    paper_params = parsed_params
-            except (TypeError, ValueError):
-                paper_params = {}
-        paper_session_mode = (
-            str(r.get("paper_session_mode") or paper_params.get("paper_session_mode") or "")
-            .strip()
-            .lower()
-        )
-        paper_feed_source = (
-            str(
-                r.get("paper_feed_source")
-                or paper_params.get("paper_feed_source")
-                or paper_params.get("feed_source")
-                or ""
-            )
-            .strip()
-            .lower()
-        )
-        symbols_json = str(r.get("symbols_json") or "")
-        universe_size = 0
-        if symbols_json:
-            try:
-                parsed = json.loads(symbols_json)
-                if isinstance(parsed, list):
-                    universe_size = len(parsed)
-            except (TypeError, ValueError):
-                universe_size = 0
-        parts = [strategy, direction]
-        if risk_based_sizing:
-            parts.append("risksize")
-        parts.append("compound" if compound_equity else "daily-reset")
-        parts.append("rvoloff" if skip_rvol_check else f"rvol{rvol_threshold:g}")
-        if cpr_min_close_atr > 0:
-            parts.append(f"atr{cpr_min_close_atr:g}")
-        if strategy == "fbr" and failure_window > 0:
-            parts.append(f"fw{failure_window}")
-        if execution_mode == "PAPER":
-            if paper_session_mode:
-                parts.append(paper_session_mode)
-            if paper_feed_source:
-                parts.append(paper_feed_source)
-        if universe_size > 0:
-            parts.append(f"u{universe_size}")
-        key = "-".join(parts)
+        trades = int(r.get("trade_count") or 0)
         start = str(r.get("start_date") or "")[:10]
         end = str(r.get("end_date") or "")[:10]
-        updated_at = _format_run_updated_at(r.get("updated_at"))
+
+        # Always reconstruct from fields — DB labels vary in quality
+        direction = str(r.get("direction_filter") or "BOTH").upper()
+        sizing = "risksize" if _as_bool(r.get("risk_based_sizing")) else "slotsize"
+        compound = "compound" if _as_bool(r.get("compound_equity")) else "daily-reset"
+        strategy = str(r.get("strategy_code") or r.get("strategy") or "").lower()
+        rvol_tag = (
+            "rvoloff"
+            if _as_bool(r.get("skip_rvol_check"))
+            else (f"rvol{float(r.get('rvol_threshold') or 1.0):g}")
+        )
+        atr_gate = float(r.get("cpr_min_close_atr") or 0.0)
+        atr_tag = f"atr{atr_gate:g}" if atr_gate > 0 else ""
+        universe_size = _universe_size_from_json(r.get("symbols_json"))
+        parts = [strategy, direction.lower(), sizing, compound, rvol_tag]
+        if atr_tag:
+            parts.append(atr_tag)
+        if universe_size:
+            parts.append(f"u{universe_size}")
+        tag = "-".join(p for p in parts if p)
         label = (
-            f"{rid} | {updated_at} | {key} | {start}→{end} | "
-            f"TotRet {total_return:.1f}% | "
-            f"P/L ₹{total_pnl:,.0f} | Trades {trades:,}"
+            f"{rid[:12]} | {ts} | {tag} | {start}→{end} | "
+            f"TotRet {tot_ret:.1f}% | P/L ₹{total_pnl:,.0f} | Trades {trades:,}"
         )
         options[label] = rid
     return options

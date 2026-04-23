@@ -258,74 +258,77 @@ eliminates the whole class of "stale dashboard" issues.
 
 ## 2026-04-22 — EXPERIMENT (HIGH PRIORITY): Backtest `entry_window_start_short=09:35`
 
-**Status:** PENDING — queue after EOD; gold_51 × 15-month window
-**Severity:** Informational — strategy improvement candidate
+**Status:** REJECTED — backtest data (15 months, 4,669 SHORT trades, run `804f589a2fc7`) definitively contradicts the 2-day live hypothesis. Do NOT implement.
+**Severity:** Informational — hypothesis retired
 
-### Motivation
-Two consecutive live days (Apr 21 up-day, Apr 22 down-day) show the same pattern:
-- SHORT entries at 9:20–9:30 disproportionately hit INITIAL_SL or BREAKEVEN_SL within 1–3 bars
-- The culprit is **gap-open + intraday bounce**: market gaps down, SHORT entry triggers at 9:20,
-  then a recovery move into 9:30–9:35 sweeps the SL
-- Entries at 9:35+ (post-bounce) on both days had materially better hit rates
+### Motivation (original, from 2 live days)
+Two consecutive live days (Apr 21 up-day, Apr 22 down-day) showed early SHORT entries
+(09:20–09:30) hitting SL disproportionately vs later entries at 09:35+.
 
-Apr 22 evidence:
+Apr 22 live evidence (52 trades):
 | Entry time | SHORT outcomes |
 |------------|----------------|
-| 9:20 | 10 opened → 7 BREAKEVEN or INITIAL_SL, 1 TARGET (DMART), 2 still open at that point |
-| 9:25–9:30 | 5 opened → 4 SL, 0 targets in window |
-| 9:35–9:45 | 9 opened → CANTABIL TARGET, LT TARGET, VERANDA TARGET, FEDFINA TARGET; others mostly BREAKEVEN |
+| 9:20 | 10 opened → 7 BREAKEVEN or INITIAL_SL, 1 TARGET, 2 open |
+| 9:25–9:30 | 5 opened → 4 SL, 0 targets |
+| 9:35–9:45 | 9 opened → 4 targets; others mostly BREAKEVEN |
 
-Apr 21 (same pattern): early shorts reversed by 9:35 bounce; SHORT P&L dragged positive by later entries.
+### Backtest refutation (Apr 22, 2026 — SQL analysis on 15-month run)
 
-### Hypothesis
-Delaying the SHORT entry window to 09:35 eliminates the bounce-SL cluster while retaining
-entries into confirmed intraday down-moves. The 9:20 bar (OR open) still sets direction —
-we just wait for the bounce to exhaust before entering.
+Queried `backtest_results` for SHORT run `804f589a2fc7` (2025-01-01→2026-04-21, 2040 symbols):
 
-### Backtest Command
-```bash
-PYTHONUNBUFFERED=1 doppler run -- uv run pivot-backtest \
-  --universe-name gold_51 --start 2024-10-01 --end 2026-03-31 \
-  --preset CPR_LEVELS_RISK_SHORT \
-  --strategy-params '{"entry_window_start_short": "09:35"}' \
-  --save --quiet --progress-file .tmp_logs/bt_short_entry35.jsonl
-```
+| Time | Trades | Trade% | WR% | Avg PnL | PnL% | TARGET% | InitSL% | BE_SL% |
+|------|--------|--------|-----|---------|------|---------|---------|--------|
+| **09:20** | **1,891** | **40.5%** | **36.8%** | **₹290** | **51.7%** | 32.0% | 30.9% | 31.1% |
+| 09:25 | 635 | 13.6% | 33.2% | ₹226 | 13.5% | 29.9% | 30.9% | 34.5% |
+| 09:30 | 416 | 8.9% | 32.5% | ₹233 | 9.1% | 29.1% | 26.7% | 40.9% |
+| **09:35** | **321** | **6.9%** | **27.1%** | **₹93** | **2.8%** | **21.5%** | **37.1%** | 34.9% |
+| 09:40 | 279 | 6.0% | 31.9% | ₹166 | 4.4% | 27.6% | 37.3% | 30.5% |
+| 09:45 | 213 | 4.6% | 29.1% | ₹154 | 3.1% | 24.4% | 30.0% | 38.0% |
+| 09:50–10:15 | 856 | 18.3% | ~30% | ~160 | ~17% | ~25% | ~31% | ~36% |
 
-### Accept Criteria
-- SHORT trade count stays ≥ 70% of baseline (some early trades lost is acceptable)
-- SHORT Calmar holds or improves vs baseline `23376249a6ca`
-- Win rate improves (fewer early SL hits)
+**Key findings:**
+- **09:20 is the best SHORT slot**: 40.5% of trades, 51.7% of total PnL, 36.8% WR, ₹290 avg.
+  Delaying entry to 09:35 would forfeit more than half the strategy's PnL.
+- **09:35 is the worst SHORT slot**: 27.1% WR (lowest), 21.5% TARGET rate (lowest),
+  37.1% INITIAL_SL rate (highest), ₹93 avg PnL (lowest). Implementing `entry_window_start_short=09:35`
+  would actively move entries from the best slot to the worst.
+- **Also checked for LONG** (run `c543038a648a`, 3,165 trades): same conclusion.
+  09:20 LONG: 38.4% WR, ₹415 avg, 23.2% of trades. Best LONG slot is 09:40 (41.8%, ₹472)
+  but early entries are broadly good. No case for delayed start.
+- **Gap analysis**: On large gap-down days (gap < −0.5%), early SHORT WR = 31.7% avg ₹202 —
+  still better than late SHORT on the same days (WR 29.3%, avg ₹136).
 
-### Risk
-If the 09:35 window also misses the real downward continuation (market falls early, bounces
-by 09:35 then stalls), we may lose both ends. Check: does LONG benefit from the same delay?
-(Probably not — LONG entries benefit from early momentum.)
+### Why live data showed the opposite (2 days ≠ 4,669 trades)
+The 2-day live sessions captured a specific market regime (Apr 21–22 bounce pattern).
+At 52 live SHORT trades, any 2-day cluster of adverse entries is within normal variance.
+The 15-month backtest across 2040 symbols provides 90× the sample size and definitively
+shows 09:20 as the alpha source, not a liability.
+
+Note: `entry_window_start_short` is not implemented in the engine — `CPRLevelsParams`
+has only `entry_window_end`. The `--strategy-params` JSON override in the original command
+would have been silently ignored.
 
 ---
 
 ## 2026-04-22 — OBSERVATION: Gap-open reversal kills early SHORT entries (2-day pattern)
 
-**Status:** INFORMATIONAL — informs `entry_window_start_short` experiment above
-**Severity:** Low — expected market behaviour; not a bug
+**Status:** INFORMATIONAL — hypothesis NOT confirmed by backtest; see experiment above
+**Severity:** Low — the 2-day pattern is real but not structurally significant at scale
 
-### Pattern
+### Pattern (observed in live, 2 days)
 On both Apr 21 (up-day) and Apr 22 (down-day by NIFTY close), the same intraday structure:
 1. **09:15–09:20**: CPR direction fires SHORT for many symbols (gap-down open or intraday weakness)
 2. **09:20–09:30**: Sharp reversal / bounce off day lows. Early SHORT entries get swept.
 3. **09:35+**: Bounce exhausts, move resumes in original direction. Later entries profitable.
 
-This pattern is NOT visible in daily-reset backtests because backtests use vectorised 5-min
-bars that don't capture the 09:15–09:25 tick-level bounce that triggers intraday SL sweeps.
-Paper live replay captures it because candle-by-candle SL evaluation uses OHLC intra-bar.
+### Backtest verdict
+This pattern is real on individual days but does NOT dominate the 15-month distribution.
+Across 4,669 SHORT trades, 09:20 gap-down entries still outperform 09:35 entries.
+The bounce SL-sweep that was visible in live is absorbed into the backtest's INITIAL_SL rate
+(30.9% at 09:20), which is lower than the INITIAL_SL rate at 09:35 (37.1%). In aggregate,
+the early entries are still better despite the gap-bounce effect.
 
-### Implication
-The strategy's 09:15 entry window (first bar after open) is aggressive for SHORT. The SL at
-`BC + ATR_buffer` is narrow enough that a 1-bar bounce can sweep it even on a genuine down-day.
-LONG is less affected because up-gaps tend to hold in the first few bars more often than
-down-gaps (buying-dip-fast is a common institutional pattern).
-
-### Action
-Backtest `entry_window_start_short=09:35`. See experiment above.
+**Do not act on this observation for entry window changes.**
 
 ---
 
@@ -357,9 +360,46 @@ Only `connected=False` or persistent `stale > 5` across multiple bars warrants a
 
 ---
 
+## 2026-04-22 — EXPERIMENT: `entry_window_end=10:00` vs baseline `10:15`
+
+**Status:** REJECTED — both directions worse. Keep default `entry_window_end=10:15`.
+**Severity:** Informational — hypothesis disproved
+
+### Motivation
+Given that late entries (09:35+) underperform, question was whether restricting the entry
+window to 09:15–10:00 (cutting the 10:00–10:15 tail) would improve quality by removing
+the marginal late-entry slots.
+
+### Experiment (2026-04-22, universe=baseline_apr21_2040, 2035 symbols, 2025-01-01→2026-04-21)
+
+**SHORT direction** — `CPR_LEVELS_RISK_SHORT`:
+
+| Parameter | Run ID | Trades | WR% | PF | PnL | Ann% | MaxDD | Calmar |
+|-----------|--------|--------|-----|----|-----|------|-------|--------|
+| EW=10:15 (baseline) | `804f589a2fc7` | 4,669 | 33.5% | 2.12 | ₹1,060,744 | 74.2% | 1.0% | 72.83 |
+| EW=10:00 | `62e309688892` | 4,275 | 33.7% | 2.15 | ₹997,534 | 70.1% | 1.1% | 66.34 |
+| **Δ** | | **-394 (−8.4%)** | +0.2% | +0.03 | **−₹63K (−6.0%)** | **−4.1%** | +0.1% | **−6.5 (−8.9%)** |
+
+**LONG direction** — `CPR_LEVELS_RISK_LONG`:
+
+| Parameter | Run ID | Trades | WR% | PF | PnL | Ann% | MaxDD | Calmar |
+|-----------|--------|--------|-----|----|-----|------|-------|--------|
+| EW=10:15 (baseline) | `c543038a648a` | 3,165 | 35.1% | 2.70 | ₹992,935 | 69.8% | 0.4% | 167.84 |
+| EW=10:00 | `af32eed649e4` | 2,733 | 36.0% | 2.81 | ₹913,011 | 64.5% | 0.8% | 81.36 |
+| **Δ** | | **-432 (−13.7%)** | +0.9% | +0.11 | **−₹80K (−8.0%)** | **−5.3%** | +0.4% | **−86.5 (−51.5%)** |
+
+### Verdict
+The 10:00–10:15 window contributes net-positive trades in both directions. Cutting it:
+- SHORT: −6% P/L, −8.9% Calmar
+- LONG: −8% P/L, Calmar halved (167 → 81) because MaxDD also doubled (0.4% → 0.8%)
+
+The marginal late entries are still worth taking. **Keep `entry_window_end=10:15`.**
+
+---
+
 ## 2026-04-22 — OBSERVATION: BREAKEVEN_SL commission drain on slow trending days
 
-**Status:** PENDING EXPERIMENT — `breakeven_r=1.5` backtest queued (lower priority than `entry_window_start_short`)
+**Status:** EXPERIMENT COMPLETED (2026-04-22) — `breakeven_r=1.5` tested on 2035-symbol universe, 15 months. **Verdict: REJECT — keep `breakeven_r=1.0`.** Calmar regresses in both directions.
 **Severity:** Low
 
 ### Observation
@@ -373,24 +413,58 @@ reached. On choppy mid-session bars the position oscillates between entry and +1
 stopping out at entry. This is by design: the alternative (not moving SL to entry) risks
 converting a +1R position into a full SL loss if the move reverses sharply.
 
-### Potential improvement
-Test `breakeven_r=1.5` on the 15-month gold_51 window: does higher breakeven threshold reduce
-commission drain while not materially increasing full-SL losses? The trade-off: fewer BREAKEVEN
-exits but each breakeven failure costs more.
+### Bug discovered: `--breakeven-r` silently ignored when using `--preset`
 
-Command (future experiment, lower priority than `entry_window_start_short`):
-```bash
-doppler run -- uv run pivot-backtest \
-  --universe-name gold_51 --start 2024-10-01 --end 2026-03-31 \
-  --preset CPR_LEVELS_RISK_SHORT \
-  --breakeven-r 1.5 --save
+When `--preset` is combined with `--breakeven-r`, the CLI's preset code path built
+`preset_cli_overrides` without `breakeven_r`, so the flag was silently dropped and the
+run used `breakeven_r=1.0` (default) regardless of what was specified.
+
+**Fix (2026-04-22):** `engine/run_backtest.py` lines 923–926 — added non-default guard:
+```python
+if args.breakeven_r != 1.0:
+    preset_cli_overrides["breakeven_r"] = args.breakeven_r
+if args.rr_ratio != 2.0:
+    preset_cli_overrides["rr_ratio"] = args.rr_ratio
 ```
+Same pattern as `trail_atr_multiplier`. Re-run required to get valid results.
+
+### Experiment results (2026-04-22, universe=baseline_apr21_2040, 2035 symbols, 2025-01-01→2026-04-21)
+
+**SHORT direction** — `CPR_LEVELS_RISK_SHORT`:
+
+| Run | breakeven_r | Run ID | Trades | WR% | PF | PnL | Ann% | MaxDD | Calmar |
+|-----|-------------|--------|--------|-----|----|-----|------|-------|--------|
+| Baseline | 1.0 | `804f589a2fc7` | 4,669 | 33.5% | 2.12 | ₹1,060,744 | 74.2% | 1.02% | 72.83 |
+| BE=1.5 | 1.5 | `45ed0e169528` | 4,512 | **37.5%** | 2.05 | ₹1,097,233 | **76.5%** | 1.09% | 70.48 |
+| **Δ** | | | **-157 (−3.4%)** | +4.0pp | −0.07 | **+₹36K (+3.4%)** | +2.3pp | +0.07pp | **−2.35 (−3.2%)** |
+
+**LONG direction** — `CPR_LEVELS_RISK_LONG`:
+
+| Run | breakeven_r | Run ID | Trades | WR% | PF | PnL | Ann% | MaxDD | Calmar |
+|-----|-------------|--------|--------|-----|----|-----|------|-------|--------|
+| Baseline | 1.0 | `c543038a648a` | 3,165 | 35.1% | 2.70 | ₹992,935 | 69.8% | 0.42% | 167.84 |
+| BE=1.5 | 1.5 | `1c731dd72125` | 3,111 | **37.9%** | 2.46 | ₹977,562 | 68.7% | 0.46% | 149.19 |
+| **Δ** | | | **-54 (−1.7%)** | +2.8pp | −0.24 | **−₹15K (−1.5%)** | −1.1pp | +0.04pp | **−18.65 (−11.1%)** |
+
+### Verdict: REJECT `breakeven_r=1.5`
+
+Both directions show the same pattern: WR rises (fewer BREAKEVEN_SL scratch exits),
+but PF and Calmar both fall because trades that previously scratched at entry (small loss)
+now either reach target OR become full INITIAL_SL losses (larger loss). The net effect:
+
+- **SHORT**: P/L gains +₹36K (+3.4%) but Calmar drops 72.83 → 70.48 (−3.2%). Trade count
+  also drops by ~157 (slot pressure: positions held longer block new entries under `max_positions=10`).
+- **LONG**: P/L loses −₹15K (−1.5%) AND Calmar drops 167.84 → 149.19 (−11%). Clear regression.
+
+The original `breakeven_r=1.0` produces better risk-adjusted returns (Calmar) in both directions.
+The commission drain from BREAKEVEN_SL exits (~₹2,324/day observation) is not significant enough
+to justify the Calmar hit. **Do not change `breakeven_r`.**
 
 ---
 
 ## 2026-04-22 — EXPERIMENT: Time-stop for slow-bleed INITIAL_SL trades
 
-**Status:** PENDING — queue after `entry_window_start_short` experiment; gold_51 × 15-month window
+**Status:** COMPLETED (2026-04-23) — `time_stop_bars=12` tested on 2035-symbol universe, 2025-01-01–2026-04-21. **Verdict: REJECT — neutral to marginally worse; no benefit worth the added complexity.**
 **Severity:** Informational — strategy improvement candidate; reduces capital locked in dead trades
 
 ### Observation
@@ -409,25 +483,42 @@ A time-stop rule — exit if price has not reached +0.5R within N bars after ent
 these dead-money trades early and free the slot for other entries. The cost: occasionally exiting
 a trade that would have eventually moved in the desired direction.
 
-### Backtest Command
+### Backtest Commands (executed 2026-04-23)
 ```bash
 PYTHONUNBUFFERED=1 doppler run -- uv run pivot-backtest \
-  --universe-name gold_51 --start 2024-10-01 --end 2026-03-31 \
-  --preset CPR_LEVELS_RISK_SHORT \
-  --strategy-params '{"time_stop_bars": 12}' \
-  --save --quiet --progress-file .tmp_logs/bt_timestop_12.jsonl
+  --all --universe-size 0 --start 2025-01-01 --end 2026-04-21 \
+  --preset CPR_LEVELS_RISK_SHORT --time-stop-bars 12 \
+  --save --quiet --progress-file .tmp_logs/bt_short_tsb12.jsonl
+
+PYTHONUNBUFFERED=1 doppler run -- uv run pivot-backtest \
+  --all --universe-size 0 --start 2025-01-01 --end 2026-04-21 \
+  --preset CPR_LEVELS_RISK_LONG --time-stop-bars 12 \
+  --save --quiet --progress-file .tmp_logs/bt_long_tsb12.jsonl
 ```
 
-### Accept Criteria
-- INITIAL_SL trade count reduces
-- Calmar holds or improves vs baseline
-- Trade count does not drop by more than 10% (time-stop exits do not reduce new entries)
+### Results
+
+| Config | Run ID | Trades | WR | PF | PnL | Ann% | MaxDD | Calmar |
+|--------|--------|--------|----|----|-----|------|-------|--------|
+| **RISK_SHORT baseline** | `804f589a2fc7` | 4,669 | 33.5% | 2.120 | ₹1,060,744 | 74.2% | 1.0% | 72.83 |
+| **RISK_SHORT TSB=12** | `52c22b1e45f1` | 4,666 | 33.3% | 2.120 | ₹1,048,454 | 73.4% | 1.0% | 71.72 |
+| **RISK_LONG baseline** | `c543038a648a` | 3,165 | 35.1% | 2.700 | ₹992,935 | 69.8% | 0.4% | 167.84 |
+| **RISK_LONG TSB=12** | `e8ed5ccbd87a` | 3,158 | 34.9% | 2.750 | ₹993,670 | 69.8% | 0.4% | 167.79 |
+
+### Analysis
+
+- **SHORT**: -3 trades, WR -0.2pp, PF unchanged (2.120), PnL -₹12K, Calmar 71.72 vs 72.83 (-1.5%). Marginally worse.
+- **LONG**: -7 trades, WR -0.2pp, PF +0.05, PnL +₹735, Calmar essentially flat (167.79 vs 167.84). Neutral.
+- The ~800 "slow-bleed" trades identified in the original SQL analysis (505 SHORT + 295 LONG) do not concentrate P&L drag as hypothesised. They fall within normal SL-range losses; early exit offers no edge.
+- TIME_STOP exits do NOT free position slots for re-entry (unlike momentum_confirm) — the symbol slot is locked for the full day regardless, so trade count barely changes.
+
+**Verdict: REJECT.** No material improvement in either direction. Adds engine complexity for zero gain.
 
 ---
 
 ## 2026-04-22 — EXPERIMENT: Momentum confirmation filter (early exit if no direction in bar 1)
 
-**Status:** PENDING — queue after `entry_window_start_short` experiment; companion to time-stop above
+**Status:** COMPLETED (2026-04-23) — `momentum_confirm=True` tested on 2035-symbol universe, 2025-01-01–2026-04-21. **Verdict: ACCEPT — meaningful Calmar improvement (+38% SHORT, +20% LONG) with higher PF and lower MaxDD. Recommend enabling in CPR_LEVELS_RISK presets.**
 **Severity:** Informational — strategy improvement candidate; addresses commission drain from rapid BREAKEVEN_SL losses
 
 ### Observation (from Apr 21 + Apr 22 paper data)
@@ -502,13 +593,67 @@ if direction == "SHORT" and bar1_close > entry_price + 0.1 * atr:
     exit_at_bar2_open = True  # momentum did not confirm, exit early
 ```
 
-### Priority and sequencing
+### Backtest Commands (executed 2026-04-23)
+```bash
+PYTHONUNBUFFERED=1 doppler run -- uv run pivot-backtest \
+  --all --universe-size 0 --start 2025-01-01 --end 2026-04-21 \
+  --preset CPR_LEVELS_RISK_SHORT --momentum-confirm \
+  --save --quiet --progress-file .tmp_logs/bt_short_mc.jsonl
 
-1. Run `entry_window_start_short=09:35` backtest first (delayed window — no code changes needed)
-2. Run time-stop backtest second (N=12 bars)
-3. If both of those are insufficient, design and implement momentum confirmation filter
+PYTHONUNBUFFERED=1 doppler run -- uv run pivot-backtest \
+  --all --universe-size 0 --start 2025-01-01 --end 2026-04-21 \
+  --preset CPR_LEVELS_RISK_LONG --momentum-confirm \
+  --save --quiet --progress-file .tmp_logs/bt_long_mc.jsonl
+```
 
-The momentum filter requires engine changes, so it is lowest priority. Document here for later.
+### Results
+
+| Config | Run ID | Trades | WR | PF | PnL | Ann% | MaxDD | Calmar |
+|--------|--------|--------|----|----|-----|------|-------|--------|
+| **RISK_SHORT baseline** | `804f589a2fc7` | 4,669 | 33.5% | 2.120 | ₹1,060,744 | 74.2% | 1.0% | 72.83 |
+| **RISK_SHORT MC=True** | `81bc928ec7ad` | 4,885 | 31.5% | 2.260 | ₹1,094,892 | 76.4% | 0.8% | 100.18 |
+| **RISK_LONG baseline** | `c543038a648a` | 3,165 | 35.1% | 2.700 | ₹992,935 | 69.8% | 0.4% | 167.84 |
+| **RISK_LONG MC=True** | `83b0a8535295` | 3,201 | 33.8% | 2.960 | ₹1,017,690 | 71.4% | 0.4% | 200.66 |
+
+### Analysis
+
+- **SHORT**: +216 more trades (exits free up slots for re-entry), WR -2.0pp (MOMENTUM_FAIL exits are losses), PF +0.14 (+6.6%), PnL +₹34K (+3.2%), MaxDD -0.2pp, **Calmar 100.18 vs 72.83 (+37.5%)**.
+- **LONG**: +36 more trades, WR -1.3pp, **PF +0.26 (+9.6%)**, PnL +₹25K (+2.5%), MaxDD unchanged, **Calmar 200.66 vs 167.84 (+19.6%)**.
+- The mechanism is clear: MOMENTUM_FAIL exits at bar 2 open cut the immediate reversal entries before they can develop into full SL hits. This reduces the severity of losing trades (lower MaxDD) while the freed slots occasionally allow better entries (trade count increases, PnL improves despite lower WR).
+- WR dips because MOMENTUM_FAIL exits are counted as losses (exit at bar 2 open for a small loss or commission), but these small losses replace the deeper INITIAL_SL losses they prevent.
+- Calmar improvement is driven primarily by MaxDD compression — SHORT MaxDD drops from 1.0% to 0.8%, a meaningful reduction in worst-case drawdown.
+
+### Implementation
+Engine changes made in this session:
+- `engine/cpr_atr_shared.py`: `simulate_trade_lifecycle` — `momentum_exit_pending` flag, exit at bar 2 open with `exit_reason="MOMENTUM_FAIL"`
+- `engine/cpr_atr_strategy.py`: `CPRLevelsParams.momentum_confirm: bool = False` + call-site wired
+- `engine/run_backtest.py`: `--momentum-confirm` flag (default False, preset path uses non-default guard)
+- `engine/strategy_presets.py`: `momentum_confirm` propagated in `cpr_levels_config` fields
+- `db/backtest_db.py`: `exit_reason` CHECK constraint updated to include `MOMENTUM_FAIL`, `TIME_STOP`
+
+**Verdict: ACCEPT.** Both directions show clear Calmar improvement with higher PnL and lower MaxDD. The trade-off (lower WR) is expected and acceptable — MOMENTUM_FAIL exits are small losses that prevent deeper SL hits.
+
+### 2026-04-23 follow-up: promoted into all 4 CPR presets and reran the clean 8-baseline set
+
+We promoted `momentum_confirm=True` into all four CPR presets (risk + standard, LONG + SHORT),
+deleted the temporary Apr 22–23 CPR baseline reruns, and reran the canonical 8 CPR baselines
+through `2026-04-22`.
+
+New canonical CPR baseline set:
+
+| Mode | Preset | Run ID | Window | P/L | Calmar |
+|------|--------|--------|--------|-----|--------|
+| Daily Reset | `CPR_LEVELS_RISK_LONG` | `dbf89ea77af6` | 2025-01-01 → 2026-04-22 | ₹1,024,831 | 201.42 |
+| Daily Reset | `CPR_LEVELS_RISK_SHORT` | `a37501b04fa8` | 2025-01-01 → 2026-04-22 | ₹1,094,206 | 99.85 |
+| Daily Reset | `CPR_LEVELS_STANDARD_LONG` | `58c20fe411d8` | 2025-01-01 → 2026-04-22 | ₹1,033,436 | 200.47 |
+| Daily Reset | `CPR_LEVELS_STANDARD_SHORT` | `9f0e916bbff0` | 2025-01-01 → 2026-04-22 | ₹1,094,116 | 85.72 |
+| Compound | `CPR_LEVELS_RISK_LONG` | `d6bcb94cce9c` | 2025-01-01 → 2026-04-22 | ₹2,244,433 | 244.19 |
+| Compound | `CPR_LEVELS_RISK_SHORT` | `f143a95023c0` | 2025-01-01 → 2026-04-22 | ₹2,734,772 | 162.88 |
+| Compound | `CPR_LEVELS_STANDARD_LONG` | `c8e45b38a697` | 2025-01-01 → 2026-04-22 | ₹2,248,867 | 244.61 |
+| Compound | `CPR_LEVELS_STANDARD_SHORT` | `a050cedebdb8` | 2025-01-01 → 2026-04-22 | ₹2,766,392 | 166.62 |
+
+This replaced the older Apr 21 CPR reference rows. Use these 8 run IDs for future CPR baseline
+comparisons unless a later explicitly approved strategy change supersedes them.
 
 ---
 
@@ -2078,6 +2223,253 @@ parquet values. This is an architectural limitation of MODE_QUOTE WebSocket feed
 - #7 (OHLCV drift) — same underlying cause, this issue is a specific manifestation
 - #1 (OR fields NULL → 0.0) — the Apr 16 fix enabled the live OR fallback
 - #8 (live candle OHLCV diverges from intraday_day_pack) — same architectural limitation
+
+### 2026-04-22 follow-up: quantified trade-count impact on Apr 20-21
+
+The Apr 18 analysis established the mechanism. A direct symbol-by-symbol compare on the
+retained daily-reset risk baselines now shows the impact is large enough to invalidate
+`live-kite` as a parity reference for entry qualification.
+
+Compared against the retained baselines:
+
+- `2026-04-17` replay stayed close:
+  - LONG: backtest `26` vs replay `25`
+  - SHORT: backtest `5` vs replay `5`
+- `2026-04-20` local-live also stayed close:
+  - LONG: backtest `5` vs local-live `5`
+  - SHORT: backtest `12` vs local-live `14`
+- `2026-04-20` kite-live diverged materially:
+  - LONG: backtest `5` vs kite-live `30`
+  - SHORT: backtest `12` vs kite-live `38`
+- `2026-04-21` kite-live diverged materially:
+  - LONG: backtest `21` vs kite-live `29`
+  - SHORT: backtest `6` vs kite-live `22`
+
+Across the `2026-04-20` and `2026-04-21` kite-live sessions:
+
+- `99` symbols were **paper-only** (traded in kite-live, absent from baseline backtest)
+- `79 / 99` (`79.8%`) were explained by a **setup filter flip**
+- the dominant flip was `OR_ATR_RATIO`: the packed 09:15 candle failed the filter, while the
+  live-kite 09:15 candle passed it because the live OR range was much smaller
+
+Representative examples:
+
+| Date | Side | Symbol | Packed `or_atr_5` | Live-kite `or_atr_5` | Effect |
+|------|------|--------|-------------------|----------------------|--------|
+| 2026-04-20 | SHORT | `20MICRONS` | `10.627` | `1.117` | backtest rejects, kite-live trades |
+| 2026-04-20 | LONG | `ACUTAAS` | `6.976` | `1.831` | backtest rejects, kite-live trades |
+| 2026-04-20 | SHORT | `BAJAJHCARE` | `8.608` | `1.678` | backtest rejects, kite-live trades |
+| 2026-04-21 | LONG | `DEEPAKFERT` | `3.048` | `2.341` | backtest rejects, kite-live trades |
+| 2026-04-21 | SHORT | `BAJAJHLDNG` | `3.426` | `1.325` | backtest rejects, kite-live trades |
+
+The drift also cuts the other way:
+
+- `24` symbols were **baseline-only** (traded in backtest, absent from kite-live)
+- `9 / 24` (`37.5%`) were also explained by setup-filter flips, again mostly `OR_ATR_RATIO`
+- in some symbols the kite-live first bar collapsed to zero range:
+
+| Date | Side | Symbol | Packed `or_atr_5` | Live-kite `or_atr_5` | Effect |
+|------|------|--------|-------------------|----------------------|--------|
+| 2026-04-20 | LONG | `KRITI` | `1.845` | `0.000` | baseline trades, kite-live rejects |
+| 2026-04-20 | LONG | `VHL` | `1.490` | `0.000` | baseline trades, kite-live rejects |
+| 2026-04-20 | SHORT | `CONTROLPR` | `2.199` | `0.000` | baseline trades, kite-live rejects |
+
+Conclusion:
+
+- replay/local-live parity still validates the shared candle-based engine
+- `daily-live --feed-source kite` is **not** a valid parity reference for entry qualification
+  while entries depend on WebSocket-built 09:15 OHLC
+- if real-money live trading is the acceptance standard, the live money path must consume an
+  entry signal source that can be reproduced after the fact
+
+Practical implication:
+
+- Zerodha WebSocket is still appropriate for live transport and LTP monitoring
+- the parity problem is not "WebSocket should never be used"
+- the problem is that `MODE_QUOTE` snapshots are not an authoritative bar source for binary
+  first-bar filters such as `or_atr_5`, `or_close_5`, and derived direction
+- any future parity fix must either:
+  1. derive entry qualification from an authoritative candle source, or
+  2. replay from the exact captured live feed (`paper_feed_audit`) instead of comparing against
+     `intraday_day_pack`
+
+### 2026-04-22 follow-up: exact-feed backtest path implemented, parity still open
+
+An opt-in exact-feed source path now exists for single-session analysis:
+
+- backtest can use `pack_source=paper_feed_audit`
+- replay can use `pack_source=paper_feed_audit`
+- both require `pack_source_session_id=<archived session_id>`
+- default behavior remains `intraday_day_pack`
+
+This allows backtest/replay to consume the exact archived bars from `paper_feed_audit`
+instead of the EOD-packed candle tape.
+
+First proof run against archived kite-live sessions (`2026-04-20` through `2026-04-22`):
+
+| Session | Exact-feed backtest | Archived live | Delta |
+|---------|---------------------|---------------|-------|
+| `CPR_LEVELS_LONG-2026-04-20-live-kite` | `26` trades / `₹10,516.22` | `30` / `₹13,520.31` | `-4` trades |
+| `CPR_LEVELS_SHORT-2026-04-20-live-kite` | `28` / `₹1,602.46` | `38` / `₹460.64` | `-10` |
+| `CPR_LEVELS_LONG-2026-04-21-live-kite` | `17` / `₹3,064.07` | `29` / `₹3,856.14` | `-12` |
+| `CPR_LEVELS_SHORT-2026-04-21-live-kite` | `21` / `-₹2,407.50` | `22` / `-₹2,748.10` | `-1` |
+| `CPR_LEVELS_LONG-2026-04-22-live-kite` | `19` / `₹7,663.09` | `34` / `₹7,084.62` | `-15` |
+| `CPR_LEVELS_SHORT-2026-04-22-live-kite` | `23` / `-₹942.80` | `30` / `-₹2,447.39` | `-7` |
+
+Notes:
+
+- Apr 20 exact-feed runs had to drop 2 symbols from the parity set because runtime coverage
+  was missing for `HILINFRA` and `JKIPL`
+- Apr 21 dropped `KECL` for the same reason
+- even after exact-feed loading, full trade-key overlap is still not closed
+- symbol+direction overlap improved versus the packed-candle compare, but remained partial:
+  - `2026-04-20 LONG`: `16` shared / `10` backtest-only / `14` live-only
+  - `2026-04-20 SHORT`: `20` / `8` / `18`
+  - `2026-04-21 LONG`: `10` / `7` / `19`
+  - `2026-04-21 SHORT`: `15` / `6` / `7`
+  - `2026-04-22 LONG`: `8` / `11` / `26`
+  - `2026-04-22 SHORT`: `13` / `10` / `17`
+
+Conclusion:
+
+- the first-bar candle-source mismatch was a real and important problem
+- fixing the candle source alone is **not sufficient** to reproduce live-kite exactly
+- remaining parity drift is now narrower: session orchestration / setup hydration / candidate
+  ordering still differ between exact-feed backtest and archived live
+- next investigation should compare exact-feed backtest against `daily-replay` driven from the
+  same `paper_feed_audit` session to isolate backtest-vs-paper engine differences from feed
+  differences
+
+### 2026-04-22 follow-up: exact-feed replay vs exact-feed backtest still diverge
+
+That follow-up compare was run on the same archived live-kite sessions using the new
+`paper_feed_audit` source on both paths.
+
+Temporary exact-feed replay sessions:
+
+- `TMP_EXACT_REPLAY_CPR_LEVELS_LONG-2026-04-20-live-kite`
+- `TMP_EXACT_REPLAY_CPR_LEVELS_SHORT-2026-04-20-live-kite`
+- `TMP_EXACT_REPLAY_CPR_LEVELS_LONG-2026-04-21-live-kite`
+- `TMP_EXACT_REPLAY_CPR_LEVELS_SHORT-2026-04-21-live-kite`
+- `TMP_EXACT_REPLAY_CPR_LEVELS_LONG-2026-04-22-live-kite`
+- `TMP_EXACT_REPLAY_CPR_LEVELS_SHORT-2026-04-22-live-kite`
+
+Observed counts / PnL:
+
+- `2026-04-20 LONG`
+  - live: `30` trades, `₹13,520.31`
+  - exact-feed replay: `23` trades, `₹9,689.13`
+  - exact-feed backtest: `26` trades, `₹10,516.22`
+- `2026-04-20 SHORT`
+  - live: `38` trades, `₹460.64`
+  - exact-feed replay: `22` trades, `₹1,006.15`
+  - exact-feed backtest: `28` trades, `₹1,602.46`
+- `2026-04-21 LONG`
+  - live: `29` trades, `₹3,856.14`
+  - exact-feed replay: `7` trades, `₹1,071.85`
+  - exact-feed backtest: `17` trades, `₹3,064.07`
+- `2026-04-21 SHORT`
+  - live: `22` trades, `-₹2,748.10`
+  - exact-feed replay: `14` trades, `-₹4,562.35`
+  - exact-feed backtest: `21` trades, `-₹2,407.50`
+- `2026-04-22 LONG`
+  - live: `34` trades, `₹7,084.62`
+  - exact-feed replay: `11` trades, `₹5,869.45`
+  - exact-feed backtest: `19` trades, `₹7,663.09`
+- `2026-04-22 SHORT`
+  - live: `30` trades, `-₹2,447.39`
+  - exact-feed replay: `17` trades, `-₹1,215.13`
+  - exact-feed backtest: `23` trades, `-₹942.80`
+
+Important structural result:
+
+- replay did **not** match backtest even when both used the same captured `paper_feed_audit`
+  bars
+- replay was a strict subset of backtest on all six sessions
+- replay-vs-backtest overlap:
+  - `2026-04-20 LONG`: shared `23`, replay-only `0`, backtest-only `3`
+  - `2026-04-20 SHORT`: shared `22`, replay-only `0`, backtest-only `6`
+  - `2026-04-21 LONG`: shared `7`, replay-only `0`, backtest-only `10`
+  - `2026-04-21 SHORT`: shared `14`, replay-only `0`, backtest-only `7`
+  - `2026-04-22 LONG`: shared `11`, replay-only `0`, backtest-only `8`
+  - `2026-04-22 SHORT`: shared `17`, replay-only `0`, backtest-only `6`
+
+Examples of backtest-only trades that replay did not open:
+
+- `2026-04-20 LONG`: `AMBUJACEM 10:15`, `BBOX 09:35`, `TATACONSUM 09:45`
+- `2026-04-20 SHORT`: `AEROENTER 09:25`, `CEATLTD 09:20`, `GSPL 09:20`
+- `2026-04-21 LONG`: `BALMLAWRIE 09:20`, `DEEPAKFERT 09:20`, `MANYAVAR 09:20`
+- `2026-04-22 LONG`: `ADOR 09:20`, `ATLASCYCLE 09:20`, `GRAPHITE 09:20`
+
+Interpretation:
+
+- the first-bar WebSocket candle source is a real live-vs-historical problem
+- but it is **not** the only parity blocker
+- after removing candle-source drift, a second gap remains between the paper/replay driver
+  and the batch backtest engine itself
+- priority should shift to replay-vs-backtest orchestration and entry-selection parity before
+  spending more time on live WebSocket candle reconstruction
+
+Likely investigation area:
+
+- `engine/paper_session_driver.py`
+- `engine/paper_runtime.py`
+- `engine/cpr_atr_strategy.py`
+
+Specifically compare how replay and batch backtest handle:
+
+- setup-row hydration timing
+- bar-major candidate evaluation
+- entry selection under `max_positions`
+- position-close cash release timing across later bars
+
+### 2026-04-22 resolution: replay/backtest gap was sparse-tape terminal close handling
+
+Root cause is now confirmed and fixed in replay.
+
+What was happening:
+
+- archived `paper_feed_audit` is sparse by design because live shrinks the active symbol list
+  during the session
+- some exact-feed counterfactual trades opened on symbols whose captured tape stopped early
+  (`CEATLTD`, `GSPL`, etc.)
+- batch backtest already handled that case by falling back to a `TIME` exit at `15:15`
+  using the last available captured close
+- replay did not; it left those positions `OPEN`, so they never archived into
+  `backtest_results`
+
+Evidence:
+
+- on clean exact-feed replay reruns, the prior replay-vs-backtest trade deficit matched the
+  count of stranded `OPEN` paper positions exactly:
+  - `2026-04-20 LONG`: diff `3`, open `3`
+  - `2026-04-20 SHORT`: diff `6`, open `6`
+  - `2026-04-21 LONG`: diff `10`, open `10`
+  - `2026-04-21 SHORT`: diff `7`, open `7`
+  - `2026-04-22 LONG`: diff `8`, open `8`
+  - `2026-04-22 SHORT`: diff `6`, open `6`
+
+Fix:
+
+- replay now synthesizes one terminal candle at `params.time_exit` for any still-open symbol,
+  using that symbol's last known captured close
+- this reuses the normal paper exit path and closes the position as `TIME`, matching the
+  batch backtest contract on sparse tapes
+
+Validation after the fix:
+
+- `2026-04-20 LONG`: replay `26`, backtest `26`, open `0`
+- `2026-04-20 SHORT`: replay `28`, backtest `28`, open `0`
+- `2026-04-21 LONG`: replay `17`, backtest `17`, open `0`
+- `2026-04-21 SHORT`: replay `21`, backtest `21`, open `0`
+- `2026-04-22 LONG`: replay `19`, backtest `19`, open `0`
+- `2026-04-22 SHORT`: replay `23`, backtest `23`, open `0`
+
+Implication:
+
+- replay and backtest now agree on the same sparse exact-feed tape
+- the remaining live-vs-backtest parity problem is back in the live-input domain:
+  first-bar feed drift and live-session symbol/tape sparsity, not replay-vs-backtest logic
 
 ---
 

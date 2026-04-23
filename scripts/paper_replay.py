@@ -19,6 +19,12 @@ from engine.bar_orchestrator import (
 )
 from engine.constants import parse_iso_date
 from engine.cpr_atr_strategy import DayPack
+from engine.day_pack_sources import (
+    apply_opening_range_from_day_pack,
+    is_feed_audit_pack_source,
+    load_feed_audit_day_pack_records,
+    normalize_pack_source,
+)
 from engine.paper_runtime import (
     PaperRuntimeState,
     SymbolRuntimeState,
@@ -92,6 +98,68 @@ def _runtime_setup_status(runtime_state: PaperRuntimeState, symbol: str) -> str:
         return "pending"
     direction = str(state.setup_row.get("direction") or "").upper()
     return "candidate" if direction in {"LONG", "SHORT"} else "rejected"
+
+
+async def _close_remaining_open_positions_at_time_exit(
+    *,
+    session: Any,
+    runtime_state: PaperRuntimeState,
+    tracker: SessionPositionTracker,
+    params: Any,
+    symbol_last_prices: dict[str, float],
+) -> tuple[int, datetime | None]:
+    """Force-close any replay positions still open when the captured tape ends.
+
+    Batch backtest falls back to a TIME exit at `params.time_exit` using the last
+    available close when a sparse day pack ends before the configured exit time.
+    Replay needs the same terminal behavior or exact-feed comparisons will leave
+    OPEN positions stranded in paper.duckdb and undercount archived trades.
+    """
+
+    open_symbols = sorted(tracker.open_symbols())
+    if not open_symbols:
+        return 0, None
+
+    closed = 0
+    terminal_ts: datetime | None = None
+    for symbol in open_symbols:
+        state = runtime_state.symbols.get(symbol)
+        if state is None or state.trade_date is None:
+            continue
+        last_price = symbol_last_prices.get(symbol)
+        if last_price is None and state.closes:
+            last_price = float(state.closes[-1])
+        tracked_position = tracker.get_open_position(symbol)
+        if last_price is None and tracked_position is not None:
+            last_price = float(getattr(tracked_position, "last_price", 0.0) or 0.0)
+        if last_price is None or float(last_price) <= 0.0:
+            continue
+
+        candle_ts = _combine_bar_ts(str(state.trade_date), str(params.time_exit))
+        candle = SimpleNamespace(
+            symbol=symbol,
+            bar_end=candle_ts,
+            open=float(last_price),
+            high=float(last_price),
+            low=float(last_price),
+            close=float(last_price),
+            volume=0.0,
+        )
+        evaluation = await evaluate_candle(
+            session=session,
+            candle=candle,
+            runtime_state=runtime_state,
+            now=candle_ts,
+            position_tracker=tracker,
+            allow_entry_evaluation=False,
+        )
+        advance = dict(evaluation.get("advance_result") or {})
+        if advance.get("action") == "CLOSE":
+            tracker.record_close(symbol, float(advance.get("exit_value") or 0.0))
+            closed += 1
+            terminal_ts = candle_ts
+
+    return closed, terminal_ts
 
 
 def _has_column(db: Any, table: str, column: str) -> bool:
@@ -216,7 +284,37 @@ def load_replay_day_packs(
     symbols: list[str],
     start_date: str | None,
     end_date: str | None,
+    pack_source: str = "intraday_day_pack",
+    pack_source_session_id: str | None = None,
 ) -> list[ReplayDayPack]:
+    resolved_source = normalize_pack_source(pack_source)
+    if is_feed_audit_pack_source(resolved_source):
+        records = load_feed_audit_day_pack_records(
+            session_id=str(pack_source_session_id or ""),
+            symbols=symbols,
+            start_date=start_date,
+            end_date=end_date,
+        )
+        return [
+            ReplayDayPack(
+                symbol=str(record["symbol"]),
+                trade_date=str(record["trade_date"])[:10],
+                day_pack=DayPack(
+                    time_str=[str(value) for value in record["time_str"]],
+                    opens=[float(x) for x in record["opens"]],
+                    highs=[float(x) for x in record["highs"]],
+                    lows=[float(x) for x in record["lows"]],
+                    closes=[float(x) for x in record["closes"]],
+                    volumes=[float(x) for x in record["volumes"]],
+                    rvol_baseline=[
+                        float(v) if v is not None else None
+                        for v in (record.get("rvol_baseline") or [])
+                    ],
+                ),
+            )
+            for record in records
+        ]
+
     db = get_db()
     pack_time_mode = _resolve_pack_time_mode(db)
     query, params = _build_replay_query(
@@ -399,6 +497,23 @@ async def _process_replay_bar_major(
 
         await asyncio.sleep(0)
 
+    if not triggered and tracker.open_symbols():
+        closed_count, terminal_ts = await _close_remaining_open_positions_at_time_exit(
+            session=session,
+            runtime_state=runtime_state,
+            tracker=tracker,
+            params=params,
+            symbol_last_prices=symbol_last_prices,
+        )
+        if closed_count > 0:
+            logger.info(
+                "Replay terminal time close session_id=%s closed=%d bar=%s",
+                session_id,
+                closed_count,
+                terminal_ts.isoformat() if terminal_ts else None,
+            )
+            last_bar_ts = terminal_ts or last_bar_ts
+
     # Write feed state for the last bar using the last symbol's data.
     if last_bar_ts is not None:
         await upsert_feed_state(
@@ -518,6 +633,7 @@ async def replay_session(
     if isinstance(prepared, dict):
         return prepared
     session, replay_symbols, normalized_start, normalized_end = prepared
+    params = build_backtest_params(session)
 
     if preloaded_days is not None:
         replay_symbols_set = set(replay_symbols)
@@ -527,6 +643,10 @@ async def replay_session(
             symbols=replay_symbols,
             start_date=normalized_start,
             end_date=normalized_end,
+            pack_source=str(
+                getattr(params, "pack_source", "intraday_day_pack") or "intraday_day_pack"
+            ),
+            pack_source_session_id=str(getattr(params, "pack_source_session_id", "") or ""),
         )
     if not replay_days:
         return await _complete_empty_replay(
@@ -543,7 +663,6 @@ async def replay_session(
         allow_live_setup_fallback=False, bar_end_offset=timedelta(minutes=5)
     )
     symbol_last_prices: dict[str, float] = {}
-    params = build_backtest_params(session)
     tracker = SessionPositionTracker(
         max_positions=int(getattr(session, "max_positions", 1) or 1),
         portfolio_value=float(getattr(params, "portfolio_value", 0.0) or 0.0),
@@ -564,6 +683,7 @@ async def replay_session(
         len({d.trade_date for d in replay_days}),
         leave_active,
     )
+    day_pack_lookup = {(d.symbol, d.trade_date): d.day_pack for d in replay_days}
     sorted_days = sorted(replay_days, key=lambda d: (d.trade_date, d.symbol))
     grouped_days = [(dt, list(grp)) for dt, grp in groupby(sorted_days, key=lambda d: d.trade_date)]
     total_dates = len(grouped_days)
@@ -598,6 +718,20 @@ async def replay_session(
             if tc <= 0.0 or bc <= 0.0 or atr <= 0.0:
                 runtime_state.invalid_setup_rows += 1
                 continue
+            if is_feed_audit_pack_source(getattr(params, "pack_source", None)):
+                day_pack = day_pack_lookup.get((symbol, _trade_date))
+                if day_pack is not None:
+                    setup_row = apply_opening_range_from_day_pack(
+                        setup_row,
+                        time_str=day_pack.time_str,
+                        opens=day_pack.opens,
+                        highs=day_pack.highs,
+                        lows=day_pack.lows,
+                        closes=day_pack.closes,
+                        volumes=day_pack.volumes,
+                        or_minutes=int(params.or_minutes or 5),
+                        source_label="paper_feed_audit",
+                    )
             setup_row.setdefault("setup_source", "market_day_state")
             state.setup_row = setup_row
             # Set trade_date so _reset_symbol_state_for_trade_date becomes a no-op

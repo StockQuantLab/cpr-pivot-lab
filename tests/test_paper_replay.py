@@ -12,6 +12,101 @@ from db.postgres import FeedState
 from engine.cpr_atr_strategy import DayPack
 
 
+def test_load_replay_day_packs_supports_feed_audit_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        paper_replay,
+        "load_feed_audit_day_pack_records",
+        lambda **kwargs: [
+            {
+                "symbol": "SBIN",
+                "trade_date": "2026-04-20",
+                "time_str": ["09:15", "09:20"],
+                "opens": [100.0, 101.0],
+                "highs": [101.0, 102.0],
+                "lows": [99.5, 100.5],
+                "closes": [100.5, 101.5],
+                "volumes": [1000.0, 900.0],
+                "rvol_baseline": [800.0, 850.0],
+            }
+        ],
+    )
+
+    packs = paper_replay.load_replay_day_packs(
+        symbols=["SBIN"],
+        start_date="2026-04-20",
+        end_date="2026-04-20",
+        pack_source="paper_feed_audit",
+        pack_source_session_id="sess-1",
+    )
+
+    assert len(packs) == 1
+    assert packs[0].symbol == "SBIN"
+    assert packs[0].trade_date == "2026-04-20"
+    assert packs[0].day_pack.time_str == ["09:15", "09:20"]
+    assert packs[0].day_pack.rvol_baseline == [800.0, 850.0]
+
+
+@pytest.mark.asyncio
+async def test_close_remaining_open_positions_at_time_exit_uses_last_price(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = SimpleNamespace(strategy="CPR_LEVELS", strategy_params={})
+    params = SimpleNamespace(time_exit="15:15")
+    runtime_state = paper_replay.PaperRuntimeState()
+    state = runtime_state.symbols.setdefault("SBIN", paper_replay.SymbolRuntimeState())
+    state.trade_date = "2024-01-02"
+    state.closes = [101.5]
+
+    tracker = paper_replay.SessionPositionTracker(max_positions=10, portfolio_value=100_000.0)
+    tracker.record_open(
+        SimpleNamespace(
+            position_id="pos-1",
+            symbol="SBIN",
+            direction="LONG",
+            entry_price=100.0,
+            stop_loss=99.0,
+            target_price=105.0,
+            quantity=10.0,
+            current_qty=10.0,
+            last_price=101.5,
+            trail_state={"entry_time": "09:20"},
+        ),
+        position_value=1_000.0,
+    )
+
+    calls: list[datetime] = []
+
+    async def fake_evaluate_candle(**kwargs):
+        calls.append(kwargs["candle"].bar_end)
+        return {
+            "symbol": kwargs["candle"].symbol,
+            "action": "ADVANCE",
+            "candidate": None,
+            "setup_row": None,
+            "advance_result": {
+                "action": "CLOSE",
+                "exit_value": 1_015.0,
+            },
+        }
+
+    monkeypatch.setattr(paper_replay, "evaluate_candle", fake_evaluate_candle)
+
+    closed, terminal_ts = await paper_replay._close_remaining_open_positions_at_time_exit(
+        session=session,
+        runtime_state=runtime_state,
+        tracker=tracker,
+        params=params,
+        symbol_last_prices={"SBIN": 101.5},
+    )
+
+    assert closed == 1
+    assert terminal_ts == datetime(2024, 1, 2, 15, 15, tzinfo=paper_replay.IST)
+    assert calls == [terminal_ts]
+    assert tracker.open_count == 0
+
+
 @pytest.mark.asyncio
 async def test_replay_session_streams_candles_and_archives_completed_session(
     monkeypatch: pytest.MonkeyPatch,

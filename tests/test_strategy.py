@@ -27,6 +27,7 @@ from engine.cpr_atr_strategy import (
 from engine.strategy_presets import (
     CPR_LEVELS_PRESETS,
     FBR_PRESETS,
+    build_strategy_config_from_overrides,
     build_strategy_config_from_preset,
     list_strategy_preset_names,
 )
@@ -99,12 +100,19 @@ class TestBacktestParams:
         assert long_cfg.min_price == 50.0
         assert long_cfg.cpr_levels.cpr_min_close_atr == 0.5
         assert long_cfg.cpr_levels.use_narrowing_filter is True
+        assert long_cfg.cpr_levels.momentum_confirm is True
         assert short_cfg.direction_filter == "SHORT"
         assert short_cfg.risk_based_sizing is True
         assert short_cfg.skip_rvol_check is True
         assert short_cfg.cpr_levels.cpr_min_close_atr == 0.5
         assert short_cfg.cpr_levels.use_narrowing_filter is True
+        assert short_cfg.cpr_levels.momentum_confirm is True
         assert short_cfg.short_trail_atr_multiplier == 1.25
+
+        std_long = build_strategy_config_from_preset("CPR_LEVELS_STANDARD_LONG")
+        std_short = build_strategy_config_from_preset("CPR_LEVELS_STANDARD_SHORT")
+        assert std_long.cpr_levels.momentum_confirm is True
+        assert std_short.cpr_levels.momentum_confirm is True
 
     def test_fbr_risk_presets(self):
         assert "FBR_RISK_LONG" in FBR_PRESETS
@@ -163,6 +171,17 @@ class TestBacktestParams:
         assert cfg_short.direction_filter == "SHORT", "direction clobbered"
         assert cfg_short.skip_rvol_check is True, "skip_rvol_check clobbered by False"
         assert cfg_short.short_trail_atr_multiplier == 1.25, "short trail multiplier clobbered"
+
+    def test_pack_source_params_round_trip(self):
+        cfg = build_strategy_config_from_overrides(
+            "CPR_LEVELS",
+            {
+                "pack_source": "paper_feed_audit",
+                "pack_source_session_id": "CPR_LEVELS_LONG-2026-04-20-live-kite",
+            },
+        )
+        assert cfg.pack_source == "paper_feed_audit"
+        assert cfg.pack_source_session_id == "CPR_LEVELS_LONG-2026-04-20-live-kite"
 
     def test_custom_params(self):
         p = BacktestParams(

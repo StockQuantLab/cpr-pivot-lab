@@ -174,6 +174,13 @@ def find_cpr_levels_entry(
         _last_reject_reason.value = "NARROWING"
         return None
 
+    cpr_shift_filter = str(cpr_cfg.cpr_shift_filter or "ALL").upper()
+    if cpr_shift_filter != "ALL":
+        setup_shift = str(setup_row.get("cpr_shift") or "").upper()
+        if setup_shift != cpr_shift_filter:
+            _last_reject_reason.value = "CPR_SHIFT"
+            return None
+
     atr = float(setup_row["atr"])
     or_high_raw = setup_row.get("high_915")
     if or_high_raw is None:
@@ -576,6 +583,8 @@ def simulate_trade_lifecycle(
     runner_target_price: float | None = None,
     scale_out_pct: float = 0.0,
     candle_exit: int = 0,
+    time_stop_bars: int = 0,
+    momentum_confirm: bool = False,
 ) -> TradeLifecycleOutcome:
     """Run the sequential trade lifecycle that follows entry."""
     ts = TrailingStop(
@@ -619,13 +628,23 @@ def simulate_trade_lifecycle(
     lows = day_pack.lows
     highs = day_pack.highs
     closes = day_pack.closes
+    opens = day_pack.opens
     n = len(times)
     i0 = max(0, int(start_idx))
+    momentum_exit_pending = False
 
     for i in range(i0, n):
         time_str = times[i]
         if time_str <= entry_time:
             continue
+
+        # Momentum filter: exit at bar 2 open if bar 1 closed adverse
+        if momentum_exit_pending:
+            exit_time = time_str
+            exit_reason = "MOMENTUM_FAIL"
+            _record_fill(remaining_qty, float(opens[i]))
+            break
+
         low = float(lows[i])
         high = float(highs[i])
         close = float(closes[i])
@@ -639,6 +658,26 @@ def simulate_trade_lifecycle(
             adverse = high - entry_price
         max_favorable = max(max_favorable, favorable)
         max_adverse = max(max_adverse, adverse)
+
+        # Time-stop: exit at close if N bars elapsed with MFE still below 0.5R
+        if (
+            time_stop_bars > 0
+            and candle_count >= time_stop_bars
+            and sl_distance > 0
+            and max_favorable / sl_distance < 0.5
+        ):
+            exit_time = time_str
+            exit_reason = "TIME_STOP"
+            _record_fill(remaining_qty, close)
+            break
+
+        # Set momentum exit flag if bar 1 closed against trade direction
+        if momentum_confirm and candle_count == 1:
+            if (direction == "LONG" and close < entry_price) or (
+                direction == "SHORT" and close > entry_price
+            ):
+                momentum_exit_pending = True
+
         decision = resolve_completed_candle_trade_step(
             ts=ts,
             direction=direction,

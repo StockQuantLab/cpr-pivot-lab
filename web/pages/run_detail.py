@@ -14,6 +14,7 @@ from nicegui import ui
 
 from web.components import (  # shared helpers
     COLORS,
+    METRIC_GLOSSARY,
     THEME,
     _as_bool,
     apply_chart_theme,
@@ -29,7 +30,6 @@ from web.components import (  # shared helpers
     page_layout,
     paginated_table,
     param_detail_card,
-    param_header_strip,
     safe_timer,
     strat_badge,
     trade_filter_bar,
@@ -37,6 +37,7 @@ from web.components import (  # shared helpers
 from web.state import (
     aget_run_metadata,
     aget_runs,
+    aget_setup_funnel,
     aget_trade_inspection,
     aget_trades,
     build_run_options,
@@ -63,9 +64,19 @@ def _mini_card(title: str, value: str, color: str) -> None:
         ui.label(value).classes("text-lg font-bold mono-font tabular-nums").style(
             f"color: {color};"
         )
-        ui.label(title).classes("text-xs uppercase tracking-wide mt-1").style(
-            f"color: {theme['text_secondary']};"
+        title_label = (
+            ui.label(title)
+            .classes("text-xs uppercase tracking-wide mt-1")
+            .style(f"color: {theme['text_secondary']};")
         )
+        tooltip_text = METRIC_GLOSSARY.get(title)
+        if tooltip_text:
+            with title_label:
+                ui.tooltip(tooltip_text).classes("text-sm").style(
+                    f"background: {theme['surface']}; color: {theme['text_primary']}; "
+                    f"border: 1px solid {theme['surface_border']}; "
+                    "max-width: 300px; padding: 8px 12px;"
+                )
 
 
 def _extract_run_params(meta: dict, run_meta: dict) -> dict:
@@ -231,13 +242,16 @@ def _render_content(
     display_params = _effective_run_params(params)
 
     # ── Header: strategy badge + period ──────────────────────────────────────
+    total_universe = len(run_meta.get("symbols", [])) if run_meta.get("symbols") else 0
     with ui.row().classes("w-full justify-between items-center mb-3"):
         ui.html(strat_badge(strategy))
         with ui.row().classes("items-center gap-3"):
             start = str(meta.get("start_date") or "")[:10]
             end = str(meta.get("end_date") or "")[:10]
-            syms = meta.get("symbol_count", 0)
-            ui.label(f"{start} → {end}  ·  {syms} symbols").classes("text-sm mono-font").style(
+            sym_label = (
+                f"{total_universe:,}" if total_universe else str(meta.get("symbol_count", 0))
+            )
+            ui.label(f"{start} → {end}  ·  {sym_label} symbols").classes("text-sm mono-font").style(
                 f"color: {theme['text_secondary']};"
             )
             if run_id:
@@ -255,12 +269,9 @@ def _render_content(
                     .tooltip("Copy run ID")
                 )
 
-    # ── Parameter header strip ──────────────────────────────────────────────
+    # ── Parameter detail card (collapsed by default) ────────────────────────
     if display_params:
-        param_header_strip(display_params)
-
-    # ── Parameter detail card ────────────────────────────────────────────────
-    param_detail_card(display_params)
+        param_detail_card(display_params)
 
     # ── Primary KPIs (compact — supporting metrics inline) ──────────────────
     n_trades = int(meta.get("trade_count") or (len(df) if not df.is_empty() else 0))
@@ -310,16 +321,21 @@ def _render_content(
     )
 
     # Secondary metrics — styled mini cards
+    sym_card_val = (
+        f"{n_syms:,} / {total_universe:,}"
+        if total_universe and n_syms != total_universe
+        else str(total_universe or n_syms)
+    )
     with ui.row().classes("w-full gap-3 mb-4 flex-wrap mini-card-row"):
         _mini_card("Trades", f"{n_trades:,}", colors["info"])
-        _mini_card("Symbols", str(n_syms), colors["info"])
+        _mini_card("Symbols", sym_card_val, colors["info"])
         _mini_card(
             "Return",
             f"{total_return:.1f}%",
             colors["success"] if total_return >= 0 else colors["error"],
         )
         _mini_card(
-            "PF",
+            "Profit Factor",
             f"{profit_factor:.2f}",
             colors["success"] if profit_factor >= 1.5 else colors["warning"],
         )
@@ -387,22 +403,21 @@ def _render_content(
 
     divider()
 
-    # ── Analytics Tabs (5 tabs) ─────────────────────────────────────────────
+    # ── Analytics Tabs (4 tabs) ─────────────────────────────────────────────
     with ui.tabs().classes("w-full") as tabs:
         ui.tab("trades", label="Trades")
-        ui.tab("top_trades", label="Top Trades")
         ui.tab("charts", label="Charts")
         ui.tab("analysis", label="Analysis")
         ui.tab("audit", label="Audit")
 
     with ui.tab_panels(tabs, value="trades").classes("w-full bg-transparent pt-4"):
         with ui.tab_panel("trades"):
-            with ui.expansion("Trades", icon="table_chart").classes("w-full"):
+            with ui.expansion("Trades", icon="table_chart", value=True).classes("w-full"):
                 _tab_trades(df, colors, theme, _open_trade_inspector)
+            with ui.expansion("Top Winners & Losers", icon="emoji_events").classes("w-full"):
+                _tab_winners_losers(df, colors, theme, _open_trade_inspector)
             with ui.expansion("Daily Summary", icon="calendar_view_day").classes("w-full"):
                 _tab_daily_summary(df, colors, theme)
-        with ui.tab_panel("top_trades"):
-            _tab_winners_losers(df, colors, theme, _open_trade_inspector)
         with ui.tab_panel("charts"):
             _tab_equity(df, colors)
             divider()
@@ -418,6 +433,8 @@ def _render_content(
             divider()
             _tab_yearly(df, colors, theme)
         with ui.tab_panel("audit"):
+            _tab_setup_funnel(run_id, colors, theme)
+            divider()
             _tab_execution_audit(df, run_meta, colors, theme)
 
 
@@ -977,6 +994,92 @@ def _tab_exits(df: pl.DataFrame, colors: dict, theme: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Tab: Setup Funnel
+# ---------------------------------------------------------------------------
+def _tab_setup_funnel(run_id: str, colors: dict, theme: dict) -> None:
+    """Render setup funnel showing how many symbols survived each filter step."""
+    container = ui.column().classes("w-full")
+
+    async def _load() -> None:
+        funnel_data = await aget_setup_funnel(run_id)
+        container.clear()
+        with container:
+            if not funnel_data:
+                ui.label(
+                    "No setup funnel data for this run. "
+                    "Re-run with --save to capture filter step counts."
+                ).classes("text-sm").style(f"color: {theme['text_muted']};")
+                return
+
+            steps = funnel_data
+            total_first = steps[0]["count"] if steps else 1
+            total_last = steps[-1]["count"] if steps else 0
+            yield_pct = (total_last / total_first * 100) if total_first else 0
+
+            ui.label("Setup Funnel").classes("text-lg font-semibold mb-2").style(
+                f"color: {theme['text_primary']};"
+            )
+            info_box(
+                f"{total_first:,} symbols scanned → {total_last:,} produced trades "
+                f"({yield_pct:.1f}% yield). Shows how many symbols survived each filter stage.",
+                color="blue",
+            )
+
+            labels = [s["filter_step"].replace("_", " ").title() for s in steps]
+            counts = [s["count"] for s in steps]
+            pcts = [f"{c / total_first * 100:.1f}%" if total_first else "0%" for c in counts]
+
+            fig = go.Figure()
+            fig.add_trace(
+                go.Bar(
+                    x=counts,
+                    y=labels,
+                    orientation="h",
+                    marker_color=colors["primary"],
+                    text=[f"{c:,} ({p})" for c, p in zip(counts, pcts, strict=True)],
+                    textposition="outside",
+                    hovertemplate="%{y}: %{x:,} symbols<extra></extra>",
+                )
+            )
+            fig.update_layout(
+                title="Symbols Surviving Each Filter Step",
+                xaxis_title="Symbol Count",
+                height=max(300, len(steps) * 36 + 100),
+                yaxis=dict(autorange="reversed"),
+                margin=dict(l=180),
+            )
+            apply_chart_theme(fig)
+            ui.plotly(fig).classes("w-full mb-4")
+
+            rows = [
+                {
+                    "step": s["filter_step"].replace("_", " ").title(),
+                    "count": f"{s['count']:,}",
+                    "pct": pcts[i],
+                    "drop": (
+                        f"-{steps[i - 1]['count'] - s['count']:,}"
+                        if i > 0 and steps[i - 1]["count"] > s["count"]
+                        else "—"
+                    ),
+                }
+                for i, s in enumerate(steps)
+            ]
+            paginated_table(
+                columns=[
+                    {"name": "step", "label": "Filter Step", "field": "step", "align": "left"},
+                    {"name": "count", "label": "Symbols", "field": "count", "align": "right"},
+                    {"name": "pct", "label": "% of Total", "field": "pct", "align": "right"},
+                    {"name": "drop", "label": "Dropped", "field": "drop", "align": "right"},
+                ],
+                rows=rows,
+                row_key="step",
+                page_size=20,
+            )
+
+    safe_timer(0.1, _load)
+
+
+# ---------------------------------------------------------------------------
 # Tab: Execution Audit
 # ---------------------------------------------------------------------------
 def _tab_execution_audit(df: pl.DataFrame, run_meta: dict, colors: dict, theme: dict) -> None:
@@ -1176,32 +1279,56 @@ def _tab_trades(df: pl.DataFrame, colors: dict, theme: dict, on_trade_click) -> 
             columns=[
                 {"name": "date", "label": "Date", "field": "date", "align": "left"},
                 {"name": "symbol", "label": "Symbol", "field": "symbol", "align": "left"},
-                {"name": "entry_time", "label": "In", "field": "entry_time", "align": "center"},
-                {"name": "exit_time", "label": "Out", "field": "exit_time", "align": "center"},
+                {
+                    "name": "entry_time",
+                    "label": "In Time",
+                    "field": "entry_time",
+                    "align": "center",
+                },
+                {"name": "exit_time", "label": "Out Time", "field": "exit_time", "align": "center"},
                 {"name": "dir", "label": "Dir", "field": "dir", "align": "center"},
                 {"name": "entry", "label": "Entry", "field": "entry", "align": "right"},
                 {"name": "exit", "label": "Exit", "field": "exit", "align": "right"},
                 {"name": "qty", "label": "Qty", "field": "qty", "align": "right"},
                 {
                     "name": "position_value",
-                    "label": "Pos ₹",
+                    "label": "Position ₹",
                     "field": "position_value",
                     "align": "right",
                 },
                 {"name": "pnl", "label": "P/L", "field": "pnl", "align": "right"},
                 {"name": "pnl_pct", "label": "P/L %", "field": "pnl_pct", "align": "right"},
                 {"name": "exit_reason", "label": "Exit", "field": "exit_reason", "align": "left"},
-                {"name": "sl", "label": "SL", "field": "sl", "align": "right"},
+                {"name": "sl", "label": "Stop Loss", "field": "sl", "align": "right"},
                 {"name": "target", "label": "Target", "field": "target", "align": "right"},
-                {"name": "atr", "label": "ATR", "field": "atr", "align": "right"},
-                {"name": "or_atr", "label": "OR/ATR", "field": "or_atr", "align": "right"},
+                {
+                    "name": "atr",
+                    "label": "ATR",
+                    "field": "atr",
+                    "align": "right",
+                    "classes": "hide-detail",
+                },
+                {
+                    "name": "or_atr",
+                    "label": "OR/ATR",
+                    "field": "or_atr",
+                    "align": "right",
+                    "classes": "hide-detail",
+                },
                 {
                     "name": "cpr_width_pct",
-                    "label": "CPR W%",
+                    "label": "CPR Width %",
                     "field": "cpr_width_pct",
                     "align": "right",
+                    "classes": "hide-detail",
                 },
-                {"name": "gap_pct", "label": "Gap %", "field": "gap_pct", "align": "right"},
+                {
+                    "name": "gap_pct",
+                    "label": "Gap %",
+                    "field": "gap_pct",
+                    "align": "right",
+                    "classes": "hide-detail",
+                },
             ],
             rows=filtered,
             row_key="idx",
@@ -1222,14 +1349,38 @@ def _tab_trades(df: pl.DataFrame, colors: dict, theme: dict, on_trade_click) -> 
         exit_options=exit_reasons,
     )
 
+    show_detail = {"on": False}
+
+    def _toggle_detail() -> None:
+        show_detail["on"] = not show_detail["on"]
+        action = "el.style.display = ''" if show_detail["on"] else "el.style.display = 'none'"
+        ui.run_javascript(
+            f"document.querySelectorAll('.hide-detail').forEach(el => {{ {action}; }});"
+        )
+        detail_btn.text("Hide detail columns" if show_detail["on"] else "Show detail columns")
+
+    detail_btn = (
+        ui.button("Show detail columns", on_click=_toggle_detail)
+        .props("flat dense size=sm")
+        .classes("mb-2")
+        .style(f"color: {theme['text_secondary']};")
+    )
+
+    # Hide detail columns on initial render
+    ui.timer(
+        0.3,
+        lambda: ui.run_javascript(
+            "document.querySelectorAll('.hide-detail').forEach(el => { el.style.display = 'none'; });"
+        ),
+        once=True,
+    )
+
     _filtered()
 
 
 def _tab_winners_losers(df: pl.DataFrame, colors: dict, theme: dict, on_trade_click) -> None:
-    winners = (
-        df.sort("profit_loss_pct", descending=True).head(min(25, len(df))).with_row_index("idx")
-    )
-    losers = df.sort("profit_loss_pct").head(min(25, len(df))).with_row_index("idx")
+    winners = df.sort("profit_loss", descending=True).head(min(25, len(df))).with_row_index("idx")
+    losers = df.sort("profit_loss").head(min(25, len(df))).with_row_index("idx")
 
     def _rows(frame: pl.DataFrame) -> list[dict]:
         return [
@@ -1239,7 +1390,6 @@ def _tab_winners_losers(df: pl.DataFrame, colors: dict, theme: dict, on_trade_cl
                 "date": str(r.get("trade_date") or "")[:10],
                 "entry_time": str(r.get("entry_time") or "")[:5],
                 "exit_time": str(r.get("exit_time") or "")[:5],
-                "dir": r.get("direction", ""),
                 "entry": round(float(r.get("entry_price") or 0.0), 2),
                 "exit": round(float(r.get("exit_price") or 0.0), 2),
                 "pnl": round(float(r.get("profit_loss") or 0.0), 2),
@@ -1252,9 +1402,8 @@ def _tab_winners_losers(df: pl.DataFrame, colors: dict, theme: dict, on_trade_cl
     columns = [
         {"name": "symbol", "label": "Symbol", "field": "symbol"},
         {"name": "date", "label": "Date", "field": "date"},
-        {"name": "entry_time", "label": "In", "field": "entry_time"},
-        {"name": "exit_time", "label": "Out", "field": "exit_time"},
-        {"name": "dir", "label": "Dir", "field": "dir"},
+        {"name": "entry_time", "label": "In Time", "field": "entry_time"},
+        {"name": "exit_time", "label": "Out Time", "field": "exit_time"},
         {"name": "entry", "label": "Entry", "field": "entry", "align": "right"},
         {"name": "exit", "label": "Exit", "field": "exit", "align": "right"},
         {"name": "pnl", "label": "P/L", "field": "pnl", "align": "right"},
@@ -1264,7 +1413,7 @@ def _tab_winners_losers(df: pl.DataFrame, colors: dict, theme: dict, on_trade_cl
 
     info_box(
         "Click any winner or loser to open the Daily CPR inspection view. "
-        "Direction is shown explicitly here so longs and shorts are not ambiguous.",
+        "Sorted by absolute rupee P/L.",
         color="blue",
     )
 

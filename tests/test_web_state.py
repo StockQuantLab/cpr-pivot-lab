@@ -222,13 +222,13 @@ def test_build_run_options_includes_rvol_state() -> None:
 
     labels = list(options)
     assert labels[0].startswith(
-        "run-1 | 2026-04-12 20:50 | cpr-levels-long-daily-reset-rvol1-atr0.35 | 2025-01-01→2026-03-27 | "
+        "run-1 | 2026-04-12 20:50 | cpr_levels-long-slotsize-daily-reset-rvol1-atr0.35 | 2025-01-01→2026-03-27 | "
         "TotRet 58.3% | P/L ₹582,592 | Trades 2,060"
-    )
+    ), f"Got: {labels[0]}"
     assert labels[1].startswith(
-        "run-2 | 2026-04-11 18:15 | cpr-levels-short-daily-reset-rvoloff | 2025-01-01→2026-03-27 | "
+        "run-2 | 2026-04-11 18:15 | cpr_levels-short-slotsize-daily-reset-rvoloff | 2025-01-01→2026-03-27 | "
         "TotRet 51.2% | P/L ₹511,200 | Trades 1,800"
-    )
+    ), f"Got: {labels[1]}"
 
 
 def test_build_run_options_includes_paper_mode_and_feed() -> None:
@@ -255,11 +255,11 @@ def test_build_run_options_includes_paper_mode_and_feed() -> None:
     )
 
     label = next(iter(options))
-    assert "cpr-levels-long-daily-reset-rvol1-atr0.5-live-local" in label
+    assert "cpr_levels-long-slotsize-daily-reset-rvol1-atr0.5" in label
     assert label.startswith(
-        "paper-1 | 2026-04-17 15:20 | cpr-levels-long-daily-reset-rvol1-atr0.5-live-local | "
+        "paper-1 | 2026-04-17 15:20 | cpr_levels-long-slotsize-daily-reset-rvol1-atr0.5 | "
         "2026-04-17→2026-04-17 | TotRet 10.2% | P/L ₹1,010 | Trades 22"
-    )
+    ), f"Got: {label}"
 
 
 @pytest.mark.asyncio

@@ -100,24 +100,24 @@ Reference sets (Apr 2026):
 | Daily Reset Std SHORT | `1d6e5e93618e` | 2025-01-01 → 2026-04-09 | ₹1,041,450 |
 | Daily Reset Std LONG | `84a85d954f99` | 2025-01-01 → 2026-04-09 | ₹827,381 |
 
-- **Current CPR baselines (2026-04-21 refresh on the current shared-exit code — use these for all future comparisons):**
+- **Current CPR baselines (2026-04-23 refresh with `momentum_confirm=True` on all four CPR presets — use these for all future comparisons):**
 
 SHORT presets now use `short_trail_atr_multiplier = 1.25`. LONG keeps `trail_atr_multiplier = 1.0`.
 
 | Mode | Preset | Run ID | Start → End | P/L | Calmar |
 |------|--------|--------|-------------|-----|--------|
-| Daily Reset | `CPR_LEVELS_RISK_LONG` | `c543038a648a` | 2025-01-01 → 2026-04-21 | ₹992,935 | 167.84 |
-| Daily Reset | `CPR_LEVELS_RISK_SHORT` | `804f589a2fc7` | 2025-01-01 → 2026-04-21 | ₹1,060,744 | 72.83 |
-| Daily Reset | `CPR_LEVELS_STANDARD_LONG` | `ed2a43f23bde` | 2025-01-01 → 2026-04-21 | ₹1,005,080 | 170.15 |
-| Daily Reset | `CPR_LEVELS_STANDARD_SHORT` | `14d160199314` | 2025-01-01 → 2026-04-21 | ₹1,064,488 | 65.91 |
-| Compound | `CPR_LEVELS_STANDARD_LONG` | `f2bf97b2dc70` | 2025-01-01 → 2026-04-21 | ₹2,148,464 | 216.73 |
-| Compound | `CPR_LEVELS_STANDARD_SHORT` | `cf4efe1d53c5` | 2025-01-01 → 2026-04-21 | ₹2,563,469 | 103.33 |
-| Compound | `CPR_LEVELS_RISK_LONG` | `4707f7fe5585` | 2025-01-01 → 2026-04-21 | ₹2,147,635 | 216.63 |
-| Compound | `CPR_LEVELS_RISK_SHORT` | `5bb7df6e7c0c` | 2025-01-01 → 2026-04-21 | ₹2,603,192 | 104.75 |
+| Daily Reset | `CPR_LEVELS_RISK_LONG` | `dbf89ea77af6` | 2025-01-01 → 2026-04-22 | ₹1,024,831 | 201.42 |
+| Daily Reset | `CPR_LEVELS_RISK_SHORT` | `a37501b04fa8` | 2025-01-01 → 2026-04-22 | ₹1,094,206 | 99.85 |
+| Daily Reset | `CPR_LEVELS_STANDARD_LONG` | `58c20fe411d8` | 2025-01-01 → 2026-04-22 | ₹1,033,436 | 200.47 |
+| Daily Reset | `CPR_LEVELS_STANDARD_SHORT` | `9f0e916bbff0` | 2025-01-01 → 2026-04-22 | ₹1,094,116 | 85.72 |
+| Compound | `CPR_LEVELS_STANDARD_LONG` | `c8e45b38a697` | 2025-01-01 → 2026-04-22 | ₹2,248,867 | 244.61 |
+| Compound | `CPR_LEVELS_STANDARD_SHORT` | `a050cedebdb8` | 2025-01-01 → 2026-04-22 | ₹2,766,392 | 166.62 |
+| Compound | `CPR_LEVELS_RISK_LONG` | `d6bcb94cce9c` | 2025-01-01 → 2026-04-22 | ₹2,244,433 | 244.19 |
+| Compound | `CPR_LEVELS_RISK_SHORT` | `f143a95023c0` | 2025-01-01 → 2026-04-22 | ₹2,734,772 | 162.88 |
 
-The 2026-04-21 rerun refreshed the canonical baseline set on the current shared-exit code.
-LONG improved again versus the prior reference rows; SHORT stayed flat. See
-`docs/ISSUES.md` and `docs/trailing-stop-explained.md` for the full explanation.
+The 2026-04-23 rerun refreshed the canonical baseline set after promoting
+`momentum_confirm=True` into all four CPR presets. This replaced the prior Apr 21
+reference rows and is now the clean 8-run baseline family for CPR comparisons.
 
 When extending the v2 set to a later end date, rerun these same eight presets and
 compare the overlapping window only. The incremental window should be the only source

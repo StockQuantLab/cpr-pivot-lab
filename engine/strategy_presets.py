@@ -23,6 +23,7 @@ CPR_LEVELS_PRESETS: dict[str, dict[str, Any]] = {
             "narrowing_filter": True,
             "risk_based_sizing": True,
             "skip_rvol_check": False,
+            "momentum_confirm": True,
         },
     },
     "CPR_LEVELS_RISK_SHORT": {
@@ -35,6 +36,7 @@ CPR_LEVELS_PRESETS: dict[str, dict[str, Any]] = {
             "risk_based_sizing": True,
             "skip_rvol_check": True,
             "short_trail_atr_multiplier": 1.25,
+            "momentum_confirm": True,
         },
     },
     "CPR_LEVELS_STANDARD_LONG": {
@@ -46,6 +48,7 @@ CPR_LEVELS_PRESETS: dict[str, dict[str, Any]] = {
             "narrowing_filter": True,
             "risk_based_sizing": False,
             "skip_rvol_check": False,
+            "momentum_confirm": True,
         },
     },
     "CPR_LEVELS_STANDARD_SHORT": {
@@ -58,6 +61,7 @@ CPR_LEVELS_PRESETS: dict[str, dict[str, Any]] = {
             "risk_based_sizing": False,
             "skip_rvol_check": True,
             "short_trail_atr_multiplier": 1.25,
+            "momentum_confirm": True,
         },
     },
 }
@@ -141,6 +145,8 @@ def build_strategy_config_from_overrides(
         "regime_index_symbol",
         "regime_min_move_pct",
         "regime_snapshot_minutes",
+        "pack_source",
+        "pack_source_session_id",
         "strategy",
     }
     overrides.pop("version", None)
@@ -155,8 +161,9 @@ def build_strategy_config_from_overrides(
     cpr_overrides = dict(overrides.get("cpr_levels_config") or {})
     fbr_overrides = dict(overrides.get("fbr_config") or {})
 
-    if "cpr_min_close_atr" in overrides and "cpr_min_close_atr" not in cpr_overrides:
-        cpr_overrides["cpr_min_close_atr"] = overrides["cpr_min_close_atr"]
+    for _cpr_field in ("cpr_min_close_atr", "time_stop_bars", "momentum_confirm"):
+        if _cpr_field in overrides and _cpr_field not in cpr_overrides:
+            cpr_overrides[_cpr_field] = overrides[_cpr_field]
     if "cpr_scale_out_pct" in overrides and "scale_out_pct" not in cpr_overrides:
         cpr_overrides["scale_out_pct"] = overrides["cpr_scale_out_pct"]
     if "scale_out_pct" in overrides and "scale_out_pct" not in cpr_overrides:

@@ -69,6 +69,11 @@ from engine.cpr_atr_utils import (
     calculate_position_size,
     normalize_cpr_bounds,
 )
+from engine.day_pack_sources import (
+    apply_opening_range_from_day_pack,
+    is_feed_audit_pack_source,
+    load_feed_audit_day_pack_records,
+)
 from engine.progress import BacktestProgress
 
 logger = logging.getLogger(__name__)
@@ -130,6 +135,8 @@ class CPRLevelsParams:
     cpr_hold_confirm: bool
     cpr_min_close_atr: float
     scale_out_pct: float = 0.0
+    time_stop_bars: int = 0  # exit at close of bar N if MFE < 0.5R (0 = disabled)
+    momentum_confirm: bool = False  # exit at bar 2 open if bar 1 closes adverse
 
 
 @dataclass(frozen=True)
@@ -241,6 +248,12 @@ class StrategyConfig:
     regime_index_symbol: str = ""
     regime_min_move_pct: float = 0.0
     regime_snapshot_minutes: int = 30
+
+    # Optional intraday source override:
+    # Default backtest/replay path uses intraday_day_pack. For exact live-feed parity
+    # analysis, callers can opt into paper_feed_audit for one archived session.
+    pack_source: str = "intraday_day_pack"
+    pack_source_session_id: str = ""
 
     # Strategy selection: "CPR_LEVELS" | "FBR" | "VIRGIN_CPR"
     strategy: str = "CPR_LEVELS"
@@ -1184,6 +1197,9 @@ class CPRATRBacktest:
         if not symbols:
             return funnel
 
+        if is_feed_audit_pack_source(getattr(p, "pack_source", None)):
+            return funnel
+
         if strategy == "VIRGIN_CPR":
             # VIRGIN_CPR has a different filter pipeline; skip for now.
             return funnel
@@ -1407,12 +1423,39 @@ class CPRATRBacktest:
         high_col, low_col, close_col = self._or_columns_for_minutes(p.or_minutes)
         direction_col, or_atr_col = self._strategy_columns_for_minutes(p.or_minutes)
         regime_close_col = regime_snapshot_close_col(p.regime_snapshot_minutes)
+        use_feed_audit_source = is_feed_audit_pack_source(getattr(p, "pack_source", None))
 
         strategy_filter_sql = ""
         if strategy == "CPR_LEVELS":
             strategy_filter_sql = (
                 "\n              AND ($cpr_shift_filter = 'ALL' OR cpr_shift = $cpr_shift_filter)"
             )
+
+        final_where_sql = f"""
+            WHERE direction IN ('LONG', 'SHORT')
+              AND ($direction_filter = 'BOTH' OR direction = $direction_filter)
+              AND ($min_price <= 0 OR prev_day_close >= $min_price)
+              AND gap_abs_pct <= $max_gap
+              AND or_atr_915 >= $or_atr_min
+              AND or_atr_915 <= $or_atr_max
+              AND (NOT $use_narrowing OR CAST(is_narrowing AS INTEGER) = 1){strategy_filter_sql}
+              AND (
+                  $regime_index_symbol = ''
+                  OR $regime_min_move_pct <= 0
+                  OR (
+                      regime_move_pct IS NOT NULL
+                      AND NOT (
+                          (direction = 'SHORT' AND regime_move_pct >= $regime_min_move_pct)
+                          OR (direction = 'LONG' AND regime_move_pct <= -$regime_min_move_pct)
+                      )
+                  )
+              )
+        """
+        if use_feed_audit_source:
+            final_where_sql = f"""
+            WHERE ($min_price <= 0 OR prev_day_close >= $min_price)
+              AND (NOT $use_narrowing OR CAST(is_narrowing AS INTEGER) = 1){strategy_filter_sql}
+            """
 
         query = f"""
             WITH base AS (
@@ -1493,24 +1536,7 @@ class CPRATRBacktest:
                 direction,
                 regime_move_pct
             FROM with_direction
-            WHERE direction IN ('LONG', 'SHORT')
-              AND ($direction_filter = 'BOTH' OR direction = $direction_filter)
-              AND ($min_price <= 0 OR prev_day_close >= $min_price)
-              AND gap_abs_pct <= $max_gap
-              AND or_atr_915 >= $or_atr_min
-              AND or_atr_915 <= $or_atr_max
-              AND (NOT $use_narrowing OR CAST(is_narrowing AS INTEGER) = 1){strategy_filter_sql}
-              AND (
-                  $regime_index_symbol = ''
-                  OR $regime_min_move_pct <= 0
-                  OR (
-                      regime_move_pct IS NOT NULL
-                      AND NOT (
-                          (direction = 'SHORT' AND regime_move_pct >= $regime_min_move_pct)
-                          OR (direction = 'LONG' AND regime_move_pct <= -$regime_min_move_pct)
-                      )
-                  )
-              )
+            {final_where_sql}
             ORDER BY symbol, trade_date
         """
 
@@ -1518,20 +1544,21 @@ class CPRATRBacktest:
             "start": start,
             "end": end,
             "max_width": p.cpr_max_width_pct,
-            "direction_filter": p.direction_filter,
             "min_price": p.min_price,
-            "max_gap": p.max_gap_pct,
-            "or_atr_min": max(p.or_atr_min, fbr_cfg.fbr_min_or_atr)
-            if strategy == "FBR"
-            else p.or_atr_min,
-            "or_atr_max": p.or_atr_max,
             "use_narrowing": cpr_cfg.use_narrowing_filter
             if strategy == "CPR_LEVELS"
             else fbr_cfg.use_narrowing_filter,
             "symbols": sym_param,
             "regime_index_symbol": str(p.regime_index_symbol or "").upper(),
-            "regime_min_move_pct": float(p.regime_min_move_pct or 0.0),
         }
+        if not use_feed_audit_source:
+            params_dict["direction_filter"] = p.direction_filter
+            params_dict["max_gap"] = p.max_gap_pct
+            params_dict["or_atr_min"] = (
+                max(p.or_atr_min, fbr_cfg.fbr_min_or_atr) if strategy == "FBR" else p.or_atr_min
+            )
+            params_dict["or_atr_max"] = p.or_atr_max
+            params_dict["regime_min_move_pct"] = float(p.regime_min_move_pct or 0.0)
         if strategy == "CPR_LEVELS":
             params_dict["cpr_shift_filter"] = cpr_cfg.cpr_shift_filter
 
@@ -1567,6 +1594,44 @@ class CPRATRBacktest:
             return {}
 
         include_rvol = not self.params.skip_rvol_check
+        if is_feed_audit_pack_source(getattr(self.params, "pack_source", None)):
+            session_id = str(getattr(self.params, "pack_source_session_id", "") or "").strip()
+            if not session_id:
+                raise ValueError("paper_feed_audit pack source requires pack_source_session_id")
+            setup_days = setups.select(["symbol", "trade_date"]).unique(maintain_order=True)
+            setup_symbols = [str(symbol) for symbol in setup_days["symbol"].to_list()]
+            trade_dates = [str(value)[:10] for value in setup_days["trade_date"].to_list()]
+            records = load_feed_audit_day_pack_records(
+                session_id=session_id,
+                symbols=setup_symbols,
+                start_date=min(trade_dates) if trade_dates else None,
+                end_date=max(trade_dates) if trade_dates else None,
+            )
+            requested = {
+                (str(symbol), str(trade_date)[:10]) for symbol, trade_date in setup_days.iter_rows()
+            }
+            feed_audit_packs: dict[str, dict[str, DayPack]] = {}
+            for record in records:
+                key = (str(record["symbol"]), str(record["trade_date"])[:10])
+                if key not in requested:
+                    continue
+                day_pack = DayPack(
+                    time_str=[str(value) for value in record["time_str"]],
+                    opens=[float(x) for x in record["opens"]],
+                    highs=[float(x) for x in record["highs"]],
+                    lows=[float(x) for x in record["lows"]],
+                    closes=[float(x) for x in record["closes"]],
+                    volumes=[float(x) for x in record["volumes"]],
+                    rvol_baseline=[
+                        float(v) if v is not None else None
+                        for v in (record.get("rvol_baseline") or [])
+                    ]
+                    if include_rvol
+                    else None,
+                )
+                feed_audit_packs.setdefault(key[0], {})[key[1]] = day_pack
+            return feed_audit_packs
+
         pack_time_mode = self._resolve_pack_time_mode()
         pack_time_select = (
             "p.minute_arr AS pack_time_arr"
@@ -1735,6 +1800,7 @@ class CPRATRBacktest:
         entry_window_end = str(self.params.entry_window_end)
 
         grouped_by_date: dict[str, list[tuple[str, dict[str, Any], DayPack]]] = {}
+        use_feed_audit_source = is_feed_audit_pack_source(getattr(self.params, "pack_source", None))
         for symbol in batch_symbols:
             setups = setups_by_sym.get(symbol)
             if setups is None or setups.is_empty():
@@ -1747,6 +1813,18 @@ class CPRATRBacktest:
                 day_pack = symbol_candles.get(trade_date)
                 if day_pack is None or not day_pack.time_str:
                     continue
+                if use_feed_audit_source:
+                    setup_row = apply_opening_range_from_day_pack(
+                        setup_row,
+                        time_str=day_pack.time_str,
+                        opens=day_pack.opens,
+                        highs=day_pack.highs,
+                        lows=day_pack.lows,
+                        closes=day_pack.closes,
+                        volumes=day_pack.volumes,
+                        or_minutes=int(self.params.or_minutes or 5),
+                        source_label="paper_feed_audit",
+                    )
                 grouped_by_date.setdefault(trade_date, []).append((symbol, setup_row, day_pack))
 
         for trade_date in sorted(grouped_by_date):
@@ -2576,6 +2654,8 @@ class CPRATRBacktest:
             rr_ratio=actual_rr_ratio,
             breakeven_r=p.breakeven_r,
             candle_exit=candle_exit,
+            time_stop_bars=self.params.cpr_levels.time_stop_bars,
+            momentum_confirm=self.params.cpr_levels.momentum_confirm,
         )
 
         # Apply transaction cost model

@@ -395,6 +395,18 @@ def build_parser() -> argparse.ArgumentParser:
         default="10:15",
         help="Stop scanning for new entries after this time HH:MM (default 10:15)",
     )
+    parser.add_argument(
+        "--time-stop-bars",
+        type=int,
+        default=0,
+        help="Exit at close of bar N if MFE < 0.5R (0 = disabled). 12 bars = 60 min.",
+    )
+    parser.add_argument(
+        "--momentum-confirm",
+        action="store_true",
+        default=False,
+        help="Exit at bar 2 open if bar 1 closes adverse to trade direction.",
+    )
     parser.add_argument("--save", action="store_true", help="Save results to DuckDB")
     parser.add_argument(
         "--progress-file",
@@ -508,6 +520,20 @@ def build_parser() -> argparse.ArgumentParser:
             "Regime snapshot window in minutes from the open (default 30 = 09:45 close). "
             "Use 5 for 09:20 or 10 for 09:25."
         ),
+    )
+    parser.add_argument(
+        "--pack-source",
+        choices=["intraday_day_pack", "paper_feed_audit"],
+        default="intraday_day_pack",
+        help=(
+            "Intraday candle source for this run. Default uses intraday_day_pack; "
+            "paper_feed_audit replays one archived paper/live session exactly."
+        ),
+    )
+    parser.add_argument(
+        "--pack-source-session-id",
+        default="",
+        help="Required with --pack-source paper_feed_audit: archived paper session_id to replay.",
     )
     parser.add_argument(
         "--or-minutes",
@@ -842,6 +868,8 @@ def _run_with_lock(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
         "regime_index_symbol": args.regime_index_symbol,
         "regime_min_move_pct": args.regime_min_move_pct,
         "regime_snapshot_minutes": args.regime_snapshot_minutes,
+        "pack_source": args.pack_source,
+        "pack_source_session_id": args.pack_source_session_id,
         "or_minutes": args.or_minutes,
         "strategy": args.strategy,
         "commission_model": args.commission_model,
@@ -855,6 +883,8 @@ def _run_with_lock(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
             "cpr_hold_confirm": args.cpr_hold_confirm,
             "cpr_min_close_atr": args.cpr_min_close_atr,
             "scale_out_pct": args.cpr_scale_out_pct,
+            "time_stop_bars": args.time_stop_bars,
+            "momentum_confirm": args.momentum_confirm,
         },
         "fbr_config": {
             "failure_window": args.failure_window,
@@ -884,6 +914,8 @@ def _run_with_lock(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
             "slippage_bps": args.slippage_bps,
             "time_exit": args.time_exit,
             "entry_window_end": args.entry_window_end,
+            "pack_source": args.pack_source,
+            "pack_source_session_id": args.pack_source_session_id,
         }
         # Strategy semantics: only include if explicitly provided (non-default value).
         if args.narrowing_filter:
@@ -906,9 +938,23 @@ def _run_with_lock(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
             preset_cli_overrides["trail_atr_multiplier"] = args.trail_atr_multiplier
         if args.short_trail_atr_multiplier is not None:
             preset_cli_overrides["short_trail_atr_multiplier"] = args.short_trail_atr_multiplier
+        if args.breakeven_r != 1.0:
+            preset_cli_overrides["breakeven_r"] = args.breakeven_r
+        if args.rr_ratio != 2.0:
+            preset_cli_overrides["rr_ratio"] = args.rr_ratio
+        if args.time_stop_bars > 0:
+            preset_cli_overrides["time_stop_bars"] = args.time_stop_bars
+        if args.momentum_confirm:
+            preset_cli_overrides["momentum_confirm"] = True
         params = build_strategy_config_from_preset(args.preset, preset_cli_overrides)
     else:
         params = build_strategy_config_from_overrides(args.strategy, strategy_overrides)
+
+    if (
+        str(args.pack_source or "").strip().lower() == "paper_feed_audit"
+        and not str(args.pack_source_session_id or "").strip()
+    ):
+        parser.error("--pack-source paper_feed_audit requires --pack-source-session-id")
 
     # Run (single window or chunked windows)
     chunks = _build_chunks(start_date, end_date, args.chunk_by)

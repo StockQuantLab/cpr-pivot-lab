@@ -19,7 +19,7 @@ from web.components import (
     paginated_table,
     set_table_mobile_labels,
 )
-from web.state import aget_runs
+from web.state import _universe_size_from_json, aget_runs
 
 _STRAT_NOTES = {
     "CPR_LEVELS": (
@@ -152,8 +152,8 @@ async def strategy_page() -> None:
                 .classes("w-full mb-3")
                 .style(
                     f"background: {theme['surface']}; "
-                    f"border: 1px solid {theme['surface_border']}; "
-                    f"border-left: 3px solid {color};"
+                    f"border: 1px solid {color}; "
+                    f"border-radius: 6px;"
                 )
             ):
                 if not strat_runs:
@@ -203,7 +203,10 @@ async def strategy_page() -> None:
                     {
                         "run_id": (r.get("run_id") or "")[:12],
                         "period": f"{str(r.get('start_date', ''))[:7]} → {str(r.get('end_date', ''))[:7]}",
-                        "symbols": str(int(r.get("symbol_count") or 0)),
+                        "symbols": str(
+                            _universe_size_from_json(r.get("symbols_json"))
+                            or int(r.get("symbol_count") or 0)
+                        ),
                         "trades": f"{int(r.get('trade_count') or 0):,}",
                         "win_rate": f"{float(r.get('win_rate') or 0):.1f}%",
                         "total_pnl": f"₹{float(r.get('total_pnl') or 0):,.0f}",
@@ -217,7 +220,7 @@ async def strategy_page() -> None:
                 columns = [
                     {"name": "run_id", "label": "Run ID", "field": "run_id", "align": "left"},
                     {"name": "period", "label": "Period", "field": "period", "align": "left"},
-                    {"name": "symbols", "label": "Syms", "field": "symbols", "align": "right"},
+                    {"name": "symbols", "label": "Symbols", "field": "symbols", "align": "right"},
                     {"name": "trades", "label": "Trades", "field": "trades", "align": "right"},
                     {
                         "name": "win_rate",

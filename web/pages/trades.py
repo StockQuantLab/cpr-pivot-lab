@@ -1,4 +1,4 @@
-"""Trade Analytics page — exit reasons, monthly performance, symbol breakdown."""
+"""Trade Analytics page — cross-run aggregated exit reasons, monthly performance, symbol breakdown."""
 
 from __future__ import annotations
 
@@ -18,12 +18,13 @@ from web.components import (
     paginated_table,
     safe_timer,
 )
-from web.state import aget_runs, aget_trades, build_run_options
+from web.state import aget_cross_run_trades, aget_runs, build_run_options
 
 
 async def trade_analytics_page() -> None:
-    """Render the Trade Analytics page."""
+    """Render the Trade Analytics page — aggregates across ALL saved backtest runs."""
     runs = await aget_runs(force=True)
+    bt_runs = [r for r in runs if str(r.get("execution_mode") or "BACKTEST").upper() != "PAPER"]
 
     with page_layout("Trade Analytics", "analytics"):
         theme = THEME
@@ -31,53 +32,62 @@ async def trade_analytics_page() -> None:
 
         page_header(
             "Trade Analytics",
-            "Deep-dive into exit patterns, monthly performance, and symbol breakdown",
+            "Aggregated across all saved backtest runs — exit patterns, monthly trends, symbol breakdown",
         )
 
-        if not runs:
+        if not bt_runs:
             empty_state(
-                "No runs found",
+                "No backtest runs found",
                 "Run a backtest with --save to see trade analytics.",
                 icon="analytics",
             )
             return
 
-        options = build_run_options(runs)
-        labels = list(options.keys())
-
-        @ui.refreshable
-        def render_analytics(label: str) -> None:
-            exp_id = options.get(label, "")
-            if not exp_id:
-                return
-            trades_container = ui.column().classes("w-full")
-
-            async def _load() -> None:
-                df = await aget_trades(exp_id)
-                trades_container.clear()
-                with trades_container:
-                    _render_analytics_content(df, colors, theme)
-
-            safe_timer(0.1, _load)
-
-        _ = (
-            ui.select(
-                labels,
-                value=labels[0],
-                label="Select Run",
-                on_change=lambda e: render_analytics.refresh(e.value),
+        container = ui.column().classes("w-full")
+        options = build_run_options(bt_runs)
+        all_labels = list(options.keys())
+        # Multi-run selector inside collapsible panel
+        with (
+            ui.expansion("Select Runs", icon="filter_list", value=False)
+            .classes("w-full mb-2")
+            .style(
+                f"background: {theme['surface']}; border: 1px solid {theme['surface_border']}; "
+                "border-radius: 4px;"
             )
-            .props("outlined dense use-input options-dense input-debounce=0")
-            .classes("w-full max-w-2xl mb-4")
-        )
+        ):
+            run_select = ui.select(
+                all_labels,
+                label="Runs to aggregate",
+                multiple=True,
+                value=all_labels,
+            ).classes("w-full")
 
-        divider()
-        render_analytics(labels[0])
+        async def _load() -> None:
+            selected_labels = run_select.value
+            selected_rids = {options[lbl] for lbl in selected_labels if lbl in options}
+            filtered = [r for r in bt_runs if str(r.get("run_id") or "") in selected_rids]
+            n_selected = len(filtered)
+            df = await aget_cross_run_trades(filtered)
+            container.clear()
+            with container:
+                ui.label(
+                    f"Aggregating {n_selected} of {len(bt_runs)} run"
+                    f"{'s' if len(bt_runs) != 1 else ''}"
+                ).classes("text-xs mb-4").style(f"color: {theme['text_muted']};")
+                _render_analytics_content(df, colors, theme)
+
+        def _on_selection_change(e: object) -> None:
+            if run_select.value:
+                safe_timer(0.05, _load)
+
+        run_select.on("update:model-value", _on_selection_change)
+
+        await _load()
 
 
 def _render_analytics_content(df: pl.DataFrame, colors: dict, theme: dict) -> None:
     if df.is_empty():
-        empty_state("No trades", "This run has no saved trade data.", icon="receipt_long")
+        empty_state("No trades", "No saved trade data across runs.", icon="receipt_long")
         return
 
     n_trades = len(df)
@@ -187,7 +197,7 @@ def _section_exit_reasons(df: pl.DataFrame, colors: dict, theme: dict) -> None:
                     textinfo="label+percent",
                 )
             )
-            fig.update_layout(title="Exit Distribution")
+            fig.update_layout(title="Exit Distribution (All Runs)")
             apply_chart_theme(fig)
             ui.plotly(fig).classes("w-full h-72")
 
@@ -294,7 +304,7 @@ def _section_monthly(df: pl.DataFrame, colors: dict, theme: dict) -> None:
             hovertemplate="%{x}<br>P/L: ₹%{y:,.0f}<extra></extra>",
         )
     )
-    fig.update_layout(title="Monthly P/L", xaxis_title="Month", yaxis_title="₹")
+    fig.update_layout(title="Monthly P/L (All Runs)", xaxis_title="Month", yaxis_title="₹")
     apply_chart_theme(fig)
     ui.plotly(fig).classes("w-full h-72 mb-4")
 

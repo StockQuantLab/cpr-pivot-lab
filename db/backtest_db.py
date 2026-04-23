@@ -144,7 +144,8 @@ class BacktestDB:
                 profit_loss_pct  DOUBLE,
                 exit_reason      VARCHAR CHECK (exit_reason IN (
                     'TARGET', 'INITIAL_SL', 'BREAKEVEN_SL',
-                    'TRAILING_SL', 'TIME', 'REVERSAL', 'CANDLE_EXIT'
+                    'TRAILING_SL', 'TIME', 'REVERSAL', 'CANDLE_EXIT',
+                    'TIME_STOP', 'MOMENTUM_FAIL'
                 )),
                 sl_phase         VARCHAR CHECK (sl_phase IN ('PROTECT', 'BREAKEVEN', 'TRAIL')),
                 atr              DOUBLE,

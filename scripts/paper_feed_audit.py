@@ -322,9 +322,7 @@ def compare_feed_audit(
         session_mismatched = 0
         session_price_exact = 0
         session_volume_exact = 0
-        session_field_mismatch_counts = dict.fromkeys(
-            ("open", "high", "low", "close", "volume"), 0
-        )
+        session_field_mismatch_counts = dict.fromkeys(("open", "high", "low", "close", "volume"), 0)
         session_samples: list[dict[str, Any]] = []
 
         for row in audit_rows:

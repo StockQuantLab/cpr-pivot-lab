@@ -1,4 +1,4 @@
-"""Symbol Performance page — per-symbol P/L across all saved runs."""
+"""Symbol Performance page — cross-run aggregated per-symbol P/L."""
 
 from __future__ import annotations
 
@@ -15,14 +15,14 @@ from web.components import (
     page_header,
     page_layout,
     paginated_table,
-    safe_timer,
 )
-from web.state import aget_runs, aget_trades, build_run_options
+from web.state import aget_cross_run_trades, aget_runs
 
 
 async def symbols_page() -> None:
-    """Per-symbol performance across all runs."""
+    """Per-symbol performance aggregated across ALL backtest runs."""
     runs = await aget_runs(force=True)
+    bt_runs = [r for r in runs if str(r.get("execution_mode") or "BACKTEST").upper() != "PAPER"]
 
     with page_layout("Symbols", "show_chart"):
         theme = THEME
@@ -30,47 +30,49 @@ async def symbols_page() -> None:
 
         page_header(
             "Symbol Performance",
-            "Per-symbol win rates, P/L and trade counts — select a run to explore",
+            f"Aggregated across {len(bt_runs)} backtest run{'s' if len(bt_runs) != 1 else ''} "
+            "— per-symbol win rates, P/L, and trade counts",
         )
 
-        if not runs:
-            empty_state("No runs found", "Run a backtest with --save first.", icon="show_chart")
+        if not bt_runs:
+            empty_state(
+                "No backtest runs found", "Run a backtest with --save first.", icon="show_chart"
+            )
             return
 
-        options = build_run_options(runs)
-        labels = list(options.keys())
+        container = ui.column().classes("w-full")
 
-        @ui.refreshable
-        def render_symbols(label: str) -> None:
-            exp_id = options.get(label, "")
-            if not exp_id:
-                return
-            container = ui.column().classes("w-full")
+        # Collapsible list of included runs
+        with (
+            ui.expansion(f"Included runs ({len(bt_runs)})", icon="list", value=False)
+            .classes("w-full mb-2")
+            .style(
+                f"background: {theme['surface']}; border: 1px solid {theme['surface_border']}; "
+                "border-radius: 4px;"
+            )
+        ):
+            for r in bt_runs:
+                rid = str(r.get("run_id") or "")[:12]
+                direction = str(r.get("direction_filter") or "BOTH").upper()
+                sizing = "Risk" if r.get("risk_based_sizing") else "Slot"
+                compound = "Compound" if r.get("compound_equity") else "Daily"
+                trades = int(r.get("trade_count") or 0)
+                ui.label(f"{rid} · {direction} {sizing} {compound} · {trades:,} trades").classes(
+                    "text-xs mono-font"
+                ).style(f"color: {theme['text_secondary']};")
 
-            async def _load() -> None:
-                df = await aget_trades(exp_id)
-                container.clear()
-                with container:
-                    _render_symbols_content(df, colors, theme)
+        async def _load() -> None:
+            df = await aget_cross_run_trades(bt_runs)
+            container.clear()
+            with container:
+                _render_symbols_content(df, colors, theme)
 
-            safe_timer(0.1, _load)
-
-        ui.select(
-            labels,
-            value=labels[0],
-            label="Select Run",
-            on_change=lambda e: render_symbols.refresh(e.value),
-        ).props("outlined dense use-input options-dense input-debounce=0").classes(
-            "w-full max-w-2xl mb-4"
-        )
-
-        divider()
-        render_symbols(labels[0])
+        await _load()
 
 
 def _render_symbols_content(df: pl.DataFrame, colors: dict, theme: dict) -> None:
     if df.is_empty():
-        empty_state("No trade data", "This run has no saved trades.", icon="show_chart")
+        empty_state("No trade data", "No saved trades across runs.", icon="show_chart")
         return
 
     sym_df = (
@@ -121,7 +123,7 @@ def _render_symbols_content(df: pl.DataFrame, colors: dict, theme: dict) -> None
         )
     )
     fig.update_layout(
-        title="Top 30 Symbols by Total P/L",
+        title="Top 30 Symbols by Total P/L (All Runs)",
         xaxis_title="₹",
         height=max(350, len(symbols) * 22 + 80),
         yaxis=dict(autorange="reversed"),

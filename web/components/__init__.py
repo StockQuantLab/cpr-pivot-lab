@@ -58,33 +58,32 @@ COLORS_TERMINAL = {
     "strat_default": "#64748b",
 }
 
-# Clean theme — Light, modern SaaS dashboard with indigo primary
+# Clean theme — Light, warm professional dashboard with teal primary
 THEME_CLEAN = {
-    "page_bg": "#f8fafc",
+    "page_bg": "#f7f6f3",  # Warm off-white — paper-like, easy on eyes
     "surface": "#ffffff",
-    "surface_border": "#e2e8f0",
-    "surface_hover": "#f1f5f9",
-    "text_primary": "#0f172a",
-    "text_secondary": "#475569",
-    # WCAG AA compliant (5:1 on surface) — from nse-momentum-lab
-    "text_muted": "#757985",
-    "primary": "#6366f1",  # Indigo - more distinctive than standard blue
-    "primary_dark": "#4f46e5",
-    "divider": "#e2e8f0",
+    "surface_border": "#e0ddd8",  # Warm gray border
+    "surface_hover": "#eeede9",
+    "text_primary": "#1a1a1a",
+    "text_secondary": "#525252",
+    "text_muted": "#7a7a7a",
+    "primary": "#0d9488",  # Teal — distinctive, not generic indigo
+    "primary_dark": "#0f766e",
+    "divider": "#e0ddd8",
 }
 
 COLORS_CLEAN = {
-    "success": "#22c55e",
-    "error": "#ef4444",
-    "warning": "#f59e0b",
-    "info": "#6366f1",  # Match primary
-    "primary": "#6366f1",
-    "gray": "#64748b",
+    "success": "#16a34a",
+    "error": "#dc2626",
+    "warning": "#d97706",
+    "info": "#0d9488",  # Match primary
+    "primary": "#0d9488",
+    "gray": "#6b7280",
     # Strategy colors — centralized for consistency
-    "strat_cpr_levels": "#2563eb",
-    "strat_fbr": "#10b981",
-    "strat_virgin_cpr": "#8b5cf6",
-    "strat_default": "#64748b",
+    "strat_cpr_levels": "#0d9488",
+    "strat_fbr": "#d97706",
+    "strat_virgin_cpr": "#7c3aed",
+    "strat_default": "#6b7280",
 }
 
 
@@ -280,6 +279,9 @@ METRIC_GLOSSARY: dict[str, str] = {
     "Portfolio Base": "Starting capital the backtest assumes. All position sizes are computed from this.",
     "Trades": "Total number of completed trades (entry + exit).",
     "Traded Symbols": "Number of different stocks that had at least one trade.",
+    "Symbols": "Universe size — total stocks in the backtest. Shows traded / total when they differ.",
+    "Return": "Total percentage gain or loss on starting capital for this run.",
+    "Capital": "Starting capital (portfolio base) used for this backtest run.",
 }
 
 EXIT_GLOSSARY: dict[str, str] = {
@@ -332,7 +334,7 @@ COLORS: Mapping[str, str] = _LivePalette(get_current_colors)
 
 
 # ---------------------------------------------------------------------------
-# Fonts — Terminal (IBM Plex Sans + Fira Code) and Clean (DM Sans + JetBrains Mono)
+# Fonts — Terminal (IBM Plex Sans + Fira Code) and Clean (Bitter + JetBrains Mono)
 # ---------------------------------------------------------------------------
 # Terminal fonts — IBM Plex Sans for body, Fira Code for monospace/terminal aesthetic
 _FONT_HEAD_TERMINAL = """
@@ -343,13 +345,13 @@ _FONT_HEAD_TERMINAL = """
 <noscript><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=Fira+Code:wght@400;500;600;700&display=swap"></noscript>
 """
 
-# Clean theme fonts — DM Sans (distinctive, not generic Inter) + JetBrains Mono
+# Clean theme fonts — Manrope (geometric grotesque) + JetBrains Mono for data
 _FONT_HEAD_CLEAN = """
 <link rel="preconnect" href="https://fonts.googleapis.com" crossorigin>
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link rel="preload" as="style" href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap">
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" media="print" onload="this.media='all'">
-<noscript><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap"></noscript>
+<link rel="preload" as="style" href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" media="print" onload="this.media='all'">
+<noscript><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap"></noscript>
 """
 
 
@@ -533,7 +535,7 @@ body[class*="terminal"] .kpi-card {
 
 /* Base styles */
 body, .q-app {
-    font-family: var(--font-body, 'DM Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif) !important;
+    font-family: var(--font-body, 'Manrope', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif) !important;
 }
 .mono-font, .kpi-value, .q-table, .q-input, .q-select {
     font-family: var(--font-mono, 'JetBrains Mono', 'SF Mono', 'Consolas', 'Courier New', monospace) !important;
@@ -672,14 +674,6 @@ body.terminal-mode::after {
     to   { opacity: 1; }
 }
 .kpi-card { animation: fade-in-terminal 0.15s ease-out backwards; }
-.kpi-card:nth-child(1) { animation-delay: 0.01s; }
-.kpi-card:nth-child(2) { animation-delay: 0.02s; }
-.kpi-card:nth-child(3) { animation-delay: 0.03s; }
-.kpi-card:nth-child(4) { animation-delay: 0.04s; }
-.kpi-card:nth-child(5) { animation-delay: 0.05s; }
-.kpi-card:nth-child(6) { animation-delay: 0.06s; }
-.kpi-card:nth-child(7) { animation-delay: 0.07s; }
-.kpi-card:nth-child(8) { animation-delay: 0.08s; }
 
 /* Nav tiles */
 .nav-tile {
@@ -864,6 +858,9 @@ body.terminal-mode::after {
     .q-table .hide-mobile {
         display: none !important;
     }
+    .q-table .hide-detail {
+        display: none;
+    }
     /* Tab bar scroll on mobile */
     .q-tabs__content {
         overflow-x: auto !important;
@@ -1043,7 +1040,7 @@ body {
 """
     else:
         css_vars += """
-    --font-body: 'DM Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    --font-body: 'Manrope', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
     --font-mono: 'JetBrains Mono', 'SF Mono', 'Consolas', 'Courier New', monospace;
     --card-radius: 8px;
     --card-shadow: 0 1px 3px rgba(0,0,0,0.1);
@@ -1584,7 +1581,7 @@ def apply_chart_theme(fig: Any) -> None:
     is_terminal = _theme_state.is_terminal
     theme = get_current_theme()
     mono_font = "Fira Code, monospace" if is_terminal else "JetBrains Mono, monospace"
-    body_font = "IBM Plex Sans, sans-serif" if is_terminal else "DM Sans, sans-serif"
+    body_font = "IBM Plex Sans, sans-serif" if is_terminal else "Manrope, sans-serif"
 
     axis_style = dict(
         gridcolor=theme["surface_border"],
@@ -1614,7 +1611,7 @@ def apply_chart_theme(fig: Any) -> None:
             font_size=11,
         ),
         hovermode="x unified",
-        transition_duration=300,
+        transition_duration=0,
     )
 
 

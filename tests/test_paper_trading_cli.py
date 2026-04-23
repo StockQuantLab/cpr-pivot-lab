@@ -107,6 +107,7 @@ def test_paper_trading_parser_supports_daily_commands() -> None:
     assert daily_replay_args.strategy == "CPR_LEVELS"
     assert daily_replay_args.all_symbols is False
     assert daily_replay_args.multi is True
+    assert daily_replay_args.pack_source == "intraday_day_pack"
 
     daily_live_args = parser.parse_args(
         [
@@ -157,6 +158,28 @@ def test_paper_trading_parser_supports_daily_commands() -> None:
         ]
     )
     assert preset_live_args.preset == "CPR_LEVELS_RISK_LONG"
+
+
+def test_paper_trading_parser_supports_feed_audit_pack_source() -> None:
+    parser = build_parser()
+
+    args = parser.parse_args(
+        [
+            "daily-replay",
+            "--trade-date",
+            "2026-04-20",
+            "--symbols",
+            "SBIN",
+            "--pack-source",
+            "paper_feed_audit",
+            "--pack-source-session-id",
+            "CPR_LEVELS_LONG-2026-04-20-live-kite",
+        ]
+    )
+
+    assert args.command == "daily-replay"
+    assert args.pack_source == "paper_feed_audit"
+    assert args.pack_source_session_id == "CPR_LEVELS_LONG-2026-04-20-live-kite"
 
     daily_live_skip_args = parser.parse_args(
         ["daily-live", "--trade-date", "2024-01-03", "--all-symbols", "--skip-coverage"]
@@ -264,6 +287,7 @@ def test_paper_standard_matrix_uses_cpr_canonical_params() -> None:
         "direction_filter": "LONG",
         "min_price": 50,
         "cpr_min_close_atr": 0.5,
+        "momentum_confirm": True,
         "narrowing_filter": True,
         "risk_based_sizing": True,
         "skip_rvol_check": False,
@@ -273,6 +297,7 @@ def test_paper_standard_matrix_uses_cpr_canonical_params() -> None:
         "skip_rvol_check": True,
         "min_price": 50,
         "cpr_min_close_atr": 0.5,
+        "momentum_confirm": True,
         "narrowing_filter": True,
         "risk_based_sizing": True,
     }
