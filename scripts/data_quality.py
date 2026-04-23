@@ -18,10 +18,21 @@ from __future__ import annotations
 
 import argparse
 import time
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from db.duckdb import get_db
 from engine.command_lock import acquire_command_lock
+
+_IST = timezone(timedelta(hours=5, minutes=30))
+
+
+def _is_pre_market(trade_date: str) -> bool:
+    """True if trade_date is today and current IST time is before 09:15."""
+    now_ist = datetime.now(_IST)
+    today = now_ist.date().isoformat()
+    return trade_date == today and (now_ist.hour, now_ist.minute) < (9, 15)
+
 
 _SEVERITY_ORDER = {"CRITICAL": 0, "WARNING": 1, "INFO": 2}
 
@@ -281,12 +292,17 @@ def build_trade_date_readiness_report(trade_date: str) -> dict[str, Any]:
     except Exception:
         pass
 
-    ready = (
-        bool(candidate_symbols)
-        and not freshness_blocking
-        and not coverage_blocking
-        and not setup_query_failed
-    )
+    pre_market = _is_pre_market(trade_date)
+    if pre_market:
+        # Pre-market: no 5-min parquet exists yet for today. Gate only on state table coverage.
+        ready = not freshness_blocking and not coverage_blocking
+    else:
+        ready = (
+            bool(candidate_symbols)
+            and not freshness_blocking
+            and not coverage_blocking
+            and not setup_query_failed
+        )
 
     return {
         "trade_date": trade_date,
@@ -302,6 +318,7 @@ def build_trade_date_readiness_report(trade_date: str) -> dict[str, Any]:
         "missing_counts": missing_counts,
         "coverage_blocking": coverage_blocking,
         "freshness_blocking": freshness_blocking,
+        "pre_market": pre_market,
         "ready": ready,
     }
 
@@ -318,11 +335,18 @@ def print_trade_date_readiness_report(report: dict[str, Any]) -> None:
     coverage = report.get("coverage") or {}
     ready = bool(report.get("ready", False))
 
-    print(f"\nTrade-date readiness ({trade_date}):")
-    print(f"  5-min symbols on date: {len(candidate_symbols):,}")
-    if not candidate_symbols:
-        print("  No 5-min symbols found for the requested trade date.")
-        print("  Suggested fix: ingest the date range and rebuild runtime tables.")
+    pre_market = bool(report.get("pre_market", False))
+
+    print(f"\nTrade-date readiness ({trade_date}){' [PRE-MARKET MODE]' if pre_market else ''}:")
+    if pre_market:
+        print(
+            "  Pre-market: 5-min parquet for today does not exist yet — checking state tables only."
+        )
+    else:
+        print(f"  5-min symbols on date: {len(candidate_symbols):,}")
+        if not candidate_symbols:
+            print("  No 5-min symbols found for the requested trade date.")
+            print("  Suggested fix: ingest the date range and rebuild runtime tables.")
     print("\nRuntime table freshness:")
     print(f"  {'Table':<20} {'max trade_date':<12} Status")
     print("  " + "-" * 50)
@@ -364,7 +388,15 @@ def print_trade_date_readiness_report(report: dict[str, Any]) -> None:
     print("\nReadiness:")
     print(f"  {'Ready':<10} {'YES' if ready else 'NO'}")
     if not ready:
-        print(f"  Suggested fix: doppler run -- uv run pivot-build --refresh-since {trade_date}")
+        if pre_market:
+            print("  Check: market_day_state and strategy_day_state must cover today.")
+            print(
+                "  Fix:   doppler run -- uv run pivot-paper-trading daily-prepare --trade-date today --all-symbols"
+            )
+        else:
+            print(
+                f"  Suggested fix: doppler run -- uv run pivot-build --refresh-since {trade_date}"
+            )
 
 
 def _print_trade_date_report(trade_date: str) -> bool:

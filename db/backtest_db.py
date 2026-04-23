@@ -658,6 +658,43 @@ class BacktestDB:
             params,
         ).pl()
 
+    def get_paper_daily_summary(self) -> list[tuple[object, ...]]:
+        """Daily aggregate of all non-TMP paper sessions.
+
+        Returns rows with: trade_date, long_trades, long_wins, long_pnl,
+        short_trades, short_wins, short_pnl, total_trades, total_wins, total_pnl.
+        """
+        try:
+            self.ensure_backtest_table()
+        except Exception as e:
+            logger.debug("Failed to ensure backtest_results for paper daily summary: %s", e)
+            return []
+
+        has_em = self._table_has_column("backtest_results", "execution_mode")
+        if not has_em:
+            return []
+
+        return self.con.execute(
+            """
+            SELECT
+                trade_date,
+                SUM(CASE WHEN direction = 'LONG'  THEN 1 ELSE 0 END) AS long_trades,
+                SUM(CASE WHEN direction = 'LONG' AND profit_loss > 0 THEN 1 ELSE 0 END) AS long_wins,
+                ROUND(SUM(CASE WHEN direction = 'LONG'  THEN profit_loss ELSE 0 END), 2) AS long_pnl,
+                SUM(CASE WHEN direction = 'SHORT' THEN 1 ELSE 0 END) AS short_trades,
+                SUM(CASE WHEN direction = 'SHORT' AND profit_loss > 0 THEN 1 ELSE 0 END) AS short_wins,
+                ROUND(SUM(CASE WHEN direction = 'SHORT' THEN profit_loss ELSE 0 END), 2) AS short_pnl,
+                COUNT(*) AS total_trades,
+                SUM(CASE WHEN profit_loss > 0 THEN 1 ELSE 0 END) AS total_wins,
+                ROUND(SUM(profit_loss), 2) AS total_pnl
+            FROM backtest_results
+            WHERE COALESCE(execution_mode, 'BACKTEST') = 'PAPER'
+              AND run_id NOT LIKE 'TMP_%'
+            GROUP BY trade_date
+            ORDER BY trade_date DESC
+            """
+        ).fetchall()
+
     def get_compare_breakdown(self, run_a: str, run_b: str) -> dict:
         """Trade-level breakdown for two runs used by the compare page.
 
@@ -867,6 +904,8 @@ class BacktestDB:
                     "TRY_CAST(json_extract(rm.params_json, '$.compound_equity') AS BOOLEAN), "
                     "FALSE) AS compound_equity"
                 )
+                params_json_sql = "rm.params_json"
+                symbols_json_sql = "rm.symbols_json"
                 updated_at_sql = "COALESCE(r.updated_at, rm.created_at)::VARCHAR AS updated_at"
                 if has_run_execution_mode:
                     execution_sql = (
@@ -909,6 +948,9 @@ class BacktestDB:
                 )
                 risk_based_sizing_sql = "FALSE AS risk_based_sizing"
                 compound_equity_sql = "FALSE AS compound_equity"
+                params_json_sql = "NULL::VARCHAR AS params_json"
+                symbols_json_sql = "NULL::VARCHAR AS symbols_json"
+                updated_at_sql = "r.updated_at::VARCHAR AS updated_at"
                 if has_run_execution_mode:
                     execution_sql = (
                         "UPPER(COALESCE(brm.execution_mode, 'BACKTEST')) AS execution_mode"
@@ -974,8 +1016,8 @@ class BacktestDB:
                     __SKIP_RVOL_SQL__,
                     __RISK_BASED_SIZING_SQL__,
                     __COMPOUND_EQUITY_SQL__,
-                    rm.params_json,
-                    rm.symbols_json,
+                    __PARAMS_JSON_SQL__,
+                    __SYMBOLS_JSON_SQL__,
                     __UPDATED_AT_SQL__,
                     CASE
                         WHEN r.start_date IS NOT NULL AND r.end_date IS NOT NULL
@@ -995,6 +1037,8 @@ class BacktestDB:
                 .replace("__SKIP_RVOL_SQL__", skip_rvol_sql)
                 .replace("__RISK_BASED_SIZING_SQL__", risk_based_sizing_sql)
                 .replace("__COMPOUND_EQUITY_SQL__", compound_equity_sql)
+                .replace("__PARAMS_JSON_SQL__", params_json_sql)
+                .replace("__SYMBOLS_JSON_SQL__", symbols_json_sql)
                 .replace("__UPDATED_AT_SQL__", updated_at_sql)
                 .replace("__FBR_SETUP_SQL__", fbr_setup_sql)
                 .replace("__FROM_SQL__", from_sql)

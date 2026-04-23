@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from datetime import datetime
 
 import numpy as np
@@ -30,14 +31,17 @@ from web.state import (
     aget_market_breadth_snapshot,
     aget_paper_active_sessions,
     aget_paper_archived_runs,
+    aget_paper_daily_summary,
     aget_run_ledger,
     aget_run_metadata,
     aget_runtime_coverage,
     aget_scan_snapshot,
     aget_status,
     aget_trade_inspection,
-    build_run_options,
+    build_paper_session_options,
 )
+
+logger = logging.getLogger(__name__)
 
 
 async def scans_page() -> None:
@@ -295,12 +299,7 @@ def _render_live_paper_sessions(active_sessions: list[dict], colors: dict) -> No
         labels.append(label)
         lookup[label] = payload
 
-    with ui.card().classes("w-full mb-6").style(f"border-top:3px solid {colors['primary']};"):
-        with ui.row().classes("items-center gap-2 mb-3"):
-            ui.icon("sensors").classes("text-lg").style(f"color: {colors['primary']};")
-            ui.label("Active Paper Sessions").classes("text-lg font-semibold").style(
-                f"color: {THEME['text_primary']};"
-            )
+    with ui.card().classes("w-full mb-2"):
 
         @ui.refreshable
         def _render(label: str) -> None:
@@ -530,83 +529,272 @@ async def paper_ledger_page() -> None:
             )
 
         async def _load() -> None:
-            try:
-                active_sessions, archived_runs = await asyncio.gather(
-                    aget_paper_active_sessions(),
-                    aget_paper_archived_runs(),
-                )
-            except Exception as exc:
-                content.clear()
-                with content:
-                    empty_state(
-                        "Paper ledger unavailable",
-                        f"Could not load paper-session data right now: {exc}",
-                        icon="error",
-                    )
-                return
+            # Fetch active + archived concurrently (both use BacktestDB)
+            # then daily summary sequentially to avoid DuckDB connection
+            # race — concurrent reads on a single DuckDB connection can
+            # silently return empty result sets.
+            active_sessions, archived_runs = await asyncio.gather(
+                aget_paper_active_sessions(),
+                aget_paper_archived_runs(),
+            )
+            daily_summary = await aget_paper_daily_summary()
 
             content.clear()
             with content:
-                _render_live_paper_sessions(active_sessions, colors)
-
-                divider()
-                with ui.row().classes("items-center gap-2 mb-3"):
-                    ui.icon("archive").classes("text-lg").style(f"color: {THEME['text_muted']};")
-                    ui.label("Archived Paper Sessions").classes("text-xl font-semibold").style(
-                        f"color: {THEME['text_primary']};"
+                # ── Active Sessions (expanded by default, at top) ──
+                active_count = len(active_sessions)
+                with (
+                    ui.expansion(
+                        f"Active Paper Sessions ({active_count})",
+                        icon="sensors",
+                        value=True,
                     )
-                if not archived_runs:
-                    empty_state(
-                        "No archived paper sessions",
-                        "Completed paper sessions appear here after archiving from PostgreSQL into DuckDB.",
-                        icon="receipt_long",
+                    .classes("w-full mb-2")
+                    .style(f"border-top:3px solid {colors['primary']};")
+                ):
+                    _render_live_paper_sessions(active_sessions, colors)
+
+                # ── Daily Summary (collapsible) ──
+                _render_daily_summary(daily_summary, colors)
+
+                # ── Archived Sessions (collapsible, below active) ──
+                options = build_paper_session_options(archived_runs)
+                archive_count = len(options)
+                with (
+                    ui.expansion(
+                        f"Archived Paper Sessions ({archive_count})",
+                        icon="archive",
+                        value=active_count == 0,
                     )
-                else:
-                    options = build_run_options(archived_runs)
-                    labels = list(options.keys())
+                    .classes("w-full")
+                    .style(f"border-top:3px solid {THEME['text_muted']};")
+                ):
+                    if not options:
+                        empty_state(
+                            "No archived paper sessions",
+                            "Completed paper sessions (replay, live-local, live-kite) appear here.",
+                            icon="receipt_long",
+                        )
+                    else:
+                        labels = list(options.keys())
 
-                    @ui.refreshable
-                    def _render(label: str) -> None:
-                        run_id = options.get(label, "")
-                        if not run_id:
-                            return
+                        @ui.refreshable
+                        def _render(label: str) -> None:
+                            run_id = options.get(label, "")
+                            if not run_id:
+                                return
 
-                        container = ui.column().classes("w-full")
+                            container = ui.column().classes("w-full")
 
-                        async def _load_ledger() -> None:
-                            try:
-                                ledger_df, run_meta = await asyncio.gather(
-                                    aget_run_ledger(run_id, execution_mode="PAPER"),
-                                    aget_run_metadata(run_id),
-                                )
-                            except Exception as ledger_exc:
+                            async def _load_ledger() -> None:
+                                try:
+                                    ledger_df, run_meta = await asyncio.gather(
+                                        aget_run_ledger(run_id, execution_mode="PAPER"),
+                                        aget_run_metadata(run_id),
+                                    )
+                                except Exception as ledger_exc:
+                                    container.clear()
+                                    with container:
+                                        empty_state(
+                                            "Archived ledger unavailable",
+                                            f"Could not load archived paper trades: {ledger_exc}",
+                                            icon="error",
+                                        )
+                                    return
                                 container.clear()
                                 with container:
-                                    empty_state(
-                                        "Archived ledger unavailable",
-                                        f"Could not load archived paper trades: {ledger_exc}",
-                                        icon="error",
+                                    _render_ledger_content(
+                                        run_id, archived_runs, ledger_df, run_meta, colors
                                     )
-                                return
-                            container.clear()
-                            with container:
-                                _render_ledger_content(
-                                    run_id, archived_runs, ledger_df, run_meta, colors
-                                )
 
-                        safe_timer(0.1, _load_ledger)
+                            safe_timer(0.1, _load_ledger)
 
-                    ui.select(
-                        labels,
-                        value=labels[0],
-                        label="Select Archived Session",
-                        on_change=lambda e: _render.refresh(e.value),
-                    ).props("outlined dense use-input options-dense input-debounce=0").classes(
-                        "w-full max-w-4xl mb-4"
-                    )
-                    _render(labels[0])
+                        ui.select(
+                            labels,
+                            value=labels[0],
+                            label="Select Archived Session",
+                            on_change=lambda e: _render.refresh(e.value),
+                        ).props("outlined dense use-input options-dense input-debounce=0").classes(
+                            "w-full max-w-4xl mb-4"
+                        )
+                        _render(labels[0])
 
         safe_timer(0.1, _load)
+
+
+def _render_daily_summary(daily_rows: list[dict], colors: dict) -> None:
+    """Collapsible daily P/L summary across all paper sessions."""
+    with (
+        ui.expansion(
+            f"Daily Summary ({len(daily_rows)} days)",
+            icon="calendar_view_day",
+            value=False,
+        )
+        .classes("w-full mb-2")
+        .style(f"border-top:3px solid {colors['info']};")
+    ):
+        if not daily_rows:
+            empty_state(
+                "No daily summary data",
+                "Paper trading results will appear here once sessions are archived.",
+                icon="calendar_view_day",
+            )
+            return
+
+        # Aggregate totals for KPI cards
+        total_wins = sum(r["total_wins"] for r in daily_rows)
+        total_trades = sum(r["total_trades"] for r in daily_rows)
+        total_pnl = sum(r["total_pnl"] for r in daily_rows)
+        long_pnl = sum(r["long_pnl"] for r in daily_rows)
+        short_pnl = sum(r["short_pnl"] for r in daily_rows)
+        wr = (total_wins / total_trades * 100) if total_trades else 0.0
+
+        kpi_grid(
+            [
+                dict(
+                    title="Total Days",
+                    value=f"{len(daily_rows)}",
+                    icon="calendar_month",
+                    color=colors["info"],
+                ),
+                dict(
+                    title="Total Trades",
+                    value=f"{total_trades:,}",
+                    icon="swap_vert",
+                    color=colors["primary"],
+                ),
+                dict(
+                    title="Win Rate",
+                    value=f"{wr:.1f}%",
+                    icon="percent",
+                    color=colors["success"] if wr >= 35 else colors["warning"],
+                ),
+                dict(
+                    title="Net P/L",
+                    value=f"₹{total_pnl:,.0f}",
+                    icon="account_balance_wallet",
+                    color=colors["success"] if total_pnl >= 0 else colors["error"],
+                ),
+                dict(
+                    title="LONG P/L",
+                    value=f"₹{long_pnl:,.0f}",
+                    icon="trending_up",
+                    color=colors["success"] if long_pnl >= 0 else colors["error"],
+                ),
+                dict(
+                    title="SHORT P/L",
+                    value=f"₹{short_pnl:,.0f}",
+                    icon="trending_down",
+                    color=colors["success"] if short_pnl >= 0 else colors["error"],
+                ),
+            ],
+            columns=3,
+        )
+
+        # Per-day table
+        table_rows = []
+        cumulative = 0.0
+        for r in daily_rows:
+            cumulative += r["total_pnl"]
+            table_rows.append(
+                {
+                    "trade_date": str(r["trade_date"])[:10],
+                    "long_trades": int(r["long_trades"]),
+                    "long_wins": int(r["long_wins"]),
+                    "long_pnl": float(r["long_pnl"]),
+                    "short_trades": int(r["short_trades"]),
+                    "short_wins": int(r["short_wins"]),
+                    "short_pnl": float(r["short_pnl"]),
+                    "total_trades": int(r["total_trades"]),
+                    "total_wins": int(r["total_wins"]),
+                    "total_pnl": float(r["total_pnl"]),
+                    "cumulative_pnl": round(cumulative, 2),
+                }
+            )
+        paginated_table(
+            rows=table_rows,
+            columns=[
+                {
+                    "name": "trade_date",
+                    "label": "Date",
+                    "field": "trade_date",
+                    "align": "left",
+                },
+                {
+                    "name": "long_trades",
+                    "label": "L Trades",
+                    "field": "long_trades",
+                    "align": "right",
+                    "format": "int",
+                },
+                {
+                    "name": "long_wins",
+                    "label": "L Wins",
+                    "field": "long_wins",
+                    "align": "right",
+                    "format": "int",
+                },
+                {
+                    "name": "long_pnl",
+                    "label": "L P/L",
+                    "field": "long_pnl",
+                    "align": "right",
+                    "format": "currency",
+                },
+                {
+                    "name": "short_trades",
+                    "label": "S Trades",
+                    "field": "short_trades",
+                    "align": "right",
+                    "format": "int",
+                },
+                {
+                    "name": "short_wins",
+                    "label": "S Wins",
+                    "field": "short_wins",
+                    "align": "right",
+                    "format": "int",
+                },
+                {
+                    "name": "short_pnl",
+                    "label": "S P/L",
+                    "field": "short_pnl",
+                    "align": "right",
+                    "format": "currency",
+                },
+                {
+                    "name": "total_trades",
+                    "label": "Total",
+                    "field": "total_trades",
+                    "align": "right",
+                    "format": "int",
+                },
+                {
+                    "name": "total_wins",
+                    "label": "Wins",
+                    "field": "total_wins",
+                    "align": "right",
+                    "format": "int",
+                },
+                {
+                    "name": "total_pnl",
+                    "label": "Day P/L",
+                    "field": "total_pnl",
+                    "align": "right",
+                    "format": "currency",
+                },
+                {
+                    "name": "cumulative_pnl",
+                    "label": "Cumulative",
+                    "field": "cumulative_pnl",
+                    "align": "right",
+                    "format": "currency",
+                },
+            ],
+            page_size=15,
+            sort_by="trade_date",
+            descending=True,
+        )
 
 
 def _start_auto_refresh(state: dict) -> None:

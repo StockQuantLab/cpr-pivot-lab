@@ -1477,6 +1477,33 @@ async def aget_paper_archived_runs(force: bool = False) -> list[dict]:
     )
 
 
+async def aget_paper_daily_summary() -> list[dict]:
+    """Daily aggregate of paper session trades (LONG/SHORT counts, wins, P/L)."""
+    loop = asyncio.get_running_loop()
+
+    def _fetch() -> list[dict]:
+        try:
+            cols = [
+                "trade_date",
+                "long_trades",
+                "long_wins",
+                "long_pnl",
+                "short_trades",
+                "short_wins",
+                "short_pnl",
+                "total_trades",
+                "total_wins",
+                "total_pnl",
+            ]
+            rows = get_dashboard_backtest_db().get_paper_daily_summary()
+            return [dict(zip(cols, r, strict=True)) for r in rows]
+        except Exception as e:
+            logger.debug("Failed to fetch paper daily summary: %s", e)
+            return []
+
+    return await loop.run_in_executor(_executor, _fetch)
+
+
 async def awarm_cache(force: bool = False) -> dict[str, int]:
     """Warm run, symbol, and status caches for faster first-page interactions."""
     loop = asyncio.get_running_loop()
@@ -1605,5 +1632,28 @@ def build_run_options(runs: list[dict]) -> dict[str, str]:
             f"{rid[:12]} | {ts} | {tag} | {start}→{end} | "
             f"TotRet {tot_ret:.1f}% | P/L ₹{total_pnl:,.0f} | Trades {trades:,}"
         )
+        options[label] = rid
+    return options
+
+
+def build_paper_session_options(runs: list[dict]) -> dict[str, str]:
+    """Build label -> run_id for paper-session dropdowns.
+
+    Paper run_ids are descriptive (e.g. ``CPR_LEVELS_LONG-2026-04-23-live-kite``)
+    so we use them directly as labels.  TMP_* diagnostic runs are excluded.
+    """
+    options: dict[str, str] = {}
+    for r in runs:
+        rid = str(r.get("run_id") or "")
+        if rid.startswith("TMP_"):
+            continue
+
+        total_pnl = float(r.get("total_pnl") or 0.0)
+        trades = int(r.get("trade_count") or 0)
+        start = str(r.get("start_date") or "")[:10]
+        end = str(r.get("end_date") or "")[:10]
+
+        # rid already contains strategy, direction, date, mode, feed
+        label = f"{rid} | {start}→{end} | P/L ₹{total_pnl:,.0f} | Trades {trades:,}"
         options[label] = rid
     return options

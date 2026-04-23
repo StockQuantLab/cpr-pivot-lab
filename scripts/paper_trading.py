@@ -827,6 +827,17 @@ async def _cmd_daily_live(args: argparse.Namespace) -> None:
     symbols = _resolve_cli_symbols(build_parser(), args, read_only=True)
     strategy_params = _resolve_paper_strategy_params(args.strategy, args.strategy_params, args)
 
+    direction = (strategy_params.get("direction_filter") or "BOTH").upper()
+    if direction == "BOTH":
+        raise SystemExit(
+            "daily-live requires an explicit direction (LONG or SHORT).\n"
+            "To run both sessions together use --multi:\n"
+            "  doppler run -- uv run pivot-paper-trading daily-live \\\n"
+            "    --multi --strategy CPR_LEVELS --trade-date today --all-symbols\n"
+            "Or specify a preset with a single direction:\n"
+            "  --preset CPR_LEVELS_RISK_LONG  or  --preset CPR_LEVELS_RISK_SHORT"
+        )
+
     feed_source = getattr(args, "feed_source", "kite")
     suppress_alerts = bool(getattr(args, "no_alerts", False))
 
@@ -1243,7 +1254,6 @@ async def _cmd_daily_live_multi(args: argparse.Namespace) -> None:
     if suppress_alerts:
         set_alerts_suppressed(True)
 
-    preserve_open_positions_on_restart = not bool(getattr(args, "complete_on_exit", False))
     live_kwargs = {
         "poll_interval_sec": getattr(args, "poll_interval_sec", None),
         "candle_interval_minutes": getattr(args, "candle_interval_minutes", None),
@@ -1293,7 +1303,7 @@ async def _cmd_daily_live_multi(args: argparse.Namespace) -> None:
             candle_interval_minutes=live_kwargs.get("candle_interval_minutes"),
             max_cycles=live_kwargs.get("max_cycles"),
             complete_on_exit=bool(live_kwargs.get("complete_on_exit")),
-            auto_flatten_on_abnormal_exit=not preserve_open_positions_on_restart,
+            auto_flatten_on_abnormal_exit=True,
             allow_late_start_fallback=bool(live_kwargs.get("allow_late_start_fallback", False)),
             notes=args.notes,
         )
@@ -1648,6 +1658,59 @@ async def _cmd_stop(args: argparse.Namespace) -> None:
     print(json.dumps(payload, default=str, indent=2))
 
 
+async def _cmd_resend_eod(args: argparse.Namespace) -> None:
+    """Re-send the FLATTEN_EOD alert for a completed session.
+
+    Useful when the original alert was lost (network outage, stale exit, process crash).
+    Queries all CLOSED positions, builds the EOD summary, sends via Telegram, and logs
+    to alert_log. Safe to run multiple times — each call writes a new alert_log entry
+    (it does not check the dedup guard, which is in-memory and per-process only).
+    """
+    from engine.alert_dispatcher import get_alert_config
+    from engine.notifiers.telegram import TelegramNotifier
+    from engine.paper_runtime import _format_risk_alert, get_session_positions
+
+    sid = args.session_id
+    db = _pdb()
+    session = db.get_session(sid)
+    if session is None:
+        raise SystemExit(f"Session not found: {sid!r}")
+
+    all_closed = await get_session_positions(sid, statuses=["CLOSED"])
+    total_trades = len(all_closed)
+    if total_trades == 0:
+        raise SystemExit(f"No closed positions for {sid!r} — nothing to report")
+
+    total_pnl = sum(float(p.realized_pnl or p.pnl or 0) for p in all_closed)
+    subject, body = _format_risk_alert(
+        reason=args.notes or "resend_eod",
+        net_pnl=total_pnl,
+        session_id=sid,
+        positions_closed=0,
+        total_trades=total_trades,
+        trade_date=getattr(session, "trade_date", None),
+    )
+
+    config = get_alert_config()
+    tg = TelegramNotifier(config.telegram_bot_token, config.telegram_chat_ids)
+    if not tg.enabled:
+        raise SystemExit("Telegram not configured — check TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_IDS")
+
+    await tg.send(subject, body)
+    db.log_alert("FLATTEN_EOD", subject, body, channel="TELEGRAM", status="sent", error_msg=None)
+    print(
+        json.dumps(
+            {
+                "session_id": sid,
+                "trades": total_trades,
+                "net_pnl": round(total_pnl, 2),
+                "alert": "sent",
+            },
+            indent=2,
+        )
+    )
+
+
 async def _cmd_flatten(args: argparse.Namespace) -> None:
     # Start the alert consumer so TRADE_CLOSED and FLATTEN_EOD alerts actually deliver.
     register_session_start()
@@ -1657,6 +1720,16 @@ async def _cmd_flatten(args: argparse.Namespace) -> None:
         # Mark session COMPLETED so it leaves STOPPING/FAILED limbo and appears
         # correctly in the dashboard and archive queries.
         await update_session_state(args.session_id, status="COMPLETED", notes=args.notes)
+        # Re-archive into backtest.duckdb so the dashboard shows the correct final trade
+        # count and P/L. store_backtest_results has a PAPER dedup guard (DELETE + INSERT)
+        # so this safely replaces any stale archive written at the earlier stale/failed exit.
+        try:
+            archive_result = archive_completed_session(args.session_id)
+            payload["archive"] = (
+                await archive_result if asyncio.iscoroutine(archive_result) else archive_result
+            )
+        except Exception as exc:
+            payload["archive_error"] = str(exc)
         session = _pdb().get_session(args.session_id)
         payload["session"] = asdict(session) if session else None
         print(json.dumps(payload, default=str, indent=2))
@@ -2113,6 +2186,14 @@ def build_parser() -> argparse.ArgumentParser:
     stop.add_argument("--complete", action="store_true", help="Mark the session completed")
     stop.add_argument("--notes", default=None, help="Optional free-text annotation")
     stop.set_defaults(handler=_cmd_stop)
+
+    resend_eod = sub.add_parser(
+        "resend-eod",
+        help="Re-send the EOD summary alert for a completed session (recovery after missed alert)",
+    )
+    resend_eod.add_argument("--session-id", required=True, help="Session to summarise")
+    resend_eod.add_argument("--notes", default=None, help="Optional note appended to the alert")
+    resend_eod.set_defaults(handler=_cmd_resend_eod)
 
     flatten = sub.add_parser("flatten", help="Request flattening of open positions")
     flatten.add_argument("--session-id", required=True, help="Session to flatten")

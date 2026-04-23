@@ -587,6 +587,59 @@ doppler run -- uv run pivot-paper-trading stop --session-id <id> --complete
 
 Review archived results in the dashboard at `/paper_ledger`.
 
+### 3a. Recovery: missed FLATTEN_EOD alert
+
+If the EOD summary was not delivered (network outage at EOD, stale exit before 15:15,
+or process crash), re-send it after the session is COMPLETED:
+
+```bash
+doppler run -- uv run pivot-paper-trading resend-eod \
+  --session-id CPR_LEVELS_LONG-2026-04-23-live-kite
+```
+
+- Queries all CLOSED positions, builds the EOD summary, sends directly via Telegram.
+- Writes to `alert_log` synchronously (bypasses the in-memory dedup guard).
+- Safe to run multiple times — each call writes a fresh `alert_log` entry.
+- Requires the session to have at least 1 closed position.
+- Does not change session status, open/close positions, or affect `backtest_results`.
+
+### 3b. Recovery: session FAILED with open positions (orphaned)
+
+When a session dies STALE/FAILED with positions still OPEN in the DB:
+
+```bash
+# 1. Verify no live process is still running (DuckDB exclusive lock)
+# 2. Flatten the open position at last known price and mark session COMPLETED:
+doppler run -- uv run pivot-paper-trading flatten \
+  --session-id CPR_LEVELS_LONG-2026-04-23-live-kite \
+  --notes "stale_exit_manual"
+# 3. Re-send the EOD summary:
+doppler run -- uv run pivot-paper-trading resend-eod \
+  --session-id CPR_LEVELS_LONG-2026-04-23-live-kite
+```
+
+**Dashboard shows wrong trade count / PnL after manual flatten**: The `backtest_results`
+archive was written at stale-exit time and does not include the manually flattened position.
+Fix: delete the stale archive and re-archive from the live DB.
+
+```python
+# From a doppler run -- uv run python shell:
+import duckdb
+sid = "CPR_LEVELS_LONG-2026-04-23-live-kite"
+bcon = duckdb.connect("data/backtest.duckdb")
+for t in ["backtest_results", "run_metrics", "run_metadata", "run_daily_pnl", "setup_funnel"]:
+    bcon.execute(f"DELETE FROM {t} WHERE run_id=?", [sid])
+bcon.commit(); bcon.close()
+from scripts.paper_archive import archive_completed_session
+archive_completed_session(sid)
+```
+
+**Illiquid positions and early session death**: When only 1 illiquid symbol remains open
+after the entry window closes, and it stops ticking for 10+ minutes, the stale watchdog
+terminates the session before the 15:15 TIME exit. This is correct behaviour — the FEED_STALE
+alert includes the open position details (`entry`, `SL`, `target`, `qty`) so you can act
+manually if needed. Use `flatten` + `resend-eod` as above to close the position cleanly.
+
 ---
 
 ## Prepare Runtime Tables

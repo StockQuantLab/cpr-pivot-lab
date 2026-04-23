@@ -7,6 +7,419 @@ Supersedes: `docs/PARITY_INCIDENT_LOG.md` (contents migrated below).
 
 ---
 
+## 2026-04-23 — STRATEGY: CPR SHORT underperforms on mild down days — false breakdown pattern
+
+**Status:** OPEN — backtest experiments queued for post-market
+**Severity:** High — recurring losses on SHORT sessions, multiple consecutive days (Apr 21–23)
+
+### Observation
+
+| Date | Index | SHORT WR | SHORT PnL | LONG PnL |
+|------|-------|----------|-----------|----------|
+| Apr 21 | — | — | -₹2,000 est | positive |
+| Apr 22 | mildly bullish (LONG worked well) | 16.7% (5/30) | -₹2,447 | +₹7,085 |
+| Apr 23 | Nifty 500 -0.61% (−139 pts) | 8% (2/25 closed) | ~-₹5,500 | +₹3,398 |
+
+On Apr 23 EOD: 25 of 30 SHORT positions closed. **INITIAL_SL: 14/25 (56%). TARGET: 2/25 (8%).**
+The strategy is backtested profitable every single month — this is NOT a broken strategy.
+It is a regime/execution mismatch.
+
+### Current Parameters (LONG and SHORT identical — no differentiation)
+
+| Parameter | Value | Set in |
+|-----------|-------|--------|
+| `min_sl_atr_ratio` | **0.5** | `engine/cpr_atr_strategy.py:187` (code default, no preset override) |
+| `max_sl_atr_ratio` | **2.0** | `engine/cpr_atr_strategy.py:188` (CLAUDE.md default) |
+| `skip_rvol_check` | **True** for SHORT | `strategy_presets.py` `CPR_LEVELS_RISK_SHORT` |
+| `skip_rvol_check` | **False** for LONG | `strategy_presets.py` `CPR_LEVELS_RISK_LONG` |
+| `momentum_confirm` | **True** (both) | All 4 CPR_LEVELS presets |
+| `cpr_min_close_atr` | **0.5** (both) | All 4 CPR_LEVELS presets |
+
+`min_sl_atr_ratio=0.5` means the minimum SL distance allowed is `0.5 × ATR`. With a typical
+ATR of ₹2–5 on low-priced stocks (₹100–600), and entry near BC on narrow-CPR days, SL distance
+can be as tight as **0.1%–0.3%**. This is hair-trigger in live trading.
+
+### Apr 23 Trade-by-Trade SHORT Data
+
+25 closed positions as of analysis (5 still open). All entries at 09:20–10:05.
+
+| Symbol | Entry | SL% | PnL | Exit Reason | Bars to SL |
+|--------|-------|-----|-----|-------------|------------|
+| ABFRL | 64.91 | 0.145% | -₹229 | INITIAL_SL | **1 bar** (09:20→09:25) |
+| ACI | 595.20 | — | -₹84 | BREAKEVEN_SL | — |
+| ADVANCE | 113.93 | — | -₹84 | BREAKEVEN_SL | — |
+| AGARIND | 453.73 | — | -₹83 | BREAKEVEN_SL | — |
+| APLLTD | 765.32 | 0.109% | -₹192 | INITIAL_SL | **1 bar** (09:20→09:25) |
+| ARVSMART | 598.85 | 0.139% | -₹222 | INITIAL_SL | **1 bar** (09:20→09:25) |
+| ATUL | 6625.19 | 0.266% | -₹348 | INITIAL_SL | **1 bar** (09:20→09:25) |
+| BAJAJCON | 467.80 | 0.524% | -₹605 | INITIAL_SL | 3 bars (09:20→09:35) |
+| BALMLAWRIE | 178.71 | 0.131% | -₹215 | INITIAL_SL | **1 bar** (09:20→09:25) |
+| BHEL | 332.72 | 0.304% | -₹387 | INITIAL_SL | **1 bar** (09:20→09:25) |
+| SPORTKING | 140.61 | — | -₹84 | BREAKEVEN_SL | — |
+| LGBBROSLTD | 1779.00 | 0.442% | -₹524 | INITIAL_SL | 3 bars (09:25→09:40) |
+| PNBHOUSING | 987.00 | — | -₹83 | BREAKEVEN_SL | — |
+| IMFA | 1517.20 | — | -₹83 | BREAKEVEN_SL | — |
+| AARTIPHARM | 697.90 | 0.245% | -₹328 | INITIAL_SL | 2 bars (09:30→09:40) |
+| AGARWALEYE | 458.75 | 0.503% | -₹584 | INITIAL_SL | 2 bars (09:30→09:40) |
+| AUBANK | 1041.25 | 0.271% | -₹355 | INITIAL_SL | 3 bars (09:35→09:50) |
+| **GARFIBRES** | 648.43 | — | **+₹1,353** | **TARGET** | — |
+| ARIHANTCAP | 71.75 | — | -₹84 | BREAKEVEN_SL | — |
+| BERGEPAINT | 474.91 | 0.176% | -₹259 | INITIAL_SL | 5 bars (09:40→10:05) |
+| **ARTEMISMED** | 232.21 | — | **+₹1,041** | **TARGET** | — |
+| BOSCH-HCIL | 1373.31 | — | -₹83 | BREAKEVEN_SL | — |
+| MONTECARLO | 545.75 | 0.330% | -₹413 | INITIAL_SL | 3 bars (09:50→10:05) |
+| OMAXE | 82.84 | — | -₹84 | BREAKEVEN_SL | — |
+| MUFTI | 79.13 | 0.440% | -₹523 | INITIAL_SL | 4 bars (10:05→10:25) |
+
+**BREAKEVEN_SL (SL%=0.000)**: These hit breakeven stop — price initially moved in favor then returned to entry.
+The `-₹83/₹84` loss is purely Zerodha commission (not strategy loss).
+
+Key stats:
+- **6 of 14 INITIAL_SL hits** happened in exactly **1 bar** (entry 09:20, stop 09:25)
+- SL distances for INITIAL_SL trades: 0.109% to 0.524% (median ~0.27%)
+- Two genuine winners: GARFIBRES +₹1,353, ARTEMISMED +₹1,041
+
+### Backtest Monthly Data — SHORT (run `9f0e916bbff0`, Jan 2025–Apr 22 2026, ~2044 symbols)
+
+All 16 months profitable. INITIAL_SL rate stable at **14–29%** — far below today's 56%.
+
+| Month | Trades | Win% | PnL | INITIAL_SL% |
+|-------|--------|------|-----|-------------|
+| 2025-01 | 321 | 34.6% | +₹103,543 | 20.2% |
+| 2025-02 | 245 | 37.1% | +₹121,741 | 23.7% |
+| 2025-03 | 202 | 34.2% | +₹89,340 | 18.3% |
+| 2025-04 | 164 | 28.0% | +₹26,156 | 23.8% |
+| 2025-05 | 223 | 27.8% | +₹32,709 | 29.1% |
+| 2025-06 | 244 | 27.9% | +₹22,008 | 24.2% |
+| 2025-07 | 371 | 33.2% | +₹87,559 | 18.6% |
+| 2025-08 | 362 | 35.4% | +₹87,177 | 14.4% |
+| 2025-09 | 387 | 27.6% | +₹52,644 | 26.1% |
+| 2025-10 | 423 | 33.1% | +₹86,371 | 23.2% |
+| 2025-11 | 374 | 33.4% | +₹93,869 | 20.3% |
+| 2025-12 | 477 | 28.7% | +₹62,799 | 23.1% |
+| 2026-01 | 400 | 34.0% | +₹82,582 | 20.8% |
+| 2026-02 | 415 | 25.1% | +₹60,483 | 22.2% |
+| 2026-03 | 196 | 37.2% | +₹70,671 | 21.9% |
+| 2026-04 (1–22) | 100 | 25.0% | +₹14,464 | 20.0% |
+| **TOTAL** | **4,904** | **31.5%** | **+₹1,094,116** | **~21.8% avg** |
+
+### INITIAL_SL Rate Comparison
+
+| Context | INITIAL_SL Rate |
+|---------|----------------|
+| Backtest 16-month average | 21.8% |
+| Backtest worst month (May 2025) | 29.1% |
+| Live Apr 22 | ~40% est |
+| Live Apr 23 | **56%** |
+
+The 56% live rate is 2.5× the worst backtest month. This gap is NOT explained by tick/candle
+precision alone (that adds ~2–5% noise at most). There is a genuine regime problem on certain days.
+
+### Why Live ≠ Backtest (Tick vs Historical Candle)
+
+**Backtest** reads `intraday_day_pack`: Kite REST historical 5-min OHLCV — exchange-confirmed
+canonical candles, delivered batch after market close.
+
+**Live** builds candles from KiteTicker L1 ticks in real-time. Differences:
+
+1. **H/L precision**: Live ticks capture every transient spike; historical OHLCV uses
+   exchange-confirmed tick-level H/L. They should match, but on fast-moving opens with
+   reconnects, live H may briefly spike above historical H.
+
+2. **Bar boundary edge cases**: A tick at 09:24:59.950 ms that arrives at 09:25:00.050 ms
+   due to network latency lands in the next bar live, but is in the 09:20 bar in historical.
+   This shifts the candle open for the next bar.
+
+3. **Volume**: Live ticks sum LTP-change events; historical uses exchange-confirmed volume.
+   Volume differences affect RVOL checks (for LONG) but not SHORT (skip_rvol=True).
+
+4. **SL sensitivity with 0.1% distances**: At SL=0.109% (APLLTD), a candle H discrepancy
+   of ±0.15% changes HOLD → INITIAL_SL or vice versa. Backtest's clean OHLCV is forgiving;
+   live ticks' transient spikes are not.
+
+**However**, the Apr 23 gap (56% vs 21%) is primarily a regime issue, not a tick issue.
+To confirm: run a single-date backtest for Apr 23 and check its INITIAL_SL rate. If it's
+also ~50%+, the market microstructure on this specific day is genuinely different. That's
+important because it means the historical 21% average was achieved on days where the SL
+was not being tested this aggressively — today is an outlier day, not a system failure.
+
+### Root Cause Summary
+
+**False breakdown pattern on mild-down days:** Stocks qualifying for CPR SHORT have already
+gapped down at open. They briefly pierce BC (triggering entry at 09:20) but attract immediate
+gap-fill buying, reversing through TC+ATR_buffer in 1 bar. On genuine down days (index -1.5%+),
+this reversal doesn't happen — stocks keep trending. On -0.5% days, it reverses almost always.
+
+Three compounding factors:
+1. **No RVOL gate** (`skip_rvol_check=True`): Low-volume breakdowns are the most prone to reversal
+2. **Hair-trigger SL** (`min_sl_atr_ratio=0.5`): At 0.1%–0.3% distance, any tick noise hits stop
+3. **Index magnitude too small**: -0.5% Nifty 500 → individual stocks are not in sustained downtrend
+
+### Experiments to Run (Post-Market)
+
+**Exp 1 — Single-date backtest Apr 23 (calibration check):**
+```bash
+doppler run -- uv run pivot-backtest --all --universe-size 0 \
+  --start 2026-04-23 --end 2026-04-23 \
+  --preset CPR_LEVELS_RISK_SHORT --save
+```
+Expected: INITIAL_SL rate ~50%+ if today is genuinely a bad regime day. This rules out
+tick/candle divergence as the cause.
+
+**Exp 2 — Re-enable RVOL for SHORT:**
+```bash
+doppler run -- uv run pivot-backtest --universe-name gold_51 \
+  --start 2023-01-01 --end 2025-12-31 \
+  --preset CPR_LEVELS_RISK_SHORT \
+  --strategy-params '{"skip_rvol_check":false}' --save
+```
+Hypothesis: Volume confirmation filters low-momentum breakdowns that reverse quickly.
+Risk: fewer trades, but higher quality. Key metric: INITIAL_SL rate reduction.
+
+**Exp 3 — Raise min_sl_atr_ratio for SHORT:**
+```bash
+doppler run -- uv run pivot-backtest --universe-name gold_51 \
+  --start 2023-01-01 --end 2025-12-31 \
+  --preset CPR_LEVELS_RISK_SHORT \
+  --strategy-params '{"min_sl_atr_ratio":1.0}' --save
+```
+Hypothesis: Wider minimum SL distance absorbs tick noise and brief reversals.
+Risk: larger loss per stop hit, but fewer false stops. Check Calmar vs P1/P2.
+
+**Exp 4 — Combined RVOL + wider SL:**
+Run both together and compare trade count, WR, and Calmar vs baseline `9f0e916bbff0`.
+
+**Exp 5 — Regime gate for SHORT (if Exp 1–4 insufficient):**
+```bash
+doppler run -- uv run pivot-backtest --universe-name gold_51 \
+  --start 2023-01-01 --end 2025-12-31 \
+  --preset CPR_LEVELS_RISK_SHORT \
+  --strategy-params '{"regime_index_symbol":"NIFTY 500","regime_min_move_pct":0.5}' --save
+```
+Skip SHORT when Nifty 500 is flat or up at 9:45 snapshot. Prior test (commit `4b09c39`)
+was on gold_51 universe — rerun on same universe/date range as Exp 1–4 for fair comparison.
+
+### Do NOT
+- Change the canonical preset without running the backtest comparison first
+- Assume that because index is down shorts will work — the magnitude matters (-0.5% is not enough)
+- Mix the regime gate result from the prior NIFTY 500 test (gold_51 universe) with the
+  current baseline without re-running on the same universe/date range
+
+---
+
+## 2026-04-23 — OPS: LONG session died at 13:50 (ANUHPHR illiquid) — position orphaned, no FLATTEN_EOD
+
+**Status:** FIXED — `scripts/paper_trading.py` (`auto_flatten_on_abnormal_exit` always True for `--multi`)
+**Severity:** High — open position left in DB after session death, FLATTEN_EOD never sent for LONG
+
+### Observation
+
+CPR_LEVELS_LONG session died at ~13:50 IST due to ANUHPHR going completely illiquid after 13:37.
+The stale watchdog (10-minute timeout) terminated the session with status FAILED.
+
+Timeline:
+- `13:37:37` — last tick from ANUHPHR (last_tick_age kept climbing)
+- `13:50:15` — FEED_STALE alert fired (streak=4), open positions listed: ANUHPHR LONG entry=81.69 SL=81.40 tgt=82.69 qty=1224
+- `~13:50` — session terminated (STALE→FAILED in DB)
+- `15:20` — ANUHPHR still OPEN in paper.duckdb, manually flattened via `pivot-paper-trading flatten --session-id CPR_LEVELS_LONG-2026-04-23-live-kite`
+- ANUHPHR closed at ₹82.60 (entry ₹81.69, target was ₹82.69 — very close to target)
+
+Consequence: FLATTEN_EOD alert was never sent for the LONG session. Operator saw the last alert at 13:50 and assumed session would recover or hit TIME exit at 15:15. No FLATTEN_EOD = no end-of-day summary for LONG.
+
+LONG session final PnL (all 30 trades including ANUHPHR): **+₹17,540**
+- TRAILING_SL: 12 trades, +₹20,655
+- BREAKEVEN_SL: 9 trades, -₹751
+- INITIAL_SL: 8 trades, -₹3,477
+- ANUHPHR: TIME exit (manual flatten) at ₹82.60, +~₹1,100
+
+### Root Cause (Code Bug)
+
+`scripts/paper_trading.py` `_cmd_daily_live_multi`, line 1257–1307:
+
+```python
+preserve_open_positions_on_restart = not bool(getattr(args, "complete_on_exit", False))
+# ...
+auto_flatten_on_abnormal_exit=not preserve_open_positions_on_restart,
+```
+
+Since `complete_on_exit` defaults to `False` for a normal `--multi` run:
+- `preserve_open_positions_on_restart = True`
+- `auto_flatten_on_abnormal_exit = False`
+
+**Every `--multi` session had `auto_flatten_on_abnormal_exit=False`**, meaning STALE/FAILED exits
+always hit the "preserving for resume" path instead of auto-flattening. The `preserve_open_positions_on_restart`
+flag was designed for the retry-on-early-exit restart path, but it incorrectly controlled whether
+abnormal exits flatten positions. These are orthogonal concerns.
+
+### Fix Applied
+
+`scripts/paper_trading.py` — hardcoded `auto_flatten_on_abnormal_exit=True` for the `--multi`
+execute_variant path. STALE/FAILED sessions will now always auto-flatten orphaned positions
+and send FLATTEN_EOD, regardless of the `complete_on_exit` flag.
+
+The `preserve_open_positions_on_restart` variable is retained for the `retry_on_early_exit` logic only.
+
+### Also: Alert retry fix (same incident)
+
+The three failed alerts at 10:19–10:21 on Apr 22 (`getaddrinfo failed`) were lost because the
+dispatcher retried 3 times with (1s, 2s, 4s) = 7 seconds total — insufficient for a 2-minute
+DNS outage. Fixed in `engine/alert_dispatcher.py`: network errors now get additional retries
+at 30s and 120s, capped at 10 minutes from alert creation. The 10-minute cap prevents stale
+"FEED_STALE" alerts from being delivered long after recovery.
+
+---
+
+## 2026-04-23 — UX: Dashboard shows "Feed: UNKNOWN" during session startup (9:16–9:20 AM)
+
+**Status:** FIXED — `scripts/paper_live.py` (initial CONNECTING seed write)
+**Severity:** Low — cosmetic, no trading impact
+
+### Observation
+Dashboard shows `Feed: UNKNOWN` after both sessions become ACTIVE at 9:16 AM,
+even though KiteTicker connected at 09:16:34 and ticks are flowing.
+
+### Root Cause
+`paper_feed_state` has one row per session, written only when `latest_raw_state is not None`
+(i.e. after the first complete 5-minute candle is assembled from ticks, ~9:20 AM).
+Between session ACTIVE (9:16 AM) and the first candle close, no row exists in `paper_feed_state`.
+`get_feed_state()` returns None → `summarize_paper_positions` produces `feed_status=None` →
+dashboard falls back to `str(None or "UNKNOWN") = "UNKNOWN"`.
+
+### Fix Applied
+`scripts/paper_live.py` — after the ticker is registered and before `dispatch_session_started_alert`,
+write an initial feed state row with `status="CONNECTING"`:
+
+```python
+await _write_feed_state(
+    deps,
+    session_id=session_id,
+    status="CONNECTING",
+    ...
+    raw_state={"mode": "startup", "symbols": len(active_symbols)},
+)
+```
+
+Dashboard now shows "CONNECTING" from 9:16 AM until the first candle snapshot (9:20 AM),
+then transitions to "OK" normally. The replica syncs immediately via `_after_write`.
+
+---
+
+## 2026-04-23 — UX: `pivot-data-quality` reports "Ready: NO" falsely in pre-market
+
+**Status:** FIXED — `scripts/data_quality.py` (pre-market auto-detect)
+**Severity:** Low — misleading output, no functional impact on live trading
+
+### Observation
+Running `pivot-data-quality --date <today>` before market open (e.g. 8:42 AM IST) returns:
+
+```
+Readiness:
+  Ready      NO
+  5-min symbols on date: 0
+  Suggested fix: doppler run -- uv run pivot-build --refresh-since <today>
+```
+
+The tool gates readiness on the presence of 5-min intraday candles for the requested date.
+Pre-market, today's candles do not exist yet — they are built live as the market runs.
+The state tables that actually matter for live trading (`market_day_state`, `strategy_day_state`)
+are correctly shown as AHEAD (built with prev-day ATR via ASOF JOIN) with 0 missing symbols,
+but the overall "Ready" flag is still set to NO.
+
+### Root Cause
+The readiness gate `5-min symbols on date: 0` is appropriate for post-market validation
+(confirming ingestion ran) but incorrect for pre-market checks (confirming live trading can start).
+The suggested fix command (`pivot-build --refresh-since <today>`) is also wrong pre-market —
+rebuilding `intraday_day_pack` for a date with no candle data would produce an empty pack.
+
+### Fix Applied
+`scripts/data_quality.py` — `_is_pre_market()` helper detects if the trade date is today and
+current IST time is before 09:15. In pre-market mode:
+- `ready` is computed from `not freshness_blocking and not coverage_blocking` only (no parquet check)
+- Output header shows `[PRE-MARKET MODE]`
+- "Suggested fix" changes from the wrong `pivot-build --refresh-since` to `daily-prepare`
+- The "5-min symbols on date: 0" line is suppressed with an explanatory note
+
+---
+
+## 2026-04-23 — UX: Feed shows STALE for 5 min after a 2-second WebSocket reconnect
+
+**Status:** FIXED — `scripts/paper_live.py` (immediate OK write on stale→connected transition)
+**Severity:** Low — cosmetic dashboard confusion, no trading impact
+
+### Observation
+WebSocket code 1006 drops happened twice (12:57 and 13:21). Both auto-reconnected in 2–3 seconds.
+The dashboard showed `Feed: STALE` for up to 5 minutes after recovery because `_write_feed_state`
+only writes OK when `latest_raw_state is not None` — which requires a bar-close snapshot. The next
+bar close is up to 5 minutes away.
+
+### Fix Applied
+In the `else:` branch of the stale watchdog in `paper_live.py`, captured `_was_stale = no_snapshot_streak > 0`
+before the reset, then added an additional path:
+```python
+elif _was_stale and use_websocket and ticker_adapter is not None and ticker_adapter.is_connected:
+    await _write_feed_state(..., status="OK", raw_state={"mode": "reconnected", "connected": True})
+```
+This writes OK immediately when the supervision loop detects stale→connected transition, clearing
+the STALE status without waiting for the next 5-minute candle snapshot.
+
+---
+
+## 2026-04-23 — OPS: bare `daily-live` (no `--multi`, no direction) fails silently with direction=BOTH
+
+**Status:** FIXED — `scripts/paper_trading.py` (explicit direction guard in `_cmd_daily_live`)
+**Severity:** Medium — operator confusion, failed session attempts go unnoticed
+
+### Observation
+Five `SESSION_STARTED CPR_LEVELS BOTH` alerts fired after market hours on Apr 22 (18:02–23:11 IST).
+All had `status=failed`, `error_msg=None`. These were manual retries of a bare `daily-live` command
+that defaulted to `direction_filter=BOTH` (no preset, no `--multi` flag).
+
+### Root Cause
+`_resolve_paper_strategy_params` returns no `direction_filter` when no preset is given.
+`paper_live.py:824` falls back to `"BOTH"`, which fails downstream validation. No error was shown
+to the operator — the session attempt failed after network I/O, so the operator kept retrying.
+
+### Fix Applied
+`scripts/paper_trading.py` — `_cmd_daily_live` now checks direction immediately after resolving params:
+```python
+direction = (strategy_params.get("direction_filter") or "BOTH").upper()
+if direction == "BOTH":
+    raise SystemExit("daily-live requires an explicit direction ... use --multi ...")
+```
+The error message shows the correct `--multi` command and preset alternatives.
+
+---
+
+## 2026-04-22 — OPS: WebSocket reconnect failure on SHORT session (alert undelivered)
+
+**Status:** INVESTIGATED — root cause: DNS/network outage, not a code bug
+**Severity:** Low — session ran fine, operator impact only
+
+### Observation
+`SESSION_ERROR CPR_LEVELS_SHORT websocket_reconnect_failed` fired at 10:20 AM IST.
+Alert `status=failed` in `alert_log`. Session recovered and completed normally at 15:15.
+Several other alerts also failed around the same time.
+
+### Root Cause
+`alert_log.error_msg = "[Errno 11001] getaddrinfo failed"` on the alerts that captured errors.
+This is a DNS lookup failure — the machine briefly lost network connectivity at ~10:20 AM,
+which simultaneously caused the WebSocket drop AND the alert delivery failure. No code fix needed.
+The fire-and-forget alert design is correct — never block trading on alert delivery.
+
+### Note on `error_msg=None` entries
+Some `TRADE_OPENED` and `SESSION_STARTED` alerts show `status=failed` with `error_msg=None`.
+This means the exception was caught but not stored. Low priority — the trade state itself is
+correctly written to DB regardless of alert delivery.
+
+---
+
+## 2026-04-22 — OPS: Post-market SESSION_STARTED (BOTH direction) attempts, all failed
+
+**Status:** FIXED — see "bare daily-live direction=BOTH" entry above (Apr 23)
+**Severity:** Low — all attempts failed cleanly, no bad state written
+
+---
+
 ## 2026-04-23 — PERF: CPR incremental build scans full 10-year Parquet history
 
 **Status:** FIXED — `db/duckdb.py` `build_cpr_table()`

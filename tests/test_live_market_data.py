@@ -345,10 +345,10 @@ def test_feed_stale_and_recovered_alert_helpers_emit_messages(
     pr.dispatch_feed_recovered_alert(session_id="sess-1", details="Recovered after 3 stale cycles.")
 
     assert alerts[0][0] == "FEED_STALE"
-    assert alerts[0][1].startswith("FEED_STALE sess-1")
+    assert alerts[0][1].startswith("⚠️ Feed Stale — sess 1")
     assert "transport=websocket" in alerts[0][2]
     assert alerts[1][0] == "FEED_RECOVERED"
-    assert alerts[1][1].startswith("FEED_RECOVERED sess-1")
+    assert alerts[1][1].startswith("✅ Feed Recovered — sess 1")
     assert "Recovered after 3 stale cycles." in alerts[1][2]
 
 

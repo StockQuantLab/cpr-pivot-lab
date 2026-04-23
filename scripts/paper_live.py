@@ -883,6 +883,17 @@ async def run_live_session(
         market_adapter = market_adapter or KiteQuoteAdapter()
         builder = FiveMinuteCandleBuilder(interval_minutes=candle_interval)
 
+    await _write_feed_state(
+        deps,
+        session_id=session_id,
+        status="CONNECTING",
+        last_event_ts=None,
+        last_bar_ts=None,
+        last_price=None,
+        stale_reason=None,
+        raw_state={"mode": "startup", "symbols": len(active_symbols)},
+    )
+
     dispatch_session_started_alert(
         session_id=session_id,
         strategy=strategy,
@@ -1040,13 +1051,11 @@ async def run_live_session(
                             int(recovery.get("reconnect_count") or 0),
                         )
                         if alerts_enabled:
+                            down_sec = float(recovery.get("down_sec") or 0.0)
                             dispatch_feed_recovered_alert(
                                 session_id=session_id,
-                                details=(
-                                    "WebSocket recovered after "
-                                    f"{float(recovery.get('down_sec') or 0.0):.0f}s down."
-                                    f" reconnects={int(recovery.get('reconnect_count') or 0)}"
-                                ),
+                                stale_minutes=max(1, int(down_sec / 60)) if down_sec > 0 else None,
+                                open_count=len(tracker._open),
                             )
                     elif recovery_action == "failed":
                         _failed_cooldown_ok = (
@@ -1277,8 +1286,14 @@ async def run_live_session(
                 )
                 await _update_session(session_id, deps, stale_feed_at=now)
             else:
+                _was_stale = no_snapshot_streak > 0
                 if use_websocket and ticker_adapter is not None and ticker_adapter.is_connected:
-                    if stale_alerted and no_snapshot_streak > 0:
+                    if stale_alerted and _was_stale:
+                        stale_dur_min = (
+                            int((now - last_stale_alert_ts).total_seconds() / 60)
+                            if last_stale_alert_ts
+                            else None
+                        )
                         logger.warning(
                             "[%s] market data feed recovered after %d stale cycles",
                             session_id,
@@ -1287,10 +1302,8 @@ async def run_live_session(
                         if alerts_enabled:
                             dispatch_feed_recovered_alert(
                                 session_id=session_id,
-                                details=(
-                                    f"Recovered after {no_snapshot_streak} stale cycles."
-                                    f" Monitoring {len(tracker._open)} position(s)."
-                                ),
+                                stale_minutes=stale_dur_min,
+                                open_count=len(tracker._open),
                             )
                         stale_alerted = False  # allow re-alert if it goes stale again
                     no_snapshot_streak = 0
@@ -1305,6 +1318,25 @@ async def run_live_session(
                         stale_reason=None,
                         raw_state=latest_raw_state,
                     )
+                elif (
+                    _was_stale
+                    and use_websocket
+                    and ticker_adapter is not None
+                    and ticker_adapter.is_connected
+                ):
+                    # Reconnected after a brief drop but next bar hasn't closed yet.
+                    # Write OK immediately so the dashboard clears STALE without waiting
+                    # up to 5 minutes for the next candle snapshot.
+                    await _write_feed_state(
+                        deps,
+                        session_id=session_id,
+                        status="OK",
+                        last_event_ts=last_snapshot_ts,
+                        last_bar_ts=last_bar_ts,
+                        last_price=last_price,
+                        stale_reason=None,
+                        raw_state={"mode": "reconnected", "connected": True},
+                    )
 
             # Alert once at streak=3, but stay alive to allow KiteConnect protocol-level
             # reconnect to recover.  Only exit after 600s (10 min) of no data.
@@ -1317,27 +1349,21 @@ async def run_live_session(
                 if alerts_enabled and not stale_alerted and _stale_cooldown_ok:
                     stale_alerted = True
                     last_stale_alert_ts = now
-                    last_snapshot = last_snapshot_ts.isoformat() if last_snapshot_ts else "none"
-                    # Build open-position details so the alert can serve as a manual-order guide.
-                    open_pos_lines: list[str] = []
-                    for sym, pos in tracker._open.items():
-                        open_pos_lines.append(
-                            f"{sym} {pos.direction} entry={pos.entry_price:.2f}"
-                            f" SL={pos.stop_loss:.2f} tgt={pos.target_price:.2f}"
-                            f" qty={int(pos.current_qty)}"
-                        )
-                    pos_detail = (
-                        ("\nOPEN POSITIONS — place manual SL orders:\n" + "\n".join(open_pos_lines))
-                        if open_pos_lines
-                        else "\nNo open positions."
-                    )
+                    open_pos_data = [
+                        {
+                            "symbol": sym,
+                            "direction": pos.direction,
+                            "entry_price": pos.entry_price,
+                            "stop_loss": pos.stop_loss,
+                            "target_price": pos.target_price,
+                            "qty": int(pos.current_qty),
+                        }
+                        for sym, pos in tracker._open.items()
+                    ]
                     dispatch_feed_stale_alert(
                         session_id=session_id,
-                        details=(
-                            f"transport={'websocket' if use_websocket else 'rest'}"
-                            f" streak={no_snapshot_streak}"
-                            f" last_tick={last_snapshot}" + pos_detail
-                        ),
+                        last_tick_ts=last_snapshot_ts,
+                        open_positions=open_pos_data,
                     )
                 stale_duration_sec = (
                     (now - last_snapshot_ts).total_seconds() if last_snapshot_ts else 0

@@ -11,7 +11,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from datetime import time as dt_time
-from typing import Any
+from typing import Any, cast
 from zoneinfo import ZoneInfo
 
 from db.duckdb import get_dashboard_db
@@ -352,36 +352,119 @@ def dispatch_session_state_alert(
     _dispatch_alert(alert_type, subject, body)
 
 
+def _parse_session_label(session_id: str) -> tuple[str, str]:
+    """Extract (short_label, date_label) from session_id for alert subjects.
+
+    'CPR_LEVELS_LONG-2026-04-23-live-kite' → ('CPR LONG', '23 Apr')
+    """
+    parts = str(session_id or "").split("-")
+    label_parts: list[str] = []
+    date_label = ""
+    i = 0
+    while i < len(parts):
+        if len(parts[i]) == 4 and parts[i].isdigit() and i + 2 < len(parts):
+            try:
+                from datetime import date as _date
+
+                d = _date(int(parts[i]), int(parts[i + 1]), int(parts[i + 2]))
+                date_label = d.strftime("%d %b").lstrip("0")
+                break
+            except (ValueError, IndexError):
+                pass
+        label_parts.append(parts[i])
+        i += 1
+    raw = "_".join(label_parts)
+    short = (
+        raw.replace("CPR_LEVELS_LONG", "CPR LONG")
+        .replace("CPR_LEVELS_SHORT", "CPR SHORT")
+        .replace("FBR_LONG", "FBR LONG")
+        .replace("FBR_SHORT", "FBR SHORT")
+        .replace("_", " ")
+        .strip()
+    )
+    return short or raw, date_label
+
+
 def dispatch_feed_stale_alert(
     *,
     session_id: str,
+    last_tick_ts: datetime | None = None,
+    open_positions: list[dict[str, object]] | None = None,
     details: str | None = None,
 ) -> None:
-    """Emit a FEED_STALE alert distinct from SESSION_ERROR.
+    """Emit a FEED_STALE alert.
 
-    Use this for market-data gaps (quiet symbols, WebSocket timeout) so operators
-    can filter feed events separately from genuine session failures.
+    Pass `last_tick_ts` and `open_positions` for rich formatting. `open_positions`
+    is a list of dicts with keys: symbol, direction, entry_price, stop_loss,
+    target_price, qty.
     """
-    session_tag = str(session_id or "")[:16]
-    subject = f"FEED_STALE {session_tag}"
-    body = f"Session: <code>{session_tag}</code>\nMarket data feed is stale."
+    short_label, date_label = _parse_session_label(session_id)
+    subject = f"⚠️ Feed Stale — {short_label} · {date_label}"
+
+    body_lines = [f"📡 <b>Feed stale</b> · {short_label}"]
+
+    if last_tick_ts is not None:
+        try:
+            tick_ist = last_tick_ts.astimezone(_IST)
+            elapsed_min = max(0, int((datetime.now(_IST) - tick_ist).total_seconds() / 60))
+            body_lines.append(
+                f"Last data: <code>{tick_ist.strftime('%H:%M IST')}</code>  ({elapsed_min} min ago)"
+            )
+        except Exception:
+            pass
+
     if details:
-        body += f"\n{details}"
-    _dispatch_alert(AlertType.FEED_STALE, subject, body)
+        body_lines.append(details)
+
+    if open_positions:
+        body_lines.append("\n⚡ <b>Open positions</b> — place manual SL orders now:")
+        for pos in open_positions:
+            sym = str(pos.get("symbol", ""))
+            dirn = str(pos.get("direction", ""))
+            entry = float(pos.get("entry_price") or 0)
+            sl = float(pos.get("stop_loss") or 0)
+            tgt = float(pos.get("target_price") or 0)
+            qty = int(cast(int | float | str, pos.get("qty") or 0))
+            sl_pct = abs(entry - sl) / entry * 100 if entry else 0
+            icon = "🟢" if dirn == "LONG" else "🔴"
+            body_lines.append(
+                f"  {icon} <code>{sym}</code>  {dirn}"
+                f"  Entry <code>₹{entry:,.2f}</code>"
+                f"  SL <code>₹{sl:,.2f}</code> ({sl_pct:.2f}%)"
+                f"  Tgt <code>₹{tgt:,.2f}</code>"
+                f"  Qty {qty:,}"
+            )
+    elif open_positions is not None:
+        body_lines.append("No open positions.")
+
+    _dispatch_alert(AlertType.FEED_STALE, subject, "\n".join(body_lines))
 
 
 def dispatch_feed_recovered_alert(
     *,
     session_id: str,
+    stale_minutes: int | None = None,
+    open_count: int | None = None,
     details: str | None = None,
 ) -> None:
     """Emit a FEED_RECOVERED alert when market data resumes after a stale period."""
-    session_tag = str(session_id or "")[:16]
-    subject = f"FEED_RECOVERED {session_tag}"
-    body = f"Session: <code>{session_tag}</code>\nMarket data feed recovered."
-    if details:
-        body += f"\n{details}"
-    _dispatch_alert(AlertType.FEED_RECOVERED, subject, body)
+    short_label, date_label = _parse_session_label(session_id)
+    subject = f"✅ Feed Recovered — {short_label} · {date_label}"
+
+    body_lines = [f"✅ <b>Feed recovered</b> · {short_label}"]
+
+    parts: list[str] = []
+    if stale_minutes is not None and stale_minutes > 0:
+        parts.append(f"Stale for ~{stale_minutes} min")
+    if open_count is not None:
+        pos_word = "position" if open_count == 1 else "positions"
+        parts.append(f"monitoring {open_count} open {pos_word}")
+    if parts:
+        body_lines.append(". ".join(p.capitalize() for p in parts) + ".")
+    elif details:
+        body_lines.append(details)
+
+    _dispatch_alert(AlertType.FEED_RECOVERED, subject, "\n".join(body_lines))
 
 
 def dispatch_session_started_alert(

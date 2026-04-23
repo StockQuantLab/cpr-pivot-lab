@@ -69,6 +69,16 @@ class AlertEvent:
     subject: str
     body: str
     retries: int = 0
+    created_at: float = field(default_factory=time.monotonic)
+
+
+def _is_network_error(exc: Exception) -> bool:
+    """True for transient network errors (DNS, connect refused, timeout) — not HTTP 4xx/5xx."""
+    if isinstance(exc, OSError):
+        return True
+    if isinstance(exc, httpx.ConnectError | httpx.TimeoutException | httpx.NetworkError):
+        return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -93,6 +103,11 @@ class AlertDispatcher:
     MAX_QUEUE_SIZE = 100
     MAX_RETRIES = 3
     RETRY_BACKOFF = (1.0, 2.0, 4.0)
+    # For transient network errors (DNS down, connect refused): longer backoff.
+    # (30s, 120s) covers a 2-minute network outage. Alerts older than MAX_ALERT_AGE_SEC
+    # are discarded rather than delivered stale (e.g. a FEED_STALE from 15 min ago).
+    NETWORK_RETRY_BACKOFF = (30.0, 120.0)
+    MAX_ALERT_AGE_SEC = 600  # 10 minutes — discard rather than deliver stale
 
     def __init__(self, paper_db: PaperDB, config: AlertConfig) -> None:
         self.paper_db = paper_db
@@ -205,6 +220,18 @@ class AlertDispatcher:
         telegram_ok = False
         email_ok = False
 
+        # Check if neither channel is enabled — log immediately rather than silently failing.
+        if not self.telegram.enabled and not self.email.enabled:
+            self.paper_db.log_alert(
+                str(event.alert_type.value),
+                event.subject,
+                event.body,
+                channel="NONE",
+                status="failed",
+                error_msg="no_channels_enabled",
+            )
+            return
+
         for attempt in range(self.MAX_RETRIES):
             try:
                 # Telegram (primary)
@@ -236,6 +263,43 @@ class AlertDispatcher:
                         await asyncio.sleep(rate_limit_wait)
                     else:
                         await asyncio.sleep(self.RETRY_BACKOFF[attempt])
+
+        # Fast retries exhausted — if it was a network error, try slow re-queue before giving up.
+        if last_error is not None and _is_network_error(last_error):
+            age_sec = time.monotonic() - event.created_at
+            for wait in self.NETWORK_RETRY_BACKOFF:
+                if age_sec + wait > self.MAX_ALERT_AGE_SEC:
+                    logger.warning(
+                        "Alert too old for network retry (age=%.0fs > max=%ds): %s",
+                        age_sec,
+                        self.MAX_ALERT_AGE_SEC,
+                        event.subject,
+                    )
+                    break
+                logger.warning(
+                    "Network error — waiting %.0fs before retry (age=%.0fs): %s",
+                    wait,
+                    age_sec,
+                    event.subject,
+                )
+                await asyncio.sleep(wait)
+                age_sec += wait
+                try:
+                    if self.telegram.enabled and not telegram_ok:
+                        await self.telegram.send(event.subject, event.body)
+                        telegram_ok = True
+                    if self.email.enabled and not email_ok:
+                        await asyncio.wait_for(
+                            self.email.send(event.subject, event.body), timeout=10.0
+                        )
+                        email_ok = True
+                    if telegram_ok or email_ok:
+                        last_error = None
+                        break
+                except Exception as exc:
+                    last_error = exc
+                    if not _is_network_error(exc):
+                        break  # Non-network error in slow retry — stop immediately
 
         # Determine overall channel status
         if telegram_ok and email_ok:

@@ -142,6 +142,7 @@ def main() -> None:
         show=False,
         dark=False,
         title="CPR Pivot Lab",
+        root_path="/cpr-pivot-lab",
     )
 
 
