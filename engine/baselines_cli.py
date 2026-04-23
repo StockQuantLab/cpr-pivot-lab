@@ -347,29 +347,24 @@ def _build_baseline_table(results: list[BaselineResult], previous: dict[str, str
 
     metrics_map = _fetch_metric_rows(list(successful.values()) + list(previous.values()))
     headers = [
-        ("Variant", 16),
-        ("New Run", 12),
-        ("Prev Run", 12),
-        ("New P/L", 14),
-        ("Prev P/L", 14),
-        ("Delta", 14),
-        ("WR", 7),
-        ("Trades", 7),
-        ("Calmar", 8),
+        "Variant",
+        "New Run",
+        "Prev Run",
+        "New P/L",
+        "Prev P/L",
+        "Delta",
+        "WR",
+        "Trades",
+        "Calmar",
     ]
 
-    def fmt_row(cells: list[str]) -> str:
-        return " | ".join(
-            f"{cell:<{width}}" if idx == 0 else f"{cell:>{width}}"
-            for idx, ((_, width), cell) in enumerate(zip(headers, cells, strict=True))
-        )
+    def md_cell(value: object) -> str:
+        text = "n/a" if value is None else str(value)
+        return text.replace("|", "\\|")
 
-    lines = []
-    lines.append("")
-    lines.append("Baseline Comparison")
-    lines.append("=" * 118)
-    lines.append(fmt_row([h for h, _ in headers]))
-    lines.append("-" * 118)
+    lines = ["", "Baseline Comparison", ""]
+    lines.append("| " + " | ".join(headers) + " |")
+    lines.append("| " + " | ".join(["---"] * len(headers)) + " |")
 
     for variant in BASELINE_VARIANTS:
         label = variant["label"]
@@ -385,21 +380,25 @@ def _build_baseline_table(results: list[BaselineResult], previous: dict[str, str
             delta_pnl = float(new_pnl) - float(prev_pnl)
 
         lines.append(
-            fmt_row(
+            "| "
+            + " | ".join(
                 [
-                    label,
-                    new_id[:12] if new_id else "n/a",
-                    prev_id[:12] if prev_id else "n/a",
-                    _format_money(new_pnl),
-                    _format_money(prev_pnl),
-                    _format_delta_money(delta_pnl) if delta_pnl is not None else "n/a",
-                    _format_percent(new_m.get("win_rate")),
-                    _format_int(new_m.get("trade_count")),
-                    f"{float(new_m.get('calmar') or 0):.2f}"
-                    if new_m.get("calmar") is not None
-                    else "n/a",
+                    md_cell(label),
+                    md_cell(new_id[:12] if new_id else "n/a"),
+                    md_cell(prev_id[:12] if prev_id else "n/a"),
+                    md_cell(_format_money(new_pnl)),
+                    md_cell(_format_money(prev_pnl)),
+                    md_cell(_format_delta_money(delta_pnl) if delta_pnl is not None else "n/a"),
+                    md_cell(_format_percent(new_m.get("win_rate"))),
+                    md_cell(_format_int(new_m.get("trade_count"))),
+                    md_cell(
+                        f"{float(new_m.get('calmar') or 0):.2f}"
+                        if new_m.get("calmar") is not None
+                        else "n/a"
+                    ),
                 ]
             )
+            + " |"
         )
 
     return "\n".join(lines)
