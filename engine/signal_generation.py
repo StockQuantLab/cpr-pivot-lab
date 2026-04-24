@@ -67,21 +67,22 @@ def check_narrow_cpr(symbols: list[str], trade_date: date | None = None) -> list
     symbols_clause = ", ".join("?" for _ in normalized_symbols)
     query = f"""
     SELECT
-        symbol,
-        trade_date,
+        c.symbol,
+        c.trade_date,
         'narrow-cpr' AS condition,
-        'CPR width ' || printf('%.2f', cpr_width_pct) || '% < threshold ' ||
-        printf('%.2f', cpr_threshold_pct) || '%' ||
-        ' (' || CASE WHEN is_narrowing THEN 'Narrowing' ELSE 'stable' END || ')' AS details,
-        cpr_width_pct AS cpr_width,
-        pivot,
-        tc,
-        bc
-    FROM cpr_daily
-    WHERE symbol IN ({symbols_clause})
-      AND trade_date = ?
-      AND cpr_width_pct < cpr_threshold_pct
-    ORDER BY cpr_width_pct ASC
+        'CPR width ' || printf('%.2f', c.cpr_width_pct) || '% < threshold ' ||
+        printf('%.2f', t.cpr_threshold_pct) || '%' ||
+        ' (' || CASE WHEN c.is_narrowing THEN 'Narrowing' ELSE 'stable' END || ')' AS details,
+        c.cpr_width_pct AS cpr_width,
+        c."pivot",
+        c.tc,
+        c.bc
+    FROM cpr_daily c
+    JOIN cpr_thresholds t ON c.symbol = t.symbol AND c.trade_date = t.trade_date
+    WHERE c.symbol IN ({symbols_clause})
+      AND c.trade_date = ?
+      AND c.cpr_width_pct < t.cpr_threshold_pct
+    ORDER BY c.cpr_width_pct ASC
     """
     return _query_signals(query, [*normalized_symbols, trade_date])
 

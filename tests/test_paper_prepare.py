@@ -52,6 +52,25 @@ def test_resolve_prepare_symbols_supports_all_local_symbols(monkeypatch):
     ]
 
 
+def test_resolve_prepare_symbols_supports_saved_universe(monkeypatch):
+    monkeypatch.setattr(
+        paper_prepare,
+        "load_universe_symbols",
+        lambda universe_name, read_only=True: ["SBIN", "TCS"]
+        if universe_name == "full_2026_04_24"
+        else [],
+    )
+
+    assert paper_prepare.resolve_prepare_symbols(
+        None,
+        None,
+        universe_name="full_2026_04_24",
+    ) == [
+        "SBIN",
+        "TCS",
+    ]
+
+
 def test_resolve_all_local_symbols_prefers_v5min_universe(monkeypatch):
     class _FakeConn:
         def execute(self, query: str):
@@ -71,7 +90,7 @@ def test_resolve_all_local_symbols_prefers_v5min_universe(monkeypatch):
         def get_available_symbols(*, force_refresh: bool = False):
             raise AssertionError("fallback should not be used when v_5min is available")
 
-    monkeypatch.setattr(paper_prepare, "get_dashboard_db", lambda: _FakeDB())
+    monkeypatch.setattr(paper_prepare, "get_db", lambda: _FakeDB())
 
     assert paper_prepare._resolve_all_local_symbols() == ["RELIANCE", "SBIN"]
 
@@ -90,7 +109,7 @@ def test_validate_daily_runtime_coverage_reports_missing_rows(monkeypatch):
             seen["trade_date"] = trade_date
             return coverage
 
-    monkeypatch.setattr(paper_prepare, "get_dashboard_db", lambda: _FakeDB())
+    monkeypatch.setattr(paper_prepare, "get_db", lambda: _FakeDB())
 
     payload = paper_prepare.validate_daily_runtime_coverage(
         trade_date="2024-03-11",
@@ -130,7 +149,7 @@ def test_prepare_runtime_for_daily_paper_validates_only_no_builds(monkeypatch):
         def get_runtime_trade_date_coverage(self, symbols: list[str], trade_date: str):
             return coverage
 
-    monkeypatch.setattr(paper_prepare, "get_dashboard_db", lambda: _FakeDB())
+    monkeypatch.setattr(paper_prepare, "get_db", lambda: _FakeDB())
 
     payload = paper_prepare.prepare_runtime_for_daily_paper(
         trade_date="2024-03-11",
@@ -143,6 +162,40 @@ def test_prepare_runtime_for_daily_paper_validates_only_no_builds(monkeypatch):
     assert payload["mode"] == "replay"
     # No build calls must have been made — this function is validate-only.
     assert build_calls == []
+
+
+def test_snapshot_candidate_universe_uses_market_db(monkeypatch):
+    calls: dict[str, object] = {}
+
+    class _FakeDB:
+        @staticmethod
+        def upsert_universe(name, symbols, **kwargs):
+            calls["name"] = name
+            calls["symbols"] = list(symbols)
+            calls["kwargs"] = kwargs
+            return len(symbols)
+
+    monkeypatch.setattr(paper_prepare, "get_db", lambda: _FakeDB())
+
+    saved = paper_prepare.snapshot_candidate_universe(
+        "full_2026_04_24",
+        ["sbin", "reliance"],
+        trade_date="2026-04-24",
+        source="paper-daily-prepare",
+        notes="snapshot from test",
+    )
+
+    assert saved == 2
+    assert calls == {
+        "name": "full_2026_04_24",
+        "symbols": ["sbin", "reliance"],
+        "kwargs": {
+            "start_date": "2026-04-24",
+            "end_date": "2026-04-24",
+            "source": "paper-daily-prepare",
+            "notes": "snapshot from test",
+        },
+    }
 
 
 def test_validate_live_runtime_coverage_uses_prior_market_history(monkeypatch):
@@ -158,7 +211,7 @@ def test_validate_live_runtime_coverage_uses_prior_market_history(monkeypatch):
     class _FakeDB:
         con = _FakeCon()
 
-    monkeypatch.setattr(paper_prepare, "get_dashboard_db", lambda: _FakeDB())
+    monkeypatch.setattr(paper_prepare, "get_db", lambda: _FakeDB())
 
     payload = paper_prepare.validate_live_runtime_coverage(
         trade_date="2024-03-11",
@@ -186,7 +239,7 @@ def test_validate_live_runtime_coverage_treats_date_mismatch_as_warning(monkeypa
     class _FakeDB:
         con = _FakeCon()
 
-    monkeypatch.setattr(paper_prepare, "get_dashboard_db", lambda: _FakeDB())
+    monkeypatch.setattr(paper_prepare, "get_db", lambda: _FakeDB())
 
     payload = paper_prepare.validate_live_runtime_coverage(
         trade_date="2024-03-11",
@@ -235,7 +288,7 @@ def test_pre_filter_symbols_for_strategy_can_return_empty(monkeypatch):
     class _FakeDB:
         con = _FakeCon()
 
-    monkeypatch.setattr(paper_prepare, "get_dashboard_db", lambda: _FakeDB())
+    monkeypatch.setattr(paper_prepare, "get_db", lambda: _FakeDB())
 
     filtered = pre_filter_symbols_for_strategy(
         trade_date="2024-03-11",

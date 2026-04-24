@@ -40,11 +40,13 @@ from engine.paper_runtime import (
     build_summary_feed_state,
     dispatch_feed_recovered_alert,
     dispatch_feed_stale_alert,
+    dispatch_session_completed_alert,
     dispatch_session_error_alert,
     dispatch_session_started_alert,
     enforce_session_risk_controls,
     evaluate_candle,
     execute_entry,
+    flatten_positions_subset,
     flatten_session_positions,
     force_paper_db_sync,
     get_session_positions,
@@ -1219,28 +1221,88 @@ async def run_live_session(
                 if stop_requested:
                     break
 
-                # Sentinel-file flatten: operator creates .tmp_logs/flatten_<session_id>.signal
-                # to close all open positions for this session while the sibling keeps running.
-                _signal_file = Path(".tmp_logs") / f"flatten_{session_id}.signal"
-                if _signal_file.exists():
-                    logger.info(
-                        "[%s] Flatten signal detected — closing all positions and completing session",
-                        session_id,
-                    )
-                    try:
-                        _signal_file.unlink()
-                    except OSError:
-                        pass
-                    final_status = "COMPLETED"
-                    terminal_reason = "manual_flatten_signal"
-                    complete_on_exit = True
-                    stop_requested = True
-                    break
-
                 if local_feed and local_feed_exhausted:
                     final_status = "COMPLETED"
                     terminal_reason = "local_feed_exhausted"
                     complete_on_exit = True
+                    break
+
+            # Sentinel-file flatten: checked every poll cycle regardless of bar activity
+            # so it fires even when active_symbols is a small quiet set with no ticks.
+            _signal_file = Path(".tmp_logs") / f"flatten_{session_id}.signal"
+            if _signal_file.exists():
+                logger.info(
+                    "[%s] Flatten signal detected — closing all positions and completing session",
+                    session_id,
+                )
+                try:
+                    _signal_file.unlink()
+                except OSError:
+                    pass
+                final_status = "COMPLETED"
+                terminal_reason = "manual_flatten_signal"
+                complete_on_exit = True
+                stop_requested = True
+                break
+
+            # Admin command queue: dashboard / agent / operator drop JSON files here.
+            _cmd_dir = Path(".tmp_logs") / f"cmd_{session_id}"
+            if _cmd_dir.exists():
+                for _cmd_file in sorted(_cmd_dir.glob("*.json")):
+                    try:
+                        import json as _json
+
+                        _cmd = _json.loads(_cmd_file.read_text())
+                        _action = _cmd.get("action", "")
+                        _reason = _cmd.get("reason", "admin_command")
+                        _requester = _cmd.get("requester", "unknown")
+                        logger.info(
+                            "[%s] Admin command: action=%s symbols=%s requester=%s",
+                            session_id,
+                            _action,
+                            _cmd.get("symbols"),
+                            _requester,
+                        )
+                        if _action == "close_all":
+                            final_status = "COMPLETED"
+                            terminal_reason = f"admin_{_reason}"
+                            complete_on_exit = True
+                            stop_requested = True
+                        elif _action == "close_positions":
+                            _syms = [str(s).upper() for s in (_cmd.get("symbols") or [])]
+                            if _syms:
+                                _close_result = await flatten_positions_subset(
+                                    session_id,
+                                    _syms,
+                                    notes=f"admin_{_reason}_{_requester}",
+                                )
+                                for _pos in _close_result.get("positions", []):
+                                    _sym = str(_pos.get("symbol", ""))
+                                    if _sym and tracker.has_open_position(_sym):
+                                        _pos_obj = tracker.get_open_position(_sym)
+                                        _cp = float(_pos.get("close_price", 0))
+                                        _qty = float(
+                                            getattr(_pos_obj, "current_qty", None)
+                                            or getattr(_pos_obj, "quantity", 0)
+                                            or 0
+                                        )
+                                        _dir = str(getattr(_pos_obj, "direction", "LONG")).upper()
+                                        _ep = float(getattr(_pos_obj, "entry_price", 0) or 0)
+                                        _exit_v = (
+                                            _qty * _cp if _dir == "LONG" else _qty * (2 * _ep - _cp)
+                                        )
+                                        tracker.record_close(_sym, _exit_v)
+                                get_paper_db().force_sync()
+                    except Exception:
+                        logger.exception(
+                            "[%s] Admin command failed: %s", session_id, _cmd_file.name
+                        )
+                    finally:
+                        try:
+                            _cmd_file.unlink()
+                        except OSError:
+                            pass
+                if stop_requested:
                     break
 
             stale = False
@@ -1564,6 +1626,8 @@ async def run_live_session(
             )
     if stop_is_terminal:
         force_paper_db_sync(get_paper_db())
+        if alerts_enabled and final_status == "COMPLETED":
+            dispatch_session_completed_alert(session_id=session_id)
 
     final_session = await _load_session(session_id, deps)
     if final_session is not None and getattr(final_session, "status", None):

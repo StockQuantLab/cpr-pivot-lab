@@ -1440,7 +1440,7 @@ def get_paper_db() -> PaperDB:
             if _paper_db is None:
                 replica_dir = REPLICA_DIR
                 replica_dir.mkdir(parents=True, exist_ok=True)
-                sync = ReplicaSync(PAPER_DUCKDB_FILE, replica_dir, min_interval_sec=5.0)
+                sync = ReplicaSync(PAPER_DUCKDB_FILE, replica_dir, min_interval_sec=2.0)
                 _paper_db = PaperDB(replica_sync=sync)
                 if not _paper_db_atexit:
                     atexit.register(close_paper_db)

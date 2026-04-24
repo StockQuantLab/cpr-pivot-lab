@@ -18,7 +18,7 @@ import polars as pl
 
 from config.settings import get_settings
 from db.backtest_db import get_backtest_db
-from db.duckdb import get_dashboard_db, get_db
+from db.duckdb import get_db
 from db.paper_db import PaperSession, get_paper_db
 from engine.cli_setup import configure_windows_asyncio, configure_windows_stdio, run_asyncio
 from engine.command_lock import acquire_command_lock
@@ -45,6 +45,7 @@ from scripts.paper_prepare import (
     prepare_runtime_for_daily_paper,
     resolve_prepare_symbols,
     resolve_trade_date,
+    snapshot_candidate_universe,
 )
 from scripts.paper_replay import ReplayDayPack, load_replay_day_packs, replay_session
 
@@ -332,6 +333,22 @@ def _parse_symbols_arg(value: str | None) -> list[str] | None:
     return symbols or None
 
 
+def _default_full_universe_name(trade_date: str) -> str:
+    """Return the canonical dated snapshot universe name for a trade date."""
+    return f"full_{trade_date.replace('-', '_')}"
+
+
+def _apply_default_saved_universe(args: argparse.Namespace, trade_date: str) -> None:
+    """Default paper runs to the dated saved universe unless an override is explicit."""
+    if _parse_symbols_arg(getattr(args, "symbols", None)):
+        return
+    if bool(getattr(args, "all_symbols", False)):
+        return
+    if str(getattr(args, "universe_name", "") or "").strip():
+        return
+    args.universe_name = _default_full_universe_name(trade_date)
+
+
 def _resolve_cli_symbols(
     parser: argparse.ArgumentParser,
     args: argparse.Namespace,
@@ -340,8 +357,21 @@ def _resolve_cli_symbols(
 ) -> list[str]:
     symbols = _parse_symbols_arg(getattr(args, "symbols", None))
     use_all_symbols = bool(getattr(args, "all_symbols", False))
-    if use_all_symbols and symbols:
-        parser.error("Use either --symbols or --all-symbols, not both.")
+    universe_name = str(getattr(args, "universe_name", "") or "").strip() or None
+    if use_all_symbols and (symbols or universe_name):
+        parser.error("Use either --symbols, --universe-name, or --all-symbols, not more than one.")
+    if symbols and universe_name:
+        parser.error("Use either --symbols or --universe-name, not both.")
+    if universe_name:
+        resolved = resolve_prepare_symbols(
+            None,
+            None,
+            universe_name=universe_name,
+            read_only=read_only,
+        )
+        if not resolved:
+            parser.error(f"Universe '{universe_name}' not found or empty.")
+        return resolved
     return resolve_prepare_symbols(symbols, None, all_symbols=use_all_symbols, read_only=read_only)
 
 
@@ -654,8 +684,24 @@ def _last_available_trade_date(db) -> str:
 async def _cmd_daily_prepare(args: argparse.Namespace) -> None:
     trade_date = resolve_trade_date(args.trade_date)
     symbols = _resolve_cli_symbols(build_parser(), args, read_only=True)
+    snapshot_universe_name = str(getattr(args, "snapshot_universe_name", "") or "").strip()
+    if not snapshot_universe_name and bool(getattr(args, "all_symbols", False)):
+        snapshot_universe_name = f"full_{trade_date.replace('-', '_')}"
+    if snapshot_universe_name:
+        with acquire_command_lock("runtime-writer", detail="runtime writer"):
+            saved_count = snapshot_candidate_universe(
+                snapshot_universe_name,
+                symbols,
+                trade_date=trade_date,
+                source="paper-daily-prepare",
+                notes=f"snapshot from daily-prepare trade_date={trade_date}",
+            )
+        print(
+            f"Saved universe '{snapshot_universe_name}' with {saved_count} symbols.",
+            flush=True,
+        )
     # Detect whether this is a future/live date (no 5-min data yet) or a historical replay date.
-    db = get_dashboard_db()
+    db = get_db()
     has_intraday = bool(
         db.con.execute(
             "SELECT 1 FROM intraday_day_pack WHERE trade_date = ?::DATE LIMIT 1",
@@ -668,9 +714,12 @@ async def _cmd_daily_prepare(args: argparse.Namespace) -> None:
         symbols=symbols,
         mode=mode,
     )
+    if snapshot_universe_name:
+        payload["snapshot_universe_name"] = snapshot_universe_name
+        payload["snapshot_universe_count"] = saved_count
     # For readiness reporting use the last available data date when the requested date
     # is in the future (live mode: today's candles don't exist yet).
-    db = get_dashboard_db()
+    db = get_db()
     dq_date = trade_date if has_intraday else _last_available_trade_date(db)
     if dq_date != trade_date:
         print(
@@ -702,6 +751,7 @@ async def _cmd_daily_replay(args: argparse.Namespace) -> None:
             return
 
         trade_date = resolve_trade_date(args.trade_date)
+        _apply_default_saved_universe(args, trade_date)
         symbols = _resolve_cli_symbols(build_parser(), args, read_only=True)
         strategy_params = _resolve_paper_strategy_params(args.strategy, args.strategy_params, args)
 
@@ -826,6 +876,7 @@ async def _cmd_daily_live(args: argparse.Namespace) -> None:
         return
 
     trade_date = resolve_trade_date(args.trade_date)
+    _apply_default_saved_universe(args, trade_date)
     symbols = _resolve_cli_symbols(build_parser(), args, read_only=True)
     strategy_params = _resolve_paper_strategy_params(args.strategy, args.strategy_params, args)
 
@@ -835,7 +886,7 @@ async def _cmd_daily_live(args: argparse.Namespace) -> None:
             "daily-live requires an explicit direction (LONG or SHORT).\n"
             "To run both sessions together use --multi:\n"
             "  doppler run -- uv run pivot-paper-trading daily-live \\\n"
-            "    --multi --strategy CPR_LEVELS --trade-date today --all-symbols\n"
+            "    --multi --strategy CPR_LEVELS --trade-date today\n"
             "Or specify a preset with a single direction:\n"
             "  --preset CPR_LEVELS_RISK_LONG  or  --preset CPR_LEVELS_RISK_SHORT"
         )
@@ -1185,6 +1236,7 @@ async def _cmd_daily_live_multi(args: argparse.Namespace) -> None:
     paper.duckdb while allowing all variants to poll simultaneously.
     """
     trade_date = resolve_trade_date(args.trade_date)
+    _apply_default_saved_universe(args, trade_date)
     all_symbols = _resolve_cli_symbols(build_parser(), args, read_only=True)
 
     feed_source = getattr(args, "feed_source", "kite")
@@ -1334,6 +1386,7 @@ async def _cmd_daily_replay_multi(args: argparse.Namespace) -> None:
             "Replay one archived session at a time."
         )
     trade_date = resolve_trade_date(args.trade_date)
+    _apply_default_saved_universe(args, trade_date)
     all_symbols = _resolve_cli_symbols(build_parser(), args, read_only=True)
 
     # Preload day packs once for the union of all filtered symbols.
@@ -1510,6 +1563,7 @@ async def _cmd_daily_sim(args: argparse.Namespace) -> None:
     """Fast daily simulation: runs backtest engine for one date, stores as PAPER."""
     with acquire_command_lock("runtime-writer", detail="runtime writer"):
         trade_date = resolve_trade_date(args.trade_date)
+        _apply_default_saved_universe(args, trade_date)
         symbols = _resolve_cli_symbols(build_parser(), args, read_only=True)
         strategy_name = _assert_cpr_only_strategy(args.strategy or "CPR_LEVELS", source="strategy")
         strategy_params = _resolve_paper_strategy_params(strategy_name, args.strategy_params, args)
@@ -1620,6 +1674,36 @@ async def _cmd_status(args: argparse.Namespace) -> None:
             }
         else:
             payload = {"active_sessions": [asdict(s) for s in sessions]}
+    print(json.dumps(payload, default=str, indent=2))
+
+
+async def _cmd_universes(args: argparse.Namespace) -> None:
+    """List saved universe snapshots."""
+    db = get_db()
+    rows = db.list_universes()
+    name_filter = str(getattr(args, "name", "") or "").strip()
+    if name_filter:
+        rows = [row for row in rows if str(row.get("name", "")).strip() == name_filter]
+    prune_before = str(getattr(args, "prune_before", "") or "").strip()
+    apply = bool(getattr(args, "apply", False))
+    if prune_before:
+        prunable = [
+            row
+            for row in rows
+            if str(row.get("end_date") or "").strip() and str(row["end_date"]) < prune_before
+        ]
+        payload = {
+            "prune_before": prune_before,
+            "apply": apply,
+            "count": len(prunable),
+            "universes": prunable,
+        }
+        if apply and prunable:
+            deleted = db.delete_universes([str(row.get("name", "")).strip() for row in prunable])
+            payload["deleted"] = deleted
+        print(json.dumps(payload, default=str, indent=2))
+        return
+    payload = {"universes": rows, "count": len(rows)}
     print(json.dumps(payload, default=str, indent=2))
 
 
@@ -1734,6 +1818,7 @@ async def _cmd_flatten(args: argparse.Namespace) -> None:
             payload["archive_error"] = str(exc)
         session = _pdb().get_session(args.session_id)
         payload["session"] = asdict(session) if session else None
+        _pdb().force_sync()
         print(json.dumps(payload, default=str, indent=2))
     finally:
         # Drain the alert dispatcher before exiting, even if flatten/archive fails.
@@ -1773,6 +1858,7 @@ async def _cmd_flatten_all(args: argparse.Namespace) -> None:
                 print(f"    WARNING: archive failed — {exc}")
             results.append({"session_id": session_id, "closed": n, "archived": archived})
             print(f"    -> closed {n} position(s), status -> COMPLETED, archived={archived}")
+        _pdb().force_sync()
         print(json.dumps({"trade_date": trade_date, "sessions": results}, indent=2))
     finally:
         await maybe_shutdown_alert_dispatcher()
@@ -1913,9 +1999,17 @@ def build_parser() -> argparse.ArgumentParser:
     def _add_symbol_args(sp: argparse.ArgumentParser) -> None:
         sp.add_argument("--symbols", default=None, help="Optional comma-separated symbol override")
         sp.add_argument(
+            "--universe-name",
+            default=None,
+            help="Saved universe name from backtest_universe (for example full_2026_04_24).",
+        )
+        sp.add_argument(
             "--all-symbols",
             action="store_true",
-            help="Use the full local validated symbol universe from DuckDB metadata.",
+            help=(
+                "Override the dated saved-universe default and use the current "
+                "dynamic full universe from DuckDB metadata."
+            ),
         )
 
     def _add_strategy_args(sp: argparse.ArgumentParser) -> None:
@@ -2176,6 +2270,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     status.set_defaults(handler=_cmd_status)
 
+    universes = sub.add_parser("universes", help="List saved universe snapshots")
+    universes.add_argument("--name", default=None, help="Optional exact universe name filter")
+    universes.add_argument(
+        "--prune-before",
+        default=None,
+        help="Delete saved snapshots whose end_date is older than this YYYY-MM-DD cutoff.",
+    )
+    universes.add_argument(
+        "--apply",
+        action="store_true",
+        help="Execute the prune. Without this flag, universes are only listed.",
+    )
+    universes.set_defaults(handler=_cmd_universes)
+
     pause = sub.add_parser("pause", help="Pause a session")
     pause.add_argument("--session-id", required=True, help="Session to pause")
     pause.add_argument("--notes", default=None, help="Optional free-text annotation")
@@ -2304,6 +2412,14 @@ def build_parser() -> argparse.ArgumentParser:
     daily_prepare = sub.add_parser("daily-prepare", help="Prepare daily paper runtime tables")
     daily_prepare.add_argument(
         "--trade-date", default=None, help="Trading date YYYY-MM-DD to prepare"
+    )
+    daily_prepare.add_argument(
+        "--snapshot-universe-name",
+        default=None,
+        help=(
+            "Optional saved-universe name to persist the resolved symbol list into "
+            "backtest_universe for later reuse."
+        ),
     )
     _add_symbol_args(daily_prepare)
     daily_prepare.set_defaults(handler=_cmd_daily_prepare)

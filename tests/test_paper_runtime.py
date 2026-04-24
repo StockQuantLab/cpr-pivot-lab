@@ -1433,4 +1433,6 @@ def test_dispatch_session_started_alert_dedups_per_session(
 
     started_alerts = [d for d in dispatched if d[0].value == "SESSION_STARTED"]
     assert len(started_alerts) == 1
-    assert started_alerts[0][1].startswith("SESSION_STARTED CPR_LEVELS LONG 2026-04-21")
+    assert started_alerts[0][1].startswith("🟢 Session Started — paper live 1")
+    assert "Strategy: <code>CPR_LEVELS</code>" in started_alerts[0][2]
+    assert "Direction: <b>LONG</b>" in started_alerts[0][2]

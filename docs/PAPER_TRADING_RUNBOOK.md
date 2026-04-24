@@ -4,7 +4,7 @@
 
 ```bash
 PYTHONUNBUFFERED=1 doppler run -- uv run pivot-paper-trading daily-live \
-  --multi --strategy CPR_LEVELS --trade-date today --all-symbols \
+  --multi --strategy CPR_LEVELS --trade-date today \
   >> .tmp_logs/live_YYYYMMDD.log 2>&1
 ```
 
@@ -17,6 +17,19 @@ PYTHONUNBUFFERED=1 doppler run -- uv run pivot-paper-trading daily-live \
 - Pre-market (8:30–9:10 AM): run `pivot-refresh --since <prev_trading_date>` then
   `pivot-paper-trading daily-prepare --trade-date today --all-symbols` before starting live.
 - Do not run backtests while live is running — `market.duckdb` write lock will block startup.
+- Optional reproducibility: `daily-prepare --all-symbols` now auto-saves the resolved symbol
+  list as `full_YYYYMMDD` in `backtest_universe` inside the canonical `market.duckdb`.
+  You can still override the name with `--snapshot-universe-name full_YYYYMMDD` if needed,
+  and then reuse that exact list with `--universe-name full_YYYYMMDD` in live / replay /
+  daily-sim / baseline commands.
+- `daily-live`, `daily-replay`, and `daily-sim` now default to the dated saved universe when
+  `--symbols`, `--all-symbols`, and `--universe-name` are all omitted. `--all-symbols` is the
+  explicit dynamic-universe override.
+- Snapshot rows live in DuckDB, not as files on disk. If you want to trim old ad hoc
+  snapshots, use `pivot-paper-trading universes --prune-before YYYY-MM-DD --apply`. Do not
+  prune the dated archive if you still need it for audit comparisons.
+- Inspect saved snapshots with `pivot-paper-trading universes` or
+  `pivot-paper-trading universes --name full_YYYYMMDD`.
 
 ---
 
@@ -60,7 +73,7 @@ execution rules; none of them is exempt from parity.
   percentage of account equity. A small-share trade can therefore show a large percentage loss
   even when the rupee loss is modest.
 - Canonical CPR replay/live command (no extra CPR flags unless you are intentionally overriding):
-  `doppler run -- uv run pivot-paper-trading daily-replay --multi --strategy CPR_LEVELS --trade-date 2026-04-02 --all-symbols --no-alerts`
+  `doppler run -- uv run pivot-paper-trading daily-replay --multi --strategy CPR_LEVELS --trade-date 2026-04-02 --no-alerts`
 - For CPR_LEVELS, a trade only opens when the effective reward/risk at entry meets `min_effective_rr` (default `2.0`).
   `rr_ratio` is the target multiple used by the trade model; it is not the entry gate.
 
@@ -100,23 +113,23 @@ Reference sets (Apr 2026):
 | Daily Reset Std SHORT | `1d6e5e93618e` | 2025-01-01 → 2026-04-09 | ₹1,041,450 |
 | Daily Reset Std LONG | `84a85d954f99` | 2025-01-01 → 2026-04-09 | ₹827,381 |
 
-- **Current CPR baselines (2026-04-23 refresh with `momentum_confirm=True` on all four CPR presets — use these for all future comparisons):**
+- **Current CPR baselines (2026-04-24 refresh with `momentum_confirm=True` on all four CPR presets — use these for all future comparisons):**
 
 SHORT presets now use `short_trail_atr_multiplier = 1.25`. LONG keeps `trail_atr_multiplier = 1.0`.
 
 | Mode | Preset | Run ID | Start → End | P/L | Calmar |
 |------|--------|--------|-------------|-----|--------|
-| Daily Reset | `CPR_LEVELS_RISK_LONG` | `dbf89ea77af6` | 2025-01-01 → 2026-04-22 | ₹1,024,831 | 201.42 |
-| Daily Reset | `CPR_LEVELS_RISK_SHORT` | `a37501b04fa8` | 2025-01-01 → 2026-04-22 | ₹1,094,206 | 99.85 |
-| Daily Reset | `CPR_LEVELS_STANDARD_LONG` | `58c20fe411d8` | 2025-01-01 → 2026-04-22 | ₹1,033,436 | 200.47 |
-| Daily Reset | `CPR_LEVELS_STANDARD_SHORT` | `9f0e916bbff0` | 2025-01-01 → 2026-04-22 | ₹1,094,116 | 85.72 |
-| Compound | `CPR_LEVELS_STANDARD_LONG` | `c8e45b38a697` | 2025-01-01 → 2026-04-22 | ₹2,248,867 | 244.61 |
-| Compound | `CPR_LEVELS_STANDARD_SHORT` | `a050cedebdb8` | 2025-01-01 → 2026-04-22 | ₹2,766,392 | 166.62 |
-| Compound | `CPR_LEVELS_RISK_LONG` | `d6bcb94cce9c` | 2025-01-01 → 2026-04-22 | ₹2,244,433 | 244.19 |
-| Compound | `CPR_LEVELS_RISK_SHORT` | `f143a95023c0` | 2025-01-01 → 2026-04-22 | ₹2,734,772 | 162.88 |
+| Daily Reset | `CPR_LEVELS_RISK_LONG` | `4eaaa682e79c` | 2025-01-01 → 2026-04-24 | ₹1,035,952 | 202.41 |
+| Daily Reset | `CPR_LEVELS_RISK_SHORT` | `fd763aa18d54` | 2025-01-01 → 2026-04-24 | ₹1,107,896 | 100.53 |
+| Daily Reset | `CPR_LEVELS_STANDARD_LONG` | `a1cf51e8c749` | 2025-01-01 → 2026-04-24 | ₹1,044,567 | 201.43 |
+| Daily Reset | `CPR_LEVELS_STANDARD_SHORT` | `7ed7debb138a` | 2025-01-01 → 2026-04-24 | ₹1,107,806 | 86.24 |
+| Compound | `CPR_LEVELS_STANDARD_LONG` | `d0a4874b4d88` | 2025-01-01 → 2026-04-24 | ₹2,295,611 | 247.60 |
+| Compound | `CPR_LEVELS_STANDARD_SHORT` | `83bbfca32739` | 2025-01-01 → 2026-04-24 | ₹2,825,745 | 168.93 |
+| Compound | `CPR_LEVELS_RISK_LONG` | `326c9e2cb6ec` | 2025-01-01 → 2026-04-24 | ₹2,295,698 | 247.61 |
+| Compound | `CPR_LEVELS_RISK_SHORT` | `b6e9e4f9449e` | 2025-01-01 → 2026-04-24 | ₹2,790,336 | 166.88 |
 
-The 2026-04-23 rerun refreshed the canonical baseline set after promoting
-`momentum_confirm=True` into all four CPR presets. This replaced the prior Apr 21
+The 2026-04-24 rerun refreshed the canonical baseline set after promoting
+`momentum_confirm=True` into all four CPR presets. This replaces the prior Apr 23
 reference rows and is now the clean 8-run baseline family for CPR comparisons.
 
 When extending the v2 set to a later end date, rerun these same eight presets and
@@ -393,26 +406,31 @@ been fully closed and archived.
 - CPR width vs threshold, TC/BC levels, pivot — gives you situational awareness
 - Direction (LONG or SHORT) is determined by the **9:15 candle close** relative to TC/BC —
   unknown until market opens. The engine resolves this live; the scan is for pre-market awareness only.
-- `--all-symbols` runs the full 2105-symbol universe. The engine still watches all symbols
-  during the live session — you do **not** need to restrict `--symbols` to the candidates list.
+- `--all-symbols` runs the full local tradable universe and overrides the dated saved-universe
+  default. The engine still watches all symbols during the live session — you do **not** need
+  to restrict `--symbols` to the candidates list.
 
 **Why not pre-filter symbols for daily-live?**
 The Kite adapter batches 500 quotes per API call, so 2105 symbols = 5 calls per poll.
 Restricting to 50–100 candidates saves only 4 calls/poll at the cost of missing late movers.
-Keep `--all-symbols` for daily-live; use the signal scan for situational awareness only.
+Use the dated saved universe for daily-live by default; use `--all-symbols` only when you
+intentionally want the current dynamic universe for comparison.
 
 ### 2a. Live paper trading - primary sessions (current trading day)
 
 Use the canonical CPR preset bundle by default. Start from a named preset for every canonical run;
-only use explicit flags when you are intentionally doing ad hoc analysis. `--all-symbols` scans the full universe;
-the Kite adapter batches 500 symbols per API call so 2106 symbols = 5 calls per poll,
-well within rate limits. `max_positions=10` caps concurrent open trades, not total trades per day.
+only use explicit flags when you are intentionally doing ad hoc analysis. The dated saved universe
+is the default for canonical live/replay/sim runs; `--all-symbols` scans the dynamic full universe;
+the Kite adapter batches 500 symbols per API call, which stays within rate limits for the full
+tradable set. `max_positions=10` caps concurrent open trades, not total trades per day.
+The snapshot-universe path does not change EOD ingestion; it only adds an optional
+post-prepare freeze/reuse layer for reproducible live runs.
 
 ```bash
 # CPR LONG + SHORT concurrently (preferred)
 doppler run -- uv run pivot-paper-trading daily-live \
   --multi --strategy CPR_LEVELS \
-  --trade-date today --all-symbols
+  --trade-date today
 ```
 
 `--allow-late-start-fallback` is no longer required. `pivot-refresh` now builds
@@ -439,7 +457,7 @@ Use `--multi` to run the canonical CPR variants (LONG + SHORT) concurrently in a
 ```bash
 # CPR_LEVELS LONG + SHORT concurrently
 doppler run -- uv run pivot-paper-trading daily-live \
-  --multi --strategy CPR_LEVELS --trade-date today --all-symbols
+  --multi --strategy CPR_LEVELS --trade-date today
 ```
 
 Each variant gets its own session, pre-filtered symbol list, and RVOL policy. The alert dispatcher uses
@@ -751,6 +769,40 @@ doppler run -- uv run pivot-paper-trading flatten --session-id CPR_LEVELS_SHORT-
 
 > **Note:** The live process must be killed first — DuckDB does not allow concurrent writers.
 > The `flatten` / `flatten-all` commands fail with a lock error if the live session is still running.
+
+### Selective session flatten while live is still running
+
+**Option A — Session sentinel (close all positions in one session):**
+
+```powershell
+New-Item -ItemType File -Path .tmp_logs\flatten_CPR_LEVELS_LONG-2026-04-25-live-kite.signal -Force | Out-Null
+```
+
+The running `daily-live` process checks for `.tmp_logs/flatten_<session_id>.signal` on every
+poll cycle (~1s). When present, that session closes all open positions, sends `FLATTEN_EOD`,
+and marks itself `COMPLETED`. The sibling session is unaffected.
+
+**Option B — Admin command queue (close specific symbols or all, from any caller):**
+
+Drop a JSON file into `.tmp_logs/cmd_<session_id>/`. The live loop processes it within ~1s
+without requiring a DB lock, then deletes it.
+
+```powershell
+# Close two specific symbols — session keeps running:
+$cmd = '{"action":"close_positions","symbols":["SBIN","RELIANCE"],"reason":"manual","requester":"operator"}'
+$ts = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+New-Item -ItemType Directory -Path ".tmp_logs\cmd_CPR_LEVELS_SHORT-2026-04-25-live-kite" -Force | Out-Null
+$cmd | Out-File ".tmp_logs\cmd_CPR_LEVELS_SHORT-2026-04-25-live-kite\${ts}_close.json" -Encoding utf8
+
+# Close all — equivalent to sentinel but also works for the agent/dashboard:
+$cmd = '{"action":"close_all","reason":"market_conditions","requester":"operator"}'
+$cmd | Out-File ".tmp_logs\cmd_CPR_LEVELS_SHORT-2026-04-25-live-kite\${ts}_closeall.json" -Encoding utf8
+```
+
+The agent can trigger this via: `paper_send_command(session_id, "close_positions", symbols=[...])`
+
+Each closed position sends a `TRADE_CLOSED` alert. Dashboard updates within 2s.
+The session stays `ACTIVE` after `close_positions`; only `close_all` marks it `COMPLETED`.
 
 ### Flatten All Positions (legacy single-session)
 

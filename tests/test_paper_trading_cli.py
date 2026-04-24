@@ -87,6 +87,12 @@ def test_paper_trading_parser_supports_daily_commands() -> None:
     assert daily_prepare_args.command == "daily-prepare"
     assert daily_prepare_args.trade_date == "2024-01-01"
     assert daily_prepare_args.all_symbols is False
+    assert daily_prepare_args.universe_name is None
+    assert daily_prepare_args.snapshot_universe_name is None
+
+    universes_args = parser.parse_args(["universes", "--name", "full_2026_04_24"])
+    assert universes_args.command == "universes"
+    assert universes_args.name == "full_2026_04_24"
 
     daily_replay_args = parser.parse_args(
         [
@@ -133,6 +139,17 @@ def test_paper_trading_parser_supports_daily_commands() -> None:
     assert daily_live_args.standard_sizing is False
     assert daily_live_args.risk_based_sizing is True
     assert daily_live_args.no_alerts is False
+
+    daily_live_universe_args = parser.parse_args(
+        [
+            "daily-live",
+            "--trade-date",
+            "2024-01-03",
+            "--universe-name",
+            "full_2026_04_24",
+        ]
+    )
+    assert daily_live_universe_args.universe_name == "full_2026_04_24"
 
     daily_live_no_alerts_args = parser.parse_args(
         [
@@ -519,7 +536,6 @@ async def test_cmd_daily_prepare_runs_readiness_gate(monkeypatch: pytest.MonkeyP
         calls.append(("print", report["trade_date"]))
 
     monkeypatch.setattr(pt, "get_db", lambda: _FakeDB())
-    monkeypatch.setattr(pt, "get_dashboard_db", lambda: _FakeDB())
     monkeypatch.setattr(pt, "prepare_runtime_for_daily_paper", fake_prepare_runtime_for_daily_paper)
     monkeypatch.setattr(
         pt._data_quality,
@@ -535,7 +551,7 @@ async def test_cmd_daily_prepare_runs_readiness_gate(monkeypatch: pytest.MonkeyP
     monkeypatch.setattr(
         pt,
         "resolve_prepare_symbols",
-        lambda symbols, raw, all_symbols=False, read_only=True: symbols,
+        lambda symbols, raw, universe_name=None, all_symbols=False, read_only=True: symbols,
     )
 
     with pytest.raises(SystemExit) as excinfo:
@@ -553,6 +569,256 @@ async def test_cmd_daily_prepare_runs_readiness_gate(monkeypatch: pytest.MonkeyP
         ("dq", "2024-01-01"),
         ("print", "2024-01-01"),
     ]
+
+
+@pytest.mark.asyncio
+async def test_cmd_daily_prepare_snapshots_universe(monkeypatch: pytest.MonkeyPatch) -> None:
+    import scripts.paper_trading as pt
+
+    calls: list[object] = []
+
+    class _FakeCon:
+        def execute(self, query: str, params: list[object]):
+            return SimpleNamespace(fetchone=lambda: (1,))
+
+    class _FakeDB:
+        con = _FakeCon()
+
+    def fake_prepare_runtime_for_daily_paper(*, trade_date: str, symbols: list[str], mode: str):
+        calls.append(("prepare", trade_date, list(symbols), mode))
+        return {
+            "trade_date": trade_date,
+            "requested_symbols": symbols,
+            "coverage_ready": True,
+            "coverage": {"market_day_state": [], "strategy_day_state": [], "intraday_day_pack": []},
+        }
+
+    def fake_build_trade_date_readiness_report(trade_date: str):
+        calls.append(("dq", trade_date))
+        return {
+            "trade_date": trade_date,
+            "requested_symbols": ["SBIN"],
+            "freshness_rows": [],
+            "freshness_comparisons": [],
+            "setup_capable_symbols": ["SBIN"],
+            "late_starting_symbols": [],
+            "setup_query_failed": False,
+            "coverage": {"market_day_state": [], "strategy_day_state": [], "intraday_day_pack": []},
+            "ready": True,
+        }
+
+    def fake_print_trade_date_readiness_report(report: dict[str, object]) -> None:
+        calls.append(("print", report["trade_date"]))
+
+    monkeypatch.setattr(pt, "get_db", lambda: _FakeDB())
+    monkeypatch.setattr(pt, "resolve_trade_date", lambda value: value)
+    monkeypatch.setattr(
+        pt,
+        "resolve_prepare_symbols",
+        lambda symbols, raw, universe_name=None, all_symbols=False, read_only=True: [
+            "RELIANCE",
+            "SBIN",
+        ],
+    )
+    monkeypatch.setattr(
+        pt,
+        "snapshot_candidate_universe",
+        lambda universe_name, symbols, **kwargs: calls.append(
+            ("snapshot", universe_name, list(symbols), kwargs)
+        )
+        or len(symbols),
+    )
+    monkeypatch.setattr(pt, "prepare_runtime_for_daily_paper", fake_prepare_runtime_for_daily_paper)
+    monkeypatch.setattr(
+        pt._data_quality,
+        "build_trade_date_readiness_report",
+        fake_build_trade_date_readiness_report,
+    )
+    monkeypatch.setattr(
+        pt._data_quality,
+        "print_trade_date_readiness_report",
+        fake_print_trade_date_readiness_report,
+    )
+
+    await _cmd_daily_prepare(
+        SimpleNamespace(
+            trade_date="2024-01-01",
+            symbols=None,
+            universe_name=None,
+            all_symbols=True,
+            snapshot_universe_name="full_2024_01_01",
+        )
+    )
+
+    assert calls == [
+        (
+            "snapshot",
+            "full_2024_01_01",
+            ["RELIANCE", "SBIN"],
+            {
+                "trade_date": "2024-01-01",
+                "source": "paper-daily-prepare",
+                "notes": "snapshot from daily-prepare trade_date=2024-01-01",
+            },
+        ),
+        ("prepare", "2024-01-01", ["RELIANCE", "SBIN"], "replay"),
+        ("dq", "2024-01-01"),
+        ("print", "2024-01-01"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_cmd_daily_prepare_auto_snapshots_all_symbols(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import scripts.paper_trading as pt
+
+    calls: list[object] = []
+
+    class _FakeCon:
+        def execute(self, query: str, params: list[object]):
+            return SimpleNamespace(fetchone=lambda: (1,))
+
+    class _FakeDB:
+        con = _FakeCon()
+
+    def fake_prepare_runtime_for_daily_paper(*, trade_date: str, symbols: list[str], mode: str):
+        calls.append(("prepare", trade_date, list(symbols), mode))
+        return {
+            "trade_date": trade_date,
+            "requested_symbols": symbols,
+            "coverage_ready": True,
+            "coverage": {"market_day_state": [], "strategy_day_state": [], "intraday_day_pack": []},
+        }
+
+    def fake_build_trade_date_readiness_report(trade_date: str):
+        calls.append(("dq", trade_date))
+        return {
+            "trade_date": trade_date,
+            "requested_symbols": ["SBIN"],
+            "freshness_rows": [],
+            "freshness_comparisons": [],
+            "setup_capable_symbols": ["SBIN"],
+            "late_starting_symbols": [],
+            "setup_query_failed": False,
+            "coverage": {"market_day_state": [], "strategy_day_state": [], "intraday_day_pack": []},
+            "ready": True,
+        }
+
+    def fake_print_trade_date_readiness_report(report: dict[str, object]) -> None:
+        calls.append(("print", report["trade_date"]))
+
+    monkeypatch.setattr(pt, "get_db", lambda: _FakeDB())
+    monkeypatch.setattr(pt, "resolve_trade_date", lambda value: value)
+    monkeypatch.setattr(
+        pt,
+        "resolve_prepare_symbols",
+        lambda symbols, raw, universe_name=None, all_symbols=False, read_only=True: [
+            "RELIANCE",
+            "SBIN",
+        ],
+    )
+    monkeypatch.setattr(
+        pt,
+        "snapshot_candidate_universe",
+        lambda universe_name, symbols, **kwargs: calls.append(
+            ("snapshot", universe_name, list(symbols), kwargs)
+        )
+        or len(symbols),
+    )
+    monkeypatch.setattr(pt, "prepare_runtime_for_daily_paper", fake_prepare_runtime_for_daily_paper)
+    monkeypatch.setattr(
+        pt._data_quality,
+        "build_trade_date_readiness_report",
+        fake_build_trade_date_readiness_report,
+    )
+    monkeypatch.setattr(
+        pt._data_quality,
+        "print_trade_date_readiness_report",
+        fake_print_trade_date_readiness_report,
+    )
+
+    await _cmd_daily_prepare(
+        SimpleNamespace(
+            trade_date="2024-01-01",
+            symbols=None,
+            universe_name=None,
+            all_symbols=True,
+            snapshot_universe_name=None,
+        )
+    )
+
+    assert calls == [
+        (
+            "snapshot",
+            "full_2024_01_01",
+            ["RELIANCE", "SBIN"],
+            {
+                "trade_date": "2024-01-01",
+                "source": "paper-daily-prepare",
+                "notes": "snapshot from daily-prepare trade_date=2024-01-01",
+            },
+        ),
+        ("prepare", "2024-01-01", ["RELIANCE", "SBIN"], "replay"),
+        ("dq", "2024-01-01"),
+        ("print", "2024-01-01"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_cmd_universes_lists_saved_snapshots(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import scripts.paper_trading as pt
+
+    class _FakeDB:
+        @staticmethod
+        def list_universes():
+            return [
+                {"name": "full_2026_04_24", "symbol_count": 2030, "end_date": "2026-04-24"},
+                {"name": "gold_51", "symbol_count": 51, "end_date": "2026-01-01"},
+            ]
+
+    monkeypatch.setattr(pt, "get_db", lambda: _FakeDB())
+
+    await pt._cmd_universes(SimpleNamespace(name="full_2026_04_24"))
+    payload = __import__("json").loads(capsys.readouterr().out)
+    assert payload == {
+        "universes": [{"name": "full_2026_04_24", "symbol_count": 2030, "end_date": "2026-04-24"}],
+        "count": 1,
+    }
+
+
+@pytest.mark.asyncio
+async def test_cmd_universes_prunes_old_snapshots(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import scripts.paper_trading as pt
+
+    deleted: list[list[str]] = []
+
+    class _FakeDB:
+        @staticmethod
+        def list_universes():
+            return [
+                {"name": "full_2026_04_01", "symbol_count": 2030, "end_date": "2026-04-01"},
+                {"name": "full_2026_04_24", "symbol_count": 2029, "end_date": "2026-04-24"},
+            ]
+
+        @staticmethod
+        def delete_universes(names: list[str]) -> int:
+            deleted.append(list(names))
+            return len(names)
+
+    monkeypatch.setattr(pt, "get_db", lambda: _FakeDB())
+
+    await pt._cmd_universes(SimpleNamespace(name=None, prune_before="2026-04-10", apply=True))
+    payload = __import__("json").loads(capsys.readouterr().out)
+    assert payload["prune_before"] == "2026-04-10"
+    assert payload["apply"] is True
+    assert payload["count"] == 1
+    assert payload["deleted"] == 1
+    assert deleted == [["full_2026_04_01"]]
 
 
 @pytest.mark.asyncio
@@ -601,6 +867,61 @@ async def test_cmd_daily_replay_restores_alert_suppression_on_failure(
         )
 
     assert calls == [True, False]
+
+
+@pytest.mark.asyncio
+async def test_cmd_daily_replay_defaults_to_saved_universe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import scripts.paper_trading as pt
+
+    seen: dict[str, object] = {}
+
+    class _LockCtx:
+        def __enter__(self):
+            return None
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    async def fake_run_daily_workflow(**kwargs):
+        seen["workflow"] = kwargs
+        return {"status": "REPLAY"}
+
+    def fake_resolve_cli_symbols(parser, args, *, read_only=True):
+        seen["universe_name"] = args.universe_name
+        return ["SBIN"]
+
+    monkeypatch.setattr(pt, "acquire_command_lock", lambda *args, **kwargs: _LockCtx())
+    monkeypatch.setattr(pt, "_resolve_cli_symbols", fake_resolve_cli_symbols)
+    monkeypatch.setattr(
+        pt,
+        "_resolve_paper_strategy_params",
+        lambda *args, **kwargs: {"direction_filter": "LONG", "skip_rvol_check": False},
+    )
+    monkeypatch.setattr(pt, "pre_filter_symbols_for_strategy", lambda *args, **kwargs: ["SBIN"])
+    monkeypatch.setattr(pt, "_run_daily_workflow", fake_run_daily_workflow)
+
+    await pt._cmd_daily_replay(
+        SimpleNamespace(
+            trade_date="2024-01-02",
+            symbols=None,
+            all_symbols=False,
+            universe_name=None,
+            strategy="CPR_LEVELS",
+            strategy_params=None,
+            session_id="paper-test",
+            notes=None,
+            leave_active=False,
+            no_alerts=False,
+            pack_source="intraday_day_pack",
+            pack_source_session_id=None,
+            multi=False,
+        )
+    )
+
+    assert seen["universe_name"] == "full_2024_01_02"
+    assert seen["workflow"]["symbols"] == ["SBIN"]
 
 
 @pytest.mark.asyncio
@@ -684,6 +1005,59 @@ async def test_cmd_daily_live_local_feed_alert_toggle(
     }
     assert workflow_calls["workflow"]["strategy_params"]["feed_source"] == "local"
     assert workflow_calls["workflow"]["live_kwargs"]["ticker_adapter"].trade_date == "2026-04-09"
+
+
+@pytest.mark.asyncio
+async def test_cmd_daily_live_defaults_to_saved_universe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import scripts.paper_trading as pt
+
+    seen: dict[str, object] = {}
+
+    async def fake_run_daily_workflow(**kwargs):
+        seen["workflow"] = kwargs
+        return {"status": "LIVE"}
+
+    def fake_resolve_cli_symbols(parser, args, *, read_only=True):
+        seen["universe_name"] = args.universe_name
+        return ["SBIN"]
+
+    monkeypatch.setattr(pt, "resolve_trade_date", lambda value: value)
+    monkeypatch.setattr(pt, "_resolve_cli_symbols", fake_resolve_cli_symbols)
+    monkeypatch.setattr(
+        pt,
+        "_resolve_paper_strategy_params",
+        lambda *args, **kwargs: {"direction_filter": "LONG", "skip_rvol_check": False},
+    )
+    monkeypatch.setattr(pt, "pre_filter_symbols_for_strategy", lambda *args, **kwargs: ["SBIN"])
+    monkeypatch.setattr(pt, "set_alerts_suppressed", lambda value: None)
+    monkeypatch.setattr(pt, "_run_daily_workflow", fake_run_daily_workflow)
+    monkeypatch.setattr(pt, "_wait_until_market_ready", lambda trade_date: None)
+
+    await pt._cmd_daily_live(
+        SimpleNamespace(
+            trade_date="2026-04-09",
+            symbols=None,
+            all_symbols=False,
+            universe_name=None,
+            strategy="CPR_LEVELS",
+            strategy_params=None,
+            session_id="paper-test",
+            notes=None,
+            skip_coverage=True,
+            poll_interval_sec=1.0,
+            candle_interval_minutes=5,
+            max_cycles=1,
+            complete_on_exit=False,
+            feed_source="local",
+            no_alerts=False,
+            multi=False,
+        )
+    )
+
+    assert seen["universe_name"] == "full_2026_04_09"
+    assert seen["workflow"]["symbols"] == ["SBIN"]
 
 
 @pytest.mark.asyncio

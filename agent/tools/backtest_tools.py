@@ -26,7 +26,7 @@ from engine.cpr_atr_strategy import (
     CPRLevelsParams,
     FBRParams,
 )
-from engine.paper_runtime import summarize_paper_positions
+from engine.paper_runtime import summarize_paper_positions, write_admin_command
 
 logger = logging.getLogger(__name__)
 
@@ -565,4 +565,50 @@ def get_paper_ledger(session_id: str) -> dict:
         }
     except Exception:
         logger.exception("get_paper_ledger failed: session_id=%s", session_id)
-        return _internal_error("Internal error while fetching paper ledger.", session_id=session_id)
+        return _internal_error("get_paper_ledger failed", session_id=session_id)
+
+
+def paper_send_command(
+    session_id: str,
+    action: str,
+    symbols: list[str] | None = None,
+    reason: str = "agent_command",
+) -> dict:
+    """Send a control command to a live paper session.
+
+    The command is written to a queue file that the live process picks up on its
+    next poll cycle (~1s). The session keeps running after a 'close_positions' command;
+    only 'close_all' terminates it like the sentinel file does.
+
+    Args:
+        session_id: Full session ID (e.g. 'CPR_LEVELS_LONG-2026-04-24-live-kite').
+        action: 'close_positions' to close specific symbols, 'close_all' to end the session.
+        symbols: Required for 'close_positions'. List of symbols to close (e.g. ['SBIN', 'RELIANCE']).
+        reason: Free-text reason logged in alerts and DB.
+
+    Returns:
+        Dict with 'command_file' path and 'action' confirmation.
+    """
+    try:
+        if action not in ("close_positions", "close_all"):
+            return _internal_error(
+                f"Unknown action '{action}'. Use 'close_positions' or 'close_all'."
+            )
+        if action == "close_positions" and not symbols:
+            return _internal_error("'close_positions' requires a non-empty symbols list.")
+        cmd_file = write_admin_command(
+            session_id,
+            action,
+            symbols=symbols,
+            reason=reason,
+            requester="agent",
+        )
+        return {
+            "command_file": cmd_file,
+            "action": action,
+            "symbols": symbols,
+            "session_id": session_id,
+        }
+    except Exception:
+        logger.exception("paper_send_command failed: session_id=%s action=%s", session_id, action)
+        return _internal_error("paper_send_command failed")

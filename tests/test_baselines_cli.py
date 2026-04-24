@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import db.backtest_db
+import db.duckdb
 import engine.baselines_cli as baselines_cli
 
 
@@ -20,6 +21,38 @@ def test_build_backtest_args_includes_progress_file(tmp_path):
     assert "--quiet" in args
     assert "--progress-file" in args
     assert str(progress_file) in args
+
+
+def test_build_backtest_args_prefers_saved_universe_snapshot(monkeypatch):
+    class _Row:
+        @staticmethod
+        def fetchone():
+            return (1,)
+
+    class _FakeCon:
+        def execute(self, sql, params=None):
+            if "backtest_universe" in sql:
+                return _Row()
+            raise AssertionError(f"unexpected sql: {sql}")
+
+    class _FakeDB:
+        def __init__(self):
+            self.con = _FakeCon()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(db.duckdb, "get_db", lambda: _FakeDB())
+
+    args = baselines_cli._build_backtest_args(
+        "2025-01-01",
+        "2026-04-24",
+        {"preset": "CPR_LEVELS_STANDARD_LONG", "compound_equity": False},
+    )
+
+    assert "--universe-name" in args
+    assert "full_2026_04_24" in args
+    assert "--all" not in args
 
 
 def test_find_previous_baselines_matches_legacy_param_signature(monkeypatch):

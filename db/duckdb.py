@@ -3310,6 +3310,31 @@ class MarketDB:
             for r in rows
         ]
 
+    def delete_universes(self, names: list[str]) -> int:
+        """Delete named universe snapshots from backtest_universe."""
+        self.ensure_universe_table()
+        target = sorted(
+            {
+                _validate_universe_name((name or "").strip())
+                for name in names
+                if str(name or "").strip()
+            }
+        )
+        if not target:
+            return 0
+        placeholders = ", ".join("?" for _ in target)
+        count_row = self.con.execute(
+            f"SELECT COUNT(*) FROM backtest_universe WHERE universe_name IN ({placeholders})",
+            target,
+        ).fetchone()
+        deleted = int(count_row[0]) if count_row and count_row[0] is not None else 0
+        self.con.execute(
+            f"DELETE FROM backtest_universe WHERE universe_name IN ({placeholders})",
+            target,
+        )
+        self._publish_replica(force=True)
+        return deleted
+
     # ------------------------------------------------------------------
     # Query API — ALL use parameterized queries (no SQL injection risk)
     # ------------------------------------------------------------------

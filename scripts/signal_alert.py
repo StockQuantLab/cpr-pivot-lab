@@ -180,13 +180,7 @@ def main() -> None:
     symbols = []
     if args.universe:
         universe_name = _validate_universe_name(args.universe.strip())
-        con = get_db().con
-        universe_symbols = con.execute(
-            "SELECT DISTINCT symbol FROM backtest_universe WHERE universe_name = ?",
-            [universe_name],
-        ).pl()
-        if not universe_symbols.is_empty():
-            symbols = universe_symbols["symbol"].to_list()
+        symbols = get_db().get_universe_symbols(universe_name)
     elif args.symbols:
         symbols = [normalize_symbol(s) for s in args.symbols.split(",")]
     else:

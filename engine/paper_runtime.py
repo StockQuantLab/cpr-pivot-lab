@@ -337,19 +337,24 @@ def dispatch_session_state_alert(
     details: str | None = None,
 ) -> None:
     """Emit a non-blocking session lifecycle alert for manual pause/resume actions."""
-
     normalized_state = str(state or "").strip().upper()
     if normalized_state not in {"PAUSED", "RESUMED"}:
         raise ValueError(f"Unsupported session state alert: {normalized_state!r}")
-    session_tag = str(session_id or "")[:16]
+    short_label, date_label = _parse_session_label(session_id)
     alert_type = (
         AlertType.SESSION_PAUSED if normalized_state == "PAUSED" else AlertType.SESSION_RESUMED
     )
-    subject = f"{alert_type.value} {session_tag}"
-    body = f"Session: <code>{session_tag}</code>\nState: {normalized_state}"
+    icon = "⏸️" if normalized_state == "PAUSED" else "🔄"
+    subject = f"{icon} Session {normalized_state.title()} — {short_label} · {date_label}"
+    now_str = datetime.now(_IST).strftime("%H:%M IST")
+    body_lines = [
+        f"{icon} <b>Session {normalized_state.lower()}</b> · {short_label}",
+        f"Time: <code>{now_str}</code>",
+        f"ID: <code>{session_id}</code>",
+    ]
     if details:
-        body += f"\nDetails: {details}"
-    _dispatch_alert(alert_type, subject, body)
+        body_lines.append(f"Details: {details}")
+    _dispatch_alert(alert_type, subject, "\n".join(body_lines))
 
 
 def _parse_session_label(session_id: str) -> tuple[str, str]:
@@ -478,15 +483,32 @@ def dispatch_session_started_alert(
     """Emit a SESSION_STARTED alert when a live session becomes ACTIVE."""
     if session_id in _session_started_sent:
         return
-    session_tag = str(session_id or "")[:20]
-    subject = f"SESSION_STARTED {strategy} {direction} {trade_date}"
+    short_label, date_label = _parse_session_label(session_id)
+    icon = "🟢" if direction.upper() == "LONG" else "🔴"
+    subject = f"{icon} Session Started — {short_label} · {date_label}"
+    now_str = datetime.now(_IST).strftime("%H:%M IST")
     body = (
-        f"Session: <code>{session_tag}</code>\n"
-        f"Strategy: {strategy}  Direction: {direction}\n"
-        f"Symbols: {symbol_count}  Date: {trade_date}"
+        f"{icon} <b>Session started</b> · {short_label}\n"
+        f"Strategy: <code>{strategy}</code>  Direction: <b>{direction}</b>\n"
+        f"Symbols: {symbol_count:,}  Date: {trade_date}\n"
+        f"Started: <code>{now_str}</code>\n"
+        f"ID: <code>{session_id}</code>"
     )
     _dispatch_alert(AlertType.SESSION_STARTED, subject, body)
     _session_started_sent.add(session_id)
+
+
+def dispatch_session_completed_alert(*, session_id: str) -> None:
+    """Emit a SESSION_COMPLETED alert when a session ends normally."""
+    short_label, date_label = _parse_session_label(session_id)
+    now_str = datetime.now(_IST).strftime("%H:%M IST")
+    subject = f"✅ Session Completed — {short_label} · {date_label}"
+    body = (
+        f"✅ <b>Session completed</b> · {short_label}\n"
+        f"Completed: <code>{now_str}</code>\n"
+        f"ID: <code>{session_id}</code>"
+    )
+    _dispatch_alert(AlertType.SESSION_COMPLETED, subject, body)
 
 
 def _hhmm(value: datetime | None) -> str | None:
@@ -1518,6 +1540,123 @@ async def flatten_session_positions(
     return {"session_id": session_id, "closed_positions": len(closed), "positions": closed}
 
 
+async def flatten_positions_subset(
+    session_id: str,
+    symbols: list[str],
+    *,
+    notes: str | None = None,
+    feed_state: FeedState | None = None,
+) -> dict[str, Any]:
+    """Close specific open positions without stopping the session.
+
+    Unlike flatten_session_positions, this does not set status=STOPPING and does
+    not dispatch FLATTEN_EOD — the session keeps running with remaining positions.
+    Caller is responsible for syncing the in-memory tracker after this returns.
+    """
+    if not symbols:
+        return {"session_id": session_id, "closed_positions": 0, "positions": []}
+
+    symbol_set = {str(s).upper() for s in symbols}
+    session = await get_session(session_id)
+    if session is None:
+        return {"session_id": session_id, "missing": True}
+
+    all_open = await get_session_positions(session_id, statuses=["OPEN"])
+    positions = [p for p in all_open if str(p.symbol).upper() in symbol_set]
+    if not positions:
+        return {"session_id": session_id, "closed_positions": 0, "positions": []}
+
+    if feed_state is None:
+        feed_state = await get_feed_state(session_id)
+    price_map = _build_symbol_price_map(feed_state)
+    params = build_backtest_params(session)
+
+    closed: list[dict[str, Any]] = []
+    now_ist = datetime.now(tz=_IST)
+    for position in positions:
+        close_price = _close_price_for_position(position, price_map)
+        realized = _realized_pnl_for_close(position, close_price, params=params)
+        side = "SELL" if str(position.direction).upper() == "LONG" else "BUY"
+        await append_order_event(
+            session_id=session_id,
+            symbol=position.symbol,
+            side=side,
+            requested_qty=float(position.quantity),
+            position_id=position.position_id,
+            order_type="MARKET",
+            request_price=close_price,
+            fill_qty=float(position.quantity),
+            fill_price=close_price,
+            status="FILLED",
+            notes=notes or "partial flatten",
+        )
+        await update_position(
+            position.position_id,
+            status="CLOSED",
+            current_qty=0.0,
+            last_price=close_price,
+            close_price=close_price,
+            realized_pnl=realized,
+            exit_reason="MANUAL_CLOSE",
+            closed_by="MANUAL_CLOSE",
+            closed_at=now_ist,
+            trail_state={**(position.trail_state or {}), "close_reason": "MANUAL_CLOSE"},
+        )
+        try:
+            subject, body = _format_close_alert(
+                symbol=position.symbol,
+                direction=str(position.direction),
+                entry_price=float(position.entry_price or 0),
+                close_price=close_price,
+                reason="MANUAL_CLOSE",
+                realized_pnl=realized,
+                strategy=str(getattr(position, "opened_by", "")),
+                session_id=str(position.session_id),
+                event_time=now_ist,
+            )
+            _dispatch_alert(AlertType.TRADE_CLOSED, subject, body)
+        except Exception:
+            logger.debug(
+                "Alert dispatch for partial flatten %s failed", position.symbol, exc_info=True
+            )
+        closed.append(
+            {
+                "position_id": position.position_id,
+                "symbol": position.symbol,
+                "close_price": close_price,
+            }
+        )
+
+    return {"session_id": session_id, "closed_positions": len(closed), "positions": closed}
+
+
+def write_admin_command(
+    session_id: str,
+    action: str,
+    *,
+    symbols: list[str] | None = None,
+    reason: str = "manual",
+    requester: str = "unknown",
+) -> str:
+    """Write a command to the session's admin queue for the live loop to process.
+
+    Actions: 'close_positions' (symbols required), 'close_all'.
+    Returns the path of the command file written.
+    """
+    import json as _json
+    from pathlib import Path as _Path
+
+    cmd_dir = _Path(".tmp_logs") / f"cmd_{session_id}"
+    cmd_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    cmd_file = cmd_dir / f"{ts}_{action}.json"
+    cmd: dict[str, Any] = {"action": action, "reason": reason, "requester": requester}
+    if symbols:
+        cmd["symbols"] = [str(s).upper() for s in symbols]
+    cmd_file.write_text(_json.dumps(cmd))
+    return str(cmd_file)
+
+
 def _current_session_time(as_of: datetime) -> dt_time:
     return dt_time(as_of.hour, as_of.minute, as_of.second)
 
@@ -2309,12 +2448,14 @@ __all__ = [
     "build_backtest_params",
     "build_backtest_params_from_overrides",
     "build_summary_feed_state",
+    "dispatch_session_completed_alert",
     "dispatch_session_error_alert",
     "dispatch_session_started_alert",
     "dispatch_session_state_alert",
     "enforce_session_risk_controls",
     "evaluate_candle",
     "execute_entry",
+    "flatten_positions_subset",
     "flatten_session_positions",
     "load_setup_row",
     "mark_price_for_position",
@@ -2326,4 +2467,5 @@ __all__ = [
     "set_alert_sink",
     "set_alerts_suppressed",
     "summarize_paper_positions",
+    "write_admin_command",
 ]

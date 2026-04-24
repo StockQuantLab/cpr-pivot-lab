@@ -7,6 +7,62 @@ Supersedes: `docs/PARITY_INCIDENT_LOG.md` (contents migrated below).
 
 ---
 
+## 2026-04-24 — BUG: Sentinel file flatten silently ignored after entry window closes
+
+**Status:** FIXED — `scripts/paper_live.py`
+**Severity:** High — operator control path fails silently during live session
+
+### Symptom
+`touch .tmp_logs/flatten_CPR_LEVELS_LONG-2026-04-24-live-kite.signal` created, no
+"Flatten signal detected" log appeared after 10+ minutes across multiple bar boundaries.
+LONG session stayed ACTIVE. SHORT was unaffected (correct).
+
+### Root Cause
+The sentinel check was placed **inside `if cycle_closed:`** (16-space indent). It only
+executed when closed candles existed in the current polling cycle. After the entry window
+closes, `active_symbols` shrinks to open-position symbols only. If those symbols have no
+ticks in a polling window (lunch lull, illiquid scrips), `cycle_closed` is empty and the
+sentinel is never checked.
+
+### Fix
+Moved sentinel block **outside `if cycle_closed:`** to 12-space indent (while loop body).
+It now runs on every poll cycle regardless of whether any bars closed. File:
+`scripts/paper_live.py` — sentinel block relocated from inside `if cycle_closed:` to
+between the `if cycle_closed:` block and the stale detection logic.
+
+---
+
+## 2026-04-24 — BUG: `flatten` / `flatten-all` CLI leaves dashboard showing ACTIVE
+
+**Status:** FIXED — `scripts/paper_trading.py`
+**Severity:** Medium — operator sees stale ACTIVE status in dashboard after successful flatten
+
+### Symptom
+After `flatten-all --trade-date today` completed successfully (all positions CLOSED,
+sessions COMPLETED in DB), restarting the dashboard still showed both sessions as ACTIVE.
+No Telegram alerts were received from `flatten-all` (alerts from the live session itself
+were never sent either due to the same replica gap).
+
+### Root Cause
+`_cmd_flatten` and `_cmd_flatten_all` write session status COMPLETED via `update_session_state()`
+200–500ms after the first write (`flatten_session_positions`). The first write fires
+`maybe_sync()` in a fresh process (`_last_sync_time=0`) and succeeds. The COMPLETED write
+lands within the 5-second debounce window → `maybe_sync()` returns early → the replica
+captures positions closed but session still ACTIVE.
+
+`resend-eod` (separate process) does write to `alert_log` → `_after_write()` → `maybe_sync()`,
+and since its process has no prior sync it fires immediately — confirming the debounce is
+the root cause, not a missing `_after_write()` hook.
+
+### Fix
+Added `_pdb().force_sync()` before the final `print()` in both `_cmd_flatten` (line ~1737)
+and `_cmd_flatten_all` (line ~1776) in `scripts/paper_trading.py`. `force_sync()` bypasses
+the debounce and guarantees the replica is written before the process exits.
+`archive_completed_session` already called `force_sync()` on the backtest replica — only
+the paper replica was missing this call.
+
+---
+
 ## 2026-04-23 — STRATEGY: CPR SHORT underperforms on mild down days — false breakdown pattern
 
 **Status:** OPEN — backtest experiments queued for post-market
@@ -199,7 +255,8 @@ Interpretation:
 
 **Exp 1 — Single-date backtest Apr 23 (calibration check) — ✅ COMPLETED**
 
-Queried Apr 23 slice from RISK_SHORT baseline `64c1ded4f9f0` (run already covered this date).
+Queried Apr 23 slice from the then-current RISK_SHORT baseline `64c1ded4f9f0`
+(retired and replaced by `fd763aa18d54` on 2026-04-24; run already covered this date).
 - Backtest SHORT INITIAL_SL rate on Apr 23: **32%** (8/25 trades)
 - Live SHORT INITIAL_SL rate on Apr 23: **50%** (15/30 trades)
 - Backtest combined PnL Apr 23: +₹16,166 | Live combined PnL: +₹16,917 (nearly identical)
@@ -221,7 +278,8 @@ Implementation notes:
 - Fixed a follow-on preset override bug where `--rvol X` was silently ignored under `--preset`;
   only the boolean skip flag was propagating. This made the first `0.5` test invalid.
 
-Results vs current SHORT baseline `64c1ded4f9f0`:
+Results vs the then-current SHORT baseline `64c1ded4f9f0`
+(retired and replaced by `fd763aa18d54` on 2026-04-24):
 
 | Variant | Trades | WR | PF | PnL | Calmar |
 |--|--|--|--|--|--|
@@ -241,7 +299,8 @@ doppler run -- uv run pivot-backtest --all --universe-size 0 --yes-full-run \
   --start 2025-01-01 --end 2026-04-23 \
   --preset CPR_LEVELS_RISK_SHORT --min-sl-atr-ratio 1.0 --save
 ```
-Results vs baseline `64c1ded4f9f0` / `b6476255aa1c`:
+Results vs the then-current baselines `64c1ded4f9f0` / `b6476255aa1c`
+(retired and replaced by `fd763aa18d54` / `4eaaa682e79c` on 2026-04-24):
 
 | | SHORT baseline | SHORT min_sl=1.0 | LONG baseline | LONG min_sl=1.0 |
 |--|--|--|--|--|
@@ -373,6 +432,123 @@ await _write_feed_state(
 
 Dashboard now shows "CONNECTING" from 9:16 AM until the first candle snapshot (9:20 AM),
 then transitions to "OK" normally. The replica syncs immediately via `_after_write`.
+
+---
+
+## 2026-04-24 — OPS: replica lag made Apr 24 look unbuilt in the pre-market check
+
+**Status:** FIXED — operational correction only, no strategy impact
+**Severity:** Low — confusing pre-market signal, but the live DB / session setup remained valid
+
+### What happened
+A pre-market inspection queried the dashboard replica instead of the live `market.duckdb`, so it still showed Apr 23 state. That made it look like the Apr 24 build had not completed, even though yesterday's EOD refresh had already populated the canonical DB.
+
+### Root Cause
+The dashboard reads from the versioned replica snapshot, which can lag or point at an older replica version until the writer publishes a new one and the consumer reconnects. The build pipeline is additive/upsert-based, so stopping it mid-way does not lose data that already exists; it only risks leaving a partially refreshed table until the next clean build.
+
+### Resolution
+- The unnecessary background build was stopped.
+- The dashboard can be restarted after the build window if needed.
+- The live session should continue on the original `daily-live --all-symbols` path unless a separate strategy change is intentionally approved.
+
+### Notes
+- The universe-snapshot experiment was rolled back before live started, but the opt-in
+  snapshot path is now restored: `daily-prepare --all-symbols --snapshot-universe-name ...`
+  writes the frozen list to `backtest_universe`, and `daily-live --universe-name ...`
+  can reuse it when reproducibility is desired.
+- No strategy defaults were changed by this correction.
+
+---
+
+## 2026-04-24 — OPS: session-start Telegram alert arrived without HTML formatting
+
+**Status:** FIXED — `engine/paper_runtime.py` (2026-04-24)
+**Severity:** Low — operational visibility issue only
+
+### Symptom
+The live session started and the SESSION_STARTED alert arrived, but it used a truncated
+session_id (`[:20]` cut), plain text body, and no HTML formatting beyond `<code>` on the
+session tag. PAUSED/RESUMED alerts had the same problem.
+
+### Root Cause
+`dispatch_session_started_alert` and `dispatch_session_state_alert` did not use the
+`_parse_session_label` helper (used by FEED_STALE/FEED_RECOVERED) and had sparse, plain-text
+bodies. The `parse_mode: HTML` in the Telegram notifier was correct — the content was the issue.
+
+### Fix Applied
+- `dispatch_session_started_alert`: now uses `_parse_session_label`, direction icon (🟢/🔴),
+  bold labels, full `session_id`, start time in IST. Subject: `🟢 Session Started — CPR LONG · 24 Apr`
+- `dispatch_session_state_alert` (PAUSED/RESUMED): same pattern with ⏸️/🔄 icons.
+- Added `dispatch_session_completed_alert`: fires when `stop_is_terminal=True` and
+  `final_status=COMPLETED` in `run_live_session` finally block (after FLATTEN_EOD).
+  Subject: `✅ Session Completed — CPR SHORT · 24 Apr`
+
+---
+
+## 2026-04-24 — STRATEGY: LONG underperformed on a risk-off index day; future regime work may need sit-out or size reduction
+
+**Status:** OPEN — log for post-close analysis
+**Severity:** Medium — today’s LONG side is materially weaker than expected
+
+### Observation
+At the time of the live session, NIFTY 500 was down about `0.75%` (`22,639.15`, `-171.70`). The LONG CPR session still traded normally and is currently performing worse than expected.
+
+### Interpretation
+- A NIFTY-based regime gate would likely have filtered some LONG entries today.
+- The broader response may need to be more than binary skip logic.
+- We should evaluate:
+  - full sit-out on strongly risk-off days, or
+  - reduced capital deployed / smaller position sizing when the index is weak.
+
+### Notes
+- No live trading change is being made during the session.
+- This observation is being recorded now so we can compare it against backtest and paper-replay later.
+- The regime gate remains an opt-in hypothesis, not a default preset change.
+
+---
+
+## 2026-04-24 — OPS: LONG-only flatten could not be executed without stopping the live writer
+
+**Status:** FIXED — `engine/paper_runtime.py` + `scripts/paper_live.py` (admin command queue, 2026-04-24)
+**Severity:** Medium — prevented a selective LONG flatten while SHORT remained live
+
+### What happened
+A request to flatten only the LONG live session was blocked because `paper.duckdb` is held by the active `daily-live` process. The DB layer is single-writer, so a separate `pivot-paper-trading flatten --session-id CPR_LEVELS_LONG-2026-04-24-live-kite` process could not acquire the lock while the live session was running.
+
+### Implication
+- A selective LONG-only manual flatten is not currently available as an out-of-band operation while `daily-live` owns the writer lock.
+- Stopping the live process would also interrupt SHORT, which was explicitly not desired.
+
+### Notes
+- No live process was interrupted.
+- SHORT continues untouched.
+- If we want selective long-only flattening in the future, we likely need an in-process control hook or a session-aware management command that talks to the live process instead of opening a second writer.
+
+---
+
+## 2026-04-24 — OPS: sentinel-file LONG flatten did not complete after multiple bar boundaries
+
+**Status:** FIXED — `scripts/paper_live.py` (sentinel moved outside `if cycle_closed:`, 2026-04-24)
+**Severity:** Medium — operator control path did not complete as expected
+
+### What happened
+The per-session sentinel file `.tmp_logs/flatten_CPR_LEVELS_LONG-2026-04-24-live-kite.signal` was created while the live session was still running. The file exists, but the LONG session remained `ACTIVE` and no `Flatten signal detected` / `manual_flatten_signal` log line appeared after multiple 5-minute boundaries.
+
+### Observed state
+- LONG session stayed `ACTIVE` in the dashboard.
+- SHORT session kept running normally.
+- The signal file is present on disk.
+- Live logs continued to show bar processing for LONG up to `11:05`, but no sentinel-consumption log has appeared.
+
+### Hypotheses
+- The LONG session is not re-entering the sentinel-check path as expected.
+- The signal check may be occurring only in a branch that is no longer being reached once the LONG symbol set shrinks.
+- There may be a session-state / bar-loop interaction preventing `complete_on_exit` from being applied.
+
+### Notes
+- This is not a filename typo.
+- This is not a DuckDB writer-lock issue.
+- The issue is that the in-process sentinel path is not completing the LONG flatten in practice, even though the file exists.
 
 ---
 

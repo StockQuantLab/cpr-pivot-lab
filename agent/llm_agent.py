@@ -37,6 +37,7 @@ from agent.tools.backtest_tools import (
     get_paper_positions,
     get_paper_session_summary,
     list_paper_sessions,
+    paper_send_command,
     rebuild_indicators,
     run_backtest,
     run_multi_stock_backtest,
@@ -100,6 +101,7 @@ def create_agent(session_id: str | None = None) -> Agent:
         _json_tool(get_paper_session_summary),
         _json_tool(get_paper_positions),
         _json_tool(get_paper_ledger),
+        _json_tool(paper_send_command),
     ]
 
     storage = PgAgentStorage(

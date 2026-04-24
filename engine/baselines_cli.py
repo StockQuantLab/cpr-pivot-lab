@@ -128,11 +128,20 @@ def _find_previous_baselines(end_date: str) -> dict[str, str]:
 
 
 def _preflight_universe_check(start: str, end: str) -> int:
-    """Check how many symbols the dynamic universe would yield. Returns symbol count."""
+    """Check how many symbols the selected universe would yield. Returns symbol count."""
     from db.duckdb import get_db
 
     db = get_db()
+    universe_name = f"full_{end.replace('-', '_')}"
     row = db.con.execute(
+        "SELECT symbol_count FROM backtest_universe WHERE universe_name = ? LIMIT 1",
+        [universe_name],
+    ).fetchone()
+    if row and row[0] is not None:
+        db.close()
+        return int(row[0])
+
+    cnt_df: Any = db.con.execute(
         """
         SELECT COUNT(DISTINCT symbol) as cnt
         FROM market_day_state
@@ -142,9 +151,9 @@ def _preflight_universe_check(start: str, end: str) -> int:
     ).pl()
     db.close()
 
-    if row.height == 0:
+    if cnt_df.height == 0:
         return 0
-    return row.item(0, 0)
+    return cnt_df.item(0, 0)
 
 
 def _build_backtest_args(
@@ -161,7 +170,21 @@ def _build_backtest_args(
         args.extend(["--progress-file", str(progress_file)])
     args.extend(["--strategy", "CPR_LEVELS"])
     args.extend(["--start", start, "--end", end])
-    args.extend(["--all", "--universe-size", "0"])
+    universe_name = f"full_{end.replace('-', '_')}"
+    from db.duckdb import get_db
+
+    db = get_db()
+    has_saved_universe = bool(
+        db.con.execute(
+            "SELECT 1 FROM backtest_universe WHERE universe_name = ? LIMIT 1",
+            [universe_name],
+        ).fetchone()
+    )
+    db.close()
+    if has_saved_universe:
+        args.extend(["--universe-name", universe_name])
+    else:
+        args.extend(["--all", "--universe-size", "0"])
     args.extend(["--preset", variant["preset"]])
     if variant["compound_equity"]:
         args.append("--compound-equity")

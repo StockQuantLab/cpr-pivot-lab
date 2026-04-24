@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import sys
+
 import scripts.data_quality as data_quality
+from scripts.paper_prepare import resolve_trade_date
 
 
 def test_windowed_dq_report_prints_registry_and_window_counts(monkeypatch, capsys):
@@ -143,3 +146,60 @@ def test_trade_date_dq_report_flags_freshness_and_runtime_gaps(monkeypatch, caps
     assert "ICICIBANK" in out
     assert "[BLOCKING]" in out
     assert "Readiness:" in out
+
+
+def test_date_today_keyword_resolves_without_crash(monkeypatch):
+    """--date today must not raise ConversionException — resolves to ISO date before DB call."""
+    calls = []
+
+    class _FakeDb:
+        def get_symbols_with_parquet_data(self, trade_dates):
+            calls.append(trade_dates)
+            # Must receive an ISO date, never the literal string "today"
+            assert trade_dates != ["today"], "raw 'today' keyword reached the DB layer"
+            assert len(trade_dates) == 1 and trade_dates[0] != "today"
+            return set()
+
+        def get_table_max_trade_dates(self, tables):
+            return {}
+
+        def get_runtime_trade_date_coverage(self, symbols, trade_date):
+            return {"market_day_state": [], "strategy_day_state": [], "intraday_day_pack": []}
+
+    monkeypatch.setattr(data_quality, "get_db", lambda: _FakeDb())
+    monkeypatch.setattr(sys, "argv", ["pivot-data-quality", "--date", "today"])
+
+    # Should not raise; exit code 1 is fine (no data)
+    try:
+        data_quality.main()
+    except SystemExit:
+        pass
+
+    assert calls, "get_symbols_with_parquet_data was never called"
+
+
+def test_pre_market_mode_reports_ready_when_state_tables_current(monkeypatch, capsys):
+    """Pre-market: Ready=YES when state tables are current, even with zero 5-min symbols."""
+    today_iso = resolve_trade_date("today")
+
+    class _FakeDb:
+        def get_symbols_with_parquet_data(self, trade_dates):
+            return set()  # no 5-min data yet — normal pre-market
+
+        def get_table_max_trade_dates(self, tables):
+            return dict.fromkeys(tables, today_iso)
+
+        def get_runtime_trade_date_coverage(self, symbols, trade_date):
+            return {"market_day_state": [], "strategy_day_state": [], "intraday_day_pack": []}
+
+    monkeypatch.setattr(data_quality, "get_db", lambda: _FakeDb())
+    # Force pre-market mode regardless of actual clock
+    monkeypatch.setattr(data_quality, "_is_pre_market", lambda _date: True)
+    monkeypatch.setattr(sys, "argv", ["pivot-data-quality", "--date", today_iso])
+
+    exit_code = data_quality.main()
+
+    out = capsys.readouterr().out
+    assert exit_code == 0, "pre-market with current state tables must report Ready=YES"
+    assert "PRE-MARKET MODE" in out
+    assert "Ready" in out

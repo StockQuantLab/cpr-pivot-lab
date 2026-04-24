@@ -751,6 +751,15 @@ def _run_with_lock(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
     db = get_db()
     backtest_db = get_backtest_db()
 
+    if args.all and not args.universe_name and not args.symbol and not args.symbols:
+        snapshot_universe_name = f"full_{args.end.replace('-', '_')}"
+        try:
+            universe_loader = getattr(db, "get_universe_symbols", None)
+            if callable(universe_loader) and universe_loader(snapshot_universe_name):
+                args.universe_name = snapshot_universe_name
+        except Exception:
+            pass
+
     # Determine symbols to run
     if args.symbol:
         symbols = [normalize_symbol(args.symbol)]
@@ -769,6 +778,20 @@ def _run_with_lock(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
             f"{', '.join(symbols[:10])}{'...' if len(symbols) > 10 else ''}"
         )
     elif args.all:
+        snapshot_universe_name = f"full_{args.end.replace('-', '_')}"
+        universe_loader = getattr(db, "get_universe_symbols", None)
+        snapshot_symbols = (
+            universe_loader(snapshot_universe_name) if callable(universe_loader) else []
+        )
+        if snapshot_symbols:
+            symbols = snapshot_symbols
+            print(
+                f"Running saved universe '{snapshot_universe_name}' ({len(symbols)} symbols): "
+                f"{', '.join(symbols[:10])}{'...' if len(symbols) > 10 else ''}"
+            )
+        else:
+            snapshot_universe_name = ""
+            snapshot_symbols = []
         dq_summary = db.refresh_data_quality_issues()
         publish_replica = getattr(db, "_publish_replica", None)
         if callable(publish_replica):
@@ -779,7 +802,7 @@ def _run_with_lock(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
                 f"excluded {dq_summary.get('missing_5min', 0)} symbols missing 5-min parquet"
             )
 
-        if args.universe_size > 0:
+        if not snapshot_symbols and args.universe_size > 0:
             symbols = db.get_liquid_symbols(
                 args.start,
                 args.end,
@@ -793,7 +816,7 @@ def _run_with_lock(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
                 )
             else:
                 symbols = db.get_available_symbols()
-        else:
+        elif not snapshot_symbols:
             symbols = db.get_available_symbols()
 
         # --- Tradeable-only gate ---
@@ -811,7 +834,7 @@ def _run_with_lock(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
             print("ERROR: No symbols found in Parquet data. Run `pivot-convert` first.")
             sys.exit(1)
 
-        if args.universe_size <= 0:
+        if not snapshot_symbols and args.universe_size <= 0:
             print(
                 f"Running all {len(symbols)} available symbols: "
                 f"{', '.join(symbols[:10])}{'...' if len(symbols) > 10 else ''}"

@@ -14,7 +14,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from config.settings import get_settings
-from db.duckdb import get_dashboard_db, get_db
+from db.duckdb import get_db
 from engine.command_lock import acquire_command_lock
 from engine.constants import normalize_symbol
 
@@ -22,7 +22,9 @@ IST = ZoneInfo("Asia/Kolkata")
 
 
 def _open_runtime_db(*, read_only: bool):
-    return get_dashboard_db() if read_only else get_db()
+    # Paper workflows need the canonical market DB, not the dashboard replica:
+    # the replica can lag behind immediately after ingestion / snapshot writes.
+    return get_db()
 
 
 def _resolve_latest_source_trade_date(*, read_only: bool) -> str:
@@ -125,6 +127,7 @@ def resolve_prepare_symbols(
     symbols: list[str] | None,
     symbols_csv: str | None,
     *,
+    universe_name: str | None = None,
     all_symbols: bool = False,
     read_only: bool = True,
 ) -> list[str]:
@@ -132,7 +135,8 @@ def resolve_prepare_symbols(
 
     Precedence:
     1. explicit list or CSV input
-    2. settings.paper_default_symbols
+    2. named saved universe
+    3. settings.paper_default_symbols
     """
     merged: list[str] = []
     if symbols:
@@ -140,12 +144,40 @@ def resolve_prepare_symbols(
     merged.extend(_parse_symbols_csv(symbols_csv))
 
     if not merged:
-        if all_symbols:
+        if universe_name:
+            merged.extend(load_universe_symbols(universe_name, read_only=read_only))
+        elif all_symbols:
             merged.extend(_resolve_all_local_symbols(read_only=read_only))
         else:
             merged.extend(_parse_symbols_csv(get_settings().paper_default_symbols))
 
     return sorted({normalize_symbol(symbol) for symbol in merged})
+
+
+def load_universe_symbols(universe_name: str, *, read_only: bool = True) -> list[str]:
+    """Load a saved universe from backtest_universe."""
+    db = _open_runtime_db(read_only=read_only)
+    return db.get_universe_symbols(universe_name)
+
+
+def snapshot_candidate_universe(
+    universe_name: str,
+    symbols: list[str],
+    *,
+    trade_date: str,
+    source: str = "paper-daily-prepare",
+    notes: str = "",
+) -> int:
+    """Persist the resolved candidate universe for the day."""
+    db = get_db()
+    return db.upsert_universe(
+        universe_name,
+        symbols,
+        start_date=trade_date,
+        end_date=trade_date,
+        source=source,
+        notes=notes,
+    )
 
 
 def validate_daily_runtime_coverage(
@@ -348,10 +380,12 @@ def pre_filter_symbols_for_strategy(
 
 
 __all__ = [
+    "load_universe_symbols",
     "pre_filter_symbols_for_strategy",
     "prepare_runtime_for_daily_paper",
     "resolve_prepare_symbols",
     "resolve_trade_date",
+    "snapshot_candidate_universe",
     "validate_daily_runtime_coverage",
     "validate_live_runtime_coverage",
 ]

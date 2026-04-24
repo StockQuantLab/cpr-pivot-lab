@@ -23,6 +23,7 @@ from typing import Any
 
 from db.duckdb import get_db
 from engine.command_lock import acquire_command_lock
+from scripts.paper_prepare import resolve_trade_date
 
 _IST = timezone(timedelta(hours=5, minutes=30))
 
@@ -457,7 +458,7 @@ def main() -> int:
         parser.error("--window-start and --window-end must be provided together")
 
     if args.trade_date:
-        return 0 if _print_trade_date_report(args.trade_date) else 1
+        return 0 if _print_trade_date_report(resolve_trade_date(args.trade_date)) else 1
 
     db = get_db()
 
