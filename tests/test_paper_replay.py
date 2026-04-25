@@ -123,6 +123,7 @@ async def test_replay_session_streams_candles_and_archives_completed_session(
     processed_candles: list[datetime] = []
     archived: list[str] = []
     risk_checks: list[dict[str, object]] = []
+    session_updates: list[dict[str, object]] = []
 
     day_pack = paper_replay.ReplayDayPack(
         symbol="SBIN",
@@ -141,6 +142,7 @@ async def test_replay_session_streams_candles_and_archives_completed_session(
         return session
 
     async def fake_update_session_state(session_id: str, **kwargs):
+        session_updates.append(dict(kwargs))
         updated_statuses.append(kwargs.get("status"))
         if kwargs.get("status"):
             session.status = kwargs["status"]
@@ -188,6 +190,7 @@ async def test_replay_session_streams_candles_and_archives_completed_session(
         update_session=lambda session_id, **kwargs: session,
         upsert_feed_state=lambda **kwargs: None,
         get_feed_state=lambda session_id: None,
+        get_session_positions=lambda session_id, statuses=None: [],
         _sync=None,
         con=None,
     )
@@ -217,9 +220,10 @@ async def test_replay_session_streams_candles_and_archives_completed_session(
         datetime(2024, 1, 2, 9, 15, tzinfo=paper_replay.IST),
         datetime(2024, 1, 2, 9, 20, tzinfo=paper_replay.IST),
     ]
-    assert updated_statuses[-1] == "COMPLETED"
+    assert "COMPLETED" in updated_statuses
     assert archived == ["paper-1"]
     assert len(risk_checks) == 2
+    assert session_updates[-1]["total_pnl"] == pytest.approx(0.0)
     assert result["days_replayed"] == 1
     assert result["bars_replayed"] == 2
     assert result["completed"] is True

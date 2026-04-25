@@ -1515,6 +1515,9 @@ async def flatten_session_positions(
     all_closed = await get_session_positions(session_id, statuses=["CLOSED"])
     total_trades = len(all_closed)
     total_realized = sum(float(p.realized_pnl or 0) for p in all_closed)
+    # Stamp total_pnl on the session row so the dashboard shows the correct P&L
+    # for all exit paths (normal EOD, flatten, flatten-all, auto-flatten on stale).
+    await update_session_state(session_id, total_pnl=round(total_realized, 2))
     try:
         # Skip if nothing to report — zero-trade restart sessions after a FAILED original
         # should not send a second EOD with 0 trades, 0 PnL.

@@ -78,7 +78,7 @@ def _find_previous_baselines(end_date: str) -> dict[str, str]:
     Matches by parameter signature (direction + risk_sizing + compound) since
     older baselines may not have a ``preset`` field in their params_json.
     """
-    from db.backtest_db import get_backtest_db
+    from db.backtest_db import close_backtest_db, get_backtest_db
 
     db = get_backtest_db()
     rows = db.con.execute(
@@ -123,7 +123,7 @@ def _find_previous_baselines(end_date: str) -> dict[str, str]:
         if label not in result:
             result[label] = run_id
 
-    db.close()
+    close_backtest_db()
     return result
 
 
@@ -138,7 +138,6 @@ def _preflight_universe_check(start: str, end: str) -> int:
         [universe_name],
     ).fetchone()
     if row and row[0] is not None:
-        db.close()
         return int(row[0])
 
     cnt_df: Any = db.con.execute(
@@ -149,8 +148,6 @@ def _preflight_universe_check(start: str, end: str) -> int:
         """,
         {"start": start, "end": end},
     ).pl()
-    db.close()
-
     if cnt_df.height == 0:
         return 0
     return cnt_df.item(0, 0)
@@ -180,7 +177,6 @@ def _build_backtest_args(
             [universe_name],
         ).fetchone()
     )
-    db.close()
     if has_saved_universe:
         args.extend(["--universe-name", universe_name])
     else:
@@ -279,7 +275,7 @@ def _load_progress(path: Path) -> dict | None:
 
 def _cleanup_runs(run_ids: list[str]) -> None:
     """Delete specified runs from backtest DB and sync replica."""
-    from db.backtest_db import get_backtest_db
+    from db.backtest_db import close_backtest_db, get_backtest_db
 
     db = get_backtest_db()
     ids_sql = ", ".join(f"'{rid}'" for rid in run_ids)
@@ -289,7 +285,7 @@ def _cleanup_runs(run_ids: list[str]) -> None:
     assert sync is not None
     sync.mark_dirty()
     sync.force_sync(db.con)
-    db.close()
+    close_backtest_db()
     logger.info("Cleaned up %d runs: %s", len(run_ids), run_ids)
 
 
@@ -331,7 +327,7 @@ def _format_int(value: object) -> str:
 
 
 def _fetch_metric_rows(run_ids: list[str]) -> dict[str, dict[str, object]]:
-    from db.backtest_db import get_backtest_db
+    from db.backtest_db import close_backtest_db, get_backtest_db
 
     ids = sorted({rid for rid in run_ids if rid})
     if not ids:
@@ -354,11 +350,10 @@ def _fetch_metric_rows(run_ids: list[str]) -> dict[str, dict[str, object]]:
         WHERE run_id IN ({ids_sql})
         """,
     ).pl()
-    db.close()
-
     metrics_map: dict[str, dict[str, object]] = {}
     for row in rows.to_dicts():
         metrics_map[str(row["run_id"])] = row
+    close_backtest_db()
     return metrics_map
 
 
@@ -669,14 +664,14 @@ def main() -> None:
         _print_delta_report(results, previous)
 
     # ── Sync replica ────────────────────────────────────────────────────
-    from db.backtest_db import get_backtest_db
+    from db.backtest_db import close_backtest_db, get_backtest_db
 
     db = get_backtest_db()
     sync = db._sync
     assert sync is not None
     sync.mark_dirty()
     sync.force_sync(db.con)
-    db.close()
+    close_backtest_db()
     print("\nReplica synced.")
 
     # ── Notification ────────────────────────────────────────────────────

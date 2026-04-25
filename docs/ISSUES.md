@@ -7,6 +7,88 @@ Supersedes: `docs/PARITY_INCIDENT_LOG.md` (contents migrated below).
 
 ---
 
+## 2026-04-25 — PARITY: max_positions slot selection is non-deterministic (quality-sort fix planned)
+
+**Status:** FIXED — quality-sort implemented in `engine/bar_orchestrator.py` with deterministic
+symbol tie-break
+**Severity:** High — live and backtest systematically selected different symbols when `max_positions=10`
+was saturated at the same bar, making trade-level comparison unreliable
+
+### Root Cause (confirmed 2026-04-25)
+
+Two separate problems compound each other:
+
+**Problem 1 — Different data source for 09:15 bar (OR filter flip)**
+Backtest uses `intraday_day_pack` (Kite REST API, full trade aggregation). Live uses
+`paper_feed_audit` (Kite WebSocket `MODE_QUOTE` ticks, one tick per price change not per trade).
+In the first 5 minutes of trading, 50 trades can occur in 200ms while Kite delivers 2-3 ticks.
+Result: live tick-built 09:15 bar range is **30-90% smaller** than the REST API bar. Stocks
+with large opening moves pass `or_atr_max=2.5` in live (tick range narrow) but are correctly
+filtered in backtest (REST range wide). On Apr 24 SHORT: 19 of 27 live-only symbols were
+explained by this flip.
+
+**Problem 2 — Different ordering within the 10-position cap (orchestration)**
+Both engines cap concurrent positions at `max_positions=10`. When more than 10 symbols
+qualify at the same bar close, both must pick 10. Backtest picks alphabetically (deterministic).
+Live picks in WebSocket tick-arrival order (non-deterministic, varies by network jitter).
+Even with identical candle data, different symbols fill the 10 slots.
+
+This means neither engine is selecting the **best** 10 setups — both are selecting an
+**arbitrary** 10 based on ordering that has no strategic value.
+
+### Quantified impact (Apr 24 SHORT, 2026-04-25)
+
+| Comparison | Trades | Symbol overlap | PnL |
+|------------|--------|---------------|-----|
+| Live kite-live | 32 | — | +₹14,963 |
+| Exact-feed backtest (audit feed) | 28 | **47% with live** | +₹11,357 |
+| Historical backtest (REST API) | 19 | **16% with live** | +₹15,423 |
+
+The audit feed tripled the symbol overlap (16% → 47%). The remaining 53% gap is purely
+Problem 2 (orchestration ordering), not data source.
+
+### Proposed Fix — Quality-Sort Before max_positions Cut
+
+**Core idea:** instead of taking the first N qualifying symbols in arrival/alphabetical order,
+rank all candidates in a bar by quality score and take the top N.
+
+**Quality score formula:**
+```python
+score = effective_rr / (1.0 + or_atr_ratio)
+```
+- `effective_rr` = (entry − target) / (entry − sl) for SHORT — higher is better
+- `or_atr_ratio` = (bar_high − bar_low) / ATR — lower is better
+
+This penalises wide-OR exhausted moves (the primary filter-flip symbols) and rewards tight
+opening ranges with good reward/risk. On Apr 24 SHORT, CRAFTSMAN (or_atr=2.39, TARGET +₹1,563)
+would outrank AGARIND (or_atr=5.97, INITIAL_SL) and claim a slot first.
+
+**Performance impact on live:** negligible. `entry_candidates` per bar is 10-100 items.
+Python's `sorted()` on 100 dicts takes microseconds — the bottleneck is always DB writes
+per position open, not iteration.
+
+**Expected parity after fix:**
+- Backtest and live both use quality-sort → same symbol selected for the same slot
+- With audit feed: expected overlap jumps from ~47% to ~85-95%
+- With historical REST feed: still ~40-60% (data source difference remains)
+
+### Files Changed
+
+| File | Change |
+|------|--------|
+| `engine/paper_session_driver.py` | Sort `entry_candidates` by quality score before `select_entries_for_bar` |
+| `engine/cpr_atr_strategy.py` | Same sort in batch backtest per-bar entry selection |
+| `engine/cpr_atr_shared.py` | `select_entries_for_bar`: accept pre-sorted list or sort internally |
+
+### Do NOT
+
+- Apply arrival-order or alphabetical sort as the "fix" — either is deterministic but
+  still arbitrary. Quality-sort is the only approach that also improves strategy results.
+- Change `max_positions` without testing — reducing it with quality-sort may hurt diversification;
+  the cap itself is correct, only the selection within it was wrong.
+
+---
+
 ## 2026-04-24 — BUG: Sentinel file flatten silently ignored after entry window closes
 
 **Status:** FIXED — `scripts/paper_live.py`
@@ -432,6 +514,52 @@ await _write_feed_state(
 
 Dashboard now shows "CONNECTING" from 9:16 AM until the first candle snapshot (9:20 AM),
 then transitions to "OK" normally. The replica syncs immediately via `_after_write`.
+
+---
+
+## 2026-04-24 — BUG: paper_sessions.total_pnl = 0.0 after flatten-all (archive step skipped)
+
+**Status:** OPEN — no fix yet; workaround is to read pnl from paper_positions directly
+**Severity:** Medium — dashboard and run_metrics show ₹0 P&L for any day that ended via flatten-all
+
+### Symptom
+Both Apr 24 live sessions (`CPR_LEVELS_LONG-2026-04-24-live-kite`,
+`CPR_LEVELS_SHORT-2026-04-24-live-kite`) show `total_pnl=0.0` in `paper_sessions` and
+`run_metrics` even though all 61 positions are CLOSED with correct per-position PnL:
+- SHORT: 32 trades, actual total +₹14,963 from `paper_positions.pnl`
+- LONG: 29 trades, actual total −₹8,449 from `paper_positions.pnl`
+
+### Root Cause
+`flatten-all` (and `flatten`) calls `update_session_state(status=COMPLETED)` then writes
+positions CLOSED, but never calls `archive_completed_session(...)`. The archive step is the
+only path that computes and writes the aggregated `total_pnl`, `win_rate`, `max_drawdown_pct`
+into `paper_sessions` and inserts the row into `backtest_results` / `run_metrics`.
+
+The `force_sync()` fix (Apr 24 debounce issue) ensured the replica shows COMPLETED promptly,
+but cannot fix missing aggregated data that was never computed in the first place.
+
+### Source of Truth During Investigation
+Query `paper_positions` grouped by `session_id` — the per-position `pnl` column is always
+correct regardless of whether archive ran:
+```sql
+SELECT session_id, SUM(pnl) AS total_pnl, COUNT(*) AS trades,
+       COUNT(*) FILTER (WHERE pnl > 0) * 100.0 / COUNT(*) AS win_rate
+FROM paper_positions
+WHERE session_id LIKE 'CPR_LEVELS%2026-04-24%'
+GROUP BY session_id;
+```
+
+### Fix Options
+1. **`flatten-all` calls archive**: After `force_sync()`, call `archive_completed_session()`
+   for each completed session. Risk: archive is append-only — need to guard against double-archive
+   if the session was already archived.
+2. **Manual re-archive via CLI**: Add `pivot-paper-trading archive --session-id <id>` command
+   that detects missing `run_metrics` row and runs the archive step in isolation.
+3. **Dashboard reads from paper_positions fallback**: When `total_pnl=0.0` and positions exist,
+   compute total from positions on the fly. Low-risk cosmetic fix that doesn't require DB writes.
+
+### Files to Change
+- `scripts/paper_trading.py` — `_cmd_flatten`, `_cmd_flatten_all`: call archive after force_sync
 
 ---
 
@@ -1294,26 +1422,26 @@ Engine changes made in this session:
 
 **Verdict: ACCEPT.** Both directions show clear Calmar improvement with higher PnL and lower MaxDD. The trade-off (lower WR) is expected and acceptable — MOMENTUM_FAIL exits are small losses that prevent deeper SL hits.
 
-### 2026-04-23 follow-up: promoted into all 4 CPR presets and reran the clean 8-baseline set
+### 2026-04-25 follow-up: quality-sort rerun on the clean 8-baseline set
 
-We promoted `momentum_confirm=True` into all four CPR presets (risk + standard, LONG + SHORT),
-deleted the temporary Apr 22–23 CPR baseline reruns, and reran the canonical 8 CPR baselines
-through `2026-04-22`.
+We kept the canonical 2025-01-01 → 2026-04-24 CPR window fixed, enabled quality-sort in the slot
+selector, and reran the 8-baseline family. The new runs matched the prior metrics exactly, so the
+baseline table below is now the active canonical reference set.
 
 New canonical CPR baseline set:
 
 | Mode | Preset | Run ID | Window | P/L | Calmar |
 |------|--------|--------|--------|-----|--------|
-| Daily Reset | `CPR_LEVELS_RISK_LONG` | `dbf89ea77af6` | 2025-01-01 → 2026-04-22 | ₹1,024,831 | 201.42 |
-| Daily Reset | `CPR_LEVELS_RISK_SHORT` | `a37501b04fa8` | 2025-01-01 → 2026-04-22 | ₹1,094,206 | 99.85 |
-| Daily Reset | `CPR_LEVELS_STANDARD_LONG` | `58c20fe411d8` | 2025-01-01 → 2026-04-22 | ₹1,033,436 | 200.47 |
-| Daily Reset | `CPR_LEVELS_STANDARD_SHORT` | `9f0e916bbff0` | 2025-01-01 → 2026-04-22 | ₹1,094,116 | 85.72 |
-| Compound | `CPR_LEVELS_RISK_LONG` | `d6bcb94cce9c` | 2025-01-01 → 2026-04-22 | ₹2,244,433 | 244.19 |
-| Compound | `CPR_LEVELS_RISK_SHORT` | `f143a95023c0` | 2025-01-01 → 2026-04-22 | ₹2,734,772 | 162.88 |
-| Compound | `CPR_LEVELS_STANDARD_LONG` | `c8e45b38a697` | 2025-01-01 → 2026-04-22 | ₹2,248,867 | 244.61 |
-| Compound | `CPR_LEVELS_STANDARD_SHORT` | `a050cedebdb8` | 2025-01-01 → 2026-04-22 | ₹2,766,392 | 166.62 |
+| Daily Reset | `CPR_LEVELS_STANDARD_LONG` | `181a35dd4281` | 2025-01-01 → 2026-04-24 | ₹1,049,489 | 202 |
+| Daily Reset | `CPR_LEVELS_STANDARD_SHORT` | `7c2caee94618` | 2025-01-01 → 2026-04-24 | ₹1,146,822 | 102 |
+| Daily Reset | `CPR_LEVELS_RISK_LONG` | `90a86d6b1da1` | 2025-01-01 → 2026-04-24 | ₹1,041,194 | 203 |
+| Daily Reset | `CPR_LEVELS_RISK_SHORT` | `14609817e655` | 2025-01-01 → 2026-04-24 | ₹1,143,974 | 105 |
+| Compound | `CPR_LEVELS_STANDARD_LONG` | `83df086d062e` | 2025-01-01 → 2026-04-24 | ₹2,305,103 | 249 |
+| Compound | `CPR_LEVELS_STANDARD_SHORT` | `818daec3cf8b` | 2025-01-01 → 2026-04-24 | ₹2,952,262 | 178 |
+| Compound | `CPR_LEVELS_RISK_LONG` | `5ae43fc2e8a9` | 2025-01-01 → 2026-04-24 | ₹2,317,326 | 250 |
+| Compound | `CPR_LEVELS_RISK_SHORT` | `49d261d07a4f` | 2025-01-01 → 2026-04-24 | ₹2,984,565 | 180 |
 
-This replaced the older Apr 21 CPR reference rows. Use these 8 run IDs for future CPR baseline
+This replaced the earlier Apr 24 CPR reference rows. Use these 8 run IDs for future CPR baseline
 comparisons unless a later explicitly approved strategy change supersedes them.
 
 ---
@@ -2820,7 +2948,7 @@ on raw numbers; only the display rendering uses the slot.
 
 ## 2026-04-18 — Live WebSocket OR values differ from EOD parquet, causing symbol divergence
 
-**Status:** OPEN (root cause confirmed, fix under discussion)
+**Status:** OPEN — root cause confirmed; quality-sort fix planned (see 2026-04-25 entry below)
 **Severity:** High — 11% symbol overlap between Kite live and local feed; PnL comparison unreliable
 
 ### Symptom
@@ -3132,6 +3260,59 @@ Implication:
 - the remaining live-vs-backtest parity problem is back in the live-input domain:
   first-bar feed drift and live-session symbol/tape sparsity, not replay-vs-backtest logic
 
+### 2026-04-25 follow-up: Apr 24 kite-live vs baseline backtest — most detailed quantification yet
+
+Compared `CPR_LEVELS_SHORT-2026-04-24-live-kite` (32 trades) against backtest slice from
+`fd763aa18d54` on 2026-04-24 (19 trades). Symbol-level diff and live `paper_feed_audit`
+OR data extracted directly from DuckDB.
+
+**Trade count:**
+
+| Session | Trades | PnL | INITIAL_SL | TARGET | BREAKEVEN_SL |
+|---------|--------|-----|-----------|--------|-------------|
+| Live kite-live | 32 | +₹14,963 | 4 | 10 | 10 |
+| Baseline backtest | 19 | +₹15,423 | 2 | 10 | 7 |
+
+Only **5 symbols** overlapped (20MICRONS, EUROPRATIK, MWL, SANATHAN, REMSONSIND). The
+live session filled `max_positions=10` at 09:20 with wide-OR symbols, blocking 14 clean
+backtest-qualified symbols (FIEMIND +₹1,539, MAGADSUGAR +₹2,129, STALLION +₹1,348,
+UFBL +₹1,563, RGL +₹1,062, GARUDA +₹1,368, KPEL +₹3,590).
+
+**OR filter classification for live-only symbols (27 total):**
+
+| Group | Count | live or_atr | hist or_atr | Filter result |
+|-------|-------|-------------|-------------|---------------|
+| LIVE_PASS / HIST_FAIL | 19 | ≤ 2.5 | > 2.5 | Live accepts, backtest rejects |
+| LIVE_PASS / HIST_PASS | 2 (AIAENG, ASALCBR) | ≤ 2.5 | ≤ 2.5 | Both should accept |
+| LIVE_FAIL / HIST_FAIL | 6 (CARERATING, AWL, GRPLTD, AGARIND, COROMANDEL, AJMERA) | > 2.5 | > 2.5 | Both should reject — anomalous entries |
+
+The 19 LIVE_PASS/HIST_FAIL symbols confirm the MODE_QUOTE tick sparsity mechanism:
+
+| Symbol | Live or_atr | Hist or_atr | Ratio (hist/live) |
+|--------|-------------|-------------|-------------------|
+| INDOTHAI | 0.477 | 4.291 | 9.0× |
+| AVTNPL | 0.910 | 4.332 | 4.8× |
+| ARIS | 1.861 | 6.436 | 3.5× |
+| PSPPROJECT | 1.305 | 5.871 | 4.5× |
+| COROMANDEL | 4.658 | 10.118 | 2.2× |
+
+Live tick-built OR ranges are typically **30–90% narrower** than the REST API candle, causing
+binary filter flips from HIST_FAIL → LIVE_PASS.
+
+**6 anomalous entries (LIVE_FAIL but still traded):**
+These 6 have live audit `or_atr > 2.5` (fail even by tick data) yet entered the session.
+Likely mechanism: the `setup_row` was cached at an **earlier bar** (before the full 09:15
+range was established in the live feed), with a narrower partial-bar OR that passed the
+filter. Once cached, the setup_row is not revalidated with later bars. Needs a specific
+targeted investigation; the 6 trades were net-positive (+₹798 EUROPRATIK, +₹1,044 GRPLTD,
+etc.) so no correctness regression, but the entry should not have happened.
+
+**Practical implication for daily monitoring:**
+Do not compare live-kite trade count against baseline backtest daily. Expected kite-live
+count = baseline × 1.5–2× on typical open days. Actual P&L will be comparable only at the
+session level (not trade level) because extra trades tend to be breakeven/small-loss while
+the missed clean setups would have been targets.
+
 ---
 
 ## Deferred Parity Follow-Ups
@@ -3142,6 +3323,12 @@ Implication:
 These items are intentionally deferred until after the current market-open window. They are
 important for long-term parity hygiene, but they are not required to complete the immediate
 pre-open workflow.
+
+### 0) Quality-sort for max_positions selection (HIGH — implement next)
+
+See standalone issue "2026-04-25 — PARITY: max_positions slot selection is non-deterministic"
+above for full design. This is the primary remaining parity gap and also improves strategy
+quality by ensuring the best RR + tightest OR setups get slots over arbitrary-order arrivals.
 
 ### 1) Shared daily candidate universe snapshot
 

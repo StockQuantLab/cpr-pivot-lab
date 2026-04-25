@@ -67,6 +67,7 @@ _STATUS_CACHE_FILE = Path.home() / ".cache" / "cpr_dashboard_status.json"
 _runs_cache: list[dict] | None = None
 _runs_cache_time: float = 0
 _runs_cache_lock = threading.Lock()
+_runs_cache_replica_version: int = -1  # bust cache when replica version advances
 
 _symbols_cache: list[str] | None = None
 _symbols_cache_time: float = 0
@@ -102,7 +103,7 @@ _market_breadth_cache: dict[int, tuple[float, pl.DataFrame]] = {}
 # Sync helpers (run inside executor)
 # ---------------------------------------------------------------------------
 def _fetch_runs_sync(force: bool = False, execution_mode: str = "BACKTEST") -> list[dict]:
-    global _runs_cache, _runs_cache_time
+    global _runs_cache, _runs_cache_time, _runs_cache_replica_version
     if execution_mode.upper() != "BACKTEST":
         try:
             result = get_dashboard_backtest_db().get_runs_with_metrics(
@@ -112,6 +113,18 @@ def _fetch_runs_sync(force: bool = False, execution_mode: str = "BACKTEST") -> l
         except Exception as e:
             logger.debug("Failed to fetch %s run metrics: %s", execution_mode, e)
             return []
+
+    # Bust cache whenever the replica has been updated by any process (delete, new run, etc.).
+    # ReplicaConsumer reads the pointer file from disk on every call — cheap stat.
+    try:
+        from db.backtest_db import _dashboard_backtest_consumer
+
+        if _dashboard_backtest_consumer is not None:
+            current_ver = _dashboard_backtest_consumer.get_version()
+            if current_ver != _runs_cache_replica_version:
+                force = True
+    except Exception:
+        pass
 
     now = time.monotonic()
     if not force and _runs_cache is not None and (now - _runs_cache_time) < _RUNS_TTL:
@@ -130,6 +143,8 @@ def _fetch_runs_sync(force: bool = False, execution_mode: str = "BACKTEST") -> l
                     row["direction_filter"] = (
                         direction if direction in {"LONG", "SHORT", "BOTH"} else "BOTH"
                     )
+            if _dashboard_backtest_consumer is not None:
+                _runs_cache_replica_version = _dashboard_backtest_consumer.get_version()
         except Exception as e:
             logger.debug("Failed to fetch backtest run metrics: %s", e)
             _runs_cache = _runs_cache or []

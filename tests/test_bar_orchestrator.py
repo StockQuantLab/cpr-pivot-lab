@@ -82,7 +82,7 @@ def test_should_process_symbol_respects_window_status_and_open_positions() -> No
     )
 
 
-def test_select_entries_for_bar_applies_alpha_tiebreak_and_slots() -> None:
+def test_select_entries_for_bar_prioritizes_quality_then_symbol_tiebreak() -> None:
     tracker = SessionPositionTracker(max_positions=2, portfolio_value=100_000.0)
     tracker.record_open(
         SimpleNamespace(
@@ -99,13 +99,24 @@ def test_select_entries_for_bar_applies_alpha_tiebreak_and_slots() -> None:
         position_value=1_000.0,
     )
     candidates = [
-        {"symbol": "INFY"},
-        {"symbol": "SBIN"},
-        {"symbol": "ABB"},
+        {"symbol": "INFY", "rr_ratio": 3.0, "or_atr_ratio": 1.0},
+        {"symbol": "SBIN", "rr_ratio": 1.5, "or_atr_ratio": 0.25},
+        {"symbol": "ABB", "rr_ratio": 3.0, "or_atr_ratio": 1.0},
     ]
 
     selected = select_entries_for_bar(candidates, tracker)
     assert [item["symbol"] for item in selected] == ["ABB"]
+
+
+def test_select_entries_for_bar_prioritizes_higher_quality_over_alphabetical_order() -> None:
+    tracker = SessionPositionTracker(max_positions=1, portfolio_value=100_000.0)
+    candidates = [
+        {"symbol": "ZZZ", "rr_ratio": 3.0, "or_atr_ratio": 1.0},
+        {"symbol": "AAA", "rr_ratio": 2.0, "or_atr_ratio": 0.2},
+    ]
+
+    selected = select_entries_for_bar(candidates, tracker)
+    assert [item["symbol"] for item in selected] == ["AAA"]
 
 
 def test_compute_position_qty_risk_sizing_respects_slot_cap() -> None:

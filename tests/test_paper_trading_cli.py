@@ -623,10 +623,9 @@ async def test_cmd_daily_prepare_snapshots_universe(monkeypatch: pytest.MonkeyPa
     monkeypatch.setattr(
         pt,
         "snapshot_candidate_universe",
-        lambda universe_name, symbols, **kwargs: calls.append(
-            ("snapshot", universe_name, list(symbols), kwargs)
-        )
-        or len(symbols),
+        lambda universe_name, symbols, **kwargs: (
+            calls.append(("snapshot", universe_name, list(symbols), kwargs)) or len(symbols)
+        ),
     )
     monkeypatch.setattr(pt, "prepare_runtime_for_daily_paper", fake_prepare_runtime_for_daily_paper)
     monkeypatch.setattr(
@@ -721,10 +720,9 @@ async def test_cmd_daily_prepare_auto_snapshots_all_symbols(
     monkeypatch.setattr(
         pt,
         "snapshot_candidate_universe",
-        lambda universe_name, symbols, **kwargs: calls.append(
-            ("snapshot", universe_name, list(symbols), kwargs)
-        )
-        or len(symbols),
+        lambda universe_name, symbols, **kwargs: (
+            calls.append(("snapshot", universe_name, list(symbols), kwargs)) or len(symbols)
+        ),
     )
     monkeypatch.setattr(pt, "prepare_runtime_for_daily_paper", fake_prepare_runtime_for_daily_paper)
     monkeypatch.setattr(

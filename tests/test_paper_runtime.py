@@ -1233,6 +1233,7 @@ async def test_flatten_session_positions_uses_ist_closed_at_and_dispatches_per_t
     )
 
     update_position_calls: list[dict] = []
+    session_state_calls: list[dict] = []
 
     async def fake_get_session(session_id: str):
         return session
@@ -1240,7 +1241,15 @@ async def test_flatten_session_positions_uses_ist_closed_at_and_dispatches_per_t
     async def fake_get_session_positions(session_id: str, *, symbol=None, statuses=None):
         if statuses == ["OPEN"]:
             return [open_position]
-        return []  # all_closed for EOD summary count
+        if statuses == ["CLOSED"]:
+            return [
+                SimpleNamespace(
+                    realized_pnl=update_position_calls[0]["realized_pnl"]
+                    if update_position_calls
+                    else None
+                )
+            ]
+        return []
 
     async def fake_append_order_event(**kwargs):
         pass
@@ -1249,6 +1258,7 @@ async def test_flatten_session_positions_uses_ist_closed_at_and_dispatches_per_t
         update_position_calls.append({"position_id": position_id, **kwargs})
 
     async def fake_update_session_state(session_id: str, **kwargs):
+        session_state_calls.append({"session_id": session_id, **kwargs})
         pass
 
     class _FakeCon:
@@ -1296,6 +1306,10 @@ async def test_flatten_session_positions_uses_ist_closed_at_and_dispatches_per_t
     # exactly one FLATTEN_EOD summary at the end
     eod = [d for d in dispatched if d[0] == AlertType.FLATTEN_EOD]
     assert len(eod) == 1, f"expected 1 FLATTEN_EOD alert, got {len(eod)}"
+
+    assert session_state_calls[-1]["total_pnl"] == pytest.approx(
+        update_position_calls[0]["realized_pnl"]
+    )
 
     assert result["closed_positions"] == 1
 

@@ -56,9 +56,9 @@ def test_resolve_prepare_symbols_supports_saved_universe(monkeypatch):
     monkeypatch.setattr(
         paper_prepare,
         "load_universe_symbols",
-        lambda universe_name, read_only=True: ["SBIN", "TCS"]
-        if universe_name == "full_2026_04_24"
-        else [],
+        lambda universe_name, read_only=True: (
+            ["SBIN", "TCS"] if universe_name == "full_2026_04_24" else []
+        ),
     )
 
     assert paper_prepare.resolve_prepare_symbols(

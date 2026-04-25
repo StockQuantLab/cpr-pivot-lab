@@ -147,3 +147,249 @@ see `docs/trailing-stop-explained.md`.
     - entry candle, exit candle
     - why the setup was picked and why it exited
 - **Trade-by-trade TradingView checklist:** included in the inspector as a step-by-step check list.
+
+---
+
+## Parameter Reference
+
+Every parameter shown in the **Run Parameters** panel on the Run Results page is explained
+below. Parameters are grouped the same way as the panel. Hover over any label in the
+dashboard to see a one-line tooltip; this page provides the full explanation and examples.
+
+### Strategy Config
+
+**Strategy** · `CPR_LEVELS` or `FBR`
+Which strategy the engine ran. CPR_LEVELS = daily pivot boundary touch entry.
+FBR = failed opening breakout reversal.
+
+**Direction** · `LONG`, `SHORT`, or `BOTH`
+Filters which side of the market the engine trades.
+- `LONG`: only buy setups (price breaks above TC).
+- `SHORT`: only sell setups (price breaks below BC).
+- `BOTH`: takes whichever direction the 09:15 bar signals.
+
+**Execution Mode** · `BACKTEST`, `PAPER`, `LIVE`
+How the run was executed. Affects commission model and position sizing source.
+
+**Commission Model** · `zerodha` or `zero`
+`zerodha` applies the actual Zerodha brokerage + STT + exchange charges.
+At ₹100 stock with 100 shares (~₹10,000 position), commission ≈ ₹85 round-trip.
+`zero` is used for pure strategy analysis without cost drag.
+
+---
+
+### Entry Rules
+
+**CPR Percentile** · default `33`
+*What:* Only trade on days when a symbol's CPR width is in the bottom N-th percentile of
+its own rolling 252-day distribution.
+*Formula:* `cpr_width_pct < rolling_P{N}(symbol)` where `cpr_width_pct = |TC - BC| / pivot × 100`.
+*Example:* FIEMIND on Apr 24 had `cpr_width_pct = 0.075%`. Its rolling P33 = 0.12%.
+0.075 < 0.12 → passes. Narrow CPR = tighter S/R zone = cleaner breakout signal.
+*Why it matters:* Wide CPR days (news, earnings) have wide noise bands that produce
+false breakouts. This filter keeps the strategy on its best-behaved days.
+
+**CPR Min Close ATR** · default `0.5`
+*What:* The 09:15 bar's close must be at least `N × ATR` away from the CPR zone edge it
+broke through. Prevents entries where price barely grazed the boundary.
+*Formula (SHORT):* `(BC - or_close_5) / ATR ≥ 0.5`
+*Example:* AIAENG on Apr 24 — BC = 4066, or_close = 4051.3, ATR = 23.5.
+Distance = (4066 − 4051.3) / 23.5 = **0.63 ATR** → passes (≥ 0.5).
+*If it fails:* `CPR_MIN_CLOSE_ATR` reject. Symbol not in setup list that day.
+
+**Narrowing Filter** · `ON` or `OFF`
+*What:* Additionally requires that today's CPR width is narrower than the previous day's
+CPR width (the CPR is "contracting" into today). Extra confirmation that the range is
+compressing before a potential breakout.
+*Note:* In the current baselines this is `ON`. It reduces trade count ~10% but improves
+quality slightly by avoiding days where CPR widened overnight.
+
+**Buffer Pct** · default `0.05%`
+*What:* Small price buffer added to the CPR boundary for the entry trigger.
+*Formula (SHORT):* `trigger = BC × (1 − buffer_pct)`
+*Example:* BC = 452.42. trigger = 452.42 × 0.9995 = **452.19**.
+Fill = `max(trigger, next_bar_open)` to simulate a stop-limit order.
+*Why:* Avoids entering on a candle that merely touched BC at the wick — requires the
+full bar to close through the boundary.
+
+**Failure Window** · default `8` (FBR only)
+*What:* Number of bars after the initial breakout to look for a reversal that re-enters
+the Opening Range. Only relevant when `Strategy = FBR`.
+*Best value:* 10 bars (Calmar 4.08 vs 3.93 at 8). See ISSUES.md tuning results.
+
+---
+
+### Risk Management
+
+**RR Ratio** · default `2`
+*What:* The reward-to-risk multiple that determines the **target price**.
+*Formula:* `target = entry − (SL_distance × rr_ratio)` (SHORT).
+*Example:* Entry = 529.4, SL = 534.33, distance = 4.93. Target = 529.4 − (4.93 × 2) = **519.54**.
+Actual S1 = 517.63 → target is set to S1 (whichever is further in your favour).
+*Important:* This is NOT the entry gate — `min_effective_rr` is. `rr_ratio` just sets
+where the target lands.
+
+**Min Effective RR** · default `2.0`
+*What:* The **entry gate**. A trade only opens if the actual reward/risk ratio at the
+moment of entry is ≥ this value.
+*Formula:* `effective_rr = (entry − target) / (entry − sl_price)` (SHORT — all positive).
+*Example:* MAGADSUGAR Apr 24 — entry 529.4, SL 534.33, target 517.63.
+Effective RR = (529.4 − 517.63) / (534.33 − 529.4) = 11.77 / 4.93 = **2.39** → opens (≥ 2.0).
+*If it fails:* Trade is skipped even though the setup passed all other filters. Protects
+against entries where R1/S1 is too close to the entry price (thin CPR day).
+
+**Max SL ATR Ratio** · default `2.0`
+*What:* The stop-loss distance (entry to SL) cannot exceed `N × ATR`. Prevents very wide
+stops on volatile symbols.
+*Formula:* `|entry − sl_price| / ATR ≤ max_sl_atr_ratio`
+*Example:* ATR = 4.93. Max SL distance = 4.93 × 2.0 = 9.86. If the CPR zone would put
+SL 12 points away → trade is skipped.
+
+**Breakeven R** · default `1.0`
+*What:* When a trade reaches `1R` profit (i.e., price moved 1× the original SL distance
+in your favour), the stop is moved to the entry price (breakeven).
+*Result:* Position can only lose commission from this point forward. Activates the
+BREAKEVEN phase of the trailing stop.
+
+**Risk-Based Sizing** · `ON` or `OFF`
+*What:* When ON, position size is calculated to risk exactly `risk_pct` (default 1%) of
+portfolio per trade, bounded by `max_position_pct` (10%).
+*Formula:* `qty = floor(portfolio × risk_pct / sl_distance_in_₹)` capped at 10%.
+*Example:* Portfolio ₹1,000,000. Risk 1% = ₹10,000. SL = 4.93/share.
+qty = floor(10,000 / 4.93) = **2,028** shares (capped at 10% = ₹100,000 / 529.4 = 189 if SL is tight enough).
+*When OFF (standard sizing):* qty = floor(portfolio × max_position_pct / entry_price) — fixed 10% capital per trade regardless of SL distance.
+
+**Max Positions** · default `10`
+*What:* Maximum number of positions that can be open **concurrently** at any moment.
+*This is NOT a daily trade cap.* Once a position closes (SL, target, breakeven), a new
+one can open. On a typical day with many early BREAKEVEN exits, 20-35 total trades with
+max 10 concurrent is normal.
+*Live vs Backtest:* Competing entries now use the same quality-sort in both engines, with
+symbol tie-breaks for determinism. Remaining live/backtest differences mostly come from the
+input candles themselves, not the slot-allocation rule.
+
+---
+
+### Filters
+
+**Min Price** · default `₹50`
+*What:* Skip any symbol whose previous-day close is below ₹50.
+*Why:* Sub-₹50 stocks have wide percentage spreads and very large position sizes (10,000+
+shares at ₹10), making commission costs disproportionate and execution slippage high.
+
+**RVOL Threshold** · default `1.0` for LONG, `OFF` for SHORT
+*What:* Relative Volume filter. For LONG only — requires that the current bar's volume is
+at least `rvol_threshold × baseline_volume` before allowing entry.
+*Baseline:* 10-day rolling average of volume at the same 5-minute bar of day.
+*Why OFF for SHORT:* Adding RVOL to SHORT reduces trade count substantially (−46% at
+RVOL=1.0) with net negative PnL impact. See strategy-guide RVOL sweep table.
+*Live note:* Live RVOL uses tick-accumulated volume; backtest uses REST API volume.
+Small differences exist but do not cause binary filter flips (unlike OR ATR).
+
+**Max Gap Pct** · default `1.5%`
+*What:* Skip if the overnight gap from previous close to today's 09:15 open exceeds 1.5%.
+*Formula:* `|open_915 − prev_close| / prev_close × 100 > max_gap_pct → skip`
+*Why:* Large gap stocks have already made their move before the opening bar. The CPR
+boundary levels (computed from yesterday's OHLC) may be far from today's price, making
+SL distances very wide or the target unreachable.
+
+**OR ATR Min** · default `0.3`
+*What:* Skip if the opening 5-minute bar (09:15-09:20) range is less than 0.3× ATR.
+*Formula:* `or_atr_5 = (bar_high − bar_low) / ATR_prev_day`
+*Example:* VISAKAIND Apr 24 — bar range = 65.46 − 65.38 = 0.08. ATR = 0.365.
+or_atr = 0.08 / 0.365 = **0.22** → skip (< 0.3). No energy = no direction.
+*Why:* A near-flat opening bar suggests the stock is illiquid or circuit-filtered.
+Entering on a CPR signal with no momentum behind it produces false breakouts.
+
+**OR ATR Max** · default `2.5`
+*What:* Skip if the opening 5-minute bar range exceeds 2.5× ATR. The opposite of Min —
+the stock already made its big move in the first bar and is likely to consolidate or reverse.
+*Formula:* `or_atr_5 = (bar_high − bar_low) / ATR_prev_day`
+*Example:* AGARIND Apr 24 — historical REST API bar: high=454.85, low=445.1.
+or_atr = (454.85 − 445.1) / 1.633 = **5.97** → backtest skips. Live tick bar: high=453.5,
+low=448.5. or_atr = 5.0 / 1.633 = **3.06** → backtest still skips, but live candle
+looked different enough at entry time that it entered.
+
+⚠️ **Live vs Backtest divergence (key parity issue):**
+The Kite WebSocket runs in `MODE_QUOTE` (one tick per price change, not one per trade).
+In the opening 5 minutes, 50 trades can occur in 200ms while Kite delivers 2-3 ticks.
+The live tick-built 09:15 bar has a **30-90% smaller range** than the Kite REST API
+historical bar for the same period. This causes many stocks to pass `or_atr_max=2.5` in
+live (tick range narrow) but fail in backtest (REST range wide). On Apr 24 SHORT, this
+explained 19 of 27 live-only symbols. Quality-sort removes the separate max-position
+ordering mismatch, but it does not eliminate this feed-source gap. See ISSUES.md →
+"2026-04-18 — Live WebSocket OR values differ from EOD parquet" → 2026-04-25 follow-up
+for the full quantification.
+**Calibration note:** If `or_atr_max` is raised to `5.0` in the backtest, the symbol set
+would better match what live actually sees (since live's effective threshold ≈ 2.5 on
+tick data ≈ 4.0-5.0 on REST data).
+
+**Time Exit** · default `15:15`
+*What:* All open positions are force-closed at this time regardless of phase.
+*Why 15:15 not 15:30:* Leaves 15 minutes before NSE close to avoid last-minute spread
+widening and to allow Zerodha's execution engine to process MOC orders normally.
+
+---
+
+## Audit Feed — What It Is and When to Use It
+
+`paper_feed_audit` is a DuckDB table in `paper.duckdb` that records every live OHLCV
+bar seen by the live session as it was built from WebSocket ticks.
+
+### What it stores
+
+For every 5-minute bar that closed during a live session, it stores:
+
+- `session_id`, `symbol`, `bar_start`, `bar_end`
+- `open`, `high`, `low`, `close`, `volume` — as seen from **live ticks**
+- `first_snapshot_ts`, `last_snapshot_ts` — when the bar was first and last updated
+
+### Why it matters
+
+The difference between `paper_feed_audit` and `intraday_day_pack`:
+
+| Source | Data origin | OR range | Use case |
+|--------|-------------|----------|----------|
+| `intraday_day_pack` | Kite REST API (post-market) | Full trade-by-trade | Backtest |
+| `paper_feed_audit` | Kite WebSocket ticks (live) | 30-90% narrower | Parity analysis |
+
+The live engine uses `paper_feed_audit` data to build its bars. The backtest uses
+`intraday_day_pack`. They are the same stock, same time window, different data sources.
+
+### Three uses
+
+1. **Post-hoc parity debugging:** Compare live or_atr vs historical or_atr per symbol.
+   The Apr 24 investigation (why did AGARIND enter live but not backtest?) was solved
+   entirely by querying `paper_feed_audit`.
+
+2. **Exact-feed backtest:** Pass `--pack-source paper_feed_audit --pack-source-session-id <id>`
+   to `pivot-backtest`. The engine replaces `intraday_day_pack` candles with audit candles.
+   This gives the closest possible backtest to live execution:
+
+   ```bash
+   doppler run -- uv run pivot-backtest \
+     --all --universe-size 0 --yes-full-run \
+     --start 2026-04-24 --end 2026-04-24 \
+     --preset CPR_LEVELS_RISK_SHORT \
+     --pack-source paper_feed_audit \
+     --pack-source-session-id CPR_LEVELS_SHORT-2026-04-24-live-kite \
+     --save
+   ```
+
+3. **Exact-feed replay:** `daily-replay` also supports `--pack-source paper_feed_audit`.
+   Replay + exact-feed gives the same result as exact-feed backtest (both were verified
+   equal after the Apr 22 sparse-tape terminal close fix).
+
+### Expected overlap
+
+| Comparison | Symbol overlap | Why not 100% |
+|------------|---------------|--------------|
+| Live vs historical backtest | ~16% | OR filter + different data source |
+| Live vs exact-feed backtest | **~47-61%** | Orchestration ordering only |
+| Replay vs exact-feed backtest | **~100%** | Same engine, same data |
+
+The ~50% live vs exact-feed gap is irreducible without making the live engine deterministic.
+Live fills `max_positions=10` in WebSocket arrival order (non-deterministic); the backtest
+fills alphabetically. Both start from the same pool of qualified symbols, but the 10-slot
+selection differs. This is expected and acceptable — PnL comparison at the session level
+(not trade level) remains valid.

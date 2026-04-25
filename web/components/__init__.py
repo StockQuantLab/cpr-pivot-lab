@@ -177,7 +177,7 @@ SPACE_XS = "mb-1"  # Extra small spacing
 # ---------------------------------------------------------------------------
 # TYPOGRAPHY SCALE - Modular type scale (1.25 ratio) with semantic tokens
 # ---------------------------------------------------------------------------
-# Based on 16px base: 12→14→16→20→24→32→40→48
+# Based on 16px base: 12->14->16->20->24->32->40->48
 TYPE_DISPLAY = "text-5xl font-bold leading-tight tracking-tight"  # 48px
 TYPE_HERO = "text-4xl font-bold leading-tight tracking-tight"  # 36px
 TYPE_H1 = "text-3xl font-bold leading-tight"  # 30px
@@ -2189,6 +2189,37 @@ def param_header_strip(params: dict) -> None:
             )
 
 
+_PARAM_TOOLTIPS: dict[str, str] = {
+    # Strategy Config
+    "Strategy": "Which strategy the engine ran: CPR_LEVELS (pivot boundary touch) or FBR (failed breakout reversal).",
+    "Direction": "LONG = buy setups only. SHORT = sell setups only. BOTH = whichever the 09:15 bar signals.",
+    "Execution Mode": "BACKTEST uses intraday_day_pack (REST API candles). PAPER/LIVE use live WebSocket ticks.",
+    "Commission Model": "zerodha = actual brokerage + STT + exchange fees. zero = no costs (strategy analysis only).",
+    # Entry Rules
+    "CPR Percentile": "Only trade on days when CPR width is in the bottom N% of the symbol's own rolling 252-day distribution. Lower = stricter narrow-CPR filter.",
+    "CPR Min Close ATR": "The 09:15 bar's close must be >= N x ATR beyond the CPR boundary it broke. Prevents entries where price barely grazed the zone. Formula: (BC - or_close) / ATR >= 0.5 for SHORT.",
+    "Narrowing Filter": "ON = only trade when today's CPR is narrower than yesterday's (CPR contracting). Reduces trade count ~10%, improves quality.",
+    "Buffer Pct": "Small price buffer added to the CPR entry trigger. Entry = BC x (1-buffer) for SHORT. Avoids wick-only touches; requires bar close through boundary.",
+    "Failure Window": "FBR only. Number of bars after initial breakout to look for a re-entry reversal. Best value is 10 (Calmar 4.08 vs 3.93 at default 8).",
+    "FBR Direction": "FBR only. BREAKOUT = scan for failed long breakouts (reversal SHORT). BREAKDOWN = scan for failed short breakdowns (reversal LONG). BOTH = either.",
+    "VCPR RR Ratio": "VIRGIN_CPR only. RR multiple for that strategy's target. Not used by CPR_LEVELS or FBR.",
+    # Risk Management
+    "RR Ratio": "Sets the target price as entry +/- (SL_distance x RR). NOT the entry gate - that is Min Effective RR. Example: entry 529, SL 534, RR=2 -> target = 529 - (5 x 2) = 519.",
+    "Min Effective RR": "Entry gate. Trade only opens if actual (entry-target)/(entry-SL) >= this value at entry time. Default 2.0 ensures target is always at least 2 x the SL distance away.",
+    "Max SL ATR Ratio": "SL distance (entry to stop) cannot exceed N x ATR. Prevents very wide stops on volatile symbols. Example: ATR=5, max ratio=2 -> SL must be within 10 points of entry.",
+    "Breakeven R": "When trade reaches 1R profit (price moved 1 x SL distance in your favour), stop moves to entry price. Position can only lose commission thereafter.",
+    "Risk-Based Sizing": "ON = size to risk exactly 1% of portfolio per trade (capped at 10%). OFF = fixed 10% capital per trade regardless of SL distance.",
+    "Max Positions": "Maximum concurrent open positions. NOT a daily trade cap. Positions that close (SL/target/breakeven) free up slots. Live and backtest now share the same quality-sort for competing entries, with symbol tie-breaks for determinism.",
+    # Filters
+    "Min Price": "Skip symbols with prev-day close below Rs 50. Sub-Rs 50 stocks have high spread pct, large share quantities, and disproportionate commission costs.",
+    "RVOL Threshold": "Relative Volume gate (LONG only by default, OFF for SHORT). Requires current bar volume >= N x 10-day average volume at same time of day. Skipped for SHORT because adding RVOL there cuts PnL.",
+    "Max Gap Pct": "Skip if overnight gap from prev close to today's 09:15 open exceeds 1.5%. Large gaps = stock already moved, CPR levels may be unreachable.",
+    "OR ATR Min": "Skip if 09:15 opening bar range < 0.3 x ATR. Near-flat open = no momentum or illiquid. Formula: (bar_high - bar_low) / ATR_prev_day.",
+    "OR ATR Max": "Skip if 09:15 opening bar range > 2.5 x ATR. Already-exhausted open = likely to consolidate. Warning: live/backtest divergence. Kite WebSocket ticks give 30-90% narrower ranges than REST API, so many symbols pass this filter live but fail in backtest. See Strategy Guide -> Parameter Reference -> OR ATR Max for the full explanation.",
+    "Time Exit": "Force-close all positions at this time. 15:15 leaves 15 min before NSE close to avoid last-minute spread widening.",
+}
+
+
 def param_detail_card(params: dict) -> None:
     """Render an elegant expandable parameter card grouped by category.
 
@@ -2352,9 +2383,13 @@ def param_detail_card(params: dict) -> None:
                             else theme["text_primary"]
                         )
                         with ui.row().classes("items-center gap-2"):
-                            ui.label(label).classes("text-xs").style(
-                                f"color: {theme['text_secondary']};"
+                            lbl = (
+                                ui.label(label)
+                                .classes("text-xs")
+                                .style(f"color: {theme['text_secondary']};")
                             )
+                            if label in _PARAM_TOOLTIPS:
+                                lbl.tooltip(_PARAM_TOOLTIPS[label])
                             ui.label(value).classes("text-xs font-semibold mono-font").style(
                                 f"color: {val_color};"
                             )

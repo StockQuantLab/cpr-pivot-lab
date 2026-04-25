@@ -57,6 +57,7 @@ def test_build_backtest_args_prefers_saved_universe_snapshot(monkeypatch):
 
 def test_find_previous_baselines_matches_legacy_param_signature(monkeypatch):
     captured: dict[str, object] = {}
+    closed = {"value": False}
 
     rows = [
         {
@@ -89,13 +90,12 @@ def test_find_previous_baselines_matches_legacy_param_signature(monkeypatch):
     class _FakeDB:
         def __init__(self):
             self.con = _FakeCon()
-            self.closed = False
-
-        def close(self):
-            self.closed = True
 
     fake_db = _FakeDB()
     monkeypatch.setattr(db.backtest_db, "get_backtest_db", lambda: fake_db)
+    monkeypatch.setattr(
+        db.backtest_db, "close_backtest_db", lambda: closed.__setitem__("value", True)
+    )
 
     previous = baselines_cli._find_previous_baselines("2026-04-23")
 
@@ -107,7 +107,7 @@ def test_find_previous_baselines_matches_legacy_param_signature(monkeypatch):
     assert "$.risk_based_sizing" in str(captured["sql"])
     assert "$.min_price" in str(captured["sql"])
     assert captured["params"] == {"end": "2026-04-23"}
-    assert fake_db.closed is True
+    assert closed["value"] is True
 
 
 def test_build_baseline_table_formats_comparison(monkeypatch):

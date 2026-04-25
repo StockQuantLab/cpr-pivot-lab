@@ -92,10 +92,10 @@ change the date window when extending baselines.
 Canonical rerun commands (only change `--start`/`--end`):
 
 ```bash
-uv run pivot-backtest --all --universe-size 0 --yes-full-run --start 2025-01-01 --end 2026-04-21 --preset CPR_LEVELS_STANDARD_LONG  --save --quiet
-uv run pivot-backtest --all --universe-size 0 --yes-full-run --start 2025-01-01 --end 2026-04-21 --preset CPR_LEVELS_STANDARD_SHORT --save --quiet
-uv run pivot-backtest --all --universe-size 0 --yes-full-run --start 2025-01-01 --end 2026-04-21 --preset CPR_LEVELS_RISK_LONG      --save --quiet
-uv run pivot-backtest --all --universe-size 0 --yes-full-run --start 2025-01-01 --end 2026-04-21 --preset CPR_LEVELS_RISK_SHORT     --save --quiet
+uv run pivot-backtest --all --universe-size 0 --yes-full-run --start 2025-01-01 --end 2026-04-24 --preset CPR_LEVELS_STANDARD_LONG  --save --quiet
+uv run pivot-backtest --all --universe-size 0 --yes-full-run --start 2025-01-01 --end 2026-04-24 --preset CPR_LEVELS_STANDARD_SHORT --save --quiet
+uv run pivot-backtest --all --universe-size 0 --yes-full-run --start 2025-01-01 --end 2026-04-24 --preset CPR_LEVELS_RISK_LONG      --save --quiet
+uv run pivot-backtest --all --universe-size 0 --yes-full-run --start 2025-01-01 --end 2026-04-24 --preset CPR_LEVELS_RISK_SHORT     --save --quiet
 ```
 
 Reference sets (Apr 2026):
@@ -113,24 +113,24 @@ Reference sets (Apr 2026):
 | Daily Reset Std SHORT | `1d6e5e93618e` | 2025-01-01 → 2026-04-09 | ₹1,041,450 |
 | Daily Reset Std LONG | `84a85d954f99` | 2025-01-01 → 2026-04-09 | ₹827,381 |
 
-- **Current CPR baselines (2026-04-24 refresh with `momentum_confirm=True` on all four CPR presets — use these for all future comparisons):**
+**Current CPR baselines (2026-04-24 quality-sort refresh on all four CPR presets — use these for all future comparisons):**
 
 SHORT presets now use `short_trail_atr_multiplier = 1.25`. LONG keeps `trail_atr_multiplier = 1.0`.
 
 | Mode | Preset | Run ID | Start → End | P/L | Calmar |
 |------|--------|--------|-------------|-----|--------|
-| Daily Reset | `CPR_LEVELS_RISK_LONG` | `4eaaa682e79c` | 2025-01-01 → 2026-04-24 | ₹1,035,952 | 202.41 |
-| Daily Reset | `CPR_LEVELS_RISK_SHORT` | `fd763aa18d54` | 2025-01-01 → 2026-04-24 | ₹1,107,896 | 100.53 |
-| Daily Reset | `CPR_LEVELS_STANDARD_LONG` | `a1cf51e8c749` | 2025-01-01 → 2026-04-24 | ₹1,044,567 | 201.43 |
-| Daily Reset | `CPR_LEVELS_STANDARD_SHORT` | `7ed7debb138a` | 2025-01-01 → 2026-04-24 | ₹1,107,806 | 86.24 |
-| Compound | `CPR_LEVELS_STANDARD_LONG` | `d0a4874b4d88` | 2025-01-01 → 2026-04-24 | ₹2,295,611 | 247.60 |
-| Compound | `CPR_LEVELS_STANDARD_SHORT` | `83bbfca32739` | 2025-01-01 → 2026-04-24 | ₹2,825,745 | 168.93 |
-| Compound | `CPR_LEVELS_RISK_LONG` | `326c9e2cb6ec` | 2025-01-01 → 2026-04-24 | ₹2,295,698 | 247.61 |
-| Compound | `CPR_LEVELS_RISK_SHORT` | `b6e9e4f9449e` | 2025-01-01 → 2026-04-24 | ₹2,790,336 | 166.88 |
+| Daily Reset | `CPR_LEVELS_STANDARD_LONG` | `181a35dd4281` | 2025-01-01 → 2026-04-24 | ₹1,049,489 | 202 |
+| Daily Reset | `CPR_LEVELS_STANDARD_SHORT` | `7c2caee94618` | 2025-01-01 → 2026-04-24 | ₹1,146,822 | 102 |
+| Daily Reset | `CPR_LEVELS_RISK_LONG` | `90a86d6b1da1` | 2025-01-01 → 2026-04-24 | ₹1,041,194 | 203 |
+| Daily Reset | `CPR_LEVELS_RISK_SHORT` | `14609817e655` | 2025-01-01 → 2026-04-24 | ₹1,143,974 | 105 |
+| Compound | `CPR_LEVELS_STANDARD_LONG` | `83df086d062e` | 2025-01-01 → 2026-04-24 | ₹2,305,103 | 249 |
+| Compound | `CPR_LEVELS_STANDARD_SHORT` | `818daec3cf8b` | 2025-01-01 → 2026-04-24 | ₹2,952,262 | 178 |
+| Compound | `CPR_LEVELS_RISK_LONG` | `5ae43fc2e8a9` | 2025-01-01 → 2026-04-24 | ₹2,317,326 | 250 |
+| Compound | `CPR_LEVELS_RISK_SHORT` | `49d261d07a4f` | 2025-01-01 → 2026-04-24 | ₹2,984,565 | 180 |
 
-The 2026-04-24 rerun refreshed the canonical baseline set after promoting
-`momentum_confirm=True` into all four CPR presets. This replaces the prior Apr 23
-reference rows and is now the clean 8-run baseline family for CPR comparisons.
+The 2026-04-24 rerun refreshed the canonical baseline set after enabling
+quality-sort in the slot selector. It matched the previous metrics exactly, so
+this is now the clean 8-run baseline family for CPR comparisons.
 
 When extending the v2 set to a later end date, rerun these same eight presets and
 compare the overlapping window only. The incremental window should be the only source

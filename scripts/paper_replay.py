@@ -815,6 +815,9 @@ async def replay_session(
     final_session = await get_session(session_id)
     archive_payload = None
     if final_session and final_session.status == "COMPLETED":
+        closed_positions = _pdb().get_session_positions(session_id, statuses=["CLOSED"])
+        total_pnl = round(sum(float(p.realized_pnl or 0) for p in closed_positions), 2)
+        await update_session_state(session_id, total_pnl=total_pnl)
         logger.info("Replay archive begin session_id=%s", session_id)
         archive_result = archive_completed_session(
             session_id,
@@ -823,6 +826,9 @@ async def replay_session(
         archive_payload = (
             await archive_result if asyncio.iscoroutine(archive_result) else archive_result
         )
+        # Force-sync paper_db after total_pnl write (comes after the earlier force_paper_db_sync
+        # so it must be flushed explicitly to avoid being swallowed by the debounce).
+        force_paper_db_sync(_pdb())
         logger.info(
             "Replay archive done session_id=%s rows=%s",
             session_id,
