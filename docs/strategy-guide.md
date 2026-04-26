@@ -1,6 +1,4 @@
-# Strategy Guide: CPR Levels vs FBR
-
-This guide answers the “what is the difference between CPR_LEVELS and FBR?” question for operators, analysts, and reviewers.
+> This guide answers the “what is the difference between CPR_LEVELS and FBR?” question for operators, analysts, and reviewers.
 
 ## Data Basis (both strategies)
 
@@ -27,21 +25,14 @@ When opening behavior is neither clearly above TC nor below BC, both strategies 
   - SHORT: close <= `BC - buffer`
 - Set stop at the opposite CPR boundary with ATR noise buffer.
 - Set target at `R1` (LONG) / `S1` (SHORT) and apply standard trailing logic.
-- Short-side `cpr_hold_confirm` was tested as a stricter variant, but it is not a good default:
-  - it helped on a two-day short-only slice,
-  - but on the full `2025-01-01 → 2026-03-30` short run it reduced return from `112.32%` to `12.45%`.
-- Short-side `cpr_confirm_entry` was also tested and rejected:
-  - `2,823` trades fell to `468`, with return dropping to `6.96%`.
-  - It filtered out too many good shorts.
-- Raising `or_atr_min` to `0.5` for shorts was also tested and was not an improvement:
-  - return moved from `112.32%` to `107.40%`.
-- Adding a short-only `open_to_cpr_atr` floor was also tested and rejected:
-  - `short_open_to_cpr_atr_min = 0.5` reduced the full-period short run to `1,455` trades and `37.84%` return (`₹378,441.41`, `PF 2.05`).
-  - The promoted shared CPR close-clearance default is now `cpr_min_close_atr = 0.5`.
-  - It removed too much of the profitable baseline.
-- Adding an 80/20 CPR scale-out from `R1/S1` to `R2/S2` was also tested and rejected:
-  - `cpr_scale_out_pct = 0.8` moved the long run from `43.44%` to `43.07%` and the short run from `128.08%` to `117.85%`.
-  - Keep it opt-in only unless a narrower variant proves better.
+<!-- REJECTED_VARIANTS -->
+- **cpr_hold_confirm (SHORT):** Helped on a two-day slice, but full-period return dropped from `112.32%` → `12.45%`.
+- **cpr_confirm_entry (SHORT):** Trades fell from `2,823` → `468`, return `6.96%`. Filtered out too many good shorts.
+- **or_atr_min = 0.5 (SHORT):** Return moved from `112.32%` → `107.40%`. Not worth the trade count reduction.
+- **open_to_cpr_atr floor (SHORT):** `short_open_to_cpr_atr_min = 0.5` → `1,455` trades, `37.84%` return (`₹378K`, `PF 2.05`). The shared `cpr_min_close_atr = 0.5` default is the promoted version.
+- **80/20 CPR scale-out (R1→R2 / S1→S2):** `cpr_scale_out_pct = 0.8` moved LONG from `43.44%` → `43.07%` and SHORT from `128.08%` → `117.85%`. Opt-in only.
+<!-- /REJECTED_VARIANTS -->
+
 - Keep the default CPR_LEVELS path on the 5-minute signal unless you are explicitly testing a new short-side filter.
 - Fails setup if:
   - entry fill would be invalid (`target` behind fill),
