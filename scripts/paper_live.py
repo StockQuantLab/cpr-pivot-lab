@@ -32,6 +32,7 @@ from engine.live_market_data import (
     MarketDataAdapter,
     MarketSnapshot,
 )
+from engine.paper_reconciliation import reconcile_paper_session
 from engine.paper_runtime import (
     PaperRuntimeState,
     SymbolRuntimeState,
@@ -108,6 +109,105 @@ def _closed_candle_payload(candle: ClosedCandle) -> dict[str, Any]:
         "first_snapshot_ts": candle.first_snapshot_ts.isoformat(),
         "last_snapshot_ts": candle.last_snapshot_ts.isoformat(),
     }
+
+
+def _live_mark_feed_state(
+    *,
+    session_id: str,
+    symbol_last_prices: dict[str, float],
+    ticker_adapter: Any = None,
+    symbols: list[str] | set[str] | tuple[str, ...] | None = None,
+) -> Any:
+    """Build a feed-state view using latest live marks for immediate flatten fills."""
+    prices = dict(symbol_last_prices)
+    if ticker_adapter is not None and hasattr(ticker_adapter, "get_last_ltp"):
+        for symbol in symbols or prices.keys():
+            normalized = str(symbol).upper()
+            try:
+                ltp = ticker_adapter.get_last_ltp(normalized)
+            except Exception:
+                logger.debug("Failed to read latest LTP for %s", normalized, exc_info=True)
+                continue
+            if ltp is not None:
+                prices[normalized] = float(ltp)
+    return SimpleNamespace(
+        session_id=session_id,
+        status="LIVE_MARK",
+        last_event_ts=datetime.now(IST),
+        last_bar_ts=None,
+        last_price=None,
+        stale_reason=None,
+        raw_state={"symbol_last_prices": prices, "mark_source": "live_ltp"},
+    )
+
+
+def _open_symbols_from_tracker(tracker: SessionPositionTracker) -> list[str]:
+    return sorted(str(symbol).upper() for symbol in getattr(tracker, "_open", {}).keys())
+
+
+def _entry_disabled_symbols(
+    *,
+    tracker: SessionPositionTracker,
+    active_symbols: list[str],
+) -> list[str]:
+    del active_symbols
+    open_symbols = _open_symbols_from_tracker(tracker)
+    return open_symbols
+
+
+def _cancel_pending_admin_commands(cmd_dir: Path, current_file: Path) -> int:
+    cancelled = 0
+    if not cmd_dir.exists():
+        return cancelled
+    for pending_file in sorted(cmd_dir.glob("*.json")):
+        if pending_file == current_file:
+            continue
+        try:
+            pending_file.unlink()
+            cancelled += 1
+        except OSError:
+            logger.debug("Failed to delete pending admin command %s", pending_file, exc_info=True)
+    return cancelled
+
+
+def _reconcile_live_session(
+    *,
+    session_id: str,
+    reason: str,
+    alerts_enabled: bool,
+) -> bool:
+    """Return True when critical findings require entry-disable mode."""
+    paper_db = get_paper_db()
+    if not hasattr(paper_db, "get_session"):
+        logger.debug(
+            "[%s] Skipping reconciliation for injected paper DB after %s", session_id, reason
+        )
+        return False
+    payload = reconcile_paper_session(paper_db, session_id)
+    critical = int((payload.get("summary") or {}).get("critical") or 0)
+    if critical <= 0:
+        return False
+
+    logger.error(
+        "[%s] Reconciliation critical findings after %s: %s",
+        session_id,
+        reason,
+        payload.get("findings"),
+    )
+    if alerts_enabled:
+        dispatch_session_error_alert(
+            session_id=session_id,
+            reason="reconciliation_critical",
+            details=f"after={reason} critical={critical}",
+        )
+    try:
+        get_paper_db().update_session(
+            session_id,
+            notes=f"ENTRY_DISABLED_RECONCILIATION after={reason} critical={critical}",
+        )
+    except Exception:
+        logger.debug("[%s] Failed to stamp reconciliation note", session_id, exc_info=True)
+    return True
 
 
 def _seconds_until_next_candle_close(now: datetime, candle_interval_minutes: int) -> float:
@@ -822,6 +922,7 @@ async def run_live_session(
             "session_id": session_id,
             "error": f"no symbols remain after Stage A pre-filter for {trade_date}",
         }
+    entry_universe_symbols = list(active_symbols)
 
     register_session_start()
     _start_alert_dispatcher()  # start consumer eagerly so first alerts are not delayed
@@ -944,6 +1045,7 @@ async def run_live_session(
     stale_alerted = False
     last_disconnect_alert_ts: datetime | None = None
     last_stale_alert_ts: datetime | None = None
+    entries_disabled = False
     alerts_enabled = True if deps is None else bool(deps.alerts_enabled)
     _stale_alert_cooldown_sec = 300  # 5 min between repeated FEED_STALE alerts
     audit_feed_source = "kite"
@@ -1115,12 +1217,10 @@ async def run_live_session(
                     quote_events += len(snapshots)
                     for snapshot in snapshots:
                         last_snapshot_ts = snapshot.ts
+                        symbol_last_prices[snapshot.symbol] = float(snapshot.last_price)
                         latest_raw_state = {
                             **_feed_snapshot_payload(snapshot),
-                            "symbol_last_prices": {
-                                **symbol_last_prices,
-                                snapshot.symbol: snapshot.last_price,
-                            },
+                            "symbol_last_prices": dict(symbol_last_prices),
                         }
                         builder.ingest(snapshot)
                     cycle_closed = builder.drain_closed()
@@ -1164,6 +1264,14 @@ async def run_live_session(
                         }
 
                     try:
+                        bar_active_symbols = (
+                            _entry_disabled_symbols(
+                                tracker=tracker,
+                                active_symbols=active_symbols,
+                            )
+                            if entries_disabled
+                            else active_symbols
+                        )
                         # Defer replica sync for the entire bar group — sync once
                         # after all position opens/closes instead of per-write.
                         get_paper_db().defer_sync()
@@ -1175,7 +1283,7 @@ async def run_live_session(
                                 runtime_state=runtime_state,
                                 tracker=tracker,
                                 params=params,
-                                active_symbols=active_symbols,
+                                active_symbols=bar_active_symbols,
                                 strategy=strategy,
                                 direction_filter=direction_filter,
                                 stage_b_applied=stage_b_applied,
@@ -1217,6 +1325,15 @@ async def run_live_session(
                         stop_requested = True
                         break
                     active_symbols = list(driver_result["active_symbols"])
+                    if entries_disabled:
+                        monitor_symbols = _entry_disabled_symbols(
+                            tracker=tracker,
+                            active_symbols=active_symbols,
+                        )
+                        if monitor_symbols:
+                            active_symbols = monitor_symbols
+                            if use_websocket and ticker_adapter is not None:
+                                ticker_adapter.update_symbols(session_id, active_symbols)
                     last_price = driver_result["last_price"]
                     stage_b_applied = bool(driver_result["stage_b_applied"])
                     if deps is None:
@@ -1231,7 +1348,7 @@ async def run_live_session(
                                 bar_end.isoformat(),
                             )
                             stop_requested = True
-                        elif not active_symbols:
+                        elif not active_symbols and not entries_disabled:
                             final_status = "NO_ACTIVE_SYMBOLS"
                             terminal_reason = "no_active_symbols"
                             logger.info(
@@ -1245,6 +1362,21 @@ async def run_live_session(
                         final_status = "STOPPING"
                         terminal_reason = "risk_control_triggered"
                         stop_requested = True
+
+                    if _reconcile_live_session(
+                        session_id=session_id,
+                        reason=f"bar:{bar_end.isoformat()}",
+                        alerts_enabled=alerts_enabled,
+                    ):
+                        entries_disabled = True
+                        monitor_symbols = _entry_disabled_symbols(
+                            tracker=tracker,
+                            active_symbols=active_symbols,
+                        )
+                        if monitor_symbols:
+                            active_symbols = monitor_symbols
+                            if use_websocket and ticker_adapter is not None:
+                                ticker_adapter.update_symbols(session_id, active_symbols)
 
                     if stop_requested:
                         break
@@ -1269,9 +1401,29 @@ async def run_live_session(
                     _signal_file.unlink()
                 except OSError:
                     pass
-                final_status = "COMPLETED"
-                terminal_reason = "manual_flatten_signal"
-                complete_on_exit = True
+                live_feed_state = _live_mark_feed_state(
+                    session_id=session_id,
+                    symbol_last_prices=symbol_last_prices,
+                    ticker_adapter=ticker_adapter if use_websocket else None,
+                    symbols=list(tracker._open.keys()) or active_symbols,
+                )
+                await flatten_session_positions(
+                    session_id,
+                    notes="manual_flatten_signal",
+                    feed_state=live_feed_state,
+                )
+                if _reconcile_live_session(
+                    session_id=session_id,
+                    reason="manual_flatten_signal",
+                    alerts_enabled=alerts_enabled,
+                ):
+                    final_status = "FAILED"
+                    terminal_reason = "reconciliation_failed_after_manual_flatten"
+                    complete_on_exit = False
+                else:
+                    final_status = "COMPLETED"
+                    terminal_reason = "manual_flatten_signal"
+                    complete_on_exit = True
                 stop_requested = True
                 break
 
@@ -1294,17 +1446,45 @@ async def run_live_session(
                             _requester,
                         )
                         if _action == "close_all":
-                            final_status = "COMPLETED"
-                            terminal_reason = f"admin_{_reason}"
-                            complete_on_exit = True
+                            live_feed_state = _live_mark_feed_state(
+                                session_id=session_id,
+                                symbol_last_prices=symbol_last_prices,
+                                ticker_adapter=ticker_adapter if use_websocket else None,
+                                symbols=list(tracker._open.keys()) or active_symbols,
+                            )
+                            await flatten_session_positions(
+                                session_id,
+                                notes=f"admin_{_reason}_{_requester}",
+                                feed_state=live_feed_state,
+                            )
+                            if _reconcile_live_session(
+                                session_id=session_id,
+                                reason=f"admin:{_action}",
+                                alerts_enabled=alerts_enabled,
+                            ):
+                                entries_disabled = True
+                                final_status = "FAILED"
+                                terminal_reason = "reconciliation_failed_after_admin_close_all"
+                                complete_on_exit = False
+                            else:
+                                final_status = "COMPLETED"
+                                terminal_reason = f"admin_{_reason}"
+                                complete_on_exit = True
                             stop_requested = True
                         elif _action == "close_positions":
                             _syms = [str(s).upper() for s in (_cmd.get("symbols") or [])]
                             if _syms:
+                                live_feed_state = _live_mark_feed_state(
+                                    session_id=session_id,
+                                    symbol_last_prices=symbol_last_prices,
+                                    ticker_adapter=ticker_adapter if use_websocket else None,
+                                    symbols=_syms,
+                                )
                                 _close_result = await flatten_positions_subset(
                                     session_id,
                                     _syms,
                                     notes=f"admin_{_reason}_{_requester}",
+                                    feed_state=live_feed_state,
                                 )
                                 for _pos in _close_result.get("positions", []):
                                     _sym = str(_pos.get("symbol", ""))
@@ -1323,6 +1503,157 @@ async def run_live_session(
                                         )
                                         tracker.record_close(_sym, _exit_v)
                                 get_paper_db().force_sync()
+                                if _reconcile_live_session(
+                                    session_id=session_id,
+                                    reason=f"admin:{_action}",
+                                    alerts_enabled=alerts_enabled,
+                                ):
+                                    entries_disabled = True
+                                    monitor_symbols = _entry_disabled_symbols(
+                                        tracker=tracker,
+                                        active_symbols=active_symbols,
+                                    )
+                                    if monitor_symbols:
+                                        active_symbols = monitor_symbols
+                                        if use_websocket and ticker_adapter is not None:
+                                            ticker_adapter.update_symbols(
+                                                session_id, active_symbols
+                                            )
+                        elif _action == "set_risk_budget":
+                            portfolio_value = _cmd.get("portfolio_value")
+                            max_positions = _cmd.get("max_positions")
+                            max_position_pct = _cmd.get("max_position_pct")
+                            tracker.update_budget(
+                                portfolio_value=(
+                                    float(portfolio_value) if portfolio_value is not None else None
+                                ),
+                                max_positions=(
+                                    int(max_positions) if max_positions is not None else None
+                                ),
+                                max_position_pct=(
+                                    float(max_position_pct)
+                                    if max_position_pct is not None
+                                    else None
+                                ),
+                            )
+                            entries_disabled = False
+                            open_notional = tracker.current_open_notional()
+                            if (
+                                tracker.initial_capital > 0
+                                and open_notional >= tracker.initial_capital
+                            ):
+                                entries_disabled = True
+                                monitor_symbols = _entry_disabled_symbols(
+                                    tracker=tracker,
+                                    active_symbols=active_symbols,
+                                )
+                                if monitor_symbols:
+                                    active_symbols = monitor_symbols
+                                    if use_websocket and ticker_adapter is not None:
+                                        ticker_adapter.update_symbols(session_id, active_symbols)
+                            logger.warning(
+                                "[%s] Risk budget updated by %s: portfolio_value=%.2f "
+                                "max_positions=%d max_position_pct=%.4f open_notional=%.2f "
+                                "cash_available=%.2f entries_disabled=%s",
+                                session_id,
+                                _requester,
+                                tracker.initial_capital,
+                                tracker.max_positions,
+                                tracker.max_position_pct,
+                                open_notional,
+                                tracker.cash_available,
+                                entries_disabled,
+                            )
+                            try:
+                                get_paper_db().update_session(
+                                    session_id,
+                                    notes=(
+                                        f"RISK_BUDGET_UPDATED portfolio_value="
+                                        f"{tracker.initial_capital:.2f} max_positions="
+                                        f"{tracker.max_positions} max_position_pct="
+                                        f"{tracker.max_position_pct:.4f} reason={_reason}"
+                                    ),
+                                )
+                                get_paper_db().force_sync()
+                            except Exception:
+                                logger.debug(
+                                    "[%s] Failed to stamp risk budget update",
+                                    session_id,
+                                    exc_info=True,
+                                )
+                        elif _action == "pause_entries":
+                            entries_disabled = True
+                            monitor_symbols = _entry_disabled_symbols(
+                                tracker=tracker,
+                                active_symbols=active_symbols,
+                            )
+                            if monitor_symbols:
+                                active_symbols = monitor_symbols
+                                if use_websocket and ticker_adapter is not None:
+                                    ticker_adapter.update_symbols(session_id, active_symbols)
+                            logger.warning(
+                                "[%s] Entries paused by %s reason=%s open_positions=%d",
+                                session_id,
+                                _requester,
+                                _reason,
+                                tracker.open_count,
+                            )
+                            try:
+                                get_paper_db().update_session(
+                                    session_id,
+                                    notes=f"ENTRIES_PAUSED reason={_reason} requester={_requester}",
+                                )
+                                get_paper_db().force_sync()
+                            except Exception:
+                                logger.debug(
+                                    "[%s] Failed to stamp pause note", session_id, exc_info=True
+                                )
+                        elif _action == "resume_entries":
+                            entries_disabled = False
+                            active_symbols = list(entry_universe_symbols)
+                            if use_websocket and ticker_adapter is not None:
+                                ticker_adapter.update_symbols(session_id, active_symbols)
+                            logger.warning(
+                                "[%s] Entries resumed by %s reason=%s symbols=%d",
+                                session_id,
+                                _requester,
+                                _reason,
+                                len(active_symbols),
+                            )
+                            try:
+                                get_paper_db().update_session(
+                                    session_id,
+                                    notes=f"ENTRIES_RESUMED reason={_reason} requester={_requester}",
+                                )
+                                get_paper_db().force_sync()
+                            except Exception:
+                                logger.debug(
+                                    "[%s] Failed to stamp resume note", session_id, exc_info=True
+                                )
+                        elif _action == "cancel_pending_intents":
+                            cancelled = _cancel_pending_admin_commands(_cmd_dir, _cmd_file)
+                            logger.warning(
+                                "[%s] Pending admin intents cancelled by %s reason=%s count=%d",
+                                session_id,
+                                _requester,
+                                _reason,
+                                cancelled,
+                            )
+                            try:
+                                get_paper_db().update_session(
+                                    session_id,
+                                    notes=(
+                                        f"PENDING_INTENTS_CANCELLED count={cancelled} "
+                                        f"reason={_reason} requester={_requester}"
+                                    ),
+                                )
+                                get_paper_db().force_sync()
+                            except Exception:
+                                logger.debug(
+                                    "[%s] Failed to stamp cancel-pending note",
+                                    session_id,
+                                    exc_info=True,
+                                )
                     except Exception:
                         logger.exception(
                             "[%s] Admin command failed: %s", session_id, _cmd_file.name
@@ -1543,7 +1874,16 @@ async def run_live_session(
         # Position flatten — always runs.
         if final_status in {"COMPLETED", "NO_ACTIVE_SYMBOLS", "NO_TRADES_ENTRY_WINDOW_CLOSED"}:
             try:
-                await flatten_session_positions(session_id, notes=notes or "session flatten")
+                await flatten_session_positions(
+                    session_id,
+                    notes=notes or "session flatten",
+                    feed_state=_live_mark_feed_state(
+                        session_id=session_id,
+                        symbol_last_prices=symbol_last_prices,
+                        ticker_adapter=ticker_adapter if use_websocket else None,
+                        symbols=list(tracker._open.keys()) or active_symbols,
+                    ),
+                )
             except Exception:
                 logger.debug("Final EOD flatten/summary failed (best-effort)", exc_info=True)
         elif final_status in {"STALE", "FAILED"} and tracker.open_count > 0:
@@ -1557,7 +1897,14 @@ async def run_live_session(
                         tracker.open_count,
                     )
                     await flatten_session_positions(
-                        session_id, notes=f"{final_status}_AUTO_FLATTEN"
+                        session_id,
+                        notes=f"{final_status}_AUTO_FLATTEN",
+                        feed_state=_live_mark_feed_state(
+                            session_id=session_id,
+                            symbol_last_prices=symbol_last_prices,
+                            ticker_adapter=ticker_adapter if use_websocket else None,
+                            symbols=list(tracker._open.keys()) or active_symbols,
+                        ),
                     )
                 except Exception:
                     # Fix 2: alert operator when auto-flatten itself fails — orphaned positions.

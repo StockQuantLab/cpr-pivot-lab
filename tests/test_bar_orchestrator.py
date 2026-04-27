@@ -168,6 +168,37 @@ def test_compute_position_qty_rejects_dust_notional() -> None:
     assert qty == 0
 
 
+def test_update_budget_reduces_future_entry_capacity_without_resizing_open_position() -> None:
+    tracker = SessionPositionTracker(
+        max_positions=10,
+        portfolio_value=1_000_000.0,
+        max_position_pct=0.10,
+    )
+    position = type(
+        "Position",
+        (),
+        {
+            "position_id": "pos-1",
+            "symbol": "SBIN",
+            "direction": "SHORT",
+            "entry_price": 100.0,
+            "stop_loss": 105.0,
+            "target_price": 90.0,
+            "quantity": 1000.0,
+            "current_qty": 1000.0,
+            "trail_state": {},
+        },
+    )()
+    tracker.record_open(position, 100_000.0)
+
+    tracker.update_budget(portfolio_value=500_000.0)
+
+    assert tracker.initial_capital == pytest.approx(500_000.0)
+    assert tracker.current_open_notional() == pytest.approx(100_000.0)
+    assert tracker.cash_available == pytest.approx(400_000.0)
+    assert tracker.slot_capital == pytest.approx(50_000.0)
+
+
 def test_minimum_trade_notional_for_matches_tracker_rule() -> None:
     tracker = SessionPositionTracker(
         max_positions=10,

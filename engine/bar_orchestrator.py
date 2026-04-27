@@ -128,6 +128,37 @@ class SessionPositionTracker:
         )
         return max(0.0, float(self.cash_available or 0.0) + open_cost_basis)
 
+    def current_open_notional(self) -> float:
+        return sum(
+            max(0.0, float(tracked.current_qty or 0.0) * float(tracked.entry_price or 0.0))
+            for tracked in self._open.values()
+        )
+
+    def update_budget(
+        self,
+        *,
+        portfolio_value: float | None = None,
+        max_positions: int | None = None,
+        max_position_pct: float | None = None,
+    ) -> None:
+        old_open_notional = self.current_open_notional()
+        old_cash = float(self.cash_available or 0.0)
+        if portfolio_value is not None:
+            self.initial_capital = max(0.0, float(portfolio_value or 0.0))
+        if max_positions is not None:
+            self.max_positions = max(1, int(max_positions or 1))
+        if max_position_pct is not None:
+            self.max_position_pct = max(0.0, float(max_position_pct or 0.0))
+        self.slot_capital = slot_capital_for(
+            max_positions=self.max_positions,
+            portfolio_value=self.initial_capital,
+            max_position_pct=self.max_position_pct,
+            capital_base=self.initial_capital,
+        )
+        # Existing positions are not resized. Free cash is recomputed so future
+        # entries cannot exceed the new operator budget.
+        self.cash_available = min(old_cash, max(0.0, self.initial_capital - old_open_notional))
+
     def credit_cash(self, amount: float) -> None:
         self.cash_available += max(0.0, float(amount or 0.0))
 

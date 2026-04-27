@@ -3651,3 +3651,74 @@ not change strategy behavior.
 
 ### Files Changed / Files to Change
 ```
+
+## 2026-04-27 — EXECUTION SAFETY: paper live operator controls, idempotency, and reconciliation
+
+**Status:** FIXED / IMPLEMENTED
+**Severity:** High — prerequisite before any real-broker dry run
+
+### Symptom
+
+Paper-live was usable for strategy validation, but the real-trading safety surface was incomplete:
+
+- operator flatten documentation still assumed killing the live process before flattening
+- paper order events had no idempotency key for retry-safe order writes
+- manual/admin flatten pricing could fall back to stale closed-candle marks instead of latest live LTP
+- no explicit reconciliation command existed for order/position/session invariants
+- no automatic live-loop behavior existed for critical reconciliation failures
+
+### Root Cause
+
+The system evolved from paper validation into live-operation rehearsal. Paper execution state was
+still modelled as direct DB writes instead of broker-like order intents with throttling, idempotency,
+and reconciliation.
+
+### Fix Applied
+
+- Added `engine/execution_safety.py` with a default 8 orders/sec `OrderRateGovernor` and
+  deterministic order idempotency key builder.
+- Added `paper_orders.idempotency_key` and duplicate suppression in `db/paper_db.py`.
+- Routed paper order events through the governor in `engine/paper_runtime.py`.
+- Added idempotency keys for entry, normal exit, partial exit, position flatten, and session flatten.
+- Added live-paper immediate manual flatten pricing from latest in-memory LTP via
+  `KiteTickerAdapter.get_last_ltp()` / local-feed LTP, with fallbacks to feed-state/position marks.
+- Added `pivot-paper-trading send-command` for active-session close-one / close-all commands.
+- Added `pivot-paper-trading flatten-both` to queue close-all for both LONG and SHORT sessions.
+- Added `send-command --action set_risk_budget` to reduce/adjust one running session's future-entry
+  budget and slot caps without resizing existing open positions.
+- Added `send-command --action pause_entries`, `resume_entries`, and `cancel_pending_intents` for
+  explicit entry gating and admin-queue cleanup.
+- Added dashboard `/paper_ledger` controls for close symbols, flatten session, flatten LONG+SHORT,
+  pause/resume entries, cancel pending intents, risk-budget update, and reconciliation.
+- Added `engine/paper_reconciliation.py` and `pivot-paper-trading reconcile --strict`.
+- Added `engine/broker_adapter.py` with `BrokerAdapter`, `PaperBrokerAdapter`, and
+  `ZerodhaBrokerAdapter(mode="REAL_DRY_RUN")`.
+- Added `pivot-paper-trading real-dry-run-order` to generate and record Zerodha payloads without
+  calling Kite `place_order`.
+- Live loop now runs reconciliation after bars, admin close commands, and sentinel flatten. Critical
+  findings after `close_positions` disable new entries while preserving exit monitoring for open
+  positions. Critical findings after `close_all` / sentinel flatten fail the session closed instead
+  of marking it cleanly completed.
+- Replaced executable `datetime.utcnow()` usage in `db/paper_db.py` with timezone-aware UTC helpers.
+
+### Validation
+
+- `uv run pytest tests/test_execution_safety.py tests/test_paper_reconciliation.py tests/test_paper_live_polling.py tests/test_live_market_data.py tests/test_paper_admin_commands.py tests/test_web_state.py -q` → `49 passed`
+- `uv run pytest tests/test_broker_adapter.py tests/test_execution_safety.py tests/test_paper_db.py tests/test_paper_reconciliation.py tests/test_paper_admin_commands.py tests/test_paper_trading_cli.py -q` → `55 passed`
+- `uv run ruff check engine\paper_runtime.py agent\tools\backtest_tools.py scripts\paper_trading.py scripts\paper_live.py web\state.py web\pages\ops_pages.py tests\test_paper_admin_commands.py tests\test_web_state.py tests\test_paper_live_polling.py` → clean
+- `uv run ruff check engine\broker_adapter.py db\paper_db.py scripts\paper_trading.py tests\test_broker_adapter.py` → clean
+- Local-feed live-paper smoke:
+  `daily-live --trade-date 2026-04-24 --feed-source local --preset CPR_LEVELS_RISK_LONG --symbols SBIN,RELIANCE,TCS --session-id safety-smoke-20260424-long --max-cycles 25 --no-alerts --skip-coverage`
+  completed with `final_status=COMPLETED`, `terminal_reason=NO_TRADES_ENTRY_WINDOW_CLOSED`, no open positions.
+- `pivot-paper-trading reconcile --session-id safety-smoke-20260424-long --strict` → `ok=true`.
+
+### Operator Contract
+
+- Strategy exits remain completed-5-minute-candle driven.
+- Manual/operator/emergency exits are immediate market-style exits using latest live mark/LTP when
+  available.
+- Risk-budget reductions apply to future entries only. Existing open positions continue to be
+  managed unless the operator also sends `close_positions` or `close_all`.
+- During active live sessions, use `send-command` / `flatten-both`, not direct `flatten-all`, to avoid
+  DuckDB writer-lock contention. Reconciliation is automatic in the live loop; the standalone
+  `reconcile --strict` command is for explicit diagnostics or gates.

@@ -104,6 +104,20 @@ execution rules; none of them is exempt from parity.
 - Live finalization is defensive: final flush is guarded, abnormal exits auto-flatten, and a
   `SESSION_ERROR` alert is emitted if terminal cleanup fails. A clean shutdown still requires
   the DB terminal status stamp to land successfully.
+- Manual/operator exits are execution controls, not strategy signals. In live paper, `close_positions`,
+  `close_all`, sentinel flatten, and final abnormal-exit flatten close immediately using the latest
+  in-memory LTP/tick mark when available; they do not wait for the next 5-minute strategy candle.
+  Strategy SL/target/trailing/time exits remain completed-5-minute-candle driven.
+- Paper order events now pass through a process-local execution safety layer: default 8 orders/sec
+  governor plus order idempotency keys. This is below the 10 orders/sec regulatory threshold and is
+  deliberately conservative for future real-broker mode.
+- Real-broker dry-run is available for payload validation only. `real-dry-run-order` builds the
+  Zerodha order payload, passes through the same governor/idempotency layer, records the payload in
+  `paper_orders.broker_payload`, and never calls Kite `place_order`.
+- Live paper reconciles order/position/session invariants after each bar and after admin close
+  commands. If a critical mismatch is detected, new entries are disabled, current open positions
+  continue to be monitored for exits, and the session note is stamped with
+  `ENTRY_DISABLED_RECONCILIATION`.
 - When multiple symbols qualify on the same bar, the current shared selector uses a
   deterministic symbol-order tie-break via `select_entries_for_bar()`. That keeps replay,
   live, and backtest reproducible. It is not a profitability optimizer. If you want to rank
@@ -645,6 +659,13 @@ doppler run -- uv run pivot-paper-trading stop --session-id <id> --complete
 
 Review archived results in the dashboard at `/paper_ledger`.
 
+During an active `daily-live` run, `/paper_ledger` also exposes the operator
+control plane. Use it to close selected symbols, flatten one selected session,
+flatten both LONG and SHORT sessions for a date, pause/resume future entries,
+cancel unprocessed admin intents, reduce future-entry budget/caps, or run
+reconciliation. These buttons write the same admin command files as the CLI
+commands below; the dashboard does not directly mutate live positions.
+
 ### 3a. Recovery: missed FLATTEN_EOD alert
 
 If the EOD summary was not delivered (network outage at EOD, stale exit before 15:15,
@@ -784,31 +805,121 @@ doppler run -- uv run pivot-paper-trading resume --session-id paper-001
 
 ### Early Exit / Emergency Close (market conditions)
 
-Use when you need to close all open positions immediately due to market conditions or end-of-day.
+Use when you need to close open positions immediately due to market conditions, operator judgment,
+or end-of-day. While `daily-live` is still running, prefer the admin command queue wrappers below.
+They do not compete with the live process for the DuckDB writer lock.
 
-**Step 1 — kill the live process:**
-```powershell
-Get-CimInstance Win32_Process | Where-Object {$_.CommandLine -like "*pivot-paper-trading*"} | ForEach-Object { taskkill //F //PID $_.ProcessId }
+**Close specific symbols in one running session:**
+```bash
+doppler run -- uv run pivot-paper-trading send-command \
+  --session-id CPR_LEVELS_LONG-2026-04-27-live-kite \
+  --action close_positions \
+  --symbols SBIN,RELIANCE \
+  --reason operator_close
 ```
 
-**Step 2 — flatten all sessions for today:**
+The session keeps running after `close_positions`.
+
+**Flatten one running session:**
+```bash
+doppler run -- uv run pivot-paper-trading send-command \
+  --session-id CPR_LEVELS_SHORT-2026-04-27-live-kite \
+  --action close_all \
+  --reason market_conditions
+```
+
+`close_all` marks that session complete. The sibling LONG/SHORT session is unaffected.
+
+**Flatten both LONG and SHORT sessions for a date:**
+```bash
+doppler run -- uv run pivot-paper-trading flatten-both \
+  --trade-date today \
+  --reason risk_off
+```
+
+**Reduce budget for future entries only:**
+```bash
+doppler run -- uv run pivot-paper-trading send-command \
+  --session-id CPR_LEVELS_SHORT-2026-04-27-live-kite \
+  --action set_risk_budget \
+  --portfolio-value 500000 \
+  --max-positions 5 \
+  --reason reduce_short_risk
+```
+
+This does not resize existing open positions. It changes the in-memory live tracker used for
+future entries. If existing open notional already consumes the reduced budget, new entries are
+disabled until those positions close. To reduce current exposure immediately, also use
+`close_positions` or `close_all`.
+
+**Pause future entries while still monitoring open-position exits:**
+```bash
+doppler run -- uv run pivot-paper-trading send-command \
+  --session-id CPR_LEVELS_LONG-2026-04-27-live-kite \
+  --action pause_entries \
+  --reason market_regime_pause
+```
+
+**Resume future entries for the original session universe:**
+```bash
+doppler run -- uv run pivot-paper-trading send-command \
+  --session-id CPR_LEVELS_LONG-2026-04-27-live-kite \
+  --action resume_entries \
+  --reason market_regime_recovered
+```
+
+**Cancel unprocessed admin intents for one session:**
+```bash
+doppler run -- uv run pivot-paper-trading send-command \
+  --session-id CPR_LEVELS_LONG-2026-04-27-live-kite \
+  --action cancel_pending_intents \
+  --reason operator_reset_queue
+```
+
+`cancel_pending_intents` deletes only command files that the live loop has not processed yet.
+It does not cancel already-filled paper exits or broker orders; real broker order cancellation
+belongs to the future broker-adapter phase.
+
+Flatten commands reconcile automatically inside the running live loop after positions are closed and
+alerts are queued. If reconciliation reports critical findings after `close_all` or sentinel flatten,
+the session fails closed instead of being marked as cleanly completed.
+
+Use the standalone reconcile command when you want an explicit operator gate or diagnostic readout:
+```bash
+doppler run -- uv run pivot-paper-trading reconcile \
+  --session-id CPR_LEVELS_SHORT-2026-04-27-live-kite \
+  --strict
+```
+
+`reconcile --strict` exits non-zero on critical order/position/session mismatches.
+
+**Real-broker dry-run payload check (no order placement):**
+```bash
+doppler run -- uv run pivot-paper-trading real-dry-run-order \
+  --session-id CPR_LEVELS_LONG-2026-04-27-live-kite \
+  --symbol SBIN \
+  --side BUY \
+  --quantity 10 \
+  --role entry \
+  --event-time 2026-04-27T09:20:00+05:30
+```
+
+This prints and records the Zerodha payload with `broker_mode=REAL_DRY_RUN`.
+It is safe for payload validation because the adapter does not call Kite `place_order`.
+Real order placement remains disabled in this phase.
+
+**Offline fallback if the live process is already dead or DB status is stale:**
 ```bash
 doppler run -- uv run pivot-paper-trading flatten-all --trade-date today --notes "market_conditions"
 ```
 
-This single command:
-- Closes all OPEN positions at last feed price (exit_reason = MANUAL_FLATTEN)
-- Sends TRADE_CLOSED Telegram alert per position
-- Sends FLATTEN_EOD summary per session
-- Marks all sessions COMPLETED
+Use `flatten` / `flatten-all` only when the live process is no longer holding the writer lock.
+During an active live session, use `send-command` or `flatten-both`.
 
-To flatten a single specific session:
-```bash
-doppler run -- uv run pivot-paper-trading flatten --session-id CPR_LEVELS_SHORT-2026-04-21-live-kite
-```
-
-> **Note:** The live process must be killed first — DuckDB does not allow concurrent writers.
-> The `flatten` / `flatten-all` commands fail with a lock error if the live session is still running.
+All manual/operator flatten paths close at latest live mark when available:
+- Kite/live mode: latest `KiteTickerAdapter.get_last_ltp(symbol)`.
+- Local-feed mode: latest local feed LTP.
+- Fallback: last recorded feed-state symbol price, then position last price, then entry price.
 
 ### Selective session flatten while live is still running
 
@@ -839,10 +950,14 @@ $cmd = '{"action":"close_all","reason":"market_conditions","requester":"operator
 $cmd | Out-File ".tmp_logs\cmd_CPR_LEVELS_SHORT-2026-04-25-live-kite\${ts}_closeall.json" -Encoding utf8
 ```
 
-The agent can trigger this via: `paper_send_command(session_id, "close_positions", symbols=[...])`
+Prefer the CLI wrappers above over hand-written JSON. The agent can trigger the same queue via:
+`paper_send_command(session_id, "close_positions", symbols=[...])`.
 
-Each closed position sends a `TRADE_CLOSED` alert. Dashboard updates within 2s.
-The session stays `ACTIVE` after `close_positions`; only `close_all` marks it `COMPLETED`.
+Each closed position sends a `TRADE_CLOSED` alert. Dashboard active-session state
+refreshes from the paper replica every 3s by default.
+The session stays `ACTIVE` after `close_positions`; only `close_all` marks it terminal.
+Both paths run reconciliation after the close. Critical reconciliation findings after
+`close_positions` disable new entries and continue exit monitoring for existing positions.
 
 ### Flatten All Positions (legacy single-session)
 

@@ -20,11 +20,13 @@ from config.settings import get_settings
 from db.backtest_db import get_backtest_db
 from db.duckdb import get_db
 from db.paper_db import PaperSession, get_paper_db
+from engine.broker_adapter import BrokerOrderIntent, ZerodhaBrokerAdapter, record_real_dry_run_order
 from engine.cli_setup import configure_windows_asyncio, configure_windows_stdio, run_asyncio
 from engine.command_lock import acquire_command_lock
 from engine.cpr_atr_strategy import BacktestResult, CPRATRBacktest
 from engine.kite_ticker_adapter import KiteTickerAdapter
 from engine.live_market_data import IST
+from engine.paper_reconciliation import reconcile_paper_session
 from engine.paper_runtime import (
     _start_alert_dispatcher,
     apply_paper_strategy_defaults,
@@ -34,6 +36,7 @@ from engine.paper_runtime import (
     maybe_shutdown_alert_dispatcher,
     register_session_start,
     set_alerts_suppressed,
+    write_admin_command,
 )
 from engine.strategy_presets import ALL_STRATEGY_PRESETS, list_strategy_preset_names
 from scripts import data_quality as _data_quality
@@ -1864,6 +1867,97 @@ async def _cmd_flatten_all(args: argparse.Namespace) -> None:
         await maybe_shutdown_alert_dispatcher()
 
 
+async def _cmd_send_command(args: argparse.Namespace) -> None:
+    symbols = (
+        [s.strip().upper() for s in str(args.symbols or "").split(",") if s.strip()]
+        if args.symbols
+        else None
+    )
+    if args.action == "close_positions" and not symbols:
+        raise SystemExit("--symbols is required for close_positions")
+    portfolio_value = getattr(args, "portfolio_value", None)
+    max_positions = getattr(args, "max_positions", None)
+    max_position_pct = getattr(args, "max_position_pct", None)
+    if args.action == "set_risk_budget" and all(
+        value is None for value in (portfolio_value, max_positions, max_position_pct)
+    ):
+        raise SystemExit(
+            "--portfolio-value, --max-positions, or --max-position-pct is required for set_risk_budget"
+        )
+    command_file = write_admin_command(
+        args.session_id,
+        args.action,
+        symbols=symbols,
+        portfolio_value=portfolio_value,
+        max_positions=max_positions,
+        max_position_pct=max_position_pct,
+        reason=args.reason,
+        requester=args.requester,
+    )
+    print(
+        json.dumps(
+            {
+                "session_id": args.session_id,
+                "action": args.action,
+                "symbols": symbols,
+                "portfolio_value": portfolio_value,
+                "max_positions": max_positions,
+                "max_position_pct": max_position_pct,
+                "command_file": command_file,
+            },
+            indent=2,
+        )
+    )
+
+
+async def _cmd_flatten_both(args: argparse.Namespace) -> None:
+    """Request close_all for both LONG and SHORT live sessions for a trade date."""
+    trade_date = resolve_trade_date(args.trade_date)
+    rows = (
+        _pdb()
+        .con.execute(
+            """
+        SELECT session_id, direction, status
+        FROM paper_sessions
+        WHERE trade_date = ?
+          AND status IN ('ACTIVE','PAUSED')
+          AND UPPER(direction) IN ('LONG','SHORT')
+        ORDER BY direction, created_at
+        """,
+            [trade_date],
+        )
+        .fetchall()
+    )
+    if not rows:
+        print(f"No ACTIVE/PAUSED LONG/SHORT sessions found for {trade_date}.")
+        return
+
+    results = []
+    for session_id, direction, status in rows:
+        command_file = write_admin_command(
+            str(session_id),
+            "close_all",
+            reason=args.reason,
+            requester=args.requester,
+        )
+        results.append(
+            {
+                "session_id": str(session_id),
+                "direction": str(direction),
+                "status": str(status),
+                "command_file": command_file,
+            }
+        )
+    print(json.dumps({"trade_date": trade_date, "commands": results}, indent=2))
+
+
+async def _cmd_reconcile(args: argparse.Namespace) -> None:
+    payload = reconcile_paper_session(_pdb(), args.session_id)
+    print(json.dumps(payload, default=str, indent=2))
+    if not payload.get("ok", False) and bool(getattr(args, "strict", False)):
+        raise SystemExit(1)
+
+
 async def _cmd_order(args: argparse.Namespace) -> None:
     order_id = _pdb().append_order_event(
         session_id=args.session_id,
@@ -1878,6 +1972,32 @@ async def _cmd_order(args: argparse.Namespace) -> None:
         notes=args.notes,
     )
     print(json.dumps({"order_id": order_id}, default=str, indent=2))
+
+
+async def _cmd_real_dry_run_order(args: argparse.Namespace) -> None:
+    intent = BrokerOrderIntent(
+        session_id=args.session_id,
+        symbol=args.symbol,
+        side=args.side,
+        quantity=int(args.quantity),
+        role=args.role,
+        position_id=args.position_id,
+        signal_id=args.signal_id,
+        order_type=args.order_type,
+        price=args.price,
+        product=args.product,
+        exchange=args.exchange,
+        variety=args.variety,
+        validity=args.validity,
+        tag=args.tag,
+        event_time=args.event_time,
+    )
+    payload = await record_real_dry_run_order(
+        paper_db=_pdb(),
+        intent=intent,
+        adapter=ZerodhaBrokerAdapter(mode="REAL_DRY_RUN"),
+    )
+    print(json.dumps(payload, default=str, indent=2))
 
 
 async def _cmd_close_position(args: argparse.Namespace) -> None:
@@ -2323,6 +2443,72 @@ def build_parser() -> argparse.ArgumentParser:
     flatten_all.add_argument("--notes", default=None, help="Optional free-text annotation")
     flatten_all.set_defaults(handler=_cmd_flatten_all)
 
+    send_command = sub.add_parser(
+        "send-command",
+        help="Queue a live-loop admin command without taking the DB writer lock",
+    )
+    send_command.add_argument("--session-id", required=True, help="Target live session")
+    send_command.add_argument(
+        "--action",
+        required=True,
+        choices=[
+            "close_positions",
+            "close_all",
+            "set_risk_budget",
+            "pause_entries",
+            "resume_entries",
+            "cancel_pending_intents",
+        ],
+        help="Admin action to enqueue",
+    )
+    send_command.add_argument(
+        "--symbols",
+        default=None,
+        help="Comma-separated symbols for close_positions",
+    )
+    send_command.add_argument("--reason", default="operator", help="Reason stored in alerts/logs")
+    send_command.add_argument("--requester", default="cli", help="Requester label")
+    send_command.add_argument(
+        "--portfolio-value",
+        type=float,
+        default=None,
+        help="New session budget for future entries (set_risk_budget).",
+    )
+    send_command.add_argument(
+        "--max-positions",
+        type=int,
+        default=None,
+        help="New concurrent-position cap for future entries (set_risk_budget).",
+    )
+    send_command.add_argument(
+        "--max-position-pct",
+        type=float,
+        default=None,
+        help="New per-position percentage cap for future entries (set_risk_budget).",
+    )
+    send_command.set_defaults(handler=_cmd_send_command)
+
+    flatten_both = sub.add_parser(
+        "flatten-both",
+        help="Queue close_all for all ACTIVE/PAUSED LONG and SHORT sessions for a trade date",
+    )
+    flatten_both.add_argument("--trade-date", default="today", help="Trade date (default: today)")
+    flatten_both.add_argument("--reason", default="operator_flatten_both", help="Reason label")
+    flatten_both.add_argument("--requester", default="cli", help="Requester label")
+    flatten_both.set_defaults(handler=_cmd_flatten_both)
+
+    reconcile = sub.add_parser(
+        "reconcile",
+        help="Check paper session order/position/session invariants",
+    )
+    reconcile.add_argument("--session-id", required=True, help="Session to reconcile")
+    reconcile.add_argument(
+        "--strict",
+        action="store_true",
+        help="Exit non-zero when critical reconciliation findings exist",
+    )
+    reconcile.set_defaults(handler=_cmd_reconcile)
+
     order = sub.add_parser("order", help="Append a paper order event")
     order.add_argument("--session-id", required=True, help="Session for the order")
     order.add_argument("--symbol", required=True, help="Symbol for the order")
@@ -2342,6 +2528,36 @@ def build_parser() -> argparse.ArgumentParser:
     )
     order.add_argument("--notes", default=None, help="Optional free-text annotation")
     order.set_defaults(handler=_cmd_order)
+
+    dry_run_order = sub.add_parser(
+        "real-dry-run-order",
+        help="Build and record a Zerodha order payload without placing a real order",
+    )
+    dry_run_order.add_argument("--session-id", required=True, help="Session for the order intent")
+    dry_run_order.add_argument("--symbol", required=True, help="NSE tradingsymbol")
+    dry_run_order.add_argument("--side", required=True, choices=["BUY", "SELL"], help="Order side")
+    dry_run_order.add_argument("--quantity", required=True, type=int, help="Order quantity")
+    dry_run_order.add_argument("--role", default="manual", help="Intent role for idempotency")
+    dry_run_order.add_argument("--position-id", default=None, help="Optional linked position id")
+    dry_run_order.add_argument("--signal-id", type=int, default=None, help="Optional signal id")
+    dry_run_order.add_argument(
+        "--order-type",
+        default="MARKET",
+        choices=["MARKET", "LIMIT", "SL", "SL-M"],
+        help="Zerodha order type",
+    )
+    dry_run_order.add_argument("--price", type=float, default=None, help="Required for LIMIT/SL")
+    dry_run_order.add_argument("--product", default="MIS", help="Zerodha product, default MIS")
+    dry_run_order.add_argument("--exchange", default="NSE", help="Zerodha exchange, default NSE")
+    dry_run_order.add_argument("--variety", default="regular", help="Zerodha variety")
+    dry_run_order.add_argument("--validity", default="DAY", help="Order validity")
+    dry_run_order.add_argument("--tag", default=None, help="Optional Zerodha order tag")
+    dry_run_order.add_argument(
+        "--event-time",
+        default=None,
+        help="Optional event timestamp included in the idempotency key",
+    )
+    dry_run_order.set_defaults(handler=_cmd_real_dry_run_order)
 
     close = sub.add_parser("close-position", help="Close a paper position row")
     close.add_argument("--position-id", required=True, type=int, help="Position to close")

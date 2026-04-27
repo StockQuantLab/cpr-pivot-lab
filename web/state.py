@@ -21,6 +21,7 @@ import polars as pl
 
 from db.backtest_db import get_dashboard_backtest_db
 from db.duckdb import MarketDB, close_dashboard_db, get_dashboard_db
+from db.paper_db import get_dashboard_paper_db
 from db.postgres import (
     PaperOrder,
     PaperPosition,
@@ -30,7 +31,8 @@ from db.postgres import (
     get_session_orders,
     get_session_positions,
 )
-from engine.paper_runtime import summarize_paper_positions
+from engine.paper_reconciliation import reconcile_paper_session
+from engine.paper_runtime import summarize_paper_positions, write_admin_command
 
 logger = logging.getLogger(__name__)
 
@@ -1483,6 +1485,155 @@ async def aget_paper_active_sessions() -> list[dict[str, object]]:
             }
         )
     return results
+
+
+def _queue_paper_admin_command_sync(
+    *,
+    session_id: str,
+    action: str,
+    symbols: list[str] | None = None,
+    portfolio_value: float | None = None,
+    max_positions: int | None = None,
+    max_position_pct: float | None = None,
+    reason: str = "dashboard",
+    requester: str = "dashboard",
+) -> dict[str, object]:
+    action = str(action or "").strip()
+    allowed_actions = {
+        "close_positions",
+        "close_all",
+        "set_risk_budget",
+        "pause_entries",
+        "resume_entries",
+        "cancel_pending_intents",
+    }
+    if action not in allowed_actions:
+        raise ValueError(f"action must be one of: {', '.join(sorted(allowed_actions))}")
+    clean_symbols = [str(s).strip().upper() for s in (symbols or []) if str(s).strip()]
+    if action == "close_positions" and not clean_symbols:
+        raise ValueError("close_positions requires at least one symbol")
+    if action == "set_risk_budget" and all(
+        value is None for value in (portfolio_value, max_positions, max_position_pct)
+    ):
+        raise ValueError("set_risk_budget requires at least one budget field")
+    command_file = write_admin_command(
+        session_id,
+        action,
+        symbols=clean_symbols or None,
+        portfolio_value=portfolio_value,
+        max_positions=max_positions,
+        max_position_pct=max_position_pct,
+        reason=reason,
+        requester=requester,
+    )
+    return {
+        "session_id": session_id,
+        "action": action,
+        "symbols": clean_symbols,
+        "portfolio_value": portfolio_value,
+        "max_positions": max_positions,
+        "max_position_pct": max_position_pct,
+        "reason": reason,
+        "requester": requester,
+        "command_file": command_file,
+    }
+
+
+async def aqueue_paper_admin_command(
+    *,
+    session_id: str,
+    action: str,
+    symbols: list[str] | None = None,
+    portfolio_value: float | None = None,
+    max_positions: int | None = None,
+    max_position_pct: float | None = None,
+    reason: str = "dashboard",
+    requester: str = "dashboard",
+) -> dict[str, object]:
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        _executor,
+        lambda: _queue_paper_admin_command_sync(
+            session_id=session_id,
+            action=action,
+            symbols=symbols,
+            portfolio_value=portfolio_value,
+            max_positions=max_positions,
+            max_position_pct=max_position_pct,
+            reason=reason,
+            requester=requester,
+        ),
+    )
+
+
+def _session_direction(session: object) -> str:
+    direction = str(getattr(session, "direction", "") or "").upper()
+    if direction in {"LONG", "SHORT"}:
+        return direction
+    session_id = str(getattr(session, "session_id", "") or "").upper()
+    if "_LONG" in session_id or "-LONG-" in session_id or session_id.endswith("-LONG"):
+        return "LONG"
+    if "_SHORT" in session_id or "-SHORT-" in session_id or session_id.endswith("-SHORT"):
+        return "SHORT"
+    name = str(getattr(session, "name", "") or "").upper()
+    if "LONG" in name:
+        return "LONG"
+    if "SHORT" in name:
+        return "SHORT"
+    return ""
+
+
+def _flatten_both_paper_sessions_sync(
+    *,
+    trade_date: str | None = None,
+    reason: str = "dashboard_flatten_both",
+    requester: str = "dashboard",
+) -> dict[str, object]:
+    commands: list[dict[str, object]] = []
+    seen_directions: set[str] = set()
+    sessions = get_dashboard_paper_db().get_active_sessions()
+    for session in sessions:
+        direction = _session_direction(session)
+        if direction not in {"LONG", "SHORT"} or direction in seen_directions:
+            continue
+        if trade_date and str(getattr(session, "trade_date", "") or "")[:10] != trade_date:
+            continue
+        commands.append(
+            _queue_paper_admin_command_sync(
+                session_id=str(session.session_id),
+                action="close_all",
+                reason=reason,
+                requester=requester,
+            )
+        )
+        seen_directions.add(direction)
+    return {"trade_date": trade_date, "commands": commands, "directions": sorted(seen_directions)}
+
+
+async def aflatten_both_paper_sessions(
+    *,
+    trade_date: str | None = None,
+    reason: str = "dashboard_flatten_both",
+    requester: str = "dashboard",
+) -> dict[str, object]:
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        _executor,
+        lambda: _flatten_both_paper_sessions_sync(
+            trade_date=trade_date,
+            reason=reason,
+            requester=requester,
+        ),
+    )
+
+
+def _reconcile_paper_session_sync(session_id: str) -> dict[str, object]:
+    return reconcile_paper_session(get_dashboard_paper_db(), session_id)
+
+
+async def areconcile_paper_session(session_id: str) -> dict[str, object]:
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(_executor, lambda: _reconcile_paper_session_sync(session_id))
 
 
 async def aget_paper_archived_runs(force: bool = False) -> list[dict]:

@@ -6,7 +6,12 @@ from types import SimpleNamespace
 import pytest
 
 from engine.paper_runtime import PaperRuntimeState
-from scripts.paper_live import _prefetch_setup_rows, _resolve_poll_interval
+from scripts.paper_live import (
+    _entry_disabled_symbols,
+    _live_mark_feed_state,
+    _prefetch_setup_rows,
+    _resolve_poll_interval,
+)
 
 
 def test_resolve_poll_interval_pulls_tighter_near_candle_close() -> None:
@@ -21,6 +26,38 @@ def test_resolve_poll_interval_keeps_base_far_from_close() -> None:
     now = datetime(2024, 1, 1, 9, 16, 0)
 
     assert _resolve_poll_interval(settings, None, 5, now=now) == 5.0
+
+
+def test_live_mark_feed_state_prefers_latest_ticker_ltp() -> None:
+    class FakeTicker:
+        def get_last_ltp(self, symbol: str) -> float | None:
+            return {"SBIN": 102.5}.get(symbol)
+
+    feed_state = _live_mark_feed_state(
+        session_id="paper-live-1",
+        symbol_last_prices={"SBIN": 100.0, "RELIANCE": 2500.0},
+        ticker_adapter=FakeTicker(),
+        symbols=["SBIN", "RELIANCE"],
+    )
+
+    assert feed_state.raw_state["symbol_last_prices"]["SBIN"] == 102.5
+    assert feed_state.raw_state["symbol_last_prices"]["RELIANCE"] == 2500.0
+    assert feed_state.raw_state["mark_source"] == "live_ltp"
+
+
+def test_entry_disabled_symbols_keeps_only_open_positions() -> None:
+    tracker = SimpleNamespace(_open={"SBIN": object(), "RELIANCE": object()})
+
+    assert _entry_disabled_symbols(
+        tracker=tracker,
+        active_symbols=["SBIN", "RELIANCE", "TCS"],
+    ) == ["RELIANCE", "SBIN"]
+
+
+def test_entry_disabled_symbols_returns_empty_when_no_open_positions() -> None:
+    tracker = SimpleNamespace(_open={})
+
+    assert _entry_disabled_symbols(tracker=tracker, active_symbols=["SBIN"]) == []
 
 
 def test_prefetch_setup_rows_skips_invalid_critical_fields(

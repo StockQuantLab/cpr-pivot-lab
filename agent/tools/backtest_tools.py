@@ -572,34 +572,60 @@ def paper_send_command(
     session_id: str,
     action: str,
     symbols: list[str] | None = None,
+    portfolio_value: float | None = None,
+    max_positions: int | None = None,
+    max_position_pct: float | None = None,
     reason: str = "agent_command",
 ) -> dict:
     """Send a control command to a live paper session.
 
     The command is written to a queue file that the live process picks up on its
     next poll cycle (~1s). The session keeps running after a 'close_positions' command;
-    only 'close_all' terminates it like the sentinel file does.
+    only 'close_all' terminates it like the sentinel file does. Entry pause/resume
+    commands affect future entries only; open positions continue to be monitored.
 
     Args:
         session_id: Full session ID (e.g. 'CPR_LEVELS_LONG-2026-04-24-live-kite').
-        action: 'close_positions' to close specific symbols, 'close_all' to end the session.
+        action: 'close_positions' to close specific symbols, 'close_all' to end the session,
+            'set_risk_budget' to reduce/adjust future-entry sizing, 'pause_entries',
+            'resume_entries', or 'cancel_pending_intents'.
         symbols: Required for 'close_positions'. List of symbols to close (e.g. ['SBIN', 'RELIANCE']).
+        portfolio_value: Optional new session budget for future entries.
+        max_positions: Optional new concurrent-position cap for future entries.
+        max_position_pct: Optional new per-position percentage cap for future entries.
         reason: Free-text reason logged in alerts and DB.
 
     Returns:
         Dict with 'command_file' path and 'action' confirmation.
     """
     try:
-        if action not in ("close_positions", "close_all"):
+        allowed_actions = {
+            "close_positions",
+            "close_all",
+            "set_risk_budget",
+            "pause_entries",
+            "resume_entries",
+            "cancel_pending_intents",
+        }
+        if action not in allowed_actions:
             return _internal_error(
-                f"Unknown action '{action}'. Use 'close_positions' or 'close_all'."
+                f"Unknown action '{action}'. Use one of: {', '.join(sorted(allowed_actions))}."
             )
         if action == "close_positions" and not symbols:
             return _internal_error("'close_positions' requires a non-empty symbols list.")
+        if action == "set_risk_budget" and all(
+            value is None for value in (portfolio_value, max_positions, max_position_pct)
+        ):
+            return _internal_error(
+                "'set_risk_budget' requires portfolio_value, max_positions, or max_position_pct."
+            )
         cmd_file = write_admin_command(
             session_id,
             action,
             symbols=symbols,
+            portfolio_value=portfolio_value,
+            max_positions=max_positions,
+            max_position_pct=max_position_pct,
             reason=reason,
             requester="agent",
         )
@@ -607,6 +633,9 @@ def paper_send_command(
             "command_file": cmd_file,
             "action": action,
             "symbols": symbols,
+            "portfolio_value": portfolio_value,
+            "max_positions": max_positions,
+            "max_position_pct": max_position_pct,
             "session_id": session_id,
         }
     except Exception:

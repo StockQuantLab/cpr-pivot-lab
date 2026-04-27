@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -99,6 +100,89 @@ async def test_aget_paper_active_sessions_aggregates_snapshots(
 
     assert [payload["session"].session_id for payload in active_sessions] == ["paper-1", "paper-2"]
     assert all(payload["summary"]["orders"] == 1 for payload in active_sessions)
+
+
+@pytest.mark.asyncio
+async def test_aqueue_paper_admin_command_writes_command_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    result = await web_state.aqueue_paper_admin_command(
+        session_id="CPR_LEVELS_LONG-2026-04-24-live-kite",
+        action="close_positions",
+        symbols=["sbin", "reliance"],
+        reason="dashboard_test",
+        requester="pytest",
+    )
+
+    command_path = Path(str(result["command_file"]))
+    payload = json.loads(command_path.read_text())
+    assert payload["action"] == "close_positions"
+    assert payload["symbols"] == ["SBIN", "RELIANCE"]
+    assert payload["reason"] == "dashboard_test"
+
+
+@pytest.mark.asyncio
+async def test_aqueue_paper_admin_command_accepts_pause_entries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    result = await web_state.aqueue_paper_admin_command(
+        session_id="CPR_LEVELS_LONG-2026-04-24-live-kite",
+        action="pause_entries",
+        reason="dashboard_test",
+        requester="pytest",
+    )
+
+    payload = json.loads(Path(str(result["command_file"])).read_text())
+    assert payload["action"] == "pause_entries"
+
+
+@pytest.mark.asyncio
+async def test_aflatten_both_paper_sessions_queues_long_and_short(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    fake_db = SimpleNamespace(
+        get_active_sessions=lambda: [
+            SimpleNamespace(
+                session_id="CPR_LEVELS_LONG-2026-04-24-live-kite",
+                direction="LONG",
+                trade_date="2026-04-24",
+            ),
+            SimpleNamespace(
+                session_id="CPR_LEVELS_SHORT-2026-04-24-live-kite",
+                direction="SHORT",
+                trade_date="2026-04-24",
+            ),
+            SimpleNamespace(
+                session_id="CPR_LEVELS_LONG-2026-04-23-live-kite",
+                direction="LONG",
+                trade_date="2026-04-23",
+            ),
+        ]
+    )
+    monkeypatch.setattr(web_state, "get_dashboard_paper_db", lambda: fake_db)
+
+    result = await web_state.aflatten_both_paper_sessions(
+        trade_date="2026-04-24",
+        reason="risk_off",
+        requester="pytest",
+    )
+
+    commands = result["commands"]
+    assert len(commands) == 2
+    assert result["directions"] == ["LONG", "SHORT"]
+    for command in commands:
+        payload = json.loads(Path(str(command["command_file"])).read_text())
+        assert payload["action"] == "close_all"
+        assert payload["reason"] == "risk_off"
 
 
 @pytest.mark.asyncio

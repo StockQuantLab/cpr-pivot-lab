@@ -209,6 +209,34 @@ doppler run -- uv run pivot-paper-trading daily-replay \
 doppler run -- uv run pivot-paper-trading cleanup --apply
 ```
 
+Live-paper operator controls:
+
+```bash
+# Close selected symbols immediately using latest live mark/LTP; session keeps running.
+doppler run -- uv run pivot-paper-trading send-command \
+  --session-id <session-id> --action close_positions --symbols SBIN,RELIANCE
+
+# Flatten one running session.
+doppler run -- uv run pivot-paper-trading send-command \
+  --session-id <session-id> --action close_all --reason operator_flatten
+
+# Flatten both LONG and SHORT sessions for the trade date.
+doppler run -- uv run pivot-paper-trading flatten-both --trade-date today --reason risk_off
+
+# Reduce future-entry budget for one running session. Existing open positions are not resized.
+doppler run -- uv run pivot-paper-trading send-command \
+  --session-id <session-id> --action set_risk_budget \
+  --portfolio-value 500000 --max-positions 5 --reason reduce_short_risk
+
+# Optional explicit diagnostic gate. Live-loop operator exits reconcile automatically.
+doppler run -- uv run pivot-paper-trading reconcile --session-id <session-id> --strict
+```
+
+Manual/operator exits are immediate market-style paper exits using latest live LTP when available.
+Strategy exits remain completed-5-minute-candle driven. Running live sessions reconcile automatically
+after operator close/flatten actions; the standalone `reconcile` command is for diagnostics and gates.
+Risk-budget changes affect future entries only; reduce current exposure with close commands.
+
 Important distinctions:
 
 - Replay and live paper execution remain on `Paper Sessions` at `/paper_ledger`.

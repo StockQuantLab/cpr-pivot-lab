@@ -259,6 +259,14 @@ max 10 concurrent is normal.
 symbol tie-breaks for determinism. Remaining live/backtest differences mostly come from the
 input candles themselves, not the slot-allocation rule.
 
+**Live Operator Controls** · paper/live only
+Operators can reduce a running session's future-entry budget with `send-command --action set_risk_budget`.
+They can also pause future entries with `pause_entries`, resume them with `resume_entries`, or clear
+unprocessed admin intents with `cancel_pending_intents`. These are not strategy signals and do not
+resize already-open positions. Existing positions keep their normal SL/target/trailing management;
+new entries use the current operator budget/entry-gate state after the command is processed. If
+current open notional already consumes a reduced budget, new entries are disabled until exposure falls.
+
 ---
 
 ### Filters

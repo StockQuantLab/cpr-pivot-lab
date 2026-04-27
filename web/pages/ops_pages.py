@@ -28,6 +28,7 @@ from web.components import (
     set_table_mobile_labels,
 )
 from web.state import (
+    aflatten_both_paper_sessions,
     aget_market_breadth_snapshot,
     aget_paper_active_sessions,
     aget_paper_archived_runs,
@@ -38,6 +39,8 @@ from web.state import (
     aget_scan_snapshot,
     aget_status,
     aget_trade_inspection,
+    aqueue_paper_admin_command,
+    areconcile_paper_session,
     build_paper_session_options,
 )
 
@@ -249,7 +252,11 @@ async def pipeline_page() -> None:
             ui.code(cmd, language="bash").classes("w-full text-xs")
 
 
-def _render_live_paper_sessions(active_sessions: list[dict], colors: dict) -> None:
+def _render_live_paper_sessions(
+    active_sessions: list[dict],
+    colors: dict,
+    page_state: dict | None = None,
+) -> None:
     if not active_sessions:
         empty_state(
             "No active paper sessions",
@@ -266,6 +273,7 @@ def _render_live_paper_sessions(active_sessions: list[dict], colors: dict) -> No
         return str(value)
 
     lookup: dict[str, dict] = {}
+    label_by_session_id: dict[str, str] = {}
     labels: list[str] = []
     for payload in active_sessions:
         session = payload.get("session")
@@ -298,6 +306,7 @@ def _render_live_paper_sessions(active_sessions: list[dict], colors: dict) -> No
         )
         labels.append(label)
         lookup[label] = payload
+        label_by_session_id[session_id] = label
 
     with ui.card().classes("w-full mb-2"):
 
@@ -394,6 +403,12 @@ def _render_live_paper_sessions(active_sessions: list[dict], colors: dict) -> No
             if summary.get("feed_reason"):
                 info_box(f"Feed state: {summary.get('feed_reason')}", color="yellow")
 
+            _render_paper_operator_controls(
+                session_id=str(getattr(session, "session_id", "")),
+                positions=positions,
+                colors=colors,
+            )
+
             position_rows = [
                 {
                     "position_id": getattr(position, "position_id", None),
@@ -488,15 +503,230 @@ def _render_live_paper_sessions(active_sessions: list[dict], colors: dict) -> No
                     page_size=10,
                 )
 
+        selected_session_id = str((page_state or {}).get("selected_active_session_id") or "")
+        selected_label = label_by_session_id.get(selected_session_id, labels[0])
+
+        def _select_active_session(e) -> None:
+            payload = lookup.get(e.value)
+            if page_state is not None and payload:
+                page_state["selected_active_session_id"] = str(
+                    getattr(payload.get("session"), "session_id", "") or ""
+                )
+            _render.refresh(e.value)
+
         ui.select(
             labels,
-            value=labels[0],
+            value=selected_label,
             label="Select Active Session",
-            on_change=lambda e: _render.refresh(e.value),
+            on_change=_select_active_session,
         ).props("outlined dense use-input options-dense input-debounce=0").classes(
             "w-full max-w-4xl mb-4"
         )
-        _render(labels[0])
+        if page_state is not None:
+            selected_payload = lookup.get(selected_label)
+            if selected_payload:
+                page_state["selected_active_session_id"] = str(
+                    getattr(selected_payload.get("session"), "session_id", "") or ""
+                )
+        _render(selected_label)
+
+
+def _parse_symbols_csv(value: object) -> list[str]:
+    text = str(value or "").strip()
+    if not text:
+        return []
+    return [part.strip().upper() for part in text.split(",") if part.strip()]
+
+
+def _parse_float_input(value: object) -> float | None:
+    text = str(value or "").replace(",", "").strip()
+    if not text:
+        return None
+    return float(text)
+
+
+def _parse_int_input(value: object) -> int | None:
+    text = str(value or "").replace(",", "").strip()
+    if not text:
+        return None
+    return int(float(text))
+
+
+def _render_paper_operator_controls(
+    *,
+    session_id: str,
+    positions: list[object],
+    colors: dict,
+) -> None:
+    open_symbols = sorted(
+        {
+            str(getattr(position, "symbol", "") or "").upper()
+            for position in positions
+            if str(getattr(position, "status", "") or "").upper() == "OPEN"
+        }
+    )
+
+    with (
+        ui.card()
+        .classes("w-full my-4")
+        .style(
+            f"background:{THEME['surface']};border:1px solid {THEME['surface_border']};"
+            f"border-left:4px solid {colors['warning']};"
+        )
+    ):
+        ui.label("Operator Controls").classes("text-base font-semibold").style(
+            f"color:{THEME['text_primary']};"
+        )
+        ui.label(
+            "Commands are queued for the running live loop; positions are closed by the runtime, then reconciled."
+        ).classes("text-xs mb-2").style(f"color:{THEME['text_secondary']};")
+
+        status_label = (
+            ui.label("").classes("text-xs mono-font").style(f"color:{THEME['text_secondary']};")
+        )
+
+        with ui.row().classes("w-full gap-3 items-end flex-wrap"):
+            symbols_input = (
+                ui.input(
+                    "Symbols to close",
+                    value=",".join(open_symbols[:3]),
+                    placeholder="SBIN,RELIANCE",
+                )
+                .props("outlined dense")
+                .classes("min-w-64")
+            )
+            reason_input = (
+                ui.input("Reason", value="dashboard_operator")
+                .props("outlined dense")
+                .classes("min-w-56")
+            )
+
+            async def _close_symbols() -> None:
+                symbols = _parse_symbols_csv(symbols_input.value)
+                if not symbols:
+                    ui.notify("Enter at least one symbol to close.", type="warning")
+                    return
+                try:
+                    result = await aqueue_paper_admin_command(
+                        session_id=session_id,
+                        action="close_positions",
+                        symbols=symbols,
+                        reason=str(reason_input.value or "dashboard_operator"),
+                        requester="dashboard",
+                    )
+                    status_label.text = f"Queued close_positions: {result['command_file']}"
+                    ui.notify(f"Queued close for {', '.join(symbols)}", type="positive")
+                except Exception as exc:
+                    logger.exception("Dashboard close_symbols failed")
+                    ui.notify(f"Close symbols failed: {exc}", type="negative")
+
+            async def _flatten_session() -> None:
+                try:
+                    result = await aqueue_paper_admin_command(
+                        session_id=session_id,
+                        action="close_all",
+                        reason=str(reason_input.value or "dashboard_flatten_session"),
+                        requester="dashboard",
+                    )
+                    status_label.text = f"Queued close_all: {result['command_file']}"
+                    ui.notify("Queued session flatten", type="positive")
+                except Exception as exc:
+                    logger.exception("Dashboard flatten_session failed")
+                    ui.notify(f"Flatten failed: {exc}", type="negative")
+
+            ui.button("Close Symbols", icon="logout", on_click=_close_symbols).props("outline")
+            ui.button("Flatten Session", icon="dangerous", on_click=_flatten_session).props(
+                "color=negative"
+            )
+
+        with ui.row().classes("w-full gap-3 items-end flex-wrap mt-2"):
+
+            async def _queue_control(action: str, label: str) -> None:
+                try:
+                    result = await aqueue_paper_admin_command(
+                        session_id=session_id,
+                        action=action,
+                        reason=str(reason_input.value or f"dashboard_{action}"),
+                        requester="dashboard",
+                    )
+                    status_label.text = f"Queued {action}: {result['command_file']}"
+                    ui.notify(label, type="positive")
+                except Exception as exc:
+                    logger.exception("Dashboard %s failed", action)
+                    ui.notify(f"{label} failed: {exc}", type="negative")
+
+            async def _pause_entries() -> None:
+                await _queue_control("pause_entries", "Queued entry pause")
+
+            async def _resume_entries() -> None:
+                await _queue_control("resume_entries", "Queued entry resume")
+
+            async def _cancel_pending_intents() -> None:
+                await _queue_control("cancel_pending_intents", "Queued pending-intent cancel")
+
+            ui.button(
+                "Pause Entries",
+                icon="pause_circle",
+                on_click=_pause_entries,
+            ).props("outline")
+            ui.button(
+                "Resume Entries",
+                icon="play_circle",
+                on_click=_resume_entries,
+            ).props("outline")
+            ui.button(
+                "Cancel Pending Intents",
+                icon="cancel",
+                on_click=_cancel_pending_intents,
+            ).props("outline color=warning")
+
+        with ui.row().classes("w-full gap-3 items-end flex-wrap mt-2"):
+            portfolio_input = (
+                ui.input("Capital ₹", placeholder="500000").props("outlined dense").classes("w-36")
+            )
+            max_positions_input = (
+                ui.input("Max Positions", placeholder="5").props("outlined dense").classes("w-32")
+            )
+            max_pct_input = (
+                ui.input("Max Pos %", placeholder="0.10").props("outlined dense").classes("w-32")
+            )
+
+            async def _set_budget() -> None:
+                try:
+                    portfolio_value = _parse_float_input(portfolio_input.value)
+                    max_positions = _parse_int_input(max_positions_input.value)
+                    max_position_pct = _parse_float_input(max_pct_input.value)
+                    result = await aqueue_paper_admin_command(
+                        session_id=session_id,
+                        action="set_risk_budget",
+                        portfolio_value=portfolio_value,
+                        max_positions=max_positions,
+                        max_position_pct=max_position_pct,
+                        reason=str(reason_input.value or "dashboard_risk_budget"),
+                        requester="dashboard",
+                    )
+                    status_label.text = f"Queued set_risk_budget: {result['command_file']}"
+                    ui.notify("Queued risk budget update", type="positive")
+                except Exception as exc:
+                    logger.exception("Dashboard set_budget failed")
+                    ui.notify(f"Risk budget update failed: {exc}", type="negative")
+
+            async def _reconcile() -> None:
+                try:
+                    result = await areconcile_paper_session(session_id)
+                    findings = result.get("findings") or []
+                    severity = "positive" if result.get("ok") else "warning"
+                    status_label.text = (
+                        f"Reconcile ok={result.get('ok')} findings={len(findings)} "
+                        f"summary={json.dumps(result.get('summary') or {}, default=str)}"
+                    )
+                    ui.notify(f"Reconcile findings: {len(findings)}", type=severity)
+                except Exception as exc:
+                    logger.exception("Dashboard reconcile failed")
+                    ui.notify(f"Reconcile failed: {exc}", type="negative")
+
+            ui.button("Set Budget", icon="tune", on_click=_set_budget).props("outline")
+            ui.button("Reconcile", icon="fact_check", on_click=_reconcile).props("outline")
 
 
 async def paper_ledger_page() -> None:
@@ -505,22 +735,62 @@ async def paper_ledger_page() -> None:
         colors = COLORS
         page_header(
             "Paper Sessions",
-            "Live paper sessions and archived ledgers are read from DuckDB.",
+            "Live paper sessions and archived ledgers are read from the paper DuckDB replica.",
+        )
+        page_state: dict[str, object] = {
+            "auto_refresh": True,
+            "loading": False,
+            "timer": None,
+            "selected_active_session_id": "",
+        }
+        status_line = (
+            ui.label("Loading paper sessions...")
+            .classes("text-xs mono-font mb-2")
+            .style(f"color:{THEME['text_secondary']};")
         )
         with ui.row().classes("mb-4 items-center gap-3"):
-            ui.button("Refresh", icon="refresh", on_click=lambda: ui.navigate.reload()).props(
-                "outline aria-label='Refresh page'"
-            )
-            auto_refresh_state = {"on": False, "timer": None}
+            ui.button(
+                "Refresh Now", icon="refresh", on_click=lambda: safe_timer(0.01, _load)
+            ).props("outline aria-label='Refresh paper sessions now'")
             ui.checkbox(
-                "Auto-refresh 60s",
-                value=False,
-                on_change=lambda e: (
-                    _start_auto_refresh(auto_refresh_state)
-                    if e.value
-                    else _stop_auto_refresh(auto_refresh_state)
-                ),
+                "Near-real-time refresh 3s",
+                value=True,
+                on_change=lambda e: page_state.update({"auto_refresh": bool(e.value)}),
             ).classes("text-sm")
+
+            trade_date_input = (
+                ui.input("Trade Date", value=datetime.now().date().isoformat())
+                .props("outlined dense")
+                .classes("w-36")
+            )
+            reason_input = (
+                ui.input("Reason", value="dashboard_flatten_both")
+                .props("outlined dense")
+                .classes("w-56")
+            )
+
+            async def _flatten_both() -> None:
+                try:
+                    result = await aflatten_both_paper_sessions(
+                        trade_date=str(trade_date_input.value or "").strip() or None,
+                        reason=str(reason_input.value or "dashboard_flatten_both"),
+                        requester="dashboard",
+                    )
+                    commands = result.get("commands") or []
+                    if not commands:
+                        ui.notify(
+                            "No active LONG/SHORT sessions found for that date.", type="warning"
+                        )
+                        return
+                    ui.notify(f"Queued flatten for {len(commands)} sessions", type="positive")
+                    status_line.text = f"Queued flatten-both commands={len(commands)}"
+                except Exception as exc:
+                    logger.exception("Dashboard flatten_both failed")
+                    ui.notify(f"Flatten both failed: {exc}", type="negative")
+
+            ui.button("Flatten LONG+SHORT", icon="dangerous", on_click=_flatten_both).props(
+                "color=negative"
+            )
 
         content = ui.column().classes("w-full")
         with content:
@@ -529,97 +799,112 @@ async def paper_ledger_page() -> None:
             )
 
         async def _load() -> None:
+            if page_state.get("loading"):
+                return
+            page_state["loading"] = True
             # Fetch active + archived concurrently (both use BacktestDB)
             # then daily summary sequentially to avoid DuckDB connection
             # race — concurrent reads on a single DuckDB connection can
             # silently return empty result sets.
-            active_sessions, archived_runs = await asyncio.gather(
-                aget_paper_active_sessions(),
-                aget_paper_archived_runs(),
-            )
-            daily_summary = await aget_paper_daily_summary()
+            try:
+                active_sessions, archived_runs = await asyncio.gather(
+                    aget_paper_active_sessions(),
+                    aget_paper_archived_runs(),
+                )
+                daily_summary = await aget_paper_daily_summary()
 
-            content.clear()
-            with content:
-                # ── Active Sessions (expanded by default, at top) ──
-                active_count = len(active_sessions)
-                with (
-                    ui.expansion(
-                        f"Active Paper Sessions ({active_count})",
-                        icon="sensors",
-                        value=True,
+                content.clear()
+                with content:
+                    # ── Active Sessions (expanded by default, at top) ──
+                    active_count = len(active_sessions)
+                    status_line.text = (
+                        f"Replica refreshed {datetime.now().strftime('%H:%M:%S')} | "
+                        f"active={active_count} archived={len(archived_runs)}"
                     )
-                    .classes("w-full mb-2")
-                    .style(f"border-top:3px solid {colors['primary']};")
-                ):
-                    _render_live_paper_sessions(active_sessions, colors)
-
-                # ── Daily Summary (collapsible) ──
-                _render_daily_summary(daily_summary, colors)
-
-                # ── Archived Sessions (collapsible, below active) ──
-                options = build_paper_session_options(archived_runs)
-                archive_count = len(options)
-                with (
-                    ui.expansion(
-                        f"Archived Paper Sessions ({archive_count})",
-                        icon="archive",
-                        value=active_count == 0,
-                    )
-                    .classes("w-full")
-                    .style(f"border-top:3px solid {THEME['text_muted']};")
-                ):
-                    if not options:
-                        empty_state(
-                            "No archived paper sessions",
-                            "Completed paper sessions (replay, live-local, live-kite) appear here.",
-                            icon="receipt_long",
+                    with (
+                        ui.expansion(
+                            f"Active Paper Sessions ({active_count})",
+                            icon="sensors",
+                            value=True,
                         )
-                    else:
-                        labels = list(options.keys())
+                        .classes("w-full mb-2")
+                        .style(f"border-top:3px solid {colors['primary']};")
+                    ):
+                        _render_live_paper_sessions(active_sessions, colors, page_state)
 
-                        @ui.refreshable
-                        def _render(label: str) -> None:
-                            run_id = options.get(label, "")
-                            if not run_id:
-                                return
+                    # ── Daily Summary (collapsible) ──
+                    _render_daily_summary(daily_summary, colors)
 
-                            container = ui.column().classes("w-full")
+                    # ── Archived Sessions (collapsible, below active) ──
+                    options = build_paper_session_options(archived_runs)
+                    archive_count = len(options)
+                    with (
+                        ui.expansion(
+                            f"Archived Paper Sessions ({archive_count})",
+                            icon="archive",
+                            value=active_count == 0,
+                        )
+                        .classes("w-full")
+                        .style(f"border-top:3px solid {THEME['text_muted']};")
+                    ):
+                        if not options:
+                            empty_state(
+                                "No archived paper sessions",
+                                "Completed paper sessions (replay, live-local, live-kite) appear here.",
+                                icon="receipt_long",
+                            )
+                        else:
+                            labels = list(options.keys())
 
-                            async def _load_ledger() -> None:
-                                try:
-                                    ledger_df, run_meta = await asyncio.gather(
-                                        aget_run_ledger(run_id, execution_mode="PAPER"),
-                                        aget_run_metadata(run_id),
-                                    )
-                                except Exception as ledger_exc:
+                            @ui.refreshable
+                            def _render(label: str) -> None:
+                                run_id = options.get(label, "")
+                                if not run_id:
+                                    return
+
+                                container = ui.column().classes("w-full")
+
+                                async def _load_ledger() -> None:
+                                    try:
+                                        ledger_df, run_meta = await asyncio.gather(
+                                            aget_run_ledger(run_id, execution_mode="PAPER"),
+                                            aget_run_metadata(run_id),
+                                        )
+                                    except Exception as ledger_exc:
+                                        container.clear()
+                                        with container:
+                                            empty_state(
+                                                "Archived ledger unavailable",
+                                                f"Could not load archived paper trades: {ledger_exc}",
+                                                icon="error",
+                                            )
+                                        return
                                     container.clear()
                                     with container:
-                                        empty_state(
-                                            "Archived ledger unavailable",
-                                            f"Could not load archived paper trades: {ledger_exc}",
-                                            icon="error",
+                                        _render_ledger_content(
+                                            run_id, archived_runs, ledger_df, run_meta, colors
                                         )
-                                    return
-                                container.clear()
-                                with container:
-                                    _render_ledger_content(
-                                        run_id, archived_runs, ledger_df, run_meta, colors
-                                    )
 
-                            safe_timer(0.1, _load_ledger)
+                                safe_timer(0.1, _load_ledger)
 
-                        ui.select(
-                            labels,
-                            value=labels[0],
-                            label="Select Archived Session",
-                            on_change=lambda e: _render.refresh(e.value),
-                        ).props("outlined dense use-input options-dense input-debounce=0").classes(
-                            "w-full max-w-4xl mb-4"
-                        )
-                        _render(labels[0])
+                            ui.select(
+                                labels,
+                                value=labels[0],
+                                label="Select Archived Session",
+                                on_change=lambda e: _render.refresh(e.value),
+                            ).props(
+                                "outlined dense use-input options-dense input-debounce=0"
+                            ).classes("w-full max-w-4xl mb-4")
+                            _render(labels[0])
+            finally:
+                page_state["loading"] = False
 
         safe_timer(0.1, _load)
+        safe_timer(
+            3.0,
+            lambda: safe_timer(0.01, _load) if page_state.get("auto_refresh") else None,
+            once=False,
+        )
 
 
 def _render_daily_summary(daily_rows: list[dict], colors: dict) -> None:

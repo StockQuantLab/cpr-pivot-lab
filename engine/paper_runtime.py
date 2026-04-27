@@ -34,6 +34,7 @@ from engine.cpr_atr_utils import (
     normalize_cpr_bounds,
     resolve_cpr_direction,
 )
+from engine.execution_safety import build_order_idempotency_key, get_default_order_governor
 from engine.strategy_presets import (
     build_strategy_config_from_overrides as shared_build_strategy_config_from_overrides,
 )
@@ -168,6 +169,17 @@ async def open_position(**kwargs: Any) -> PaperPosition:
 
 
 async def append_order_event(**kwargs: Any) -> Any:
+    throttle = bool(kwargs.pop("throttle", True))
+    if throttle:
+        waited = await get_default_order_governor().acquire()
+        if waited > 0:
+            logger.info(
+                "Paper order governor delayed order %.3fs session_id=%s symbol=%s side=%s",
+                waited,
+                kwargs.get("session_id"),
+                kwargs.get("symbol"),
+                kwargs.get("side"),
+            )
     with _PAPER_DB_IO_LOCK:
         return _db().append_order_event(**kwargs)
 
@@ -1470,6 +1482,13 @@ async def flatten_session_positions(
             fill_qty=float(position.quantity),
             fill_price=close_price,
             status="FILLED",
+            idempotency_key=build_order_idempotency_key(
+                session_id=session_id,
+                role=f"session_flatten:{notes or 'paper flatten'}",
+                symbol=position.symbol,
+                side=side,
+                position_id=str(position.position_id),
+            ),
             notes=notes or "paper flatten",
         )
         await update_position(
@@ -1602,6 +1621,13 @@ async def flatten_positions_subset(
             fill_qty=float(position.quantity),
             fill_price=close_price,
             status="FILLED",
+            idempotency_key=build_order_idempotency_key(
+                session_id=session_id,
+                role=f"position_flatten:{notes or 'partial flatten'}",
+                symbol=position.symbol,
+                side=side,
+                position_id=str(position.position_id),
+            ),
             notes=notes or "partial flatten",
         )
         await update_position(
@@ -1649,12 +1675,17 @@ def write_admin_command(
     action: str,
     *,
     symbols: list[str] | None = None,
+    portfolio_value: float | None = None,
+    max_positions: int | None = None,
+    max_position_pct: float | None = None,
     reason: str = "manual",
     requester: str = "unknown",
 ) -> str:
     """Write a command to the session's admin queue for the live loop to process.
 
-    Actions: 'close_positions' (symbols required), 'close_all'.
+    Actions: 'close_positions' (symbols required), 'close_all',
+    'set_risk_budget', 'pause_entries', 'resume_entries', and
+    'cancel_pending_intents'.
     Returns the path of the command file written.
     """
     import json as _json
@@ -1667,6 +1698,12 @@ def write_admin_command(
     cmd: dict[str, Any] = {"action": action, "reason": reason, "requester": requester}
     if symbols:
         cmd["symbols"] = [str(s).upper() for s in symbols]
+    if portfolio_value is not None:
+        cmd["portfolio_value"] = float(portfolio_value)
+    if max_positions is not None:
+        cmd["max_positions"] = int(max_positions)
+    if max_position_pct is not None:
+        cmd["max_position_pct"] = float(max_position_pct)
     cmd_file.write_text(_json.dumps(cmd))
     return str(cmd_file)
 
@@ -1875,6 +1912,14 @@ async def _open_position_from_candidate(
         fill_qty=float(candidate["position_size"]),
         fill_price=float(candidate["entry_price"]),
         status="FILLED",
+        idempotency_key=build_order_idempotency_key(
+            session_id=session.session_id,
+            role="entry",
+            symbol=symbol,
+            side="BUY" if candidate["direction"] == "LONG" else "SELL",
+            position_id=str(position.position_id),
+            event_time=str(candidate.get("event_time") or now),
+        ),
         notes="paper entry",
     )
     logger.info(
@@ -2000,6 +2045,14 @@ async def _advance_open_position(
             fill_qty=qty,
             fill_price=price,
             status="FILLED",
+            idempotency_key=build_order_idempotency_key(
+                session_id=position.session_id,
+                role=notes,
+                symbol=position.symbol,
+                side="SELL" if direction == "LONG" else "BUY",
+                position_id=str(position.position_id),
+                event_time=str(candle.get("bar_end") or ""),
+            ),
             notes=notes,
         )
         return realized

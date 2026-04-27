@@ -52,6 +52,14 @@ def _loads_json(value: Any, default: Any) -> Any:
     return default
 
 
+def _utcnow() -> datetime:
+    return datetime.now(UTC)
+
+
+def _utcnow_iso() -> str:
+    return _utcnow().isoformat()
+
+
 # ---------------------------------------------------------------------------
 # Data classes (match the shapes the engine expects)
 # ---------------------------------------------------------------------------
@@ -82,8 +90,8 @@ class PaperSession:
     stale_feed_at: datetime | None = None
     started_at: datetime | None = None
     ended_at: datetime | None = None
-    created_at: datetime = field(default_factory=datetime.utcnow)
-    updated_at: datetime = field(default_factory=datetime.utcnow)
+    created_at: datetime = field(default_factory=_utcnow)
+    updated_at: datetime = field(default_factory=_utcnow)
     notes: str | None = None
     mode: str = "replay"
 
@@ -105,8 +113,8 @@ class PaperPosition:
     trail_state: dict[str, Any] = field(default_factory=dict)
     entry_time: datetime | None = None
     exit_time: datetime | None = None
-    created_at: datetime = field(default_factory=datetime.utcnow)
-    updated_at: datetime = field(default_factory=datetime.utcnow)
+    created_at: datetime = field(default_factory=_utcnow)
+    updated_at: datetime = field(default_factory=_utcnow)
     opened_by: str | None = None
     quantity: float | None = None
     opened_at: datetime | None = None
@@ -136,9 +144,12 @@ class PaperOrder:
     requested_at: datetime | None = None
     filled_at: datetime | None = None
     exchange_order_id: str | None = None
+    idempotency_key: str | None = None
+    broker_mode: str | None = None
+    broker_payload: str | None = None
     notes: str | None = None
-    created_at: datetime = field(default_factory=datetime.utcnow)
-    updated_at: datetime = field(default_factory=datetime.utcnow)
+    created_at: datetime = field(default_factory=_utcnow)
+    updated_at: datetime = field(default_factory=_utcnow)
 
 
 @dataclass(slots=True)
@@ -150,7 +161,7 @@ class FeedState:
     last_price: float | None = None
     stale_reason: str | None = None
     raw_state: dict[str, Any] = field(default_factory=dict)
-    updated_at: datetime = field(default_factory=datetime.utcnow)
+    updated_at: datetime = field(default_factory=_utcnow)
 
 
 @dataclass(slots=True)
@@ -169,8 +180,8 @@ class FeedAudit:
     volume: float
     first_snapshot_ts: datetime | None = None
     last_snapshot_ts: datetime | None = None
-    created_at: datetime = field(default_factory=datetime.utcnow)
-    updated_at: datetime = field(default_factory=datetime.utcnow)
+    created_at: datetime = field(default_factory=_utcnow)
+    updated_at: datetime = field(default_factory=_utcnow)
 
 
 # ---------------------------------------------------------------------------
@@ -347,12 +358,27 @@ class PaperDB:
                 requested_at   TIMESTAMPTZ,
                 filled_at      TIMESTAMPTZ,
                 exchange_order_id VARCHAR(80),
+                idempotency_key VARCHAR(200),
+                broker_mode    VARCHAR(30),
+                broker_payload VARCHAR(4000),
                 notes          VARCHAR(500),
                 created_at     TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
                 updated_at     TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        self.con.execute(
+            "ALTER TABLE paper_orders ADD COLUMN IF NOT EXISTS idempotency_key VARCHAR(200)"
+        )
+        self.con.execute(
+            "ALTER TABLE paper_orders ADD COLUMN IF NOT EXISTS broker_mode VARCHAR(30)"
+        )
+        self.con.execute(
+            "ALTER TABLE paper_orders ADD COLUMN IF NOT EXISTS broker_payload VARCHAR(4000)"
+        )
         self.con.execute("CREATE INDEX IF NOT EXISTS idx_po_session ON paper_orders(session_id)")
+        self.con.execute(
+            "CREATE INDEX IF NOT EXISTS idx_po_idempotency ON paper_orders(idempotency_key)"
+        )
 
         self.con.execute("""
             CREATE TABLE IF NOT EXISTS paper_feed_state (
@@ -483,7 +509,7 @@ class PaperDB:
         notes: str | None = None,
     ) -> PaperSession:
         sid = session_id or f"paper-{uuid.uuid4().hex[:8]}"
-        now = datetime.utcnow().isoformat()
+        now = _utcnow_iso()
         started_at = now if status in {"ACTIVE", "PAUSED"} else None
         ended_at = now if status in {"COMPLETED", "FAILED", "CANCELLED"} else None
         self.con.execute(
@@ -568,7 +594,7 @@ class PaperDB:
         notes: str | None = None,
     ) -> PaperSession | None:
         sets: list[str] = ["updated_at = ?"]
-        params: list[Any] = [datetime.utcnow().isoformat()]
+        params: list[Any] = [_utcnow_iso()]
         if status is not None:
             sets.append("status = ?")
             params.append(status)
@@ -660,8 +686,8 @@ class PaperDB:
             total_pnl=d.get("total_pnl", 0.0),
             latest_candle_ts=d.get("latest_candle_ts"),
             stale_feed_at=d.get("stale_feed_at"),
-            created_at=d.get("created_at", datetime.utcnow()),
-            updated_at=d.get("updated_at", datetime.utcnow()),
+            created_at=d.get("created_at", _utcnow()),
+            updated_at=d.get("updated_at", _utcnow()),
             started_at=d.get("started_at"),
             ended_at=d.get("ended_at"),
             notes=d.get("notes"),
@@ -692,7 +718,7 @@ class PaperDB:
         opened_at: datetime | None = None,
     ) -> PaperPosition:
         pid = f"pos-{uuid.uuid4().hex[:8]}"
-        now = datetime.utcnow().isoformat()
+        now = _utcnow_iso()
         qty_value = round(quantity if quantity is not None else (qty or 0))
         current_qty_value = current_qty if current_qty is not None else float(qty_value)
         entry_ts = opened_at or entry_time or now
@@ -792,13 +818,13 @@ class PaperDB:
         closed_at: datetime | None = None,
     ) -> None:
         sets: list[str] = ["updated_at = ?"]
-        params: list[Any] = [datetime.utcnow().isoformat()]
+        params: list[Any] = [_utcnow_iso()]
         if status is not None:
             sets.append("status = ?")
             params.append(status)
             if status in ("CLOSED", "FLATTENED"):
                 sets.append("exit_time = ?")
-                params.append((closed_at or datetime.utcnow()).isoformat())
+                params.append((closed_at or _utcnow()).isoformat())
         if stop_loss is not None:
             sets.append("stop_loss = ?")
             params.append(stop_loss)
@@ -931,18 +957,30 @@ class PaperDB:
         requested_at: datetime | None = None,
         filled_at: datetime | None = None,
         exchange_order_id: str | None = None,
+        idempotency_key: str | None = None,
+        broker_mode: str | None = None,
+        broker_payload: str | None = None,
         notes: str | None = None,
     ) -> str:
+        if idempotency_key:
+            existing = self.con.execute(
+                "SELECT order_id FROM paper_orders WHERE idempotency_key = ? LIMIT 1",
+                [idempotency_key],
+            ).fetchone()
+            if existing and existing[0]:
+                return str(existing[0])
+
         oid = f"ord-{uuid.uuid4().hex[:8]}"
-        now = datetime.utcnow().isoformat()
+        now = _utcnow_iso()
         self.con.execute(
             """
             INSERT INTO paper_orders (
                 order_id, session_id, position_id, signal_id, symbol, side,
                 order_type, requested_qty, request_price, fill_price, fill_qty,
-                status, requested_at, filled_at, exchange_order_id, notes,
+                status, requested_at, filled_at, exchange_order_id, idempotency_key,
+                broker_mode, broker_payload, notes,
                 created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 oid,
@@ -960,6 +998,9 @@ class PaperDB:
                 requested_at or now,
                 filled_at,
                 exchange_order_id,
+                idempotency_key,
+                broker_mode,
+                broker_payload,
                 notes,
                 now,
                 now,
@@ -977,7 +1018,8 @@ class PaperDB:
         rows = self.con.execute(
             "SELECT order_id, session_id, position_id, signal_id, symbol, side, "
             "order_type, requested_qty, request_price, fill_price, fill_qty, "
-            "status, requested_at, filled_at, exchange_order_id, notes, "
+            "status, requested_at, filled_at, exchange_order_id, idempotency_key, "
+            "broker_mode, broker_payload, notes, "
             "created_at, updated_at "
             f"FROM paper_orders WHERE {' AND '.join(where)} ORDER BY created_at ASC",
             params,
@@ -1001,6 +1043,9 @@ class PaperDB:
             "requested_at",
             "filled_at",
             "exchange_order_id",
+            "idempotency_key",
+            "broker_mode",
+            "broker_payload",
             "notes",
             "created_at",
             "updated_at",
@@ -1022,9 +1067,12 @@ class PaperDB:
             requested_at=d.get("requested_at"),
             filled_at=d.get("filled_at"),
             exchange_order_id=d.get("exchange_order_id"),
+            idempotency_key=d.get("idempotency_key"),
+            broker_mode=d.get("broker_mode"),
+            broker_payload=d.get("broker_payload"),
             notes=d.get("notes"),
-            created_at=d.get("created_at", datetime.utcnow()),
-            updated_at=d.get("updated_at", datetime.utcnow()),
+            created_at=d.get("created_at", _utcnow()),
+            updated_at=d.get("updated_at", _utcnow()),
         )
 
     # ------------------------------------------------------------------
@@ -1042,7 +1090,7 @@ class PaperDB:
         stale_reason: str | None = None,
         raw_state: dict | None = None,
     ) -> None:
-        now = datetime.utcnow().isoformat()
+        now = _utcnow_iso()
         self.con.execute(
             """
             INSERT INTO paper_feed_state (
@@ -1159,8 +1207,8 @@ class PaperDB:
                     volume=float(row[11] or 0.0),
                     first_snapshot_ts=row[12],
                     last_snapshot_ts=row[13],
-                    created_at=row[14] or datetime.utcnow(),
-                    updated_at=row[15] or datetime.utcnow(),
+                    created_at=row[14] or _utcnow(),
+                    updated_at=row[15] or _utcnow(),
                 )
             )
         return result
@@ -1221,7 +1269,7 @@ class PaperDB:
             last_price=d.get("last_price"),
             stale_reason=d.get("stale_reason"),
             raw_state=_loads_json(d.get("raw_state"), {}),
-            updated_at=d.get("updated_at", datetime.utcnow()),
+            updated_at=d.get("updated_at", _utcnow()),
         )
 
     # ------------------------------------------------------------------
