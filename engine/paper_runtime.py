@@ -110,10 +110,7 @@ async def shutdown_alert_dispatcher() -> None:
     dispatcher = _get_alert_dispatcher()
     if dispatcher._running:
         await dispatcher.shutdown()
-    # Wait for any background fire-and-forget tasks
-    for task in list(_background_tasks):
-        if not task.done():
-            task.cancel()
+    # Wait for background fire-and-forget tasks to complete (don't cancel them).
     if _background_tasks:
         await asyncio.gather(*_background_tasks, return_exceptions=True)
         _background_tasks.clear()
@@ -149,6 +146,20 @@ async def get_feed_state(session_id: str) -> FeedState | None:
 async def update_session_state(session_id: str, **kwargs: Any) -> PaperSession | None:
     with _PAPER_DB_IO_LOCK:
         return _db().update_session(session_id, **kwargs)
+
+
+async def _accumulate_session_pnl(session_id: str, pnl_delta: float) -> None:
+    """Add a position's realized PnL to the session's running total_pnl.
+
+    Called after each position close so the dashboard can show live PnL
+    during an active trading session without waiting for archive.
+    """
+    with _PAPER_DB_IO_LOCK:
+        session = _db().get_session(session_id)
+        if session is None:
+            return
+        new_total = round(float(session.total_pnl or 0.0) + pnl_delta, 2)
+        _db().update_session(session_id, total_pnl=new_total)
 
 
 async def open_position(**kwargs: Any) -> PaperPosition:
@@ -2079,6 +2090,8 @@ async def _advance_open_position(
         closed_by=exit_reason,
         closed_at=candle.get("bar_end") if isinstance(candle, dict) else None,
     )
+    # Update session total_pnl so the dashboard shows live PnL during trading.
+    await _accumulate_session_pnl(position.session_id, realized)
     logger.info(
         "Paper trade close session_id=%s symbol=%s direction=%s time=%s reason=%s exit=%.2f pnl=%.2f bars=%d",
         position.session_id,

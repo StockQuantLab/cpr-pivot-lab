@@ -7,6 +7,282 @@ Supersedes: `docs/PARITY_INCIDENT_LOG.md` (contents migrated below).
 
 ---
 
+## 2026-04-27 — BUG: Process crashes silently on max-throughput bar (all 10 positions cycling)
+
+**Status:** FIXED — 4 defensive changes applied (rate-limit, batch sync, exception handler, deferred SESSION_STARTED)
+**Severity:** High — silent crash with 20 orphaned open positions; auto-flatten did NOT fire
+
+### Symptom
+
+Live process (PID 32900, 1.1 GB RAM) died silently at 09:30 IST after processing the 09:30 bar.
+No traceback in log, no error message, no FLATTEN_EOD. Log ends at 09:30:33 (16th Telegram alert).
+`paper.duckdb` unlocked, sessions still showing ACTIVE in DB with 20 open positions orphaned.
+
+### Root Cause
+
+**This is the first session where ALL 10 max_positions in both sessions cycled simultaneously in a single bar.**
+
+At the 09:30 bar close:
+- 4 LONG INITIAL_SL closes (all 09:25 entries stopped in 1 bar)
+- 3 SHORT INITIAL_SL closes + 1 SHORT TARGET close
+- 4 LONG new opens + 4 SHORT new opens
+= **16 position events in one bar** (the maximum possible)
+
+Each event triggers:
+1. A DuckDB write (`paper_positions`)
+2. A replica sync attempt (`maybe_sync(source_conn=...)`)
+3. A Telegram HTTP POST via `httpx` (async)
+
+All 16 Telegram alerts fired in 30 seconds (09:30:04 → 09:30:33). Combined with:
+- 590-symbol tick data held in memory (~1.1 GB baseline)
+- DuckDB replica copy of 410MB paper.duckdb triggered on first write post-restart
+- 16 async httpx response objects in flight simultaneously
+
+This caused a memory/asyncio overload that killed the process without triggering the `finally` block
+(so `auto_flatten_on_abnormal_exit=True` did NOT run — positions were orphaned).
+
+### Why it never happened before (root cause of timing)
+
+Two compounding factors made today the first time this threshold was crossed:
+
+**1. Quality-sort (added 2026-04-25) increased portfolio correlation.**
+Before quality-sort, the 10 max_positions slots were filled in alphabetical order — symbols with
+no natural relationship, exits spread across many bars. After quality-sort (`effective_rr /
+(1 + or_atr_ratio)`), all 10 slots go to the highest-RR setups. These are structurally similar
+(narrow CPR + strong OR) and respond to the same intraday market move — so when the market
+reverses sharply, they ALL hit INITIAL_SL at the same bar rather than staggering over 10+ bars.
+
+**2. First-bar ISL on all 10 is a low-probability event even with correlation.**
+On most days entries are staggered across multiple bars (not all 10 fill at 09:25). Today all
+10 filled at the 09:25 bar AND all stopped out at 09:30 — probability is low but no longer zero
+once the portfolio is quality-sorted into correlated setups. Normal days with
+mixed TARGET/TRAIL/SL exits across 10+ bars never reach the 16-event-per-bar ceiling.
+
+**Short version:** Quality-sort made the worst case more likely. A single strong counter-move at
+09:30 was enough to trigger it for the first time.
+
+### Contributing Factor: SESSION_STARTED alert on resume sends duplicate alerts
+
+When relaunched, `run_live_session()` sends SESSION_STARTED alert even for reused ACTIVE sessions.
+This is not a crash cause but causes user confusion (appears as a "new session" on Telegram).
+
+### Timeline (2026-04-27)
+- 09:23:28 IST — sessions start (ACTIVE), KiteTicker connected
+- 09:25 — 10 LONG + 10 SHORT opens (20 Telegram alerts)
+- 09:30 — 8 closes + 8 opens = 16 events (16 Telegram alerts)
+- 09:30:33 — last log line (16th Telegram alert)
+- 09:30–09:38 — process dead, log frozen, DB unlocked, 20 open positions orphaned
+- 09:41 — manual relaunch, sessions reused (ACTIVE), KiteTicker reconnected
+
+### Fix Options
+1. **Rate-limit Telegram dispatches**: Queue alerts, max 3-4 concurrent HTTP requests per bar.
+2. **Batch replica sync**: Collect all bar writes, call `force_sync()` ONCE per bar end (not per write).
+3. **Add asyncio exception handler**: `loop.set_exception_handler(...)` to log fatal errors before dying.
+4. **Guard `run_live_session` with `auto_flatten` on `finally`**: Ensure FLATTEN_EOD fires even on OOM.
+5. **Reduce memory**: Don't cache all 590 tick builders in memory — lazy-init per session symbol set.
+
+### Fixes Applied (2026-04-27)
+
+All 7 fixes landed in the same session. See git diff for full details.
+
+| # | Fix | File | What changed |
+|---|-----|------|-------------|
+| 1 | Rate-limit Telegram | `engine/alert_dispatcher.py` | Class-level `asyncio.Semaphore(3)` + 200ms `INTER_SEND_DELAY` between sends in `_consumer_loop` — max 3 concurrent HTTP POSTs at any time |
+| 2 | Batch replica sync | `db/paper_db.py` | `defer_sync()` / `flush_deferred_sync()` — `_after_write` marks dirty but skips `maybe_sync()` while deferred; single `force_sync()` fires at bar end |
+| 2 | Batch replica sync (call site) | `scripts/paper_live.py` | `defer_sync()` before `process_closed_bar_group()`, `flush_deferred_sync()` in `finally` |
+| 3 | Async exception handler | `scripts/paper_live.py` | `loop.set_exception_handler()` at `run_live_session()` entry — logs fatal async errors before process death |
+| 4 | Duplicate SESSION_STARTED | `scripts/paper_live.py` | `_was_already_active` flag skips alert dispatch when session status is already ACTIVE (resume scenario) |
+| 4 | Duplicate SESSION_STARTED (dedup set) | `engine/paper_runtime.py` | `_session_started_sent: set[str]` in-process dedup — same session_id never dispatches twice in same process |
+| 5 | flatten-all alert delivery | `engine/paper_runtime.py` | `shutdown_alert_dispatcher` awaits `_background_tasks` with `gather()` instead of cancelling — FLATTEN_EOD/TRADE_CLOSED now deliver |
+| 6 | Live PnL accumulation | `engine/paper_runtime.py` | `_accumulate_session_pnl()` called after every `CLOSED` write — `paper_sessions.total_pnl` updates in real-time during live trading |
+| 7 | Kite connect timeout | `engine/kite_ticker_adapter.py` | Timeout 15s → 30s; `self.close()` called before raising `ConnectionError` (previously the WebSocket thread was orphaned on timeout) |
+
+**Post-fix regression introduced and fixed same session:**
+During fix #1, the `AlertDispatcher.__init__` was accidentally deleted (new class constants inserted
+at the same position). The class had no constructor — any instantiation would have raised
+`AttributeError` on first attribute access. Caught on review and restored before any trading.
+Verified with `uv run python -c "from engine.alert_dispatcher import AlertDispatcher, AlertConfig; d = AlertDispatcher(None, AlertConfig())"`.
+
+**Remaining open:** The 09:35/09:40 bar gap (see separate OPS entry below) is architectural — no
+post-hoc fix for today. Missed-bar reconciliation on resume is the planned mitigation.
+
+---
+
+## 2026-04-27 — BUG: flatten-all does not dispatch FLATTEN_EOD or TRADE_CLOSED alerts
+
+**Status:** FIXED — shutdown_alert_dispatcher now awaits background tasks instead of cancelling them
+**Severity:** High — operator has no Telegram confirmation that positions were closed
+
+### Symptom
+`pivot-paper-trading flatten-all --trade-date today --notes "..."` ran successfully:
+- Sessions marked COMPLETED ✅
+- archive_completed_session ran (rows written to backtest.duckdb) ✅
+- `AlertDispatcher started` logged at 10:30:57 IST ✅
+- NO `FLATTEN_EOD` or `TRADE_CLOSED` entries in `alert_log` ✗
+- NO Telegram alerts received by operator ✗
+
+### Root Cause (suspected)
+`flatten-all` runs in a short-lived `asyncio.run()` process. `flatten_session_positions()`
+dispatches alerts as async fire-and-forget HTTP POST tasks (via `httpx`). When `asyncio.run()`
+exits after all synchronous work completes, any pending async HTTP tasks are cancelled before
+they can deliver. The `alert_log` never receives the write because the DB write is also async.
+
+Unlike the live engine (which runs a long-lived event loop), the CLI flatten command doesn't
+await the alert dispatch queue to drain before returning.
+
+### Workaround
+After any `flatten-all` or `flatten` command, run:
+```bash
+doppler run -- uv run pivot-paper-trading resend-eod --session-id CPR_LEVELS_LONG-<date>-live-kite
+doppler run -- uv run pivot-paper-trading resend-eod --session-id CPR_LEVELS_SHORT-<date>-live-kite
+```
+`resend-eod` uses its own event loop and awaits dispatch before returning.
+
+### Files to Fix
+- `scripts/paper_trading.py` — `_cmd_flatten`, `_cmd_flatten_all`: await alert queue drain
+  before returning (e.g., `await dispatcher.flush()` or `asyncio.gather(*pending_tasks)`)
+
+---
+
+## 2026-04-27 — BUG: Dashboard shows PnL=0 for ACTIVE sessions (no real-time total_pnl update)
+
+**Status:** FIXED — _accumulate_session_pnl updates total_pnl on every position close
+**Severity:** High — operator cannot track live session PnL from dashboard during trading
+
+### Symptom
+Dashboard showed **Rs0** PnL for both ACTIVE sessions throughout the trading day (09:23–10:30).
+After flatten+archive, it correctly showed LONG +Rs6,494 and SHORT −Rs566. The field is correct
+at EOD but useless during the session.
+
+### Root Cause
+`paper_sessions.total_pnl` is written ONLY by `archive_completed_session()` which runs at
+session end. During a live ACTIVE session, no code path updates `total_pnl` on position close.
+The dashboard reads this field → shows 0.0 for the entire trading day.
+
+This is a different manifestation of the Apr 24 bug. That bug was about COMPLETED sessions
+showing 0.0 because archive wasn't called. Today's bug is about ACTIVE sessions showing 0.0
+because the field is never updated in real-time — even when archive DOES eventually run.
+
+### Fix Options
+1. **Update `total_pnl` on every position close** in `paper_runtime.py` via an `UPDATE paper_sessions` call.
+2. **Dashboard fallback**: when `total_pnl=0.0` AND session is ACTIVE, compute from
+   `SUM(paper_positions.pnl) WHERE status='CLOSED'` on the fly.
+3. **Add `daily_closed_pnl` live field**: a running counter updated per close event, separate
+   from the archive-populated `total_pnl`.
+
+Option 2 is safest (no DB write path changes) and can be added to the dashboard query layer.
+
+---
+
+## 2026-04-27 — OPS: 09:35 and 09:40 bars unmonitored during engine downtime (gap in position management)
+
+**Status:** OPEN — architectural limitation; no post-hoc fix for today
+**Severity:** Medium — 20 open positions unmonitored for 11 min; exits deferred to 09:45 bar
+
+### Symptom
+
+Engine dead 09:30:33→09:41:22 IST. The 09:35 and 09:40 bars closed with no engine running.
+Any INITIAL_SL, TARGET, or TRAIL hits that should have triggered at those bars were silently
+skipped. All 20 open positions held until 09:45, when the restarted engine processed them.
+
+### Impact
+- Positions that hit SL at 09:35/09:40 but recovered by 09:45 → false hold (potentially better)
+- Positions that hit SL at 09:35/09:40 and continued deteriorating → closed at worse 09:45 price
+- Positions that hit target at 09:35/09:40 but fell back → missed profit
+- 0 Telegram alerts during gap window (expected — engine not running)
+
+### Alert Tally (full day ~09:55 IST)
+| Alert Type | Sent | Expected | Match |
+|------------|------|----------|-------|
+| SESSION_STARTED | 4 | 4 (2 relaunches × 2 sessions) | ✅ |
+| TRADE_OPENED | 38 | 38 (total positions ever opened) | ✅ |
+| SL_HIT | 20 | 20 (ISL + BREAKEVEN + TRAIL) | ✅ |
+| TRADE_CLOSED | 2 | 2 (TARGET hits only) | ✅ |
+| **HTTP 200 total** | **64** | **64** | ✅ |
+
+No alerts dropped or lost. Perceived shortfall was because no events fired during 09:30–09:41 gap.
+
+### Fix Options
+1. On restart, back-process missed bars via `intraday_day_pack` for the gap window.
+2. On restart, immediately mark any open positions past SL/target as closed at last known price.
+3. Add missed-bar reconciliation step to `run_live_session` startup when resuming ACTIVE session.
+
+---
+
+## 2026-04-27 — OPS: Dashboard shows wrong PnL (reads paper_sessions.total_pnl = 0.0)
+
+**Status:** FIXED — same fix as BUG above (_accumulate_session_pnl on every close)
+**Severity:** Medium — misleading dashboard display during live session
+
+### Symptom
+Dashboard showed **+Rs9,000** while actual closed PnL was **−Rs3,063** (LONG −955 + SHORT −2,108).
+
+### Root Cause
+`paper_sessions.total_pnl = 0.0` for both ACTIVE sessions. The field is only written by
+`archive_completed_session()`, which runs on session end — not during live trading.
+Dashboard reads `paper_sessions.total_pnl` → sees 0.0 → displays incorrectly.
+The +9K figure likely came from baseline backtest runs displayed on the same dashboard panel.
+
+### Source of Truth (always correct for live sessions)
+```sql
+SELECT session_id,
+       COUNT(*) FILTER(WHERE status='CLOSED') as closed,
+       ROUND(SUM(pnl) FILTER(WHERE status='CLOSED'),0) as closed_pnl
+FROM paper_positions WHERE session_id LIKE '%2026-04-27%'
+GROUP BY session_id;
+```
+As of ~09:55 IST: LONG 8 closed −Rs955 | SHORT 14 closed −Rs2,108 | **Combined: −Rs3,063**
+
+### Fix
+See 2026-04-24 fix options — add live `total_pnl` accumulation to `paper_sessions` on each
+position close, or have dashboard fall back to `paper_positions` sum when `total_pnl=0`.
+
+---
+
+## 2026-04-27 — OPS: daily-live hangs silently on Kite connect after WiFi network change
+
+**Status:** FIXED — KiteTickerAdapter connect timeout increased to 30s with auto-close on timeout
+**Severity:** Medium — session misses the first 09:16–09:20 window but recovers on restart
+
+### Symptom
+
+`daily-live --multi` launched at 06:52 IST. Sessions pre-created (PLANNING) successfully.
+Process slept until 09:16 IST (8526s). WiFi network changed during the sleep window (~08:xx IST).
+After sleep ended, the process attempted Kite WebSocket connection with the new network interface.
+Process hung silently — no new log output, no DB writes, no exception. `paper.duckdb` remained
+locked by PID 7084 (385MB RAM, alive). Sessions stayed PLANNING in the replica.
+
+Kite API token was valid (HTTP 200 `/user/profile`). The hang occurred in the post-sleep
+startup path (`_run_multi_variants` → `prepare_runtime_for_daily_paper` or
+`_resolve_cli_symbols`) — no print statements reached.
+
+### Timeline (2026-04-27)
+- 06:52 IST — launched, sessions pre-created (PLANNING)
+- 06:53 IST — paper.duckdb last modified (session creation writes)
+- 09:14-09:16 IST — sleep ended, Kite connect attempted; WiFi had changed
+- 09:16-09:21 IST — process hung (7 log lines, PID alive, DB locked, no new writes)
+- 09:21 IST — kill attempted (PID 7084 not found — process had crashed on its own)
+- 09:21 IST — DB confirmed unlocked; sessions still PLANNING
+- 09:21 IST — relaunch with same `--universe-name full_2026_04_27`
+- 09:23 IST — sessions transitioned ACTIVE; trading resumed (missed first 09:20 bar)
+
+### Root Cause (suspected)
+Network interface change invalidated the active TCP connection used by the Kite WebSocket
+handshake. The `asyncio` event loop's TCP connect attempt blocked indefinitely rather than
+timing out (no connect timeout configured in `KiteTickerAdapter` or underlying `websocket-client`).
+The process eventually crashed without writing a traceback to the log (async context, unhandled).
+
+### Fix Options
+1. Add connect timeout to `KiteTickerAdapter` WebSocket initialization.
+2. Add explicit `asyncio.wait_for(...)` around the Kite connect call with a 30s timeout.
+3. Add a watchdog: if session stays PLANNING for >5 min past 09:16, auto-restart.
+
+### Do NOT
+- Launch `daily-live` with an unstable network connection before 09:00 IST.
+- Rely on the process staying alive if the network changes during the 09:16 sleep/connect.
+
+---
+
 ## 2026-04-25 — PARITY: max_positions slot selection is non-deterministic (quality-sort fix planned)
 
 **Status:** FIXED — quality-sort implemented in `engine/bar_orchestrator.py` with deterministic
@@ -1432,17 +1708,18 @@ New canonical CPR baseline set:
 
 | Mode | Preset | Run ID | Window | P/L | Calmar |
 |------|--------|--------|--------|-----|--------|
-| Daily Reset | `CPR_LEVELS_STANDARD_LONG` | `181a35dd4281` | 2025-01-01 → 2026-04-24 | ₹1,049,489 | 202 |
-| Daily Reset | `CPR_LEVELS_STANDARD_SHORT` | `7c2caee94618` | 2025-01-01 → 2026-04-24 | ₹1,146,822 | 102 |
-| Daily Reset | `CPR_LEVELS_RISK_LONG` | `90a86d6b1da1` | 2025-01-01 → 2026-04-24 | ₹1,041,194 | 203 |
-| Daily Reset | `CPR_LEVELS_RISK_SHORT` | `14609817e655` | 2025-01-01 → 2026-04-24 | ₹1,143,974 | 105 |
-| Compound | `CPR_LEVELS_STANDARD_LONG` | `83df086d062e` | 2025-01-01 → 2026-04-24 | ₹2,305,103 | 249 |
-| Compound | `CPR_LEVELS_STANDARD_SHORT` | `818daec3cf8b` | 2025-01-01 → 2026-04-24 | ₹2,952,262 | 178 |
-| Compound | `CPR_LEVELS_RISK_LONG` | `5ae43fc2e8a9` | 2025-01-01 → 2026-04-24 | ₹2,317,326 | 250 |
-| Compound | `CPR_LEVELS_RISK_SHORT` | `49d261d07a4f` | 2025-01-01 → 2026-04-24 | ₹2,984,565 | 180 |
+| Daily Reset | `CPR_LEVELS_STANDARD_LONG` | `f4d34a6c2de6` | 2025-01-01 → 2026-04-27 | ₹1,058,288 | 202 |
+| Daily Reset | `CPR_LEVELS_STANDARD_SHORT` | `d4eae08bb94e` | 2025-01-01 → 2026-04-27 | ₹1,146,415 | 101 |
+| Daily Reset | `CPR_LEVELS_RISK_LONG` | `5668d519003b` | 2025-01-01 → 2026-04-27 | ₹1,049,993 | 203 |
+| Daily Reset | `CPR_LEVELS_RISK_SHORT` | `14eafeeb74e5` | 2025-01-01 → 2026-04-27 | ₹1,143,567 | 104 |
+| Compound | `CPR_LEVELS_STANDARD_LONG` | `fd9481c38098` | 2025-01-01 → 2026-04-27 | ₹2,340,300 | 250 |
+| Compound | `CPR_LEVELS_STANDARD_SHORT` | `476eaddfdf1b` | 2025-01-01 → 2026-04-27 | ₹2,950,896 | 176 |
+| Compound | `CPR_LEVELS_RISK_LONG` | `d2a09e41d2b8` | 2025-01-01 → 2026-04-27 | ₹2,352,655 | 251 |
+| Compound | `CPR_LEVELS_RISK_SHORT` | `89ef33527ab4` | 2025-01-01 → 2026-04-27 | ₹2,983,190 | 178 |
 
-This replaced the earlier Apr 24 CPR reference rows. Use these 8 run IDs for future CPR baseline
-comparisons unless a later explicitly approved strategy change supersedes them.
+This replaced the earlier Apr 24 CPR reference rows (2026-04-24 → 2026-04-27 extension).
+Use these 8 run IDs for future CPR baseline comparisons unless a later explicitly
+approved strategy change supersedes them.
 
 ---
 

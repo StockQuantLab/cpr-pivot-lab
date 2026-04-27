@@ -18,9 +18,9 @@ PYTHONUNBUFFERED=1 doppler run -- uv run pivot-paper-trading daily-live \
   `pivot-paper-trading daily-prepare --trade-date today --all-symbols` before starting live.
 - Do not run backtests while live is running — `market.duckdb` write lock will block startup.
 - Optional reproducibility: `daily-prepare --all-symbols` now auto-saves the resolved symbol
-  list as `full_YYYYMMDD` in `backtest_universe` inside the canonical `market.duckdb`.
-  You can still override the name with `--snapshot-universe-name full_YYYYMMDD` if needed,
-  and then reuse that exact list with `--universe-name full_YYYYMMDD` in live / replay /
+  list as `full_YYYY_MM_DD` in `backtest_universe` inside the canonical `market.duckdb`.
+  You can still override the name with `--snapshot-universe-name full_YYYY_MM_DD` if needed,
+  and then reuse that exact list with `--universe-name full_YYYY_MM_DD` in live / replay /
   daily-sim / baseline commands.
 - `daily-live`, `daily-replay`, and `daily-sim` now default to the dated saved universe when
   `--symbols`, `--all-symbols`, and `--universe-name` are all omitted. `--all-symbols` is the
@@ -29,7 +29,47 @@ PYTHONUNBUFFERED=1 doppler run -- uv run pivot-paper-trading daily-live \
   snapshots, use `pivot-paper-trading universes --prune-before YYYY-MM-DD --apply`. Do not
   prune the dated archive if you still need it for audit comparisons.
 - Inspect saved snapshots with `pivot-paper-trading universes` or
-  `pivot-paper-trading universes --name full_YYYYMMDD`.
+  `pivot-paper-trading universes --name full_YYYY_MM_DD`.
+
+### Universe naming convention (`full_YYYY_MM_DD`)
+
+**The date in the name is the TRADE date — the day you will trade on, not the day the data came from.**
+
+| What ran | Universe saved | Use it for |
+|----------|---------------|-----------|
+| Pre-market `daily-prepare --trade-date 2026-04-27` (ran this morning) | `full_2026_04_27` | Live trading today; backtest parity for 2026-04-27 |
+| EOD `daily-prepare --trade-date 2026-04-28` (ran tonight) | `full_2026_04_28` | Live trading tomorrow; backtest parity for 2026-04-28 |
+
+**Why this naming, not the data-date?**
+The date you'd put in `--start`/`--end` for a parity backtest is always the trade date, and the
+universe name must match it. Using the data-date (prev day) would force you to subtract one day
+every time you build a backtest command — a constant source of off-by-one errors.
+
+**Practical rules:**
+
+1. **Normal live trading tomorrow** — omit the universe flag entirely:
+   ```bash
+   doppler run -- uv run pivot-paper-trading daily-live --multi --strategy CPR_LEVELS --trade-date 2026-04-28
+   ```
+   Auto-resolves to `full_2026_04_28`.
+
+2. **Emergency mid-session relaunch (same day)** — pass today's trade date explicitly so the
+   relaunch uses the identical symbol list as the original launch:
+   ```bash
+   doppler run -- uv run pivot-paper-trading daily-live --multi --strategy CPR_LEVELS \
+     --trade-date 2026-04-27 --universe-name full_2026_04_27
+   ```
+
+3. **Backtest parity check for today's paper session** — use today's universe, not tomorrow's:
+   ```bash
+   doppler run -- uv run pivot-backtest \
+     --universe-name full_2026_04_27 \
+     --start 2026-04-27 --end 2026-04-27 \
+     --preset CPR_LEVELS_RISK_SHORT --save
+   ```
+   The date in `--universe-name` always matches `--start`/`--end`.
+
+4. **Never use `--all-symbols` for live** — non-deterministic; Kite master changes intraday.
 
 ---
 
@@ -113,24 +153,24 @@ Reference sets (Apr 2026):
 | Daily Reset Std SHORT | `1d6e5e93618e` | 2025-01-01 → 2026-04-09 | ₹1,041,450 |
 | Daily Reset Std LONG | `84a85d954f99` | 2025-01-01 → 2026-04-09 | ₹827,381 |
 
-**Current CPR baselines (2026-04-24 quality-sort refresh on all four CPR presets — use these for all future comparisons):**
+**Current CPR baselines (2026-04-27 quality-sort refresh on all four CPR presets — use these for all future comparisons):**
 
 SHORT presets now use `short_trail_atr_multiplier = 1.25`. LONG keeps `trail_atr_multiplier = 1.0`.
 
 | Mode | Preset | Run ID | Start → End | P/L | Calmar |
 |------|--------|--------|-------------|-----|--------|
-| Daily Reset | `CPR_LEVELS_STANDARD_LONG` | `181a35dd4281` | 2025-01-01 → 2026-04-24 | ₹1,049,489 | 202 |
-| Daily Reset | `CPR_LEVELS_STANDARD_SHORT` | `7c2caee94618` | 2025-01-01 → 2026-04-24 | ₹1,146,822 | 102 |
-| Daily Reset | `CPR_LEVELS_RISK_LONG` | `90a86d6b1da1` | 2025-01-01 → 2026-04-24 | ₹1,041,194 | 203 |
-| Daily Reset | `CPR_LEVELS_RISK_SHORT` | `14609817e655` | 2025-01-01 → 2026-04-24 | ₹1,143,974 | 105 |
-| Compound | `CPR_LEVELS_STANDARD_LONG` | `83df086d062e` | 2025-01-01 → 2026-04-24 | ₹2,305,103 | 249 |
-| Compound | `CPR_LEVELS_STANDARD_SHORT` | `818daec3cf8b` | 2025-01-01 → 2026-04-24 | ₹2,952,262 | 178 |
-| Compound | `CPR_LEVELS_RISK_LONG` | `5ae43fc2e8a9` | 2025-01-01 → 2026-04-24 | ₹2,317,326 | 250 |
-| Compound | `CPR_LEVELS_RISK_SHORT` | `49d261d07a4f` | 2025-01-01 → 2026-04-24 | ₹2,984,565 | 180 |
+| Daily Reset | `CPR_LEVELS_STANDARD_LONG` | `f4d34a6c2de6` | 2025-01-01 → 2026-04-27 | ₹1,058,288 | 202 |
+| Daily Reset | `CPR_LEVELS_STANDARD_SHORT` | `d4eae08bb94e` | 2025-01-01 → 2026-04-27 | ₹1,146,415 | 101 |
+| Daily Reset | `CPR_LEVELS_RISK_LONG` | `5668d519003b` | 2025-01-01 → 2026-04-27 | ₹1,049,993 | 203 |
+| Daily Reset | `CPR_LEVELS_RISK_SHORT` | `14eafeeb74e5` | 2025-01-01 → 2026-04-27 | ₹1,143,567 | 104 |
+| Compound | `CPR_LEVELS_STANDARD_LONG` | `fd9481c38098` | 2025-01-01 → 2026-04-27 | ₹2,340,300 | 250 |
+| Compound | `CPR_LEVELS_STANDARD_SHORT` | `476eaddfdf1b` | 2025-01-01 → 2026-04-27 | ₹2,950,896 | 176 |
+| Compound | `CPR_LEVELS_RISK_LONG` | `d2a09e41d2b8` | 2025-01-01 → 2026-04-27 | ₹2,352,655 | 251 |
+| Compound | `CPR_LEVELS_RISK_SHORT` | `89ef33527ab4` | 2025-01-01 → 2026-04-27 | ₹2,983,190 | 178 |
 
-The 2026-04-24 rerun refreshed the canonical baseline set after enabling
-quality-sort in the slot selector. It matched the previous metrics exactly, so
-this is now the clean 8-run baseline family for CPR comparisons.
+The 2026-04-27 rerun extended the canonical baseline set to include Apr 27 data.
+The only delta from the 2026-04-24 baselines is 1 trading day (Apr 27):
+LONG +19 trades (+₹8.8K daily, +₹35K compound), SHORT +3 trades (-₹407 daily, -₹1.4K compound).
 
 When extending the v2 set to a later end date, rerun these same eight presets and
 compare the overlapping window only. The incremental window should be the only source

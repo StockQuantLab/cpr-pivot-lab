@@ -254,6 +254,8 @@ class PaperDB:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._sync = replica_sync
         self.read_only = read_only
+        self._sync_deferred = False  # When True, _after_write skips sync
+        self._sync_dirty = False  # Tracks whether writes happened while deferred
         try:
             self.con = duckdb.connect(str(db_path), read_only=read_only)
         except duckdb.IOException as exc:
@@ -416,7 +418,10 @@ class PaperDB:
     def _after_write(self) -> None:
         if self._sync:
             self._sync.mark_dirty()
-            self._sync.maybe_sync(self.con)
+            if self._sync_deferred:
+                self._sync_dirty = True
+            else:
+                self._sync.maybe_sync(self.con)
 
     def force_sync(self) -> None:
         """Bypass the debounce and publish a replica snapshot immediately.
@@ -428,6 +433,27 @@ class PaperDB:
         if self._sync:
             self._sync.mark_dirty()
             self._sync.force_sync(self.con)
+
+    def defer_sync(self) -> None:
+        """Defer replica sync until flush_deferred_sync() is called.
+
+        Use during high-throughput bar processing (16+ position events) to avoid
+        triggering maybe_sync() on every individual write. Call before processing
+        a bar group, then call flush_deferred_sync() after the bar is complete.
+        """
+        self._sync_deferred = True
+        self._sync_dirty = False
+
+    def flush_deferred_sync(self) -> None:
+        """Flush any deferred replica sync and resume normal per-write sync.
+
+        Called at the end of a bar group to publish a single replica snapshot
+        covering all position updates within that bar.
+        """
+        self._sync_deferred = False
+        if self._sync_dirty and self._sync:
+            self._sync.force_sync(self.con)
+            self._sync_dirty = False
 
     # ------------------------------------------------------------------
     # Sessions

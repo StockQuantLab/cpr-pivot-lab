@@ -24,6 +24,10 @@ def _disable_live_alert_dispatcher(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         "scripts.paper_live.get_paper_db",
         lambda: SimpleNamespace(
+            defer_sync=lambda: None,
+            resume_sync=lambda: None,
+            flush_deferred_sync=lambda: None,
+            force_sync=lambda: None,
             get_feed_state=lambda session_id: FeedState(
                 session_id=session_id,
                 status="OK",
@@ -33,7 +37,7 @@ def _disable_live_alert_dispatcher(monkeypatch: pytest.MonkeyPatch) -> None:
                 last_bar_ts=None,
                 raw_state={},
                 updated_at=datetime(2024, 1, 1, 9, 15),
-            )
+            ),
         ),
     )
 

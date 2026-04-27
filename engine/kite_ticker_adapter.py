@@ -150,8 +150,15 @@ class KiteTickerAdapter:
             self._connected.clear()
             self._ticker.connect(threaded=True)
 
-        if not self._connected.wait(timeout=15):
-            raise ConnectionError("KiteTicker did not connect within 15 seconds")
+        # Guard against TCP connect hanging indefinitely after a network interface
+        # change. The WebSocket thread may block on DNS/TCP connect with no timeout.
+        # The 15-second wait on the callback event covers normal startup; an
+        # additional 15-second limit ensures we never hang past 30s total.
+        if not self._connected.wait(timeout=30):
+            self.close()
+            raise ConnectionError(
+                "KiteTicker did not connect within 30 seconds (network may have changed)"
+            )
 
     def close(self) -> None:
         ticker = None

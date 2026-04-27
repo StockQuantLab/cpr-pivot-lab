@@ -7,7 +7,20 @@ import db.duckdb
 import engine.baselines_cli as baselines_cli
 
 
-def test_build_backtest_args_includes_progress_file(tmp_path):
+def test_build_backtest_args_includes_progress_file(tmp_path, monkeypatch):
+    class _FakeCon:
+        def execute(self, sql, params=None):
+            return self
+
+        def fetchone(self):
+            return None  # No saved universe → falls through to --all
+
+    class _FakeDB:
+        def __init__(self):
+            self.con = _FakeCon()
+
+    monkeypatch.setattr(db.duckdb, "get_db", lambda: _FakeDB())
+
     progress_file = tmp_path / "baseline.jsonl"
     args = baselines_cli._build_backtest_args(
         "2025-01-01",

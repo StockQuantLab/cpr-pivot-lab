@@ -108,6 +108,19 @@ class AlertDispatcher:
     # are discarded rather than delivered stale (e.g. a FEED_STALE from 15 min ago).
     NETWORK_RETRY_BACKOFF = (30.0, 120.0)
     MAX_ALERT_AGE_SEC = 600  # 10 minutes — discard rather than deliver stale
+    # Max concurrent HTTP sends across all dispatcher instances (class-level semaphore).
+    # Prevents thundering herd when 16+ position events fire in one bar.
+    MAX_CONCURRENT_SENDS = 3
+    # Minimum gap between consecutive sends to avoid saturating the event loop.
+    INTER_SEND_DELAY = 0.2  # 200ms between sends
+
+    _send_semaphore: asyncio.Semaphore | None = None
+
+    @classmethod
+    def _get_semaphore(cls) -> asyncio.Semaphore:
+        if cls._send_semaphore is None:
+            cls._send_semaphore = asyncio.Semaphore(cls.MAX_CONCURRENT_SENDS)
+        return cls._send_semaphore
 
     def __init__(self, paper_db: PaperDB, config: AlertConfig) -> None:
         self.paper_db = paper_db
@@ -193,7 +206,10 @@ class AlertDispatcher:
                 event = await asyncio.wait_for(self._queue.get(), timeout=1.0)
             except TimeoutError:
                 continue
-            await self._send_with_retry(event)
+            async with self._get_semaphore():
+                await self._send_with_retry(event)
+            # Small delay between sends to avoid thundering herd on high-event bars.
+            await asyncio.sleep(self.INTER_SEND_DELAY)
 
     @staticmethod
     def _telegram_retry_after(exc: Exception) -> float | None:

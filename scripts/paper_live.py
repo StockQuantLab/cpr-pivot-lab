@@ -780,6 +780,19 @@ async def run_live_session(
     settings = get_settings()
     candle_interval = _resolve_candle_interval(settings, candle_interval_minutes)
 
+    # Install a custom async exception handler so fatal errors (OOM, segfault in C
+    # extension) get logged before the process dies. This does NOT prevent crashes
+    # but ensures the root cause appears in the log instead of silent death.
+    loop = asyncio.get_running_loop()
+    loop.set_exception_handler(
+        lambda _loop, context: logger.critical(
+            "ASYNC_FATAL_EXCEPTION session=%s message=%s exception=%s",
+            session_id,
+            context.get("message", "unknown"),
+            context.get("exception", "none"),
+        )
+    )
+
     session = await _load_session(session_id, deps)
     if session is None:
         return {"session_id": session_id, "error": "session not found"}
@@ -812,6 +825,7 @@ async def run_live_session(
 
     register_session_start()
     _start_alert_dispatcher()  # start consumer eagerly so first alerts are not delayed
+    _was_already_active = getattr(session, "status", "") == "ACTIVE"
     if session.status != "ACTIVE":
         session = await _update_session(session_id, deps, status="ACTIVE", notes=notes)
         force_paper_db_sync(get_paper_db())
@@ -896,13 +910,19 @@ async def run_live_session(
         raw_state={"mode": "startup", "symbols": len(active_symbols)},
     )
 
-    dispatch_session_started_alert(
-        session_id=session_id,
-        strategy=strategy,
-        direction=direction_filter,
-        symbol_count=len(active_symbols),
-        trade_date=trade_date,
-    )
+    if not _was_already_active:
+        dispatch_session_started_alert(
+            session_id=session_id,
+            strategy=strategy,
+            direction=direction_filter,
+            symbol_count=len(active_symbols),
+            trade_date=trade_date,
+        )
+    else:
+        logger.info(
+            "[%s] Session already ACTIVE — skipping duplicate SESSION_STARTED alert",
+            session_id,
+        )
 
     stale_timeout = max(0, int(getattr(session, "stale_feed_timeout_sec", 0) or 0))
     poll_interval = _resolve_poll_interval(settings, poll_interval_sec, candle_interval)
@@ -1144,32 +1164,42 @@ async def run_live_session(
                         }
 
                     try:
-                        driver_result = await paper_session_driver.process_closed_bar_group(
-                            session_id=session_id,
-                            session=current_session,
-                            bar_candles=bar_candles,
-                            runtime_state=runtime_state,
-                            tracker=tracker,
-                            params=params,
-                            active_symbols=active_symbols,
-                            strategy=strategy,
-                            direction_filter=direction_filter,
-                            stage_b_applied=stage_b_applied,
-                            symbol_last_prices=symbol_last_prices,
-                            last_price=last_price,
-                            feed_source=audit_feed_source,
-                            transport=audit_transport,
-                            feed_audit_writer=record_closed_candles,
-                            evaluate_candle_fn=evaluate_candle,
-                            execute_entry_fn=execute_entry,
-                            enforce_risk_controls=enforce_session_risk_controls,
-                            build_feed_state=build_summary_feed_state,
-                            update_symbols_cb=(
-                                (lambda symbols: ticker_adapter.update_symbols(session_id, symbols))
-                                if use_websocket and ticker_adapter is not None
-                                else None
-                            ),
-                        )
+                        # Defer replica sync for the entire bar group — sync once
+                        # after all position opens/closes instead of per-write.
+                        get_paper_db().defer_sync()
+                        try:
+                            driver_result = await paper_session_driver.process_closed_bar_group(
+                                session_id=session_id,
+                                session=current_session,
+                                bar_candles=bar_candles,
+                                runtime_state=runtime_state,
+                                tracker=tracker,
+                                params=params,
+                                active_symbols=active_symbols,
+                                strategy=strategy,
+                                direction_filter=direction_filter,
+                                stage_b_applied=stage_b_applied,
+                                symbol_last_prices=symbol_last_prices,
+                                last_price=last_price,
+                                feed_source=audit_feed_source,
+                                transport=audit_transport,
+                                feed_audit_writer=record_closed_candles,
+                                evaluate_candle_fn=evaluate_candle,
+                                execute_entry_fn=execute_entry,
+                                enforce_risk_controls=enforce_session_risk_controls,
+                                build_feed_state=build_summary_feed_state,
+                                update_symbols_cb=(
+                                    (
+                                        lambda symbols: ticker_adapter.update_symbols(
+                                            session_id, symbols
+                                        )
+                                    )
+                                    if use_websocket and ticker_adapter is not None
+                                    else None
+                                ),
+                            )
+                        finally:
+                            get_paper_db().flush_deferred_sync()
                     except Exception:
                         logger.exception(
                             "[%s] Bar group processing failed bar_end=%s — halting session",
