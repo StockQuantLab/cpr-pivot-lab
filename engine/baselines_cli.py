@@ -168,15 +168,20 @@ def _build_backtest_args(
     args.extend(["--strategy", "CPR_LEVELS"])
     args.extend(["--start", start, "--end", end])
     universe_name = f"full_{end.replace('-', '_')}"
-    from db.duckdb import get_db
+    from db.duckdb import close_db, get_db
 
     db = get_db()
-    has_saved_universe = bool(
-        db.con.execute(
-            "SELECT 1 FROM backtest_universe WHERE universe_name = ? LIMIT 1",
-            [universe_name],
-        ).fetchone()
-    )
+    try:
+        has_saved_universe = bool(
+            db.con.execute(
+                "SELECT 1 FROM backtest_universe WHERE universe_name = ? LIMIT 1",
+                [universe_name],
+            ).fetchone()
+        )
+    finally:
+        # The child pivot-backtest process needs the exclusive market DB writer
+        # lock. Do not keep the parent pre-flight connection open across spawn.
+        close_db()
     if has_saved_universe:
         args.extend(["--universe-name", universe_name])
     else:

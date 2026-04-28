@@ -4804,8 +4804,20 @@ class MarketDB:
             where += f" AND symbol IN ({placeholders})"
             params.extend(symbols)
 
+        order_by = ["trade_date"]
+        if self._table_has_column("backtest_results", "entry_time"):
+            order_by.append("entry_time")
+        if self._table_has_column("backtest_results", "exit_time"):
+            order_by.append("exit_time")
+        if self._table_has_column("backtest_results", "symbol"):
+            order_by.append("symbol")
+
         return self.con.execute(
-            f"SELECT * FROM backtest_results {where} ORDER BY symbol, trade_date",
+            f"""
+            SELECT * FROM backtest_results
+            {where}
+            ORDER BY {", ".join(order_by)}
+            """,
             params,
         ).pl()
 

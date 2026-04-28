@@ -260,15 +260,21 @@ def should_process_symbol(
     return True
 
 
-def _candidate_quality_score(c: dict[str, Any]) -> float:
+def entry_quality_score(*, effective_rr: float, or_atr_ratio: float) -> float:
+    """Return the shared entry quality score used for slot contention."""
+    rr = float(effective_rr or 1.0)
+    or_atr = float(or_atr_ratio or 1.0)
+    # Higher RR is better. Lower OR/ATR is better.
+    return rr / (1.0 + or_atr)
+
+
+def candidate_quality_score(c: dict[str, Any]) -> float:
     # Backtest candidates have rr_ratio/or_atr_ratio directly on the dict.
     # Live/replay candidates nest the raw entry under "candidate".
     inner = c.get("candidate") or c
     effective_rr = float(inner.get("rr_ratio") or 1.0)
     or_atr = float(inner.get("or_atr_ratio") or 1.0)
-    # Higher effective_rr = better reward/risk. Lower or_atr = tighter opening range.
-    # Dividing by (1 + or_atr) penalises exhausted-open symbols without a hard cutoff.
-    return effective_rr / (1.0 + or_atr)
+    return entry_quality_score(effective_rr=effective_rr, or_atr_ratio=or_atr)
 
 
 def select_entries_for_bar(
@@ -285,7 +291,7 @@ def select_entries_for_bar(
     # backtest feed candidates in a different iteration order.
     ordered = sorted(
         candidates,
-        key=lambda c: (-_candidate_quality_score(c), str(c.get("symbol", ""))),
+        key=lambda c: (-candidate_quality_score(c), str(c.get("symbol", ""))),
     )
     return ordered[:slots]
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from types import SimpleNamespace
 
 import pytest
@@ -41,6 +42,55 @@ def test_default_session_id_includes_direction_for_daily_sessions() -> None:
         )
         == "paper-cpr_levels-short-2024-01-02-replay-historical"
     )
+
+
+def test_reject_early_kite_live_start_aborts_before_market_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    early_start = datetime(2026, 4, 28, 9, 15, 0, tzinfo=paper_trading.IST)
+
+    class _FakeDateTime:
+        @staticmethod
+        def now(_tz=None) -> datetime:
+            return early_start
+
+    monkeypatch.setattr(paper_trading, "datetime", _FakeDateTime)
+
+    with pytest.raises(SystemExit) as exc:
+        paper_trading._reject_early_kite_live_start("2026-04-28", wait_for_open=False)
+
+    assert "should be launched at/after 09:16 IST" in str(exc.value)
+
+
+def test_reject_early_kite_live_start_allows_wait_for_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    early_start = datetime(2026, 4, 28, 9, 15, 0, tzinfo=paper_trading.IST)
+
+    class _FakeDateTime:
+        @staticmethod
+        def now(_tz=None) -> datetime:
+            return early_start
+
+    monkeypatch.setattr(paper_trading, "datetime", _FakeDateTime)
+
+    paper_trading._reject_early_kite_live_start("2026-04-28", wait_for_open=True)
+
+
+def test_reject_early_kite_live_start_allows_non_trading_day_or_late_launch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    late_start = datetime(2026, 4, 28, 9, 16, 0, tzinfo=paper_trading.IST)
+
+    class _FakeDateTime:
+        @staticmethod
+        def now(_tz=None) -> datetime:
+            return late_start
+
+    monkeypatch.setattr(paper_trading, "datetime", _FakeDateTime)
+
+    paper_trading._reject_early_kite_live_start("2026-04-27", wait_for_open=False)
+    paper_trading._reject_early_kite_live_start("2026-04-28", wait_for_open=False)
 
 
 def test_variant_exit_summary_and_retry_policy_detects_spurious_early_completion() -> None:

@@ -47,6 +47,22 @@ from web.state import (
 logger = logging.getLogger(__name__)
 
 
+def _extract_tab_value(event: object) -> str | None:
+    """Return the selected tab value from a NiceGUI tab change event."""
+    args = getattr(event, "args", None)
+    if isinstance(args, str):
+        return args
+    if isinstance(args, dict):
+        if (value := args.get("value")) is not None:
+            return str(value)
+        if (value := args.get("modelValue")) is not None:
+            return str(value)
+    value = getattr(event, "value", None)
+    if value is not None:
+        return str(value)
+    return None
+
+
 async def scans_page() -> None:
     """Render setup-bias scans from strategy_day_state snapshots."""
     snapshot = await aget_scan_snapshot(limit_days=180)
@@ -567,16 +583,14 @@ def _render_paper_operator_controls(
     )
 
     with (
-        ui.card()
+        ui.expansion(
+            "Operator Controls",
+            icon="settings",
+            value=False,
+        )
         .classes("w-full my-4")
-        .style(
-            f"background:{THEME['surface']};border:1px solid {THEME['surface_border']};"
-            f"border-left:4px solid {colors['warning']};"
-        )
+        .style(f"border-left:4px solid {colors['warning']};")
     ):
-        ui.label("Operator Controls").classes("text-base font-semibold").style(
-            f"color:{THEME['text_primary']};"
-        )
         ui.label(
             "Commands are queued for the running live loop; positions are closed by the runtime, then reconciled."
         ).classes("text-xs mb-2").style(f"color:{THEME['text_secondary']};")
@@ -745,341 +759,379 @@ async def paper_ledger_page() -> None:
         }
         status_line = (
             ui.label("Loading paper sessions...")
-            .classes("text-xs mono-font mb-2")
-            .style(f"color:{THEME['text_secondary']};")
+            .classes("text-sm mono-font mb-2")
+            .style(f"color:{THEME['text_muted']};")
         )
-        with ui.row().classes("mb-4 items-center gap-3"):
-            ui.button(
-                "Refresh Now", icon="refresh", on_click=lambda: safe_timer(0.01, _load)
-            ).props("outline aria-label='Refresh paper sessions now'")
-            ui.checkbox(
-                "Near-real-time refresh 3s",
-                value=True,
-                on_change=lambda e: page_state.update({"auto_refresh": bool(e.value)}),
-            ).classes("text-sm")
 
-            trade_date_input = (
-                ui.input("Trade Date", value=datetime.now().date().isoformat())
-                .props("outlined dense")
-                .classes("w-36")
-            )
-            reason_input = (
-                ui.input("Reason", value="dashboard_flatten_both")
-                .props("outlined dense")
-                .classes("w-56")
-            )
+        tabs = ui.tabs().classes("w-full")
+        with tabs:
+            ui.tab("active", label="Active Sessions", icon="sensors")
+            ui.tab("archived", label="Archived Sessions", icon="archive")
+            ui.tab("daily", label="Daily Summary", icon="calendar_view_day")
 
-            async def _flatten_both() -> None:
-                try:
-                    result = await aflatten_both_paper_sessions(
-                        trade_date=str(trade_date_input.value or "").strip() or None,
-                        reason=str(reason_input.value or "dashboard_flatten_both"),
-                        requester="dashboard",
+        with ui.tab_panels(tabs, value="active", keep_alive=True).classes("w-full"):
+            with ui.tab_panel("active"):
+                # Active-session controls — only visible on this tab
+                with ui.row().classes("mb-4 items-center gap-3 flex-wrap"):
+                    ui.button(
+                        "Refresh Now",
+                        icon="refresh",
+                        on_click=lambda: safe_timer(0.01, _load),
+                    ).props("outline aria-label='Refresh paper sessions now'")
+                    ui.checkbox(
+                        "Near-real-time refresh 3s",
+                        value=True,
+                        on_change=lambda e: page_state.update({"auto_refresh": bool(e.value)}),
+                    ).classes("text-sm")
+
+                    trade_date_input = (
+                        ui.input("Trade Date", value=datetime.now().date().isoformat())
+                        .props("outlined dense")
+                        .classes("w-36")
                     )
-                    commands = result.get("commands") or []
-                    if not commands:
-                        ui.notify(
-                            "No active LONG/SHORT sessions found for that date.", type="warning"
-                        )
-                        return
-                    ui.notify(f"Queued flatten for {len(commands)} sessions", type="positive")
-                    status_line.text = f"Queued flatten-both commands={len(commands)}"
-                except Exception as exc:
-                    logger.exception("Dashboard flatten_both failed")
-                    ui.notify(f"Flatten both failed: {exc}", type="negative")
-
-            ui.button("Flatten LONG+SHORT", icon="dangerous", on_click=_flatten_both).props(
-                "color=negative"
-            )
-
-        content = ui.column().classes("w-full")
-        with content:
-            ui.spinner("dots").classes("mt-8 self-center").props(
-                'role="status" aria-live="polite" aria-label="Loading paper sessions..."'
-            )
-
-        async def _load() -> None:
-            if page_state.get("loading"):
-                return
-            page_state["loading"] = True
-            # Fetch active + archived concurrently (both use BacktestDB)
-            # then daily summary sequentially to avoid DuckDB connection
-            # race — concurrent reads on a single DuckDB connection can
-            # silently return empty result sets.
-            try:
-                active_sessions, archived_runs = await asyncio.gather(
-                    aget_paper_active_sessions(),
-                    aget_paper_archived_runs(),
-                )
-                daily_summary = await aget_paper_daily_summary()
-
-                content.clear()
-                with content:
-                    # ── Active Sessions (expanded by default, at top) ──
-                    active_count = len(active_sessions)
-                    status_line.text = (
-                        f"Replica refreshed {datetime.now().strftime('%H:%M:%S')} | "
-                        f"active={active_count} archived={len(archived_runs)}"
+                    reason_input = (
+                        ui.input("Reason", value="dashboard_flatten_both")
+                        .props("outlined dense")
+                        .classes("w-56")
                     )
-                    with (
-                        ui.expansion(
-                            f"Active Paper Sessions ({active_count})",
-                            icon="sensors",
-                            value=True,
-                        )
-                        .classes("w-full mb-2")
-                        .style(f"border-top:3px solid {colors['primary']};")
-                    ):
-                        _render_live_paper_sessions(active_sessions, colors, page_state)
 
-                    # ── Daily Summary (collapsible) ──
-                    _render_daily_summary(daily_summary, colors)
-
-                    # ── Archived Sessions (collapsible, below active) ──
-                    options = build_paper_session_options(archived_runs)
-                    archive_count = len(options)
-                    with (
-                        ui.expansion(
-                            f"Archived Paper Sessions ({archive_count})",
-                            icon="archive",
-                            value=active_count == 0,
-                        )
-                        .classes("w-full")
-                        .style(f"border-top:3px solid {THEME['text_muted']};")
-                    ):
-                        if not options:
-                            empty_state(
-                                "No archived paper sessions",
-                                "Completed paper sessions (replay, live-local, live-kite) appear here.",
-                                icon="receipt_long",
+                    async def _flatten_both() -> None:
+                        try:
+                            result = await aflatten_both_paper_sessions(
+                                trade_date=str(trade_date_input.value or "").strip() or None,
+                                reason=str(reason_input.value or "dashboard_flatten_both"),
+                                requester="dashboard",
                             )
-                        else:
-                            labels = list(options.keys())
+                            commands = result.get("commands") or []
+                            if not commands:
+                                ui.notify(
+                                    "No active LONG/SHORT sessions found for that date.",
+                                    type="warning",
+                                )
+                                return
+                            ui.notify(
+                                f"Queued flatten for {len(commands)} sessions", type="positive"
+                            )
+                            status_line.text = f"Queued flatten-both commands={len(commands)}"
+                        except Exception as exc:
+                            logger.exception("Dashboard flatten_both failed")
+                            ui.notify(f"Flatten both failed: {exc}", type="negative")
 
-                            @ui.refreshable
-                            def _render(label: str) -> None:
-                                run_id = options.get(label, "")
-                                if not run_id:
-                                    return
+                    ui.button("Flatten LONG+SHORT", icon="dangerous", on_click=_flatten_both).props(
+                        "color=negative"
+                    )
 
-                                container = ui.column().classes("w-full")
+                active_content = ui.column().classes("w-full")
+            with ui.tab_panel("archived"):
+                archived_content = ui.column().classes("w-full")
+            with ui.tab_panel("daily"):
+                daily_content = ui.column().classes("w-full")
 
-                                async def _load_ledger() -> None:
-                                    try:
-                                        ledger_df, run_meta = await asyncio.gather(
-                                            aget_run_ledger(run_id, execution_mode="PAPER"),
-                                            aget_run_metadata(run_id),
-                                        )
-                                    except Exception as ledger_exc:
-                                        container.clear()
-                                        with container:
-                                            empty_state(
-                                                "Archived ledger unavailable",
-                                                f"Could not load archived paper trades: {ledger_exc}",
-                                                icon="error",
-                                            )
-                                        return
+        def _loading(container: ui.column, label: str) -> None:
+            container.clear()
+            with container:
+                with ui.row().classes("justify-center items-center p-10 w-full"):
+                    ui.spinner("dots").props('role="status" aria-live="polite"')
+                    ui.label(label).classes("text-sm").style(f"color:{THEME['text_muted']};")
+
+        async def _load_active() -> None:
+            if page_state.get("loading_active"):
+                return
+            page_state["loading_active"] = True
+            try:
+                active_sessions = await aget_paper_active_sessions()
+                active_count = len(active_sessions)
+                status_line.text = (
+                    f"Active refreshed {datetime.now().strftime('%H:%M:%S')} | "
+                    f"active={active_count}"
+                )
+                active_content.clear()
+                with active_content:
+                    _render_live_paper_sessions(active_sessions, colors, page_state)
+            finally:
+                page_state["loading_active"] = False
+
+        async def _load_archived() -> None:
+            if page_state.get("loading_archived"):
+                return
+            page_state["loading_archived"] = True
+            _loading(archived_content, "Loading archived sessions...")
+            try:
+                archived_runs = await aget_paper_archived_runs()
+                options = build_paper_session_options(archived_runs)
+                archive_count = len(options)
+                archived_content.clear()
+                with archived_content:
+                    with ui.row().classes("w-full items-center justify-between mb-3"):
+                        ui.label(f"Archived Paper Sessions ({archive_count})").classes(
+                            "text-lg font-semibold"
+                        )
+                        ui.button(
+                            "Refresh Archived",
+                            icon="refresh",
+                            on_click=lambda: safe_timer(0.01, _load_archived),
+                        ).props("outline dense")
+                    if not options:
+                        empty_state(
+                            "No archived paper sessions",
+                            "Completed paper sessions (replay, live-local, live-kite) appear here.",
+                            icon="receipt_long",
+                        )
+                    else:
+                        labels = list(options.keys())
+
+                        @ui.refreshable
+                        def _render(label: str) -> None:
+                            run_id = options.get(label, "")
+                            if not run_id:
+                                return
+
+                            container = ui.column().classes("w-full")
+
+                            async def _load_ledger() -> None:
+                                try:
+                                    ledger_df = await aget_run_ledger(
+                                        run_id, execution_mode="PAPER"
+                                    )
+                                    run_meta = await aget_run_metadata(run_id)
+                                except Exception as ledger_exc:
                                     container.clear()
                                     with container:
-                                        _render_ledger_content(
-                                            run_id, archived_runs, ledger_df, run_meta, colors
+                                        empty_state(
+                                            "Archived ledger unavailable",
+                                            f"Could not load archived paper trades: {ledger_exc}",
+                                            icon="error",
                                         )
+                                    return
+                                container.clear()
+                                with container:
+                                    _render_ledger_content(
+                                        run_id, archived_runs, ledger_df, run_meta, colors
+                                    )
 
-                                safe_timer(0.1, _load_ledger)
+                            safe_timer(0.1, _load_ledger)
 
-                            ui.select(
-                                labels,
-                                value=labels[0],
-                                label="Select Archived Session",
-                                on_change=lambda e: _render.refresh(e.value),
-                            ).props(
-                                "outlined dense use-input options-dense input-debounce=0"
-                            ).classes("w-full max-w-4xl mb-4")
-                            _render(labels[0])
+                        ui.select(
+                            labels,
+                            value=labels[0],
+                            label="Select Archived Session",
+                            on_change=lambda e: _render.refresh(e.value),
+                        ).props("outlined dense use-input options-dense input-debounce=0").classes(
+                            "w-full max-w-4xl mb-4"
+                        )
+                        _render(labels[0])
             finally:
-                page_state["loading"] = False
+                page_state["loading_archived"] = False
 
-        safe_timer(0.1, _load)
+        async def _load_daily() -> None:
+            if page_state.get("loading_daily"):
+                return
+            page_state["loading_daily"] = True
+            _loading(daily_content, "Loading daily summary...")
+            try:
+                daily_summary = await aget_paper_daily_summary()
+                daily_content.clear()
+                with daily_content:
+                    with ui.row().classes("w-full justify-end mb-2"):
+                        ui.button(
+                            "Refresh Daily",
+                            icon="refresh",
+                            on_click=lambda: safe_timer(0.01, _load_daily),
+                        ).props("outline dense")
+                    _render_daily_summary(daily_summary, colors, expanded=True)
+            finally:
+                page_state["loading_daily"] = False
+
+        async def _load() -> None:
+            await _load_active()
+            if page_state.get("archived_loaded"):
+                await _load_archived()
+            if page_state.get("daily_loaded"):
+                await _load_daily()
+
+        def _on_tab_change(e) -> None:
+            selected = _extract_tab_value(e)
+            if selected == "archived" and not page_state.get("archived_loaded"):
+                page_state["archived_loaded"] = True
+                safe_timer(0.01, _load_archived)
+            elif selected == "daily" and not page_state.get("daily_loaded"):
+                page_state["daily_loaded"] = True
+                safe_timer(0.01, _load_daily)
+
+        tabs.on("update:model-value", _on_tab_change)
+        _loading(active_content, "Loading active sessions...")
+        safe_timer(0.1, _load_active)
         safe_timer(
             3.0,
-            lambda: safe_timer(0.01, _load) if page_state.get("auto_refresh") else None,
+            lambda: safe_timer(0.01, _load_active) if page_state.get("auto_refresh") else None,
             once=False,
         )
 
 
-def _render_daily_summary(daily_rows: list[dict], colors: dict) -> None:
-    """Collapsible daily P/L summary across all paper sessions."""
-    with (
-        ui.expansion(
-            f"Daily Summary ({len(daily_rows)} days)",
+def _render_daily_summary(daily_rows: list[dict], colors: dict, *, expanded: bool = False) -> None:
+    """Daily P/L summary across all paper sessions."""
+    if not daily_rows:
+        empty_state(
+            "No daily summary data",
+            "Paper trading results will appear here once sessions are archived.",
             icon="calendar_view_day",
-            value=False,
         )
-        .classes("w-full mb-2")
-        .style(f"border-top:3px solid {colors['info']};")
-    ):
-        if not daily_rows:
-            empty_state(
-                "No daily summary data",
-                "Paper trading results will appear here once sessions are archived.",
-                icon="calendar_view_day",
-            )
-            return
+        return
 
-        # Aggregate totals for KPI cards
-        total_wins = sum(r["total_wins"] for r in daily_rows)
-        total_trades = sum(r["total_trades"] for r in daily_rows)
-        total_pnl = sum(r["total_pnl"] for r in daily_rows)
-        long_pnl = sum(r["long_pnl"] for r in daily_rows)
-        short_pnl = sum(r["short_pnl"] for r in daily_rows)
-        wr = (total_wins / total_trades * 100) if total_trades else 0.0
+    # Aggregate totals for KPI cards
+    total_wins = sum(r["total_wins"] for r in daily_rows)
+    total_trades = sum(r["total_trades"] for r in daily_rows)
+    total_pnl = sum(r["total_pnl"] for r in daily_rows)
+    long_pnl = sum(r["long_pnl"] for r in daily_rows)
+    short_pnl = sum(r["short_pnl"] for r in daily_rows)
+    wr = (total_wins / total_trades * 100) if total_trades else 0.0
 
-        kpi_grid(
-            [
-                dict(
-                    title="Total Days",
-                    value=f"{len(daily_rows)}",
-                    icon="calendar_month",
-                    color=colors["info"],
-                ),
-                dict(
-                    title="Total Trades",
-                    value=f"{total_trades:,}",
-                    icon="swap_vert",
-                    color=colors["primary"],
-                ),
-                dict(
-                    title="Win Rate",
-                    value=f"{wr:.1f}%",
-                    icon="percent",
-                    color=colors["success"] if wr >= 35 else colors["warning"],
-                ),
-                dict(
-                    title="Net P/L",
-                    value=f"₹{total_pnl:,.0f}",
-                    icon="account_balance_wallet",
-                    color=colors["success"] if total_pnl >= 0 else colors["error"],
-                ),
-                dict(
-                    title="LONG P/L",
-                    value=f"₹{long_pnl:,.0f}",
-                    icon="trending_up",
-                    color=colors["success"] if long_pnl >= 0 else colors["error"],
-                ),
-                dict(
-                    title="SHORT P/L",
-                    value=f"₹{short_pnl:,.0f}",
-                    icon="trending_down",
-                    color=colors["success"] if short_pnl >= 0 else colors["error"],
-                ),
-            ],
-            columns=3,
+    kpi_grid(
+        [
+            dict(
+                title="Total Days",
+                value=f"{len(daily_rows)}",
+                icon="calendar_month",
+                color=colors["info"],
+            ),
+            dict(
+                title="Total Trades",
+                value=f"{total_trades:,}",
+                icon="swap_vert",
+                color=colors["primary"],
+            ),
+            dict(
+                title="Win Rate",
+                value=f"{wr:.1f}%",
+                icon="percent",
+                color=colors["success"] if wr >= 35 else colors["warning"],
+            ),
+            dict(
+                title="Net P/L",
+                value=f"₹{total_pnl:,.0f}",
+                icon="account_balance_wallet",
+                color=colors["success"] if total_pnl >= 0 else colors["error"],
+            ),
+            dict(
+                title="LONG P/L",
+                value=f"₹{long_pnl:,.0f}",
+                icon="trending_up",
+                color=colors["success"] if long_pnl >= 0 else colors["error"],
+            ),
+            dict(
+                title="SHORT P/L",
+                value=f"₹{short_pnl:,.0f}",
+                icon="trending_down",
+                color=colors["success"] if short_pnl >= 0 else colors["error"],
+            ),
+        ],
+        columns=3,
+    )
+
+    # Per-day table
+    table_rows = []
+    cumulative = 0.0
+    for r in daily_rows:
+        cumulative += r["total_pnl"]
+        table_rows.append(
+            {
+                "trade_date": str(r["trade_date"])[:10],
+                "long_trades": int(r["long_trades"]),
+                "long_wins": int(r["long_wins"]),
+                "long_pnl": float(r["long_pnl"]),
+                "short_trades": int(r["short_trades"]),
+                "short_wins": int(r["short_wins"]),
+                "short_pnl": float(r["short_pnl"]),
+                "total_trades": int(r["total_trades"]),
+                "total_wins": int(r["total_wins"]),
+                "total_pnl": float(r["total_pnl"]),
+                "cumulative_pnl": round(cumulative, 2),
+            }
         )
-
-        # Per-day table
-        table_rows = []
-        cumulative = 0.0
-        for r in daily_rows:
-            cumulative += r["total_pnl"]
-            table_rows.append(
-                {
-                    "trade_date": str(r["trade_date"])[:10],
-                    "long_trades": int(r["long_trades"]),
-                    "long_wins": int(r["long_wins"]),
-                    "long_pnl": float(r["long_pnl"]),
-                    "short_trades": int(r["short_trades"]),
-                    "short_wins": int(r["short_wins"]),
-                    "short_pnl": float(r["short_pnl"]),
-                    "total_trades": int(r["total_trades"]),
-                    "total_wins": int(r["total_wins"]),
-                    "total_pnl": float(r["total_pnl"]),
-                    "cumulative_pnl": round(cumulative, 2),
-                }
-            )
-        paginated_table(
-            rows=table_rows,
-            columns=[
-                {
-                    "name": "trade_date",
-                    "label": "Date",
-                    "field": "trade_date",
-                    "align": "left",
-                },
-                {
-                    "name": "long_trades",
-                    "label": "L Trades",
-                    "field": "long_trades",
-                    "align": "right",
-                    "format": "int",
-                },
-                {
-                    "name": "long_wins",
-                    "label": "L Wins",
-                    "field": "long_wins",
-                    "align": "right",
-                    "format": "int",
-                },
-                {
-                    "name": "long_pnl",
-                    "label": "L P/L",
-                    "field": "long_pnl",
-                    "align": "right",
-                    "format": "currency",
-                },
-                {
-                    "name": "short_trades",
-                    "label": "S Trades",
-                    "field": "short_trades",
-                    "align": "right",
-                    "format": "int",
-                },
-                {
-                    "name": "short_wins",
-                    "label": "S Wins",
-                    "field": "short_wins",
-                    "align": "right",
-                    "format": "int",
-                },
-                {
-                    "name": "short_pnl",
-                    "label": "S P/L",
-                    "field": "short_pnl",
-                    "align": "right",
-                    "format": "currency",
-                },
-                {
-                    "name": "total_trades",
-                    "label": "Total",
-                    "field": "total_trades",
-                    "align": "right",
-                    "format": "int",
-                },
-                {
-                    "name": "total_wins",
-                    "label": "Wins",
-                    "field": "total_wins",
-                    "align": "right",
-                    "format": "int",
-                },
-                {
-                    "name": "total_pnl",
-                    "label": "Day P/L",
-                    "field": "total_pnl",
-                    "align": "right",
-                    "format": "currency",
-                },
-                {
-                    "name": "cumulative_pnl",
-                    "label": "Cumulative",
-                    "field": "cumulative_pnl",
-                    "align": "right",
-                    "format": "currency",
-                },
-            ],
-            page_size=15,
-            sort_by="trade_date",
-            descending=True,
-        )
+    paginated_table(
+        rows=table_rows,
+        columns=[
+            {
+                "name": "trade_date",
+                "label": "Date",
+                "field": "trade_date",
+                "align": "left",
+            },
+            {
+                "name": "long_trades",
+                "label": "L Trades",
+                "field": "long_trades",
+                "align": "right",
+                "format": "int",
+            },
+            {
+                "name": "long_wins",
+                "label": "L Wins",
+                "field": "long_wins",
+                "align": "right",
+                "format": "int",
+            },
+            {
+                "name": "long_pnl",
+                "label": "L P/L",
+                "field": "long_pnl",
+                "align": "right",
+                "format": "currency",
+            },
+            {
+                "name": "short_trades",
+                "label": "S Trades",
+                "field": "short_trades",
+                "align": "right",
+                "format": "int",
+            },
+            {
+                "name": "short_wins",
+                "label": "S Wins",
+                "field": "short_wins",
+                "align": "right",
+                "format": "int",
+            },
+            {
+                "name": "short_pnl",
+                "label": "S P/L",
+                "field": "short_pnl",
+                "align": "right",
+                "format": "currency",
+            },
+            {
+                "name": "total_trades",
+                "label": "Total",
+                "field": "total_trades",
+                "align": "right",
+                "format": "int",
+            },
+            {
+                "name": "total_wins",
+                "label": "Wins",
+                "field": "total_wins",
+                "align": "right",
+                "format": "int",
+            },
+            {
+                "name": "total_pnl",
+                "label": "Day P/L",
+                "field": "total_pnl",
+                "align": "right",
+                "format": "currency",
+            },
+            {
+                "name": "cumulative_pnl",
+                "label": "Cumulative",
+                "field": "cumulative_pnl",
+                "align": "right",
+                "format": "currency",
+            },
+        ],
+        page_size=15,
+        sort_by="trade_date",
+        descending=True,
+    )
 
 
 def _start_auto_refresh(state: dict) -> None:
@@ -1146,12 +1198,22 @@ def _render_ledger_content(
     params = params if isinstance(params, dict) else {}
     portfolio_base = float(params.get("portfolio_value") or run_row.get("allocated_capital") or 0.0)
 
+    # Compute cumulative PnL from deterministic chronological order for on-screen visibility.
+    # DB reads are schema-tolerant, so sort by available columns only.
+    sort_columns = [
+        c for c in ["trade_date", "entry_time", "exit_time", "symbol"] if c in ledger_df.columns
+    ]
+    if not sort_columns:
+        sort_columns = ["profit_loss"]
+    ledger_df = ledger_df.sort(
+        by=sort_columns,
+        descending=False,
+    )
     ledger_df = ledger_df.with_columns(
         pl.col("profit_loss").cum_sum().alias("cum_pnl"),
-        (pl.lit(portfolio_base) + pl.col("profit_loss").cum_sum()).alias("equity"),
     )
     total_pnl = float(ledger_df["profit_loss"].sum())
-    final_equity = float(ledger_df["equity"][-1])
+    final_equity = portfolio_base + float(ledger_df["cum_pnl"][-1])
 
     scanned_value = str(setup_count) if setup_count > 0 else "—"
 
@@ -1165,7 +1227,9 @@ def _render_ledger_content(
         gross_wins / gross_losses if gross_losses > 0 else float("inf") if gross_wins > 0 else 0.0
     )
 
-    equity_arr = ledger_df["equity"].to_numpy()
+    equity_arr = np.asarray(
+        [portfolio_base + float(x or 0.0) for x in ledger_df["cum_pnl"].to_list()]
+    )
     running_max = np.maximum.accumulate(equity_arr)
     drawdown_arr = equity_arr - running_max
     max_dd_pct = float(np.min(drawdown_arr) / portfolio_base * 100.0) if portfolio_base > 0 else 0.0
@@ -1258,7 +1322,6 @@ def _render_ledger_content(
                 "position_value": round(float(row["position_value"] or 0.0), 2),
                 "profit_loss": round(float(row["profit_loss"] or 0.0), 2),
                 "cum_pnl": round(float(row["cum_pnl"] or 0.0), 2),
-                "equity": round(float(row["equity"] or 0.0), 2),
                 "exit_reason": str(row["exit_reason"] or ""),
             }
         )
@@ -1326,12 +1389,6 @@ def _render_ledger_content(
                 "name": "cum_pnl",
                 "label": "Cum P/L ₹",
                 "field": "cum_pnl",
-                "align": "right",
-            },
-            {
-                "name": "equity",
-                "label": "Equity ₹",
-                "field": "equity",
                 "align": "right",
             },
             {"name": "exit_reason", "label": "Exit", "field": "exit_reason", "align": "left"},

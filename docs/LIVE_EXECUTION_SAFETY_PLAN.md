@@ -56,6 +56,7 @@ Validation:
 Goal: make every operator action available from CLI, dashboard, and agent command path.
 
 - Status: CLI, agent, and dashboard queue paths implemented for paper live sessions.
+- Dashboard paper ledger tabs were updated so Archived and Daily Summary panels refresh from live data and no longer depend on a single preloaded panel lifecycle.
 - Close one symbol in one session: `send-command --action close_positions`.
 - Close all positions in one session: `send-command --action close_all`.
 - Close both LONG and SHORT sessions for a trade date: `flatten-both`.
@@ -64,6 +65,7 @@ Goal: make every operator action available from CLI, dashboard, and agent comman
 - Resume entries after automatic disable/manual pause: `send-command --action resume_entries`.
 - Cancel unprocessed admin command files for one session: `send-command --action cancel_pending_intents`.
 - Dashboard `/paper_ledger` exposes selected-session close, selected-session flatten, pause/resume entries, cancel pending intents, risk-budget update, reconcile, and page-level LONG+SHORT flatten.
+- Dashboard `/paper_ledger` validation now includes tab-switch behavior: active, archived, and daily summary should render immediately after switching while active sessions keep 3-second near-real-time refresh.
 - Emergency kill switch: implemented for paper through idempotent `flatten-both` plus `cancel_pending_intents`.
 
 Validation:
@@ -140,6 +142,26 @@ Validation:
 - Day 3: reconciliation command and local-feed fault injection.
 - Day 4: Kite-live paper with close-one, close-session, and flatten-all drills.
 - Day 5: REAL_DRY_RUN payload generation only, no order placement.
+
+### Test Gap Notes (pending from this round)
+
+- Add negative-path coverage for dashboard interactions that currently rely on runtime UI state:
+  - tab switch handlers, empty-state transitions, and stale container handling for `/paper_ledger`.
+- Add regression coverage for command/refresh sequencing:
+  - `send-command` during locked live writer windows.
+  - concurrent archive/ledger fetch paths for same `run_id`.
+- Add one end-to-end operator drill in paper:
+  - issue `close_positions` for one symbol, then verify remaining position monitoring stays active and new entries can be paused/resumed during the same run.
+
+### Test Items Completed (2026-04-28)
+
+- Added dashboard tab event parser regression coverage for NiceGUI model-value payload shapes.
+- Added schema-tolerant legacy backtest row ordering coverage so `get_backtest_trades()` no longer
+  assumes `entry_time`/`exit_time`.
+- Added additional operator-control replay/unit coverage for:
+  - backtest reconciliation and dry-run archive workflows
+  - replay orchestration ordering guards
+  - paper archive exit-reason normalization and legacy trade-list handling
 
 ## Hard Rules
 

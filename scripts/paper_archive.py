@@ -32,15 +32,23 @@ def _position_to_trade_row(session: PaperSession, position: PaperPosition) -> di
     pnl_pct = (pnl / position_value * 100.0) if position_value else 0.0
     trail_state = position.trail_state or {}
     raw_exit_reason = str(
-        trail_state.get("exit_reason") or trail_state.get("close_reason") or "TIME"
+        trail_state.get("exit_reason")
+        or trail_state.get("close_reason")
+        or getattr(position, "exit_reason", None)
+        or "TIME"
     )
     # Normalize legacy/paper-only exit reason values to backtest_results CHECK constraint values.
     exit_reason_map = {
         "SL": "INITIAL_SL",
         "MANUAL_FLATTEN": "TIME",
+        "MANUAL_CLOSE": "TIME",
+        "MANUAL": "TIME",
+        "OPERATOR_CLOSE": "TIME",
+        "CLOSE_POSITIONS": "TIME",
+        "CLOSE_ALL": "TIME",
         "FLATTEN": "TIME",
     }
-    exit_reason = exit_reason_map.get(raw_exit_reason, raw_exit_reason)
+    exit_reason = exit_reason_map.get(raw_exit_reason.strip().upper(), raw_exit_reason)
     sl_phase = str(trail_state.get("sl_phase") or "PROTECT")
 
     return {

@@ -44,6 +44,8 @@ class ReplicaSync:
     """
 
     MAX_REPLICA_VERSIONS = 2
+    REPLACE_ATTEMPTS = 20
+    REPLACE_RETRY_SLEEP_SEC = 0.1
 
     def __init__(
         self,
@@ -162,6 +164,21 @@ class ReplicaSync:
     def _quote_identifier(name: str) -> str:
         return '"' + name.replace('"', '""') + '"'
 
+    def _replace_with_retry(self, source: Path, target: Path) -> None:
+        """Replace a replica file, tolerating transient Windows reader locks."""
+        last_error: OSError | None = None
+        for attempt in range(1, self.REPLACE_ATTEMPTS + 1):
+            try:
+                source.replace(target)
+                return
+            except OSError as exc:
+                last_error = exc
+                if attempt >= self.REPLACE_ATTEMPTS:
+                    break
+                time.sleep(self.REPLACE_RETRY_SLEEP_SEC)
+        assert last_error is not None
+        raise last_error
+
     def _sync_worker(
         self,
         source_conn: duckdb.DuckDBPyConnection | None = None,
@@ -222,12 +239,12 @@ class ReplicaSync:
                     copy_conn.execute("DETACH dstdb")
                 finally:
                     copy_conn.close()
-            tmp_path.replace(final_path)
+            self._replace_with_retry(tmp_path, final_path)
 
             # Atomic pointer write (write-to-tmp, rename)
             pointer_tmp = self.latest_pointer.with_suffix(".latest.tmp")
             pointer_tmp.write_text(f"v{version}")
-            pointer_tmp.replace(self.latest_pointer)
+            self._replace_with_retry(pointer_tmp, self.latest_pointer)
 
             with self._sync_lock:
                 self._current_version = version

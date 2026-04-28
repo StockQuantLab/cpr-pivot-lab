@@ -458,7 +458,10 @@ class PaperDB:
         """
         if self._sync:
             self._sync.mark_dirty()
-            self._sync.force_sync(self.con)
+            try:
+                self._sync.force_sync(self.con)
+            except Exception as exc:
+                logger.warning("Paper replica force_sync skipped after error: %s", exc)
 
     def defer_sync(self) -> None:
         """Defer replica sync until flush_deferred_sync() is called.
@@ -478,7 +481,10 @@ class PaperDB:
         """
         self._sync_deferred = False
         if self._sync_dirty and self._sync:
-            self._sync.force_sync(self.con)
+            try:
+                self._sync.force_sync(self.con)
+            except Exception as exc:
+                logger.warning("Paper deferred replica sync skipped after error: %s", exc)
             self._sync_dirty = False
 
     # ------------------------------------------------------------------

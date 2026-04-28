@@ -896,6 +896,19 @@ async def run_live_session(
     session = await _load_session(session_id, deps)
     if session is None:
         return {"session_id": session_id, "error": "session not found"}
+    session_status = str(getattr(session, "status", "") or "").upper()
+    if session_status in {"COMPLETED", "CANCELLED"}:
+        logger.info(
+            "[%s] Session already terminal at startup status=%s — no live loop started",
+            session_id,
+            session_status,
+        )
+        return {
+            "session_id": session_id,
+            "final_status": session_status,
+            "terminal_reason": f"startup_db_status:{session_status.lower()}",
+            "cycles": 0,
+        }
 
     trade_date = _resolve_trade_date(session)
     strategy = str(getattr(session, "strategy", "") or "CPR_LEVELS")
@@ -926,7 +939,7 @@ async def run_live_session(
 
     register_session_start()
     _start_alert_dispatcher()  # start consumer eagerly so first alerts are not delayed
-    _was_already_active = getattr(session, "status", "") == "ACTIVE"
+    _was_already_active = session_status not in {"PLANNING", ""}
     if session.status != "ACTIVE":
         session = await _update_session(session_id, deps, status="ACTIVE", notes=notes)
         force_paper_db_sync(get_paper_db())
@@ -1021,8 +1034,9 @@ async def run_live_session(
         )
     else:
         logger.info(
-            "[%s] Session already ACTIVE — skipping duplicate SESSION_STARTED alert",
+            "[%s] Session already started status=%s — skipping duplicate SESSION_STARTED alert",
             session_id,
+            session_status,
         )
 
     stale_timeout = max(0, int(getattr(session, "stale_feed_timeout_sec", 0) or 0))
@@ -1411,6 +1425,7 @@ async def run_live_session(
                     session_id,
                     notes="manual_flatten_signal",
                     feed_state=live_feed_state,
+                    emit_summary=False,
                 )
                 if _reconcile_live_session(
                     session_id=session_id,
@@ -1456,6 +1471,7 @@ async def run_live_session(
                                 session_id,
                                 notes=f"admin_{_reason}_{_requester}",
                                 feed_state=live_feed_state,
+                                emit_summary=False,
                             )
                             if _reconcile_live_session(
                                 session_id=session_id,

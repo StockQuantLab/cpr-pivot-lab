@@ -125,6 +125,63 @@ def test_archive_completed_session_stamps_paper_metadata_and_coexists_with_backt
         db.close()
 
 
+def test_archive_completed_session_normalizes_manual_close_exit_reason(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    db = BacktestDB(db_path=tmp_path / "manual-close-archive.duckdb")
+    try:
+        session = SimpleNamespace(
+            session_id="paper-manual",
+            strategy="CPR_LEVELS",
+            status="COMPLETED",
+            symbols=["ZAGGLE"],
+            strategy_params={"direction_filter": "SHORT"},
+            max_daily_loss_pct=0.03,
+            max_positions=10,
+            max_position_pct=0.10,
+            mode="LIVE",
+            trade_date="2026-04-28",
+            portfolio_value=1_000_000,
+        )
+        position = SimpleNamespace(
+            position_id="pos-manual",
+            session_id="paper-manual",
+            symbol="ZAGGLE",
+            direction="SHORT",
+            status="CLOSED",
+            qty=100,
+            entry_price=100.0,
+            stop_loss=102.0,
+            target_price=96.0,
+            trail_state={"close_reason": "MANUAL_CLOSE"},
+            entry_time=datetime(2026, 4, 28, 10, 30),
+            exit_time=datetime(2026, 4, 28, 10, 55),
+            exit_price=99.0,
+            exit_reason="MANUAL_CLOSE",
+            pnl=100.0,
+        )
+        fake_paper_db = SimpleNamespace(
+            get_session=lambda sid: session if sid == "paper-manual" else None,
+            get_session_positions=lambda sid, statuses=None: (
+                [position] if sid == "paper-manual" else []
+            ),
+        )
+
+        monkeypatch.setattr(paper_archive, "get_backtest_db", lambda: db)
+        monkeypatch.setattr(paper_archive, "get_paper_db", lambda: fake_paper_db)
+
+        payload = paper_archive.archive_completed_session("paper-manual")
+
+        assert payload["archived"] is True
+        row = db.con.execute(
+            "SELECT exit_reason FROM backtest_results WHERE run_id = 'paper-manual'"
+        ).fetchone()
+        assert row == ("TIME",)
+    finally:
+        db.close()
+
+
 def test_get_runs_with_metrics_handles_legacy_run_metadata_without_execution_mode(
     tmp_path,
 ) -> None:

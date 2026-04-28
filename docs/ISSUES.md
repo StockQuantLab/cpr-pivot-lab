@@ -7,6 +7,977 @@ Supersedes: `docs/PARITY_INCIDENT_LOG.md` (contents migrated below).
 
 ---
 
+## 2026-04-28 — BUG: pivot-baselines parent process blocks child backtests
+
+**Status:** FIXED
+**Severity:** Medium — baseline refresh can fail all 8 variants before doing any strategy work
+
+### Symptom
+
+`pivot-baselines --start 2025-01-01 --end 2026-04-28` failed every variant immediately with:
+
+```text
+Another DuckDB write process is running (PID ...)
+Only one write connection is allowed at a time.
+```
+
+### Root Cause
+
+`pivot-baselines` closed the parent market DB handle before entering the run loop, but
+`_build_backtest_args()` reopened `market.duckdb` to check whether `full_<end_date>` existed and
+kept that handle open while spawning `pivot-backtest`. The child process then correctly refused to
+start because the parent process still held the market writer lock.
+
+### Fix Applied 2026-04-28
+
+- `engine/baselines_cli.py`: `_build_backtest_args()` now closes the parent market DB handle in a
+  `finally` block before the child process is spawned.
+- `tests/test_baselines_cli.py`: added regression coverage that verifies `_build_backtest_args()`
+  releases the parent market DB connection.
+
+Validation:
+- `uv run pytest tests/test_baselines_cli.py::test_build_backtest_args_closes_parent_market_db tests/test_baselines_cli.py::test_build_backtest_args_includes_progress_file tests/test_baselines_cli.py::test_build_backtest_args_prefers_saved_universe_snapshot -q` -> `3 passed`
+- `uv run ruff check engine/baselines_cli.py tests/test_baselines_cli.py` -> clean
+
+---
+
+## 2026-04-28 — BASELINE: extending CPR baselines with a new dated universe changes prior-window trades
+
+**Status:** OPEN — old baselines were preserved; do not promote the 2026-04-28 rerun until policy is decided
+**Severity:** Medium — baseline comparison can look like strategy drift even when the strategy code is unchanged
+
+### Symptom
+
+The 2026-04-28 canonical CPR baseline rerun completed all 8 variants, but the overlap check against
+the existing 2026-04-27 baselines did not reproduce the `2025-01-01..2026-04-27` rows exactly.
+
+Examples:
+
+- `STD_LONG`: overlap trade delta `-13`, overlap P&L delta `-₹1,931.59`
+- `STD_SHORT`: overlap trade delta `-16`, overlap P&L delta `-₹10,527.01`
+- `RISK_SHORT_CMP`: overlap trade delta `-17`, overlap P&L delta `-₹65,351.00`
+
+### Root Cause / Finding
+
+The previous baseline runs used a 2029-symbol universe. The 2026-04-28 saved universe
+`full_2026_04_28` contains 2015 symbols. These 14 symbols were present in the old run metadata but
+absent from the new dated universe:
+
+```text
+GLOBECIVIL, KHAICHEM, MANAKSTEEL, NAGREEKCAP, NINSYS, OSWALAGRO, PENINLAND,
+RUDRA, SADHNANIQ, SARVESHWAR, SEJALLTD, SHEKHAWATI, SHYAMTEL, VAISHALI
+```
+
+Six of those symbols had historical trades before 2026-04-28, and removing them can also change
+same-bar slot filling/ranking outcomes for other symbols. Therefore the total P&L delta is not only
+the 2026-04-28 trading day.
+
+### Required Follow-Up
+
+- Decide baseline policy before cleanup:
+  - continuity baseline: rerun 2026-04-28 using the exact old 2029-symbol reference universe, then
+    compare overlap again;
+  - current-tradeable baseline: accept `full_2026_04_28`, but document that old/new deltas include
+    universe churn and are not a pure daily delta.
+- Add an automated overlap gate to `pivot-baselines` so promotion/cleanup is blocked when the prior
+  window does not match within tolerance.
+
+---
+
+## 2026-04-28 — POLICY/BUG: Canonical universe must not shrink daily because a few symbols are missing
+
+**Status:** OPEN — fix before the next canonical baseline refresh
+**Severity:** High — shrinking the baseline/live universe makes backtests non-comparable and can hide live-trading coverage gaps
+
+### Symptom
+
+The 2026-04-28 dated universe `full_2026_04_28` had 2015 symbols, while the existing canonical
+baseline universe had 2029 symbols. This caused historical baseline deltas to change before Apr-28,
+even though the strategy overlap should have been identical.
+
+Daily universe shrink is the wrong default for canonical baselines. A few symbols being delisted,
+suspended, or missing records on a day should not cause the entire canonical universe to be reduced
+and historical runs to become non-comparable.
+
+### Required Policy
+
+- Create a stable canonical CPR baseline/live universe tomorrow, expected around the full available
+  symbol set (~2105 symbols; exact count to be confirmed from current market data).
+- Use the same canonical universe for:
+  - baseline backtests
+  - daily replay / local-feed parity
+  - live paper trading candidate preparation
+- Do not regenerate canonical baseline identity from only today's tradeable/missing-data subset.
+- Treat missing data for a small number of symbols as symbol/day sparsity, not a reason to shrink the
+  whole canonical universe.
+
+### Required Code Behaviour
+
+- Backtest and live preparation should load the canonical universe and skip only symbols that lack
+  the required setup/candle rows for the specific day being processed.
+- Live/paper should continue with the available symbols when a few symbols are missing data.
+- Missing-symbol/day counts should be logged and surfaced in readiness/quality output.
+- Baseline comparison should store and display the universe name and symbol count clearly.
+- `pivot-baselines` should block promotion if the new run uses a different universe from the
+  previous canonical baseline unless the operator explicitly opts into a universe migration.
+
+### Tomorrow's Action
+
+1. Build/save a canonical universe snapshot around the full available symbol set (~2105 symbols).
+2. Make canonical baseline and live commands use that universe by default.
+3. Confirm missing records are skipped per symbol/day without aborting the whole run.
+4. Rerun all 8 baselines from `2025-01-01` to `2026-04-28` on that stable universe only after the
+   universe policy/code path is verified.
+
+---
+
+## 2026-04-28 — PROCESS: costly baseline reruns started before isolating the mismatch
+
+**Status:** OPEN — process guard needed
+**Severity:** Medium — wastes time and creates confusing partial runs during active trading-day analysis
+
+### Symptom
+
+After the first 2026-04-28 baseline rerun showed unexpected old-vs-new deltas, a continuity rerun
+using the old 2029-symbol universe was started to isolate Apr-28 impact. The rerun was technically
+useful, but it was started before confirming with the operator and before narrowing the investigation
+to the two daily-reset risk variants.
+
+This created confusing partial runs such as:
+
+- `920f14ee4ea7` — `STD_LONG_CONT`
+- `026505f8d6c1` — `STD_SHORT_CONT`
+- `82b6b8c1e3fa` — `RISK_LONG_CONT`
+
+### Root Cause / Finding
+
+The correct diagnostic sequence should have been:
+
+1. Compare one old/new pair on the overlapping window through the prior end date.
+2. If overlap drifts, inspect run metadata, universe, and changed strategy code before rerunning.
+3. If a rerun is still needed, run only `RISK_LONG daily-reset` and `RISK_SHORT daily-reset` first.
+4. Run the full 8-baseline campaign only after the operator explicitly approves it.
+
+The pairwise check later showed that the promoted `82b6b8c1e3fa` RISK LONG daily-reset run
+matched its retired Apr-27 predecessor exactly through `2026-04-27`; its total delta was only
+the Apr-28 LONG result:
+
+- overlap trade delta: `0`
+- overlap P&L delta: `₹0.00`
+- Apr-28 trades: `31`
+- Apr-28 P&L: `-₹2,065.71`
+
+### Required Follow-Up
+
+- Add a `pivot-baselines` pre-promotion overlap gate that compares prior-window trades/P&L before
+  allowing cleanup or documentation promotion.
+- Add a lightweight command or runbook step for single-pair validation:
+  `RISK_LONG daily-reset` and `RISK_SHORT daily-reset` only.
+- Do not start full 8-run reruns without explicit operator approval.
+- Reconcile Apr-28 LONG paper-vs-backtest separately; the live Kite paper LONG had fewer trades and
+  a different P&L than the Apr-28 backtest day.
+
+---
+
+## 2026-04-28 — BUG: Cleanup can update live DuckDB but leave dashboard replica stale
+
+**Status:** FIXED — replica pointer/file publication now retries transient Windows locks
+**Severity:** Medium — dashboard can show deleted drill sessions after cleanup even though live DB rows are gone
+
+### Symptom
+
+After deleting drill paper sessions and archived PAPER runs, the dashboard could still show stale
+sessions/runs until a later sync or dashboard restart.
+
+### Root Cause
+
+Cleanup writes to the live DuckDB files and then publishes versioned dashboard replicas.
+On Windows, the dashboard can briefly hold the replica pointer file while polling it. If
+`os.replace()` hits that exact moment, replica publication raises `PermissionError`.
+
+For `paper.duckdb`, `PaperDB.force_sync()` intentionally catches sync exceptions to avoid crashing
+live trading. That made cleanup appear successful while the dashboard kept reading the previous
+replica version.
+
+### Fix Applied 2026-04-28
+
+- `db/replica.py`: added bounded retries around both replica DB file replacement and pointer-file
+  replacement.
+- `tests/test_backtest_replica_migration.py`: added regression coverage for transient
+  `PermissionError` during replacement.
+
+Validation:
+- Live and replica DBs both show only the two actual 2026-04-28 Kite sessions after cleanup.
+- `uv run pytest tests/test_backtest_replica_migration.py::test_replica_force_sync_publishes_snapshot tests/test_backtest_replica_migration.py::test_replica_replace_retries_transient_permission_error tests/test_backtest_replica_migration.py::test_backtest_delete_runs_forces_replica_publish tests/test_backtest_replica_migration.py::test_market_delete_runs_forces_replica_publish -q` -> `4 passed`
+- `uv run ruff check db/replica.py tests/test_backtest_replica_migration.py` -> clean
+
+---
+
+## 2026-04-28 — PARITY: live-local drill exceeded max_positions and is not a valid replay baseline
+
+**Status:** INVESTIGATED — current replay path obeys the cap; archived `CPR_LEVELS_LONG-2026-04-28-live-local` should not be used as a parity baseline
+**Severity:** High — historical drill overstates trade count and P&L by allowing more than 10 concurrent LONG positions
+
+### Symptom
+
+The 28-Apr LONG local-feed live drill archived as:
+
+- `CPR_LEVELS_LONG-2026-04-28-live-local`: 45 trades, `+6,506.91`
+
+A fresh 28-Apr LONG replay with the same CPR risk preset archived as:
+
+- `paper-cpr_levels-long-2026-04-28-replay-historical`: 28 trades, `+590.78`
+
+The 28 common trades matched exactly by symbol, entry/exit time, exit reason, and P&L.
+The difference was 17 extra `LOCAL_ONLY` trades in the historical live-local drill.
+
+### Root Cause / Finding
+
+The live-local drill breached the configured concurrent cap:
+
+- Session config: `max_positions=10`
+- Observed live-local max concurrent open positions: `19`
+- Fresh replay max concurrent open positions: `10`
+
+The feed-audit bars for the `LOCAL_ONLY` symbols matched replay bars, so this is not price-feed
+drift. The archived live-local drill is therefore an invalid comparison target for replay parity.
+
+### Impact
+
+- Do not compare future replay/backtest results against `CPR_LEVELS_LONG-2026-04-28-live-local`.
+- Its `+6,506.91` P&L is inflated by extra entries that should not exist under the 10-position cap.
+- Use the fresh replay run or rerun live-local with current code under a new session id if a local-feed
+  baseline is needed.
+
+### Validation 2026-04-28
+
+- Deleted extra short local drill: `CPR_LEVELS_SHORT-2026-04-28-live-local`.
+- Preserved the long local drill only as forensic evidence.
+- Fresh replay command:
+  `doppler run -- uv run pivot-paper-trading daily-replay --strategy CPR_LEVELS --preset CPR_LEVELS_RISK_LONG --trade-date 2026-04-28 --no-alerts`
+- Comparison result:
+  - `MATCH`: 28 trades
+  - `LOCAL_ONLY`: 17 trades
+  - `REPLAY_ONLY`: 0 trades
+  - Feed drift on matched bars: 0
+- Focused regression check:
+  `uv run pytest tests/test_paper_session_driver.py::test_process_closed_bar_group_skips_duplicate_candle -q` -> `1 passed`
+
+---
+
+## 2026-04-28 — BUG: Paper ledger tab change raises GenericEventArguments.value AttributeError
+
+**Status:** FIXED
+**Severity:** Low — dashboard-only; no trading/runtime impact
+
+### Symptom
+
+Switching tabs on `/paper_ledger` logged:
+
+```text
+AttributeError: 'GenericEventArguments' object has no attribute 'value'
+```
+
+### Root Cause
+
+The new tab handler used `e.value`, but NiceGUI's raw `update:model-value` event passes the selected
+tab through `GenericEventArguments.args`, not a direct `.value` attribute.
+
+### Fix Applied 2026-04-28
+
+- `web/pages/ops_pages.py`: tab change handler now reads `e.args["value"]` / 
+  `e.args["modelValue"]` first, with a fallback to `e.value`.
+
+## 2026-04-28 — BUG: ADMIN close_all can send partial FLATTEN_EOD
+
+**Status:** FIXED
+**Severity:** Medium — EOD summary can overstate/understate session trade count and P&L in the same trading day
+
+### Symptom
+
+When `close_all` (dashboard command file, operator command, or auto-stop signal) was used while
+positions were still open, Telegram and dashboard replay could report `FLATTEN_EOD` early with a
+partial trade count, then suppress a later terminal summary even after additional closes happened during
+session teardown.
+
+### Root Cause
+
+`flatten_session_positions()` always dispatched `FLATTEN_EOD` for every invocation.
+
+In `scripts/paper_live.py`, admin/early-stop paths already call `flatten_session_positions()`
+before setting `complete_on_exit`, and the final `finally`/terminal cleanup path also calls it again.
+The session can accumulate more closures between the first and final call.
+
+### Fix Applied 2026-04-28
+
+- `engine/paper_runtime.py`: added `emit_summary: bool = True` to `flatten_session_positions()`.
+  Summary dispatch is now optional.
+- `scripts/paper_live.py`: command paths that only request an early stop (`close_all` and
+  `manual_flatten_signal`) now call `flatten_session_positions(..., emit_summary=False)`.
+- The terminal finalization path still dispatches the summary once with final closed count.
+- Added regression coverage in `tests/test_paper_runtime.py::test_flatten_session_positions_can_disable_summary_dispatch`.
+
+### Validation
+
+- Re-ran the relevant behavior path in the live paper drill:
+  `close_all` now closes positions and logs per-trade `TRADE_CLOSED`,
+  and only the terminal path emits the final `FLATTEN_EOD` summary.
+
+## 2026-04-28 — BUG: Trade retrieval assumed legacy columns on historical paper runs
+
+**Status:** FIXED
+**Severity:** Low — dashboard/order summaries display inconsistencies
+
+### Symptom
+
+Loading legacy-style paper/backtest databases that only had minimal `backtest_results`
+columns (`run_id`, `symbol`, `trade_date`, `profit_loss`) failed with:
+
+- `Binder Error: Referenced column "entry_time" not found ...`
+
+and archived ledgers could not render in edge-run databases.
+
+### Root Cause
+
+`get_backtest_trades()` in both `BacktestDB` and `MarketDB` used a fixed
+`ORDER BY trade_date, entry_time, exit_time, symbol` clause. Some archived or
+legacy DBs did not yet have `entry_time` / `exit_time`.
+
+### Fix Applied
+
+- `db/backtest_db.py` and `db/duckdb.py`: build `ORDER BY` dynamically from
+  available columns (`trade_date`, then optional `entry_time`, `exit_time`, `symbol`).
+- `web/pages/ops_pages.py`: cumulative calculations now sort trade rows using only
+  columns present in the loaded DataFrame.
+
+### Impact
+
+- Legacy paper archives and mixed-schema backtest databases now render safely.
+- No change to stored P&L values; only ordering/aggregation stability for UI views.
+
+---
+
+## 2026-04-28 — BUG: Paper ledger archived/daily tabs render empty after tab switch
+
+**Status:** FIXED — keep-alive forced for paper ledger tab panels
+**Severity:** Low — dashboard-only; no trading/runtime impact
+
+### Symptom
+
+`/paper_ledger` showed active sessions but archived sessions and daily summary were blank after switching tabs.
+
+### Root Cause
+
+`ui.tab_panels` tab content can be lazily recreated by the client, which can invalidate
+`archived_content`/`daily_content` component references used by async loader callbacks.
+
+### Fix Applied 2026-04-28
+
+- `web/pages/ops_pages.py`: set `keep_alive=True` on `ui.tab_panels(...)` so tab panel component
+  references remain valid across tab switches.
+
+## 2026-04-28 — BUG: Archived paper session shows non-chronological cumulative P/L
+
+**Status:** FIXED
+**Severity:** Medium — dashboard reporting-only; no trading/runtime impact
+
+### Symptom
+
+Some archived rows showed cumulative P/L values that did not align with displayed per-trade sequence on
+`/paper_ledger` (for example, first row showing a large negative/positive drift while that trade P/L was small).
+
+### Root Cause
+
+`get_backtest_trades()` returned trades ordered by `symbol` then `trade_date`, so dashboard `cum_sum()`
+used the wrong sequence when multiple trades shared the same date.
+
+### Fix Applied 2026-04-28
+
+- `db/backtest_db.py` and `db/duckdb.py`: changed default trade fetch ordering to
+  `trade_date, entry_time, exit_time, symbol`.
+- `web/pages/ops_pages.py`: ledger renderer sorts trades before computing cumulative P/L
+  (`trade_date`, `entry_time`, `exit_time`, `symbol`) so on-screen running P/L is deterministic.
+- `tests/test_backtest_replica_migration.py`: added regression coverage for returned trade order on both
+  `BacktestDB` and `MarketDB`.
+
+---
+
+## 2026-04-28 — BUG: SHORT session archive fails (CHECK constraint on exit_reason — admin-close reason invalid)
+
+**Status:** FIXED — SHORT trades re-archived successfully; paper.duckdb source data remains unchanged
+**Severity:** Medium — session PnL data lost from dashboard/backtest view; no trading harm
+
+### Symptom
+At 15:15 IST (EOD archive):
+```
+ERROR db.backtest_db: Failed to store backtest_results:
+Constraint Error: CHECK constraint failed on table backtest_results with expression
+CHECK((exit_reason IN ('TARGET', 'INITIAL_SL', 'BREAKEVEN_SL', 'TRAILING_SL', 'TIME',
+'REVERSAL', 'CANDLE_EXIT', 'TIME_STOP', 'MOMENTUM_FAIL')))
+```
+SHORT session archive aborted. 40+ trades not written to `backtest.duckdb`.
+LONG session (26 trades, already closed at 11:49) archived successfully.
+
+### Root Cause
+ZAGGLE SHORT was closed via admin command queue at 10:55 IST (`close_positions` action).
+The admin-command close path writes a non-standard `exit_reason` to `paper_positions`
+(e.g. `MANUAL`, `OPERATOR_CLOSE`, `close_positions`, or the reason string from the command JSON).
+When `archive_completed_session()` copies `paper_positions.exit_reason` → `backtest_results.exit_reason`,
+the non-standard value fails the CHECK constraint.
+
+### Fix Applied 2026-04-28
+
+1. `scripts/paper_archive.py` now normalizes paper-only manual/admin close reasons to
+   CHECK-safe analytics values:
+   - `MANUAL_CLOSE` → `TIME`
+   - `MANUAL_FLATTEN` → `TIME`
+   - `MANUAL`, `OPERATOR_CLOSE`, `CLOSE_POSITIONS`, `CLOSE_ALL`, `FLATTEN` → `TIME`
+2. Added a regression test for a `MANUAL_CLOSE` paper position archiving into
+   `backtest_results.exit_reason='TIME'`.
+3. Re-archived `CPR_LEVELS_SHORT-2026-04-28-live-kite`.
+
+Validation:
+- `CPR_LEVELS_SHORT-2026-04-28-live-kite`: 21 archived rows, net P&L `+4,732.57`
+- Archived exit reasons: `BREAKEVEN_SL=13`, `INITIAL_SL=2`, `TARGET=4`, `TIME=2`
+
+### Impact today
+- All SHORT session PnL data is safe in `paper.duckdb` (paper_positions table)
+- Dashboard cannot display SHORT run from today until re-archived
+- Winners affected: NEOGEN +₹1,244 · PATANJALI +₹840 · FEDERALBNK +₹657 · ONMOBILE +₹1,630 · JAMNAAUTO +₹839
+
+---
+
+## 2026-04-28 — BUG: Spurious SESSION_STARTED + duplicate EOD on relaunch of COMPLETED session
+
+**Status:** FIXED — completed sessions are skipped at live-loop startup
+**Severity:** Low — false Telegram alerts only; no PnL or position impact
+
+### Symptom
+After v5 relaunch at 13:40 IST, operator received:
+1. SESSION_STARTED Telegram alert for `CPR_LEVELS_LONG-2026-04-28-live-kite` — already COMPLETED
+   since 11:49 IST (sentinel flatten)
+2. SESSION_COMPLETED / FLATTEN_EOD for the same LONG session at 13:45 — duplicate of 11:49 alerts
+Also: `backtest.duckdb` received a duplicate archive write (26 rows inserted twice for same session).
+
+### Root Cause
+`paper_live.py` checks `_was_already_active = getattr(session, "status", "") == "ACTIVE"`.
+This guard suppresses SESSION_STARTED only when the session is ACTIVE. A COMPLETED session
+returns `_was_already_active = False` → SESSION_STARTED dispatched incorrectly.
+
+The LONG variant then ran `run_live_session()`, processed one bar (13:45), found no positions
+and entry window closed → exited with `NO_TRADES_ENTRY_WINDOW_CLOSED` → archive + EOD alert.
+
+### Fix Applied 2026-04-28
+
+- `scripts/paper_live.py`: `run_live_session()` now returns immediately when the session is already
+  `COMPLETED` or `CANCELLED` at startup.
+- `SESSION_STARTED` is now suppressed for any already-started non-`PLANNING` session, not just
+  `ACTIVE`.
+
+---
+
+## 2026-04-28 — BUG: Replica PermissionError crashes live session on Windows (dashboard file lock)
+
+**Status:** FIXED — paper replica sync errors are non-fatal to the trading loop
+**Severity:** High — live session crashed at 13:36 IST; 5-min gap 13:35→13:40; positions unmonitored
+
+### Symptom
+Engine logged `ERROR db.replica: Replica sync failed for paper` followed by:
+```
+PermissionError: [WinError 5] Access is denied:
+  'data\paper_replica\paper_replica_latest.latest.tmp' ->
+  'data\paper_replica\paper_replica_latest'
+```
+The v4 process (PID 42712) then entered the `_execute_with_retry` retry loop (holding paper.duckdb
+but not processing bars) until killed manually. Sessions remained ACTIVE in DB.
+
+### Root Cause
+`flush_deferred_sync()` is called in the `finally` block of every 5-min bar group:
+```python
+finally:
+    get_paper_db().flush_deferred_sync()
+```
+Inside, `_sync_worker` copies the paper DB to a replica file then atomically renames
+`paper_replica_latest.latest.tmp` → `paper_replica_latest` (the version pointer file).
+
+The dashboard (NiceGUI, restarted ~11:50 IST) reads `paper_replica_latest` on every poll cycle
+to find which replica version to open. On Windows, if the dashboard has `paper_replica_latest`
+open (even for reading), `os.replace()` fails with `WinError 5: Access is denied`.
+
+This PermissionError propagates out of `flush_deferred_sync()` → `finally` block →
+`run_live_session()` → caught by `_execute_with_retry` → 5 retries × 30s wait → process exits.
+
+### Why it appeared at 13:36 but not earlier
+The dashboard was restarted at ~11:50 IST. Fresh dashboard startup may poll the replica pointer
+file more aggressively than an already-warmed dashboard. The issue hadn't occurred in the 4+
+hours before the restart.
+
+### Recovery (2026-04-28)
+- Killed stuck PID 42712 manually (taskkill //F //PID 42712)
+- One launch attempt (bvjnsqoo3) blocked by a surviving retry-loop subprocess (PID 40936)
+- Second relaunch (bvjnsqoo3 as PID 40936) connected successfully; SHORT session resumed at 13:40
+- Gap: 13:35→13:40 (5 min unmonitored)
+
+### Fix Applied 2026-04-28
+
+- `db/paper_db.py`: `force_sync()` and `flush_deferred_sync()` now catch replica sync exceptions,
+  log a warning, and keep the live trading loop running.
+- Replica freshness may lag briefly if Windows blocks the pointer file, but trading state remains
+  authoritative in `paper.duckdb`.
+
+---
+
+## 2026-04-28 — BUG: Dashboard backtest DB connection loops on 'closed pending query result'
+
+**Status:** FIXED — dashboard DB executor serialized
+**Severity:** Medium — WARNING log spam every few seconds; run_metadata shows empty params in UI
+
+### Symptom
+Dashboard (`pivot-dashboard`, :9999) repeatedly logs:
+```
+Failed to fetch run_metadata for run_id=CPR_LEVELS_SHORT-2026-04-27-live-kite
+  (will retry with fresh connection): Invalid Input Error:
+  Attempting to execute an unsuccessful or closed pending query result
+```
+Dashboard remains accessible. Affected run_id shows empty params. Live session unaffected.
+
+### Root Cause
+`_fetch_run_metadata_sync` (`web/state.py:492`) retries with `close_dashboard_backtest_db()` but
+the fresh connection also fails — likely a threading race: two async UI coroutines sharing the same
+DuckDB connection object mid-query. The "closed pending query result" error means one task's query
+state was clobbered by another task's query on the same connection before `.fetchone()` completed.
+
+### Confirmed (code search 2026-04-28)
+`grep -rn "closed pending query"` returns **zero matches** across the entire codebase. The error is
+never explicitly caught anywhere — only the generic `except Exception` in `_fetch_run_metadata_sync`
+handles it. No thread-safety guard exists on `get_dashboard_backtest_db()`.
+
+### Fix Options
+1. Add `threading.Lock` around `get_dashboard_backtest_db()` calls in `web/state.py`.
+2. Restart the dashboard PID only (find with `tasklist | grep python`; kill only that PID — NOT
+   `taskkill //IM python.exe //F` which kills the live session too).
+   **Workaround applied 2026-04-28**: user restarted dashboard; errors stopped.
+
+### Fix Applied 2026-04-28
+
+- `web/state.py`: dashboard DB executor changed from `max_workers=3` to `max_workers=1` so the
+  singleton DuckDB replica connections are not queried concurrently.
+- `web/pages/ops_pages.py`: `/paper_ledger` now has separate tabs for Active Sessions, Archived
+  Sessions, and Daily Summary. The 3-second near-real-time timer refreshes Active Sessions only;
+  Archived Sessions and Daily Summary refresh only when opened or manually refreshed.
+
+### Log files preserved for crash analysis
+- `.tmp_logs/live_20260428_v2.log` — 261 lines, 9:27→10:05 IST (crashed 10:07, exit code 1)
+- `.tmp_logs/live_20260428_v3.log` — 163 lines, 10:10→11:20 IST (crashed 11:24, exit code 1)
+- `.tmp_logs/live_20260428_v4.log` — active from 11:25 IST onward
+- `.tmp_logs/crash_v2_task_output_bk6zyeyyb.txt` — empty (stdout redirected to v2 log)
+- `.tmp_logs/crash_v3_task_output_byeelra2i.txt` — empty (stdout redirected to v3 log)
+- `.tmp_logs/crash_startup_task_output_bogp1h9j5.txt` — "PID: 4066" only (double-bg artifact)
+
+---
+
+## 2026-04-28 — BUG: send-command CLI fails while live session is running (paper.duckdb locked)
+
+**Status:** FIXED — file-only command path skips paper.duckdb startup cleanup
+**Severity:** Medium — operator cannot use `send-command` CLI during active trading; must fall back to manual file writes
+
+### Symptom
+```
+doppler run -- uv run pivot-paper-trading send-command --session-id <id> --action close_positions --symbols <SYM>
+```
+Exits with code 1 immediately:
+```
+[STARTUP BLOCKED] paper.duckdb is locked by PID 50600
+IO Error: Cannot open file "data/paper.duckdb": being used by another process.
+```
+
+### Root Cause
+`paper_trading.py:main()` calls `_pdb().cleanup_stale_sessions()` unconditionally at startup for ALL
+subcommands — including `send-command`, which only needs to write a JSON file to a directory and never
+needs a DB connection. The exclusive DuckDB lock held by the live process blocks this.
+
+### Fix Applied 2026-04-28
+
+- `scripts/paper_trading.py`: `send-command` now skips startup `cleanup_stale_sessions()`, so it
+  writes directly to the command queue without opening `paper.duckdb`.
+- `write_admin_command()` remains the only path needed for this subcommand.
+
+### Workaround (confirmed working 2026-04-28)
+Write the command JSON file directly to the command directory:
+```bash
+mkdir -p ".tmp_logs/cmd_<session_id>"
+echo '{"action":"close_positions","symbols":["SYMBOL"],"reason":"manual","requester":"operator"}' \
+  > ".tmp_logs/cmd_<session_id>/$(date +%s)_close.json"
+```
+Engine polls the directory every ~1s, processes the file, closes the position, sends TRADE_CLOSED
+Telegram alert, and deletes the file. Session continues with remaining positions unaffected.
+
+### Verified behaviour (2026-04-28 10:55 IST)
+- ZAGGLE SHORT closed by admin command within ~25s of file creation ✅
+- Telegram TRADE_CLOSED alert delivered (HTTP 200 OK) ✅
+- Command file deleted after processing ✅
+- Other 5 SHORT positions continued trading uninterrupted ✅
+
+---
+
+## 2026-04-28 — BUG: Silent mid-session crash at 10:07 IST — exit code 1, no traceback, orphaned positions
+
+**Status:** RESUMED — relaunched at 10:10 IST; sessions reused ACTIVE; open positions being monitored
+**Severity:** High — 5-min gap (10:05–10:10 IST) with unmonitored open positions; auto-flatten did NOT fire
+
+### Timeline
+- 10:05:04 IST — last log line (BAJAJHLDNG SHORT entry, NEOGEN TARGET close, all Telegram 200 OK)
+- 10:05–10:07 IST — process died silently, exit code 1, no traceback in log
+- 10:07 IST — background task `bk6zyeyyb` notified as failed
+- 10:07 IST — paper.duckdb unlocked (no WAL), sessions still ACTIVE in DB (no status update)
+- 10:10 IST — relaunch detected ACTIVE sessions, connected KiteTicker, resumed monitoring
+- 10:10 IST — no SESSION_STARTED alerts (duplicate dedup fired correctly)
+
+### What we know
+- Last TICKER_HEALTH at 10:05: `connected=True, ticks=412987, reconnects=0, coverage=98%`
+- No ERROR, Exception, Traceback, or ASYNC_FATAL_EXCEPTION in the log
+- Auto-flatten did NOT fire — same failure mode as 2026-04-27 9:30 crash (process killed before `finally` block)
+- PnL at crash time: SHORT +₹468 (closed), LONG −₹3,525 (closed); unknown OPEN positions
+
+### Likely root cause (under investigation)
+This is the second silent crash in 2 sessions. Both share the same pattern:
+- Session was processing normally (no Kite disconnect, no errors visible)
+- Process killed abruptly (exit code 1) without entering the `finally` auto-flatten path
+- Correlated with a high-event bar earlier (10 simultaneous opens at 9:30 — rate-limited but may have
+  caused slow memory accumulation that OOM-killed the process 35 min later)
+
+Alternative: the `_run_multi_variants` retry logic's outer try/except raised SystemExit(1) after some
+internal invariant check failed between bars. Needs post-mortem log analysis.
+
+### Open questions for post-session analysis
+1. Check if `_should_retry_variant_exit()` with status=COMPLETED before 10:30 caused the retry loop
+   to re-enter `run_live_session()` which then tried to create a new session (conflict with ACTIVE)
+2. Check RAM at time of crash — OOM kills don't write to stdout/stderr
+3. Add process memory logging every 5 min to catch slow leaks
+
+---
+
+## 2026-04-28 — BUG: Second silent crash at 11:24 IST — identical pattern, exit code 1, no traceback
+
+**Status:** RESUMED — v4 relaunched at 11:25 IST; sessions reused ACTIVE; gap 11:20–11:25 (5 min)
+**Severity:** High — recurring silent crash; 3rd crash today across 2 process instances
+
+### Timeline
+- 11:20 IST — last LIVE_BAR logged for both sessions (healthy: connected=True, coverage=100%)
+- 11:20–11:24 IST — process died silently, exit code 1, no traceback, no error in log
+- 11:24 IST — background task `byeelra2i` notified as failed; WAL file present at 11:24
+- 11:25 IST — v4 relaunched, sessions reused, connected in <1s, resuming
+
+### Pattern (all 3 crashes today)
+| Crash | Time | Last healthy log | Gap | Launch |
+|-------|------|-----------------|-----|--------|
+| v2 | 10:07 IST | 10:05 bar | 5 min | v3 at 10:10 |
+| v3 | 11:24 IST | 11:20 bar | 5 min | v4 at 11:25 |
+
+Both crashes:
+- Process was healthy at last logged bar (connected=True, 100% coverage, 0 stale)
+- No ERROR, Exception, Traceback, or async fatal in the log
+- Exit code 1 silently
+- Auto-flatten did NOT fire
+- Sessions remained ACTIVE in DB (no status update)
+- Open positions orphaned for ~5 min then recovered on relaunch
+
+### Suspected cause: `_execute_with_retry` retry loop + tool background-task timeout
+The Claude Code Bash tool with `run_in_background: true` may have an internal session-level
+timeout that kills the background task subprocess after a certain duration, regardless of
+whether the actual process is still running. Both crashes occurred at irregular intervals
+(40 min for v2→v3, 74 min for v3→v4) with no visible trigger in the application logs.
+
+Alternative: The `_execute_with_retry` loop detected a variant exit (for an internal reason
+not written to stdout, e.g. an exception in a non-logging code path) and exhausted 5 retries.
+The retry loop itself exits with `sys.exit(1)` or equivalent.
+
+### Immediate action
+On each crash: kill old Monitor, relaunch (no &, run_in_background:true), arm new Monitor on vN log.
+The ACTIVE session reuse path works cleanly — resume is reliable even after silent crashes.
+
+### Observability Fix Applied 2026-04-28
+`scripts/paper_trading.py` now logs retry decisions and final unhealthy/exceptional variant exits via
+`logger.warning` / `logger.error`, not only `print()`. If stdout detaches again, the log still records
+the retry-loop reason, attempt number, and final failure status.
+
+`pivot-paper-supervisor` was added as an external parent-process launcher for the next live-paper
+session. It starts `daily-live` as a child process with `PYTHONUNBUFFERED=1` and
+`PYTHONFAULTHANDLER=1`, writes child stdout/stderr to `.tmp_logs/supervisor/`, and records heartbeat
+JSONL events containing:
+
+- child PID and command
+- heartbeat timestamps and elapsed seconds
+- stdout/stderr byte counts
+- Windows process memory counters when available
+- final return code and stdout/stderr tails
+
+This does not prove the root cause is fixed. It makes the next recurrence diagnosable.
+
+---
+
+## 2026-04-28 — OPS: Session stuck in PLANNING, no WebSocket connect, no trades (early-launch + stdout-detach)
+
+**Status:** FIXED — Kite live starts now fail fast before 09:16 unless explicitly opted into waiting
+**Severity:** High — ~75 minutes of live trading lost (9:15–9:27 IST); no first-bar entries captured
+
+### Timeline (2026-04-28)
+- 08:58 IST — `daily-live --multi` launched via Claude Code Bash tool with `run_in_background: true` and `&` in command
+- 08:58 IST — Sessions pre-created as PLANNING, process sleeping 1066s until 09:16 IST
+- 08:58 IST — Log file frozen at 3 lines (pre-create × 2 + waiting message); paper replica frozen at v5249
+- 09:16 IST — Kite connect should have fired; no new log lines, session still PLANNING in DB
+- 09:20 IST — Monitoring loop woke up, detected PLANNING (not ACTIVE), log frozen at 08:58
+- 09:21 IST — User confirmed: no SESSION_STARTED alerts, no trades, session lost
+- 09:21 IST — PID 45520 (1.17 GB RAM, alive) killed manually; no relaunch
+
+### Probable Root Causes (two compounding)
+
+**Root Cause 1 — stdout detachment on Windows with double backgrounding:**
+`run_in_background: true` on the Claude Bash tool causes the tool's shell to exit after
+spawning the command. The `&` inside the command creates a second layer of background
+detachment. On Windows Git Bash, the child process may lose its stdout/stderr file
+descriptors when the parent shell exits. Result: the process runs (PID 45520, 1.17 GB),
+but no output reaches `.tmp_logs/live_20260428.log` — and more importantly, any crash
+or timeout during Kite connect happens silently with no log trace.
+
+**Root Cause 2 — early launch leaves a window for Kite connect failure:**
+Launched at 08:58 IST → internal sleep until 09:16 IST (~18 min). Even though the sleep
+is shorter than yesterday's 2.5-hour window, any Kite WebSocket connect failure during
+the 30s timeout fires silently (stdout detached). With no log and no DB write, the
+monitoring loop cannot distinguish "still sleeping" from "connect failed and died."
+
+**Note:** The 30s Kite connect timeout fix (applied 2026-04-27) would cause the process
+to raise `ConnectionError` and die — but since stdout/stderr were detached, neither the
+log file nor stderr shows anything. The session stays PLANNING in DB (no close write).
+
+### What was NOT the cause
+- Data readiness: verified YES at 07:43 and 08:45 IST ✅
+- Universe: `full_2026_04_28` (2015 symbols) existed and was correct ✅
+- Kite token: confirmed valid at 06:38 IST (REST OK, WebSocket ticks received) ✅
+- DuckDB locks: none at launch ✅
+
+### Fix Options
+
+1. **Never use `run_in_background: true` + `&` together on Windows** — pick one:
+   - Use `run_in_background: true` without `&` (tool manages background; shell stays alive, output preserved)
+   - Use `&` with the tool in foreground, tail the log in a separate Monitor arm
+2. **Launch AFTER 9:15 IST** — zero sleep window, Kite connect happens immediately when the
+   live 9:15 candle is being built. Any connect failure is visible within 30s. User's note:
+   *"should not start early"* — confirmed approach for future sessions.
+3. **Add a liveness probe**: Monitor the paper replica timestamp and alarm if sessions stay
+   PLANNING for >3 min past 09:16 IST (would have caught this at 09:19 IST).
+4. **Log to stderr as well**: Ensure the process writes a startup banner to stderr so even
+   if stdout is detached, the tool's stderr capture shows something.
+
+### Complete Root Cause (3 layers — confirmed by code inspection)
+
+**Layer 1 — Kite server overload at market open (primary failure trigger):**
+The process slept 1066s from 8:58 AM, waking at exactly 9:15:46 IST — the peak WebSocket
+connection moment when thousands of Kite users connect at market open. The 30s connect
+timeout (added 2026-04-27 in `6049e59`) fired before Kite's server responded. `ConnectionError`
+raised from `KiteTickerAdapter.connect()` at ~9:16:16 IST.
+Evidence: Second launch at 9:27 IST (12 min after open, past peak load) connected in <1s.
+
+**Layer 2 — Retry loop kept process alive but retrying (amplifier):**
+`retry_on_early_exit=True` in `_run_multi_variants()` (`scripts/paper_trading.py:1381`) catches
+all exceptions from `_execute_with_retry()`. `ConnectionError` from layer 1 triggered 5 retry
+attempts with wait times 10+20+30+40+50s = 150s between attempts, plus 5×30s connect timeouts
+= 300s total. Process alive from 9:15:46 → 9:20:46 IST — exactly when monitoring loop checked
+at 9:20 IST and found the 1.17GB PID still alive but sessions still PLANNING.
+Code path: `ConnectionError` → caught at `paper_trading.py:1150` → `_should_retry_variant_exit()`
+→ retry → all 5 retries fail at peak load → process exits at ~9:20:46 IST.
+
+**Layer 3 — stdout detached by double-backgrounding (masked all evidence):**
+First launch used `run_in_background: true` on the Bash tool AND `&` in the command. On
+Windows Git Bash, when the tool's shell exits after spawning the `&` background job, the
+background process's stdout FILE DESCRIPTOR may be closed or detached from the log file.
+Evidence: The pre-create banner (printed BEFORE the sleep) appeared in the log; the "Launching
+2 variant(s)..." banner (printed AFTER the sleep at line 1107 with `flush=True`) did NOT appear.
+All retry-loop print statements (5 restart messages, 5×30s timeout messages) also absent.
+Without stdout, operators had no visibility that 5 retries were in progress.
+
+**Interaction between layers 2 and 3 (new after Apr 27):**
+Before `6049e59` (Apr 27), `_connected.wait()` had NO timeout. The process hung indefinitely
+on the first Kite connect attempt — retries never triggered. Operators would see a hung process,
+kill it, and relaunch. After `6049e59`, the timeout fires, retry loop fires, and the process
+appears "busy" (alive, 1.17GB) for ~5 minutes while silently failing — more confusing, not less.
+
+**Why "last week this hasn't happened":**
+Last week there was no 30s timeout. The process either (a) connected successfully within the
+wait because server load was lower on that particular day, or (b) hung and the operator killed
+it manually. After Apr 27's timeout fix, the failure mode changed from "hang" to "silent retry
+loop" — same root cause (early launch hitting peak server load), different visible behaviour.
+
+### Lesson for Future Sessions
+- **Launch AFTER 9:16 IST** (or as close to 9:16 as possible). `_wait_until_market_ready()`
+  returns immediately if `now >= 09:16`, so there is zero pre-market sleep and zero window
+  for peak-load Kite connect failures. Today's 9:27 AM launch proved this works.
+- **Never use `run_in_background: true` WITH `&`** in the same Bash tool call on Windows.
+  Pick one: `run_in_background: true` alone (tool manages background, stdout connected), or
+  `&` alone (foreground tool, stdout stays in shell, manually monitor with Monitor tool).
+- **Add "still PLANNING after 3 min past 09:16" check** to the monitoring loop so a silent
+  retry-loop failure is caught within 3 minutes instead of being discovered at 9:20+.
+- Consider increasing `KiteTickerAdapter.connect()` timeout from 30s to 60s to survive the
+  peak market-open load window, or add a short pre-connect back-off retry within `connect()`
+  itself before propagating `ConnectionError` to the outer retry loop.
+
+### Fix Applied 2026-04-28
+
+- `scripts/paper_trading.py`: `daily-live --feed-source kite` now fails fast before `09:16 IST`
+  on the trade date.
+- Operators can still intentionally opt into the old sleep behavior with `--wait-for-open`, but
+  the default path prevents hidden pre-market wait/retry loops.
+
+---
+
+## 2026-04-28 — BUG: Dashboard archived-paper metadata fetch can fail on concurrent DuckDB reads
+
+**Status:** FIXED
+**Severity:** Medium — dashboard page can show error banners even though the dashboard process is still running
+
+### Symptom
+
+Dashboard showed:
+
+```text
+Failed to fetch run_metadata for run_id=CPR_LEVELS_SHORT-2026-04-27-live-kite (will retry with fresh connection): Invalid Input Error: Attempting to execute an unsuccessful or closed pending query result
+```
+
+The dashboard was still listening on port `8501`; this was not a full process crash.
+
+### Root Cause
+
+The archived paper ledger UI calls `aget_run_ledger()` and `aget_run_metadata()` concurrently via
+`asyncio.gather()`. Both calls run in the shared dashboard thread pool and use the same singleton
+read-only DuckDB backtest replica connection.
+
+DuckDB connections are not safe for overlapping queries from multiple threads. Concurrent reads can
+leave the connection with a closed pending result, which then causes the metadata fetch warning and
+retry path.
+
+### Fix Applied 2026-04-28
+
+- `web/state.py`: serialized dashboard DB executor work by changing the shared dashboard executor
+  from `max_workers=3` to `max_workers=1`.
+- This keeps UI DB reads queued instead of running overlapping queries on the singleton DuckDB
+  connections.
+
+Validation:
+- `uv run pytest tests/test_web_state.py -q` → `11 passed`
+- `uv run ruff check web\state.py` → clean
+
+### Pending
+
+- Consider a larger dashboard data-access refactor after today's live paper:
+  - separate per-worker DuckDB read-only connections, or
+  - explicit per-connection locks around backtest, market, and paper DuckDB singletons.
+- Add a concurrency regression test that calls archived paper ledger + metadata concurrently and
+  asserts no DuckDB pending-result failure.
+
+---
+
+## 2026-04-28 — PARITY: backtest portfolio overlay does not persist/use quality rank like live/replay selector
+
+**Status:** PARTIALLY FIXED — backtest portfolio overlay now uses the shared quality-score primitive for same-time slot pressure; candidate-rank persistence still pending
+**Severity:** High — affects max-position / slot-count what-if analysis and can create live-vs-backtest selection drift
+
+### Symptom
+
+After moving live/replay same-bar entry selection to quality sorting, a quick SQL analysis of the
+2025-01-01 → 2026-04-27 saved CPR backtests could not perfectly answer whether reducing
+`max_positions` from 10 to 5 would improve results.
+
+The saved `backtest_results` rows contain only executed trades. They do not persist:
+
+- rejected same-bar candidates
+- candidate quality score
+- selected entry rank within the bar
+- portfolio slot decision reason/order
+
+### Root Cause
+
+The live/replay bar path uses `select_entries_for_bar()` quality sorting:
+
+```text
+quality_score = effective_rr / (1 + or_atr_ratio)
+```
+
+The saved backtest portfolio overlay previously sorted executed candidate trades by:
+
+```text
+trade_date, entry_time, symbol
+```
+
+This means a no-rerun SQL approximation can replay the saved max-10 executed rows, but it cannot
+reconstruct the true "top 5 by quality" candidate set because the quality rank and non-selected
+candidates were never archived.
+
+Additional mistakes found during review:
+
+- The 2026-04-25 issue was marked `FIXED`, but the fix only covered the shared live/replay selector
+  and CPR batch simulation. The later global backtest portfolio overlay still had an older
+  time+symbol ordering path.
+- The Apr 25 issue text claimed backtest was fully aligned, but no test covered the overlay case
+  where two same-time trades compete for one portfolio slot and the alphabetically first symbol is
+  lower quality.
+- `TradeResult` / `backtest_results` persist `or_atr_ratio` but not the effective RR used by
+  the selector, so historical SQL cannot exactly reproduce the selector's quality score.
+
+### Impact
+
+- `max_positions=5` vs `max_positions=10` cannot be confirmed exactly from existing saved rows.
+- Live/replay and backtest may select different symbols when more same-bar candidates exist than
+  available slots.
+- Post-hoc SQL reports can under/over-estimate slot-count changes because they only see already
+  executed max-10 rows.
+
+### Fix Needed
+
+1. DONE 2026-04-28: align the backtest portfolio overlay slot selection with quality ordering for
+   same-time slot pressure.
+2. DONE 2026-04-28: expose the shared `entry_quality_score()` primitive and use it from both
+   live/replay candidate selection and backtest overlay ordering.
+3. PENDING after today's live paper: persist candidate-level diagnostics for CPR runs:
+   - `candidate_quality_score`
+   - `candidate_rank`
+   - `selected_rank`
+   - `selection_status` (`EXECUTED`, `SKIPPED_NO_SLOT`, `SKIPPED_NO_CASH`, etc.)
+   - `slot_capital`, `open_slot_count`, `max_positions`
+4. PENDING after today's live paper: add a parity test where a same-bar candidate set has more candidates than slots and assert
+   backtest, replay, and live-local choose the same symbols in the same order.
+5. PENDING after candidate diagnostics: rerun or replay the 5-position / 2L-position-size scenario
+   from candidate rows instead of approximating from already-executed max-10 trades.
+
+### Current Workaround
+
+For urgent pre-market analysis, use saved-row approximations only as directional evidence:
+
+- synthetic concurrent cap replay from saved max-10 rows
+- first-N-per-day SQL cuts
+- scaled notional estimates
+
+Treat these as estimates, not proof. Exact confirmation requires either a rerun with
+`max_positions=5` / `max_position_pct=0.20` or candidate-rank persistence.
+
+### Fix Applied 2026-04-28
+
+- `engine/bar_orchestrator.py`: exported shared `entry_quality_score()` and
+  `candidate_quality_score()` helpers. Live/replay candidate selection still uses
+  `select_entries_for_bar()`, but the score formula is no longer duplicated.
+- `engine/cpr_atr_strategy.py`: `_apply_portfolio_constraints()` now orders same-time portfolio
+  candidates by reconstructed effective RR using the shared `entry_quality_score()` helper before
+  symbol tie-break.
+- `tests/test_strategy.py`: added a regression test proving the overlay chooses a higher-quality
+  same-time trade over an alphabetically earlier lower-quality trade.
+- `tests/test_bar_orchestrator.py`: added a regression test proving nested live/replay candidates
+  and scalar backtest inputs share the same scoring primitive.
+
+Validation:
+- `uv run pytest tests/test_strategy.py::TestPortfolioExecutionOverlay::test_apply_portfolio_constraints_prioritizes_quality_within_same_entry_time tests/test_strategy.py::TestPortfolioExecutionOverlay::test_apply_portfolio_constraints_can_use_risk_based_sizing tests/test_bar_orchestrator.py -q` → `13 passed`
+- `uv run ruff check engine\bar_orchestrator.py engine\cpr_atr_strategy.py tests\test_strategy.py tests\test_bar_orchestrator.py` → clean
+
+---
+
 ## 2026-04-27 — BUG: Process crashes silently on max-throughput bar (all 10 positions cycling)
 
 **Status:** FIXED — 4 defensive changes applied (rate-limit, batch sync, exception handler, deferred SESSION_STARTED)
@@ -1698,28 +2669,28 @@ Engine changes made in this session:
 
 **Verdict: ACCEPT.** Both directions show clear Calmar improvement with higher PnL and lower MaxDD. The trade-off (lower WR) is expected and acceptable — MOMENTUM_FAIL exits are small losses that prevent deeper SL hits.
 
-### 2026-04-25 follow-up: quality-sort rerun on the clean 8-baseline set
+### 2026-04-28 follow-up: Apr-28 `u2029` CPR baseline promotion
 
-We kept the canonical 2025-01-01 → 2026-04-24 CPR window fixed, enabled quality-sort in the slot
-selector, and reran the 8-baseline family. The new runs matched the prior metrics exactly, so the
-baseline table below is now the active canonical reference set.
+The 2026-04-28 `u2029` runs below supersede the 2026-04-27 `u2029` rows as the active CPR
+comparison set. Daily-reset variants matched the overlapping window through 2026-04-27 exactly;
+compound variants are accepted as current reference rows but should be compared only inside the
+same `u2029` universe family.
 
 New canonical CPR baseline set:
 
 | Mode | Preset | Run ID | Window | P/L | Calmar |
 |------|--------|--------|--------|-----|--------|
-| Daily Reset | `CPR_LEVELS_STANDARD_LONG` | `f4d34a6c2de6` | 2025-01-01 → 2026-04-27 | ₹1,058,288 | 202 |
-| Daily Reset | `CPR_LEVELS_STANDARD_SHORT` | `d4eae08bb94e` | 2025-01-01 → 2026-04-27 | ₹1,146,415 | 101 |
-| Daily Reset | `CPR_LEVELS_RISK_LONG` | `5668d519003b` | 2025-01-01 → 2026-04-27 | ₹1,049,993 | 203 |
-| Daily Reset | `CPR_LEVELS_RISK_SHORT` | `14eafeeb74e5` | 2025-01-01 → 2026-04-27 | ₹1,143,567 | 104 |
-| Compound | `CPR_LEVELS_STANDARD_LONG` | `fd9481c38098` | 2025-01-01 → 2026-04-27 | ₹2,340,300 | 250 |
-| Compound | `CPR_LEVELS_STANDARD_SHORT` | `476eaddfdf1b` | 2025-01-01 → 2026-04-27 | ₹2,950,896 | 176 |
-| Compound | `CPR_LEVELS_RISK_LONG` | `d2a09e41d2b8` | 2025-01-01 → 2026-04-27 | ₹2,352,655 | 251 |
-| Compound | `CPR_LEVELS_RISK_SHORT` | `89ef33527ab4` | 2025-01-01 → 2026-04-27 | ₹2,983,190 | 178 |
+| Daily Reset | `CPR_LEVELS_STANDARD_LONG` | `920f14ee4ea7` | 2025-01-01 → 2026-04-28 | ₹1,055,848 | 201 |
+| Daily Reset | `CPR_LEVELS_STANDARD_SHORT` | `026505f8d6c1` | 2025-01-01 → 2026-04-28 | ₹1,149,596 | 101 |
+| Daily Reset | `CPR_LEVELS_RISK_LONG` | `82b6b8c1e3fa` | 2025-01-01 → 2026-04-28 | ₹1,047,927 | 202 |
+| Daily Reset | `CPR_LEVELS_RISK_SHORT` | `f7f1a698788f` | 2025-01-01 → 2026-04-28 | ₹1,144,828 | 104 |
+| Compound | `CPR_LEVELS_STANDARD_LONG` | `fa35b2a13877` | 2025-01-01 → 2026-04-28 | ₹2,344,200 | 333 |
+| Compound | `CPR_LEVELS_STANDARD_SHORT` | `b7dfa94cec97` | 2025-01-01 → 2026-04-28 | ₹2,978,877 | 177 |
+| Compound | `CPR_LEVELS_RISK_LONG` | `cd842bcbb076` | 2025-01-01 → 2026-04-28 | ₹2,352,553 | 333 |
+| Compound | `CPR_LEVELS_RISK_SHORT` | `8af633d259e1` | 2025-01-01 → 2026-04-28 | ₹2,998,996 | 178 |
 
-This replaced the earlier Apr 24 CPR reference rows (2026-04-24 → 2026-04-27 extension).
-Use these 8 run IDs for future CPR baseline comparisons unless a later explicitly
-approved strategy change supersedes them.
+Future ~2105-symbol baselines are a universe migration and must be labelled separately. Do not
+compare `u2105` totals against this `u2029` family as a daily extension.
 
 ---
 
@@ -3601,11 +4572,15 @@ These items are intentionally deferred until after the current market-open windo
 important for long-term parity hygiene, but they are not required to complete the immediate
 pre-open workflow.
 
-### 0) Quality-sort for max_positions selection (HIGH — implement next)
+### 0) Quality-sort for max_positions selection (DONE — implemented)
 
 See standalone issue "2026-04-25 — PARITY: max_positions slot selection is non-deterministic"
-above for full design. This is the primary remaining parity gap and also improves strategy
-quality by ensuring the best RR + tightest OR setups get slots over arbitrary-order arrivals.
+for historical context.
+
+`engine/bar_orchestrator.py` now computes a shared candidate quality score
+(`effective_rr / (1 + or_atr_ratio)`), sorts same-bar candidates by descending score,
+and then by symbol for deterministic ties. `engine/cpr_atr_strategy.py` uses the same
+ordering to preserve parity across backtest/replay execution.
 
 ### 1) Shared daily candidate universe snapshot
 

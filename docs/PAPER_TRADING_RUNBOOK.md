@@ -2,6 +2,21 @@
 
 ## Daily Live Trading — Canonical Startup Command
 
+Preferred supervised launch for live-paper days:
+
+```bash
+doppler run -- uv run pivot-paper-supervisor -- \
+  --multi --strategy CPR_LEVELS --trade-date today
+```
+
+This starts `pivot-paper-trading daily-live` as a child process and writes:
+- heartbeat JSONL: `.tmp_logs/supervisor/live_YYYYMMDD_HHMMSS.heartbeat.jsonl`
+- child stdout: `.tmp_logs/supervisor/live_YYYYMMDD_HHMMSS.stdout.log`
+- child stderr: `.tmp_logs/supervisor/live_YYYYMMDD_HHMMSS.stderr.log`
+
+Use the direct command below only when you intentionally do not need process-level exit
+diagnostics:
+
 ```bash
 PYTHONUNBUFFERED=1 doppler run -- uv run pivot-paper-trading daily-live \
   --multi --strategy CPR_LEVELS --trade-date today \
@@ -13,9 +28,14 @@ PYTHONUNBUFFERED=1 doppler run -- uv run pivot-paper-trading daily-live \
   exclusive locking means two separate `daily-live` processes will always fail on the second.
 - `--multi` uses `PAPER_STANDARD_MATRIX` → `CPR_CANONICAL_PARAMS` (= `CPR_LEVELS_RISK_LONG`
   overrides). Risk-based sizing is already baked in. Do NOT add `--preset` with `--multi`.
-- `PYTHONUNBUFFERED=1` is required for real-time log visibility when redirecting to a file.
+- `pivot-paper-supervisor` sets `PYTHONUNBUFFERED=1` and `PYTHONFAULTHANDLER=1` for the child.
+  If the child exits silently, inspect the heartbeat JSONL first; it records PID, return code,
+  elapsed time, log sizes, log tails, and Windows memory counters when available.
+- `PYTHONUNBUFFERED=1` is required for real-time log visibility when using the direct command.
 - Pre-market (8:30–9:10 AM): run `pivot-refresh --since <prev_trading_date>` then
   `pivot-paper-trading daily-prepare --trade-date today --all-symbols` before starting live.
+- Start `daily-live --feed-source kite` at/after 09:16 IST. The CLI now fails fast before
+  09:16 unless `--wait-for-open` is explicitly supplied; do not use the wait mode for normal ops.
 - Do not run backtests while live is running — `market.duckdb` write lock will block startup.
 - Optional reproducibility: `daily-prepare --all-symbols` now auto-saves the resolved symbol
   list as `full_YYYY_MM_DD` in `backtest_universe` inside the canonical `market.duckdb`.
@@ -76,9 +96,8 @@ Expected result:
 
 **Start live paper:**
 ```bash
-PYTHONUNBUFFERED=1 doppler run -- uv run pivot-paper-trading daily-live \
-  --multi --strategy CPR_LEVELS --trade-date today \
-  >> .tmp_logs/live_YYYYMMDD.log 2>&1
+doppler run -- uv run pivot-paper-supervisor -- \
+  --multi --strategy CPR_LEVELS --trade-date today
 ```
 
 **In-session safety drills after LONG/SHORT session IDs exist:**
@@ -255,24 +274,28 @@ Reference sets (Apr 2026):
 | Daily Reset Std SHORT | `1d6e5e93618e` | 2025-01-01 → 2026-04-09 | ₹1,041,450 |
 | Daily Reset Std LONG | `84a85d954f99` | 2025-01-01 → 2026-04-09 | ₹827,381 |
 
-**Current CPR baselines (2026-04-27 quality-sort refresh on all four CPR presets — use these for all future comparisons):**
+**Current CPR baselines (2026-04-28 `u2029` quality-sort refresh on all four CPR presets — use these for current comparisons):**
 
 SHORT presets now use `short_trail_atr_multiplier = 1.25`. LONG keeps `trail_atr_multiplier = 1.0`.
 
 | Mode | Preset | Run ID | Start → End | P/L | Calmar |
 |------|--------|--------|-------------|-----|--------|
-| Daily Reset | `CPR_LEVELS_STANDARD_LONG` | `f4d34a6c2de6` | 2025-01-01 → 2026-04-27 | ₹1,058,288 | 202 |
-| Daily Reset | `CPR_LEVELS_STANDARD_SHORT` | `d4eae08bb94e` | 2025-01-01 → 2026-04-27 | ₹1,146,415 | 101 |
-| Daily Reset | `CPR_LEVELS_RISK_LONG` | `5668d519003b` | 2025-01-01 → 2026-04-27 | ₹1,049,993 | 203 |
-| Daily Reset | `CPR_LEVELS_RISK_SHORT` | `14eafeeb74e5` | 2025-01-01 → 2026-04-27 | ₹1,143,567 | 104 |
-| Compound | `CPR_LEVELS_STANDARD_LONG` | `fd9481c38098` | 2025-01-01 → 2026-04-27 | ₹2,340,300 | 250 |
-| Compound | `CPR_LEVELS_STANDARD_SHORT` | `476eaddfdf1b` | 2025-01-01 → 2026-04-27 | ₹2,950,896 | 176 |
-| Compound | `CPR_LEVELS_RISK_LONG` | `d2a09e41d2b8` | 2025-01-01 → 2026-04-27 | ₹2,352,655 | 251 |
-| Compound | `CPR_LEVELS_RISK_SHORT` | `89ef33527ab4` | 2025-01-01 → 2026-04-27 | ₹2,983,190 | 178 |
+| Daily Reset | `CPR_LEVELS_STANDARD_LONG` | `920f14ee4ea7` | 2025-01-01 → 2026-04-28 | ₹1,055,848 | 201 |
+| Daily Reset | `CPR_LEVELS_STANDARD_SHORT` | `026505f8d6c1` | 2025-01-01 → 2026-04-28 | ₹1,149,596 | 101 |
+| Daily Reset | `CPR_LEVELS_RISK_LONG` | `82b6b8c1e3fa` | 2025-01-01 → 2026-04-28 | ₹1,047,927 | 202 |
+| Daily Reset | `CPR_LEVELS_RISK_SHORT` | `f7f1a698788f` | 2025-01-01 → 2026-04-28 | ₹1,144,828 | 104 |
+| Compound | `CPR_LEVELS_STANDARD_LONG` | `fa35b2a13877` | 2025-01-01 → 2026-04-28 | ₹2,344,200 | 333 |
+| Compound | `CPR_LEVELS_STANDARD_SHORT` | `b7dfa94cec97` | 2025-01-01 → 2026-04-28 | ₹2,978,877 | 177 |
+| Compound | `CPR_LEVELS_RISK_LONG` | `cd842bcbb076` | 2025-01-01 → 2026-04-28 | ₹2,352,553 | 333 |
+| Compound | `CPR_LEVELS_RISK_SHORT` | `8af633d259e1` | 2025-01-01 → 2026-04-28 | ₹2,998,996 | 178 |
 
-The 2026-04-27 rerun extended the canonical baseline set to include Apr 27 data.
-The only delta from the 2026-04-24 baselines is 1 trading day (Apr 27):
-LONG +19 trades (+₹8.8K daily, +₹35K compound), SHORT +3 trades (-₹407 daily, -₹1.4K compound).
+The 2026-04-28 `u2029` rerun extended the canonical baseline set by one trading day from the
+2026-04-27 `u2029` reference set. Daily-reset variants matched the overlapping window exactly
+through 2026-04-27; Apr 28 was the only source of P/L delta for those four runs. Compound variants
+are accepted as the current comparison set, but their compounding path has small prior-window drift.
+
+Future ~2105-symbol baselines are a deliberate universe migration, not a daily extension of this
+`u2029` family. Keep them labelled separately and compare only within the same universe family.
 
 When extending the v2 set to a later end date, rerun these same eight presets and
 compare the overlapping window only. The incremental window should be the only source
@@ -496,9 +519,9 @@ LIVE_DIRECTION_PREFLIGHT session=CPR_LEVELS_SHORT-2026-04-15 resolved=5 pending=
   `connected`, `ticks`, `last_tick_age`, `closes`, `reconnects`, `subs`, `coverage`, `stale`,
   and `missing` counts. Use this to diagnose whether direction resolution failures are caused
   by a transport problem or a data gap.
-- `MARKET_READY_HHMM = "09:16"` — the WebSocket subscription is delayed until 09:16 IST
-  (market open + 1 minute) so the 9:15 candle has time to close before direction resolution
-  uses it. Before 09:16 the startup code sleeps; after 09:16 it subscribes immediately.
+- `MARKET_READY_HHMM = "09:16"` — default live Kite startup now fails fast before 09:16 IST
+  instead of sleeping inside the process. This avoids hidden pre-market wait/retry loops on
+  Windows. Use `--wait-for-open` only for an intentional supervised early launch.
 
 **Failure drills for no-surprises live ops**:
 - `market_data_stale`: use `daily-live --feed-source local` and inject a gap in the feeder, or

@@ -6,6 +6,8 @@ import pytest
 
 from engine.bar_orchestrator import (
     SessionPositionTracker,
+    candidate_quality_score,
+    entry_quality_score,
     minimum_trade_notional_for,
     select_entries_for_bar,
     should_process_symbol,
@@ -117,6 +119,17 @@ def test_select_entries_for_bar_prioritizes_higher_quality_over_alphabetical_ord
 
     selected = select_entries_for_bar(candidates, tracker)
     assert [item["symbol"] for item in selected] == ["AAA"]
+
+
+def test_candidate_quality_score_uses_shared_scalar_score() -> None:
+    candidate = {
+        "symbol": "SBIN",
+        "candidate": {"rr_ratio": 3.0, "or_atr_ratio": 0.5},
+    }
+
+    assert candidate_quality_score(candidate) == pytest.approx(
+        entry_quality_score(effective_rr=3.0, or_atr_ratio=0.5)
+    )
 
 
 def test_compute_position_qty_risk_sizing_respects_slot_cap() -> None:

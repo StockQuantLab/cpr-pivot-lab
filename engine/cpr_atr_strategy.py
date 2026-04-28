@@ -42,6 +42,7 @@ from db.duckdb import MarketDB
 from db.duckdb import get_db as get_market_db
 from engine.bar_orchestrator import (
     SessionPositionTracker,
+    entry_quality_score,
     minimum_trade_notional_for,
     select_entries_for_bar,
     should_process_symbol,
@@ -897,10 +898,24 @@ class CPRATRBacktest:
                 "ending_portfolio_value": round(portfolio_value + total_pnl, 2),
             }
 
-        def _sort_key(trade: TradeResult) -> tuple[str, str, str]:
+        def _trade_quality_score(trade: TradeResult) -> float:
+            if trade.direction == "LONG":
+                risk = float(trade.entry_price - trade.sl_price)
+                reward = float(trade.target_price - trade.entry_price)
+            else:
+                risk = float(trade.sl_price - trade.entry_price)
+                reward = float(trade.entry_price - trade.target_price)
+            effective_rr = reward / risk if risk > 0 else float(self.params.rr_ratio or 1.0)
+            return entry_quality_score(
+                effective_rr=effective_rr,
+                or_atr_ratio=float(trade.or_atr_ratio or 1.0),
+            )
+
+        def _sort_key(trade: TradeResult) -> tuple[str, str, float, str]:
             return (
                 trade.trade_date,
                 trade.entry_time or "99:99",
+                -_trade_quality_score(trade),
                 trade.symbol,
             )
 

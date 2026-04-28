@@ -904,7 +904,12 @@ async def _cmd_daily_live(args: argparse.Namespace) -> None:
     suppress_alerts = bool(getattr(args, "no_alerts", False))
 
     if feed_source == "kite":
-        await _wait_until_market_ready(trade_date)
+        _reject_early_kite_live_start(
+            trade_date,
+            wait_for_open=bool(getattr(args, "wait_for_open", False)),
+        )
+        if bool(getattr(args, "wait_for_open", False)):
+            await _wait_until_market_ready(trade_date)
 
     filtered = pre_filter_symbols_for_strategy(trade_date, symbols, args.strategy, strategy_params)
     if not filtered:
@@ -1169,6 +1174,18 @@ async def _run_multi_variants(
             # ─────────────────────────────────────────────────────────────
 
             wait_sec = retry_wait_base_sec * (attempt + 1)
+            logger.warning(
+                "[%s] Variant exited early: status=%s reason=%s last_bar=%s at=%s "
+                "restart=%d/%d wait_sec=%d",
+                label,
+                final_status,
+                summary["terminal_reason"] or retry_reason,
+                summary["last_bar_hhmm"] or "n/a",
+                now_hhmm,
+                attempt + 1,
+                retry_max,
+                wait_sec,
+            )
             print(
                 f"\n  [{label}] Variant exited early: status={final_status}"
                 f" reason={summary['terminal_reason'] or retry_reason}"
@@ -1178,6 +1195,18 @@ async def _run_multi_variants(
             )
             await asyncio.sleep(wait_sec)
 
+        if isinstance(result, Exception):
+            logger.error(
+                "[%s] Variant finished with exception after retries",
+                label,
+                exc_info=(type(result), result, result.__traceback__),
+            )
+        else:
+            final_summary = _variant_exit_summary(result)
+            if str(final_summary.get("status") or "").upper() in {"FAILED", "STALE", "MISSING"}:
+                logger.error(
+                    "[%s] Variant finished unhealthy after retries: %s", label, final_summary
+                )
         return result
 
     results = list(
@@ -1237,6 +1266,23 @@ async def _wait_until_market_ready(trade_date: str) -> None:
     await asyncio.sleep(wait_sec)
 
 
+def _reject_early_kite_live_start(trade_date: str, *, wait_for_open: bool) -> None:
+    """Fail fast for live Kite starts before the market-ready time."""
+    if wait_for_open:
+        return
+    now = datetime.now(IST)
+    if now.date().isoformat() != trade_date:
+        return
+    ready_hh, ready_mm = (int(x) for x in MARKET_READY_HHMM.split(":"))
+    ready_at = now.replace(hour=ready_hh, minute=ready_mm, second=0, microsecond=0)
+    if now < ready_at:
+        raise SystemExit(
+            f"daily-live --feed-source kite should be launched at/after {MARKET_READY_HHMM} IST. "
+            f"Current time is {now.strftime('%H:%M:%S')} IST. "
+            "Relaunch after market-ready time, or pass --wait-for-open to intentionally sleep."
+        )
+
+
 async def _cmd_daily_live_multi(args: argparse.Namespace) -> None:
     """Run multiple paper variants concurrently in a single process.
 
@@ -1250,6 +1296,11 @@ async def _cmd_daily_live_multi(args: argparse.Namespace) -> None:
 
     feed_source = getattr(args, "feed_source", "kite")
     suppress_alerts = bool(getattr(args, "no_alerts", False))
+    if feed_source == "kite":
+        _reject_early_kite_live_start(
+            trade_date,
+            wait_for_open=bool(getattr(args, "wait_for_open", False)),
+        )
 
     local_union_symbols: list[str] | None = None
     strategy_upper = _assert_cpr_only_strategy(
@@ -1301,7 +1352,8 @@ async def _cmd_daily_live_multi(args: argparse.Namespace) -> None:
         # dashboard sees every PLANNING session immediately, bypassing the
         # 5-second debounce that otherwise only captures the first session.
         _pdb().force_sync()
-        await _wait_until_market_ready(trade_date)
+        if bool(getattr(args, "wait_for_open", False)):
+            await _wait_until_market_ready(trade_date)
 
     if feed_source == "local":
         from engine.local_ticker_adapter import LocalTickerAdapter
@@ -2381,6 +2433,14 @@ def build_parser() -> argparse.ArgumentParser:
                 "rows are missing."
             ),
         )
+        sp.add_argument(
+            "--wait-for-open",
+            action="store_true",
+            help=(
+                f"Allow daily-live to sleep until {MARKET_READY_HHMM} IST when launched early. "
+                "Default is fail-fast before market-ready time."
+            ),
+        )
 
     # -- Subcommands --
 
@@ -2847,9 +2907,11 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
     # Startup: cancel any stale sessions left from a previous crash.
-    stale = _pdb().cleanup_stale_sessions()
-    if stale:
-        print(f"Cleaned up {stale} stale session(s) from previous run(s)", flush=True)
+    file_only_commands = {"send-command"}
+    if getattr(args, "command", "") not in file_only_commands:
+        stale = _pdb().cleanup_stale_sessions()
+        if stale:
+            print(f"Cleaned up {stale} stale session(s) from previous run(s)", flush=True)
     run_asyncio(args.handler(args))
 
 

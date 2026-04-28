@@ -1315,6 +1315,121 @@ async def test_flatten_session_positions_uses_ist_closed_at_and_dispatches_per_t
 
 
 @pytest.mark.asyncio
+async def test_flatten_session_positions_can_disable_summary_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Admin/command paths can close positions early and defer final summary to terminal finalization."""
+    from engine.alert_dispatcher import AlertType
+    from engine.paper_runtime import (
+        flatten_session_positions,
+        set_alert_sink,
+        set_alerts_suppressed,
+    )
+
+    session = SimpleNamespace(
+        session_id="test-flatten-2",
+        strategy="CPR_LEVELS",
+        strategy_params={},
+        max_positions=10,
+        max_daily_loss_pct=0.0,
+        max_position_pct=0.1,
+        portfolio_value=1_000_000.0,
+        trade_date="2026-04-13",
+    )
+
+    open_position = SimpleNamespace(
+        position_id="pos-1",
+        session_id="test-flatten-2",
+        symbol="SUKHJITS",
+        direction="SHORT",
+        status="OPEN",
+        entry_price=175.90,
+        current_qty=568.0,
+        quantity=568.0,
+        stop_loss=180.0,
+        target_price=165.0,
+        last_price=176.34,
+        trail_state={},
+        realized_pnl=None,
+        opened_by="CPR_LEVELS",
+    )
+
+    update_position_calls: list[dict] = []
+    session_state_calls: list[dict] = []
+
+    async def fake_get_session(session_id: str):
+        return session
+
+    async def fake_get_session_positions(session_id: str, *, symbol=None, statuses=None):
+        if statuses == ["OPEN"]:
+            return [open_position]
+        if statuses == ["CLOSED"]:
+            return [
+                SimpleNamespace(
+                    realized_pnl=update_position_calls[0]["realized_pnl"]
+                    if update_position_calls
+                    else None
+                )
+            ]
+        return []
+
+    async def fake_append_order_event(**kwargs):
+        pass
+
+    async def fake_update_position(position_id: str, **kwargs):
+        update_position_calls.append({"position_id": position_id, **kwargs})
+
+    async def fake_update_session_state(session_id: str, **kwargs):
+        session_state_calls.append({"session_id": session_id, **kwargs})
+        return session
+
+    class _FakeCon:
+        def execute(self, sql: str, params: list):
+            # Flatten EOD dedup check — report "not yet sent"
+            return SimpleNamespace(fetchone=lambda: (0,))
+
+    class _FakeDB:
+        con = _FakeCon()
+
+    monkeypatch.setattr("engine.paper_runtime.get_session", fake_get_session)
+    monkeypatch.setattr("engine.paper_runtime.get_session_positions", fake_get_session_positions)
+    monkeypatch.setattr("engine.paper_runtime.append_order_event", fake_append_order_event)
+    monkeypatch.setattr("engine.paper_runtime.update_position", fake_update_position)
+    monkeypatch.setattr("engine.paper_runtime.update_session_state", fake_update_session_state)
+    monkeypatch.setattr("engine.paper_runtime._db", lambda: _FakeDB())
+
+    dispatched: list[tuple] = []
+    set_alerts_suppressed(False)
+    set_alert_sink(lambda t, s, b: dispatched.append((t, s, b)))
+    try:
+        feed_state = SimpleNamespace(raw_state={"symbol_last_prices": {"SUKHJITS": 176.34}})
+        result = await flatten_session_positions(
+            "test-flatten-2",
+            notes="admin-close",
+            feed_state=feed_state,
+            emit_summary=False,
+        )
+    finally:
+        set_alert_sink(None)
+        set_alerts_suppressed(False)
+
+    assert len(update_position_calls) == 1
+
+    trade_closed = [d for d in dispatched if d[0] == AlertType.TRADE_CLOSED]
+    assert len(trade_closed) == 1
+    assert "SUKHJITS" in trade_closed[0][1]
+
+    eod = [d for d in dispatched if d[0] == AlertType.FLATTEN_EOD]
+    assert len(eod) == 0
+
+    assert session_state_calls[-1]["total_pnl"] == pytest.approx(
+        update_position_calls[0]["realized_pnl"]
+    )
+
+    assert result["closed_positions"] == 1
+
+
+@pytest.mark.asyncio
 async def test_flatten_session_positions_eod_dedup_in_memory(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

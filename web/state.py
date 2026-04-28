@@ -54,7 +54,10 @@ class _DashboardDBProxy:
 
 
 db: MarketDB = _DashboardDBProxy()  # type: ignore[assignment]
-_executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="db-worker")
+# Dashboard DuckDB readers share singleton read-only connections. Keep executor
+# work serialized so concurrent UI refreshes do not overlap queries on the same
+# connection and leave DuckDB with a closed pending result.
+_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="db-worker")
 _shutdown_lock = threading.Lock()
 _shutdown_done = False
 

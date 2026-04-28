@@ -64,6 +64,8 @@ pivot-build = "scripts.build_tables:main"
 pivot-db-init = "scripts.init_postgres:main"
 # Paper trading session control
 pivot-paper-trading = "scripts.paper_trading:main"
+# External process supervisor for live paper trading observability
+pivot-paper-supervisor = "scripts.paper_supervisor:main"
 # NiceGUI dashboard
 pivot-dashboard = "web.run_nicedash:main"
 # Data quality check

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from pathlib import Path
 from types import SimpleNamespace
 
 import duckdb
@@ -49,6 +50,99 @@ def _trade_frame(run_id: str, trade_date: str = "2024-03-10") -> pl.DataFrame:
             }
         ]
     )
+
+
+def _trade_frame_unordered(run_id: str) -> pl.DataFrame:
+    return pl.DataFrame(
+        [
+            {
+                "run_id": run_id,
+                "session_id": f"session-{run_id}",
+                "source_session_id": f"source-{run_id}",
+                "execution_mode": "BACKTEST",
+                "symbol": "ZZZZ",
+                "trade_date": "2026-04-28",
+                "direction": "SHORT",
+                "entry_time": "10:00",
+                "exit_time": "10:30",
+                "entry_timestamp": datetime(2026, 4, 28, 10, 0),
+                "exit_timestamp": datetime(2026, 4, 28, 10, 30),
+                "entry_price": 100.0,
+                "exit_price": 101.0,
+                "sl_price": 102.0,
+                "target_price": 99.0,
+                "profit_loss": 100.0,
+                "profit_loss_pct": 1.0,
+                "exit_reason": "TARGET",
+                "sl_phase": "PROTECT",
+                "atr": 2.0,
+                "cpr_width_pct": 0.3,
+                "position_size": 10,
+                "position_value": 1000.0,
+                "mfe_r": 1.4,
+                "mae_r": -0.2,
+                "or_atr_ratio": 0.8,
+                "gap_pct": 0.1,
+            },
+            {
+                "run_id": run_id,
+                "session_id": f"session-{run_id}",
+                "source_session_id": f"source-{run_id}",
+                "execution_mode": "BACKTEST",
+                "symbol": "AAAA",
+                "trade_date": "2026-04-28",
+                "direction": "SHORT",
+                "entry_time": "09:30",
+                "exit_time": "09:50",
+                "entry_timestamp": datetime(2026, 4, 28, 9, 30),
+                "exit_timestamp": datetime(2026, 4, 28, 9, 50),
+                "entry_price": 100.0,
+                "exit_price": 98.5,
+                "sl_price": 102.0,
+                "target_price": 99.0,
+                "profit_loss": -50.0,
+                "profit_loss_pct": -0.5,
+                "exit_reason": "BREAKEVEN_SL",
+                "sl_phase": "PROTECT",
+                "atr": 2.0,
+                "cpr_width_pct": 0.3,
+                "position_size": 10,
+                "position_value": 1000.0,
+                "mfe_r": 1.4,
+                "mae_r": -0.2,
+                "or_atr_ratio": 0.8,
+                "gap_pct": 0.1,
+            },
+        ]
+    )
+
+
+def test_backtest_trades_are_returned_in_chronological_order_in_backtest_db(tmp_path) -> None:
+    db = BacktestDB(db_path=tmp_path / "backtest-order.duckdb")
+    try:
+        db.ensure_backtest_table()
+        db.store_backtest_results(_trade_frame_unordered("order-run-backtest"))
+        rows = db.get_backtest_trades("order-run-backtest")
+    finally:
+        db.close()
+
+    assert rows.height == 2
+    assert rows["symbol"].to_list() == ["AAAA", "ZZZZ"]
+    assert rows["profit_loss"].to_list() == [-50.0, 100.0]
+
+
+def test_backtest_trades_are_returned_in_chronological_order_in_market_db(tmp_path) -> None:
+    db = MarketDB(db_path=tmp_path / "market-order.duckdb")
+    try:
+        db.ensure_backtest_table()
+        db.store_backtest_results(_trade_frame_unordered("order-run-market"))
+        rows = db.get_backtest_trades("order-run-market")
+    finally:
+        db.close()
+
+    assert rows.height == 2
+    assert rows["symbol"].to_list() == ["AAAA", "ZZZZ"]
+    assert rows["profit_loss"].to_list() == [-50.0, 100.0]
 
 
 def _seed_run(db, run_id: str) -> None:
@@ -250,6 +344,29 @@ def test_replica_force_sync_publishes_snapshot(tmp_path) -> None:
         replica_db.close()
 
     assert rows.height == 1
+
+
+def test_replica_replace_retries_transient_permission_error(tmp_path, monkeypatch) -> None:
+    sync = ReplicaSync(tmp_path / "retry.duckdb", tmp_path / "retry-replica")
+    source = tmp_path / "pointer.tmp"
+    target = tmp_path / "pointer"
+    source.write_text("v1")
+    attempts = {"count": 0}
+    original_replace = Path.replace
+
+    def flaky_replace(self: Path, target_path: Path) -> Path:
+        if self == source and attempts["count"] < 2:
+            attempts["count"] += 1
+            raise PermissionError("locked")
+        return original_replace(self, target_path)
+
+    monkeypatch.setattr("db.replica.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr(Path, "replace", flaky_replace)
+
+    sync._replace_with_retry(source, target)
+
+    assert attempts["count"] == 2
+    assert target.read_text() == "v1"
 
 
 def test_market_publish_replica_uses_live_connection(tmp_path) -> None:

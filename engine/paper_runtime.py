@@ -1452,6 +1452,7 @@ async def flatten_session_positions(
     *,
     notes: str | None = None,
     feed_state: FeedState | None = None,
+    emit_summary: bool = True,
 ) -> dict[str, Any]:
     session = await get_session(session_id)
     if session is None:
@@ -1549,25 +1550,28 @@ async def flatten_session_positions(
     # for all exit paths (normal EOD, flatten, flatten-all, auto-flatten on stale).
     await update_session_state(session_id, total_pnl=round(total_realized, 2))
     try:
-        # Skip if nothing to report — zero-trade restart sessions after a FAILED original
-        # should not send a second EOD with 0 trades, 0 PnL.
-        if total_trades == 0 and not closed:
-            logger.debug("FLATTEN_EOD skipped for session %s — no trades to report", session_id)
-        elif session_id in _flatten_eod_sent:
-            # Synchronous in-memory dedup — set before dispatch so concurrent callers
-            # can't race past the check before alert_log is written.
-            logger.debug("FLATTEN_EOD already sent for session %s — skipping duplicate", session_id)
-        else:
-            _flatten_eod_sent.add(session_id)
-            subject, body = _format_risk_alert(
-                reason=notes or "session flatten",
-                net_pnl=total_realized,
-                session_id=session_id,
-                positions_closed=len(closed),
-                total_trades=total_trades,
-                trade_date=getattr(session, "trade_date", None),
-            )
-            _dispatch_alert(AlertType.FLATTEN_EOD, subject, body)
+        if emit_summary:
+            # Skip if nothing to report — zero-trade restart sessions after a FAILED original
+            # should not send a second EOD with 0 trades, 0 PnL.
+            if total_trades == 0 and not closed:
+                logger.debug("FLATTEN_EOD skipped for session %s — no trades to report", session_id)
+            elif session_id in _flatten_eod_sent:
+                # Synchronous in-memory dedup — set before dispatch so concurrent callers
+                # can't race past the check before alert_log is written.
+                logger.debug(
+                    "FLATTEN_EOD already sent for session %s — skipping duplicate", session_id
+                )
+            else:
+                _flatten_eod_sent.add(session_id)
+                subject, body = _format_risk_alert(
+                    reason=notes or "session flatten",
+                    net_pnl=total_realized,
+                    session_id=session_id,
+                    positions_closed=len(closed),
+                    total_trades=total_trades,
+                    trade_date=getattr(session, "trade_date", None),
+                )
+                _dispatch_alert(AlertType.FLATTEN_EOD, subject, body)
     except Exception:
         logger.debug("Alert dispatch for flatten failed (best-effort)", exc_info=True)
     return {"session_id": session_id, "closed_positions": len(closed), "positions": closed}

@@ -1099,6 +1099,55 @@ class TestPortfolioExecutionOverlay:
         assert stats["not_executed_portfolio"] == 1
         assert stats["skipped_no_slots"] == 1
 
+    def test_apply_portfolio_constraints_prioritizes_quality_within_same_entry_time(self):
+        bt = CPRATRBacktest(
+            params=BacktestParams(portfolio_value=100_000, max_positions=1),
+            db=object(),
+        )
+        trades = [
+            TradeResult(
+                run_id="r1",
+                symbol="AAA",
+                trade_date="2023-01-02",
+                direction="LONG",
+                entry_time="09:20",
+                exit_time="09:45",
+                entry_price=100.0,
+                exit_price=101.0,
+                sl_price=99.0,
+                target_price=101.0,
+                profit_loss=1_000.0,
+                profit_loss_pct=1.0,
+                exit_reason="TARGET",
+                position_size=10,
+                or_atr_ratio=2.0,
+            ),
+            TradeResult(
+                run_id="r1",
+                symbol="ZZZ",
+                trade_date="2023-01-02",
+                direction="LONG",
+                entry_time="09:20",
+                exit_time="09:45",
+                entry_price=100.0,
+                exit_price=103.0,
+                sl_price=99.0,
+                target_price=103.0,
+                profit_loss=3_000.0,
+                profit_loss_pct=3.0,
+                exit_reason="TARGET",
+                position_size=10,
+                or_atr_ratio=0.5,
+            ),
+        ]
+
+        executed, stats = bt._apply_portfolio_constraints(trades)
+
+        assert len(executed) == 1
+        assert executed[0].symbol == "ZZZ"
+        assert stats["not_executed_portfolio"] == 1
+        assert stats["skipped_no_slots"] == 1
+
     def test_apply_portfolio_constraints_recomputes_profit_loss_pct(self):
         bt = CPRATRBacktest(
             params=BacktestParams(portfolio_value=100_000, max_positions=1),

@@ -68,6 +68,36 @@ def test_build_backtest_args_prefers_saved_universe_snapshot(monkeypatch):
     assert "--all" not in args
 
 
+def test_build_backtest_args_closes_parent_market_db(monkeypatch):
+    closed = {"value": False}
+
+    class _Row:
+        @staticmethod
+        def fetchone():
+            return None
+
+    class _FakeCon:
+        def execute(self, sql, params=None):
+            if "backtest_universe" in sql:
+                return _Row()
+            raise AssertionError(f"unexpected sql: {sql}")
+
+    class _FakeDB:
+        def __init__(self):
+            self.con = _FakeCon()
+
+    monkeypatch.setattr(db.duckdb, "get_db", lambda: _FakeDB())
+    monkeypatch.setattr(db.duckdb, "close_db", lambda: closed.__setitem__("value", True))
+
+    baselines_cli._build_backtest_args(
+        "2025-01-01",
+        "2026-04-24",
+        {"preset": "CPR_LEVELS_STANDARD_LONG", "compound_equity": False},
+    )
+
+    assert closed["value"] is True
+
+
 def test_find_previous_baselines_matches_legacy_param_signature(monkeypatch):
     captured: dict[str, object] = {}
     closed = {"value": False}

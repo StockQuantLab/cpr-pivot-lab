@@ -1101,6 +1101,7 @@ async def test_cmd_daily_live_kite_feed_waits_until_market_ready(
             max_cycles=1,
             complete_on_exit=False,
             feed_source="kite",
+            wait_for_open=True,
             no_alerts=False,
             multi=False,
         )
