@@ -7,6 +7,7 @@ from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from typing import Any, Protocol
 
+from engine.broker_reconciliation import BrokerOrderSnapshot, BrokerPositionSnapshot
 from engine.execution_safety import (
     OrderRateGovernor,
     build_order_idempotency_key,
@@ -111,6 +112,12 @@ class BrokerAdapter(Protocol):
     async def place_order(self, intent: BrokerOrderIntent) -> BrokerExecutionResult:
         """Place or simulate one order intent."""
 
+    async def fetch_order_snapshots(self) -> list[BrokerOrderSnapshot]:
+        """Read broker order snapshots."""
+
+    async def fetch_position_snapshots(self) -> list[BrokerPositionSnapshot]:
+        """Read broker position snapshots."""
+
 
 class PaperBrokerAdapter:
     mode = "PAPER"
@@ -125,6 +132,12 @@ class PaperBrokerAdapter:
             idempotency_key=intent.idempotency_key(),
             exchange_order_id=None,
         )
+
+    async def fetch_order_snapshots(self) -> list[BrokerOrderSnapshot]:
+        return []
+
+    async def fetch_position_snapshots(self) -> list[BrokerPositionSnapshot]:
+        return []
 
 
 class ZerodhaBrokerAdapter:
@@ -169,6 +182,27 @@ class ZerodhaBrokerAdapter:
         raise RealOrderPlacementDisabledError(
             "Real Zerodha order placement is not implemented in this safety phase."
         )
+
+    async def fetch_order_snapshots(self) -> list[BrokerOrderSnapshot]:
+        if self._kite_client is None:
+            return []
+        orders = self._kite_client.orders()
+        return [BrokerOrderSnapshot.from_mapping(dict(order)) for order in orders or []]
+
+    async def fetch_position_snapshots(self) -> list[BrokerPositionSnapshot]:
+        if self._kite_client is None:
+            return []
+        positions = self._kite_client.positions()
+        day_positions = []
+        if isinstance(positions, dict):
+            day_positions = list(positions.get("day") or positions.get("net") or [])
+        elif isinstance(positions, list):
+            day_positions = positions
+        return [
+            BrokerPositionSnapshot.from_mapping(dict(position))
+            for position in day_positions
+            if abs(float(position.get("quantity") or position.get("net_quantity") or 0.0)) > 1e-9
+        ]
 
 
 async def record_real_dry_run_order(

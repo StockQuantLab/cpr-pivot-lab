@@ -3722,3 +3722,37 @@ and reconciliation.
 - During active live sessions, use `send-command` / `flatten-both`, not direct `flatten-all`, to avoid
   DuckDB writer-lock contention. Reconciliation is automatic in the live loop; the standalone
   `reconcile --strict` command is for explicit diagnostics or gates.
+
+---
+
+## 2026-04-28 — EXECUTION SAFETY: broker reconciliation and pilot guardrails
+
+**Status:** FIXED / IMPLEMENTED
+**Severity:** High — final dry-run gate before any supervised real-order pilot
+
+### Symptom
+
+The paper safety layer could generate Zerodha dry-run payloads, but there was no broker-state
+comparison contract or explicit pilot scope gate.
+
+### Fix Applied
+
+- Added `engine/broker_reconciliation.py` with normalized broker order and position snapshots.
+- Added local-vs-broker reconciliation for missing broker orders, symbol/side/quantity mismatches,
+  missing broker positions, and untracked broker positions.
+- Added read-only `ZerodhaBrokerAdapter.fetch_order_snapshots()` and
+  `fetch_position_snapshots()`; tests verify they do not call `place_order`.
+- Added `pivot-paper-trading broker-reconcile --strict` for supplied broker snapshot JSON.
+- Added `PilotGuardrails` and `pivot-paper-trading pilot-check --strict`.
+- Pilot guardrails require max 2 symbols, quantity 1, max Rs10,000 notional, MIS product, MARKET
+  order type, and explicit `I_ACCEPT_REAL_ORDER_RISK` acknowledgement.
+- Passing pilot guardrails still returns `real_orders_enabled=false`; real order placement remains
+  disabled.
+
+### Validation
+
+- `uv run pytest tests/test_broker_adapter.py tests/test_broker_reconciliation.py -q` → `10 passed`
+- `uv run pytest tests/test_broker_reconciliation.py tests/test_broker_adapter.py tests/test_paper_reconciliation.py -q` → `13 passed`
+- `uv run ruff check engine\broker_adapter.py engine\broker_reconciliation.py scripts\paper_trading.py tests\test_broker_adapter.py tests\test_broker_reconciliation.py` → clean
+- `uv run pivot-paper-trading broker-reconcile --help` → command registered
+- `uv run pivot-paper-trading pilot-check --help` → command registered

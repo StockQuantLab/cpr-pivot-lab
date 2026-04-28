@@ -94,6 +94,53 @@ async def test_real_order_mode_is_blocked_even_with_client() -> None:
 
 
 @pytest.mark.asyncio
+async def test_zerodha_adapter_fetches_read_only_snapshots_without_placing_orders() -> None:
+    class FakeKiteClient:
+        def __init__(self) -> None:
+            self.place_order_called = False
+
+        def place_order(self, **kwargs):  # pragma: no cover - should never be reached
+            self.place_order_called = True
+            raise AssertionError(f"place_order must not be called: {kwargs}")
+
+        def orders(self):
+            return [
+                {
+                    "order_id": "kite-1",
+                    "tradingsymbol": "SBIN",
+                    "transaction_type": "BUY",
+                    "quantity": 1,
+                    "filled_quantity": 1,
+                    "status": "COMPLETE",
+                }
+            ]
+
+        def positions(self):
+            return {
+                "day": [
+                    {
+                        "tradingsymbol": "SBIN",
+                        "quantity": 1,
+                        "product": "MIS",
+                        "exchange": "NSE",
+                    }
+                ]
+            }
+
+    kite = FakeKiteClient()
+    adapter = ZerodhaBrokerAdapter(mode="REAL_DRY_RUN", kite_client=kite)
+
+    orders = await adapter.fetch_order_snapshots()
+    positions = await adapter.fetch_position_snapshots()
+
+    assert orders[0].order_id == "kite-1"
+    assert orders[0].symbol == "SBIN"
+    assert positions[0].symbol == "SBIN"
+    assert positions[0].quantity == 1
+    assert kite.place_order_called is False
+
+
+@pytest.mark.asyncio
 async def test_record_real_dry_run_order_writes_payload_and_dedupes(tmp_path) -> None:
     db = PaperDB(db_path=tmp_path / "paper.duckdb")
     try:

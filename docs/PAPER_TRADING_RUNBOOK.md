@@ -908,6 +908,33 @@ This prints and records the Zerodha payload with `broker_mode=REAL_DRY_RUN`.
 It is safe for payload validation because the adapter does not call Kite `place_order`.
 Real order placement remains disabled in this phase.
 
+**Broker reconciliation check (read-only):**
+```bash
+doppler run -- uv run pivot-paper-trading broker-reconcile \
+  --session-id CPR_LEVELS_LONG-2026-04-27-live-kite \
+  --broker-orders-json broker_orders.json \
+  --broker-positions-json broker_positions.json \
+  --strict
+```
+
+`broker-reconcile` compares local paper orders/positions against supplied broker snapshots. It does
+not call Kite and does not place/cancel orders. The read-only adapter path can map Kite
+`orders()` / `positions()` responses into the same snapshot format for future supervised drills.
+
+**Real-pilot guardrail check (does not enable real orders):**
+```bash
+doppler run -- uv run pivot-paper-trading pilot-check \
+  --symbols SBIN \
+  --order-quantity 1 \
+  --estimated-notional 5000 \
+  --acknowledgement I_ACCEPT_REAL_ORDER_RISK \
+  --strict
+```
+
+The guardrail allows at most 2 symbols, quantity 1, up to Rs10,000 notional, MIS product, and
+MARKET orders. Even when it passes, the payload reports `real_orders_enabled=false`; it is a readiness
+gate, not a switch that enables Zerodha order placement.
+
 **Offline fallback if the live process is already dead or DB status is stale:**
 ```bash
 doppler run -- uv run pivot-paper-trading flatten-all --trade-date today --notes "market_conditions"

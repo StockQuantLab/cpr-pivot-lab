@@ -6,7 +6,7 @@ Scope: build and validate the remaining real-trading safety controls in paper mo
 
 Paper trading has run for multiple weeks and many parity/runtime issues have been fixed. That is enough to start execution-safety work, but not enough to send real orders yet. The next phase is to make paper mode behave like a broker-executed system: queued order intents, throttled dispatch, idempotent retries, reconciliation, and explicit kill switches.
 
-## Status Snapshot - 2026-04-27
+## Status Snapshot - 2026-04-28
 
 Implemented and validated in paper mode:
 
@@ -27,10 +27,14 @@ Implemented and validated in paper mode:
 - Dashboard `/paper_ledger` refreshes the paper replica in-place every 3 seconds by default and shows the latest refresh timestamp.
 - `BrokerAdapter` protocol and `ZerodhaBrokerAdapter(mode="REAL_DRY_RUN")` generate Zerodha order payloads without calling `place_order`.
 - `real-dry-run-order` records generated Zerodha payloads in `paper_orders.broker_payload` with `broker_mode=REAL_DRY_RUN`.
+- Read-only broker snapshot fetchers map Zerodha `orders()` / `positions()` responses into normalized reconciliation snapshots.
+- `broker-reconcile --strict` compares local paper orders/positions against supplied broker snapshots.
+- `pilot-check --strict` validates minimal real-pilot scope without enabling real orders.
 
 Still pending:
 
-- Real Zerodha order placement remains disabled and out of scope until dry-run validation passes.
+- Real Zerodha order placement remains disabled.
+- A controlled real small-size pilot still requires explicit operator approval after live dry-run drills.
 
 ## Phase 1 - Paper Execution Gateway
 
@@ -114,10 +118,20 @@ Validation:
 
 Goal: before scaling, verify broker state is the source of truth.
 
-- Poll Zerodha orders/positions after every order burst.
-- Reconcile local state against broker order status and broker positions.
-- If broker/local mismatch is critical, disable entries and flatten or alert depending on severity.
-- Start with 1-2 symbols and minimal size only after all dry-run checks pass.
+- Status: reconciliation scaffolding and pilot guardrails implemented; real placement still disabled.
+- Read-only `ZerodhaBrokerAdapter.fetch_order_snapshots()` maps Kite `orders()` into normalized broker order snapshots.
+- Read-only `ZerodhaBrokerAdapter.fetch_position_snapshots()` maps Kite `positions()` into normalized broker position snapshots.
+- `broker-reconcile` compares local paper state against supplied broker order/position snapshots.
+- Critical mismatch examples: missing broker order, side/symbol/quantity mismatch, missing broker position, untracked broker position.
+- `pilot-check` enforces minimal scope before any future pilot: max 2 symbols, quantity 1, max ₹10,000 notional, MIS + MARKET only, and explicit acknowledgement.
+- Real order placement remains impossible in this phase; pilot guardrails report readiness only and return `real_orders_enabled=false`.
+
+Validation:
+- Unit-test broker/local match.
+- Unit-test untracked broker position is critical.
+- Unit-test missing broker order is critical.
+- Unit-test read-only Kite snapshot fetchers do not call `place_order`.
+- Unit-test pilot guardrail failure and minimal-scope pass.
 
 ## This Week Test Schedule
 
