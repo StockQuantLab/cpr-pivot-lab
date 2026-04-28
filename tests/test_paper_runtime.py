@@ -10,7 +10,7 @@ import pytest
 
 import engine.paper_runtime as paper_runtime
 from engine.bar_orchestrator import SessionPositionTracker
-from engine.cpr_atr_strategy import BacktestParams, DayPack
+from engine.cpr_atr_strategy import BacktestParams, CPRLevelsParams, DayPack
 from engine.paper_runtime import (
     PaperRuntimeState,
     _format_close_alert,
@@ -893,6 +893,105 @@ async def test_advance_open_position_preserves_initial_sl_for_trail_transition(
     assert position.trail_state["current_sl"] == pytest.approx(99.29)
     assert position.stop_loss == pytest.approx(99.29)
     assert len(updates) == 2
+
+
+@pytest.mark.asyncio
+async def test_advance_open_position_honors_momentum_confirm_exit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    updates: list[dict[str, object]] = []
+    events: list[dict[str, object]] = []
+    position = SimpleNamespace(
+        position_id=1,
+        session_id="paper-1",
+        symbol="SBIN",
+        direction="LONG",
+        quantity=100.0,
+        current_qty=100.0,
+        entry_price=100.0,
+        stop_loss=95.0,
+        target_price=115.0,
+        trail_state={
+            "entry_price": 100.0,
+            "direction": "LONG",
+            "initial_sl": 95.0,
+            "current_sl": 95.0,
+            "atr": 2.0,
+            "rr_ratio": 3.0,
+            "breakeven_r": 1.0,
+            "phase": "PROTECT",
+            "highest_since_entry": 100.0,
+            "lowest_since_entry": 100.0,
+            "entry_time": "09:30",
+            "first_target_price": 115.0,
+            "scale_out_pct": 0.0,
+            "scaled_out": False,
+            "initial_qty": 100.0,
+            "candle_count": 0,
+        },
+        realized_pnl=0.0,
+        opened_by="CPR_LEVELS",
+        status="OPEN",
+    )
+
+    async def fake_update_position(position_id: int, **kwargs):
+        updates.append({"position_id": position_id, **kwargs})
+        for key, value in kwargs.items():
+            setattr(position, key, value)
+        return position
+
+    async def fake_append_order_event(**kwargs):
+        events.append(kwargs)
+        return SimpleNamespace(**kwargs)
+
+    monkeypatch.setattr("engine.paper_runtime.update_position", fake_update_position)
+    monkeypatch.setattr("engine.paper_runtime.append_order_event", fake_append_order_event)
+
+    params = BacktestParams(
+        cpr_levels_config=CPRLevelsParams(
+            cpr_shift_filter="ALL",
+            min_effective_rr=2.0,
+            use_narrowing_filter=True,
+            cpr_entry_start="",
+            cpr_confirm_entry=False,
+            cpr_hold_confirm=False,
+            cpr_min_close_atr=0.5,
+            momentum_confirm=True,
+        )
+    )
+    first = await paper_runtime._advance_open_position(
+        position=position,
+        candle={
+            "bar_end": datetime(2024, 1, 1, 9, 35),
+            "open": 100.0,
+            "high": 100.5,
+            "low": 98.5,
+            "close": 99.0,
+            "volume": 1000.0,
+        },
+        params=params,
+    )
+    second = await paper_runtime._advance_open_position(
+        position=position,
+        candle={
+            "bar_end": datetime(2024, 1, 1, 9, 40),
+            "open": 98.0,
+            "high": 99.0,
+            "low": 97.5,
+            "close": 98.5,
+            "volume": 900.0,
+        },
+        params=params,
+    )
+
+    assert first["action"] == "HOLD"
+    assert position.trail_state["momentum_exit_pending"] is True
+    assert second["action"] == "CLOSE"
+    assert second["reason"] == "MOMENTUM_FAIL"
+    assert second["close_price"] == pytest.approx(98.0)
+    assert position.status == "CLOSED"
+    assert position.exit_reason == "MOMENTUM_FAIL"
+    assert events[-1]["fill_price"] == pytest.approx(98.0)
 
 
 @pytest.mark.asyncio

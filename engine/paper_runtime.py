@@ -19,6 +19,7 @@ from db.paper_db import FeedState, PaperPosition, PaperSession, get_paper_db
 from engine.alert_dispatcher import AlertDispatcher, AlertType, get_alert_config
 from engine.bar_orchestrator import SessionPositionTracker
 from engine.cpr_atr_shared import (
+    CompletedCandleDecision,
     normalize_stop_loss,
     regime_snapshot_close_col,
     resolve_completed_candle_trade_step,
@@ -2015,23 +2016,36 @@ async def _advance_open_position(
 
     mark_price = float(candle["close"])
     direction = position.direction.upper()
-    decision = resolve_completed_candle_trade_step(
-        ts=ts,
-        direction=direction,
-        low=float(candle["low"]),
-        high=float(candle["high"]),
-        close=mark_price,
-        time_str=_hhmm(candle["bar_end"]) or "",
-        time_exit=params.time_exit,
-        target_price=first_target_price if scale_out_pct > 0 else final_target_price,
-        current_qty=current_qty,
-        candle_count=candle_count,
-        candle_exit=0,
-        runner_target_price=final_target_price if scale_out_pct > 0 else None,
-        scale_out_pct=scale_out_pct,
-        scale_split=scale_split,
-        scaled_out=scaled_out,
-    )
+    momentum_confirm = bool(getattr(params.cpr_levels, "momentum_confirm", False))
+    if bool(trail_state.get("momentum_exit_pending") or False):
+        decision = CompletedCandleDecision(
+            action="CLOSE",
+            exit_reason="MOMENTUM_FAIL",
+            fills=((current_qty, float(candle["open"])),),
+        )
+    else:
+        if momentum_confirm and candle_count == 1:
+            if (direction == "LONG" and mark_price < float(position.entry_price)) or (
+                direction == "SHORT" and mark_price > float(position.entry_price)
+            ):
+                trail_state["momentum_exit_pending"] = True
+        decision = resolve_completed_candle_trade_step(
+            ts=ts,
+            direction=direction,
+            low=float(candle["low"]),
+            high=float(candle["high"]),
+            close=mark_price,
+            time_str=_hhmm(candle["bar_end"]) or "",
+            time_exit=params.time_exit,
+            target_price=first_target_price if scale_out_pct > 0 else final_target_price,
+            current_qty=current_qty,
+            candle_count=candle_count,
+            candle_exit=0,
+            runner_target_price=final_target_price if scale_out_pct > 0 else None,
+            scale_out_pct=scale_out_pct,
+            scale_split=scale_split,
+            scaled_out=scaled_out,
+        )
 
     pre_update_trail_state = _updated_trail_state(ts, trail_state, candle)
     pre_update_trail_state["candle_count"] = candle_count

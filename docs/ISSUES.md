@@ -131,6 +131,57 @@ and historical runs to become non-comparable.
 
 ---
 
+## 2026-04-28 — PARITY BUG: paper/live ignored CPR momentum-confirm exit while backtest applied it
+
+**Status:** FIXED IN CODE — needs next replay/live validation
+**Severity:** High — live/paper exits can diverge from backtest even when params both say `momentum_confirm=true`
+
+### Symptom
+
+Apr-28 promoted risk baselines and archived Kite paper sessions had poor trade parity:
+
+- LONG backtest `82b6b8c1e3fa`: `31` trades, `-₹2,065.71`
+- LONG live paper `CPR_LEVELS_LONG-2026-04-28-live-kite`: `26` trades, `+₹267.44`
+- SHORT backtest `f7f1a698788f`: `17` trades, `+₹1,261.28`
+- SHORT live paper `CPR_LEVELS_SHORT-2026-04-28-live-kite`: `21` trades, `+₹4,732.57`
+
+The archived run metadata showed both backtest and live/paper had `momentum_confirm=true`, but only
+the backtest rows produced `MOMENTUM_FAIL` exits. Live/paper had no `MOMENTUM_FAIL` exits.
+
+### Root Cause
+
+Backtest calls `simulate_trade_lifecycle(... momentum_confirm=True)` in `engine/cpr_atr_shared.py`.
+That shared lifecycle exits at the next bar's open when the first post-entry candle closes adverse.
+
+Paper/live uses `_advance_open_position()` in `engine/paper_runtime.py` and calls
+`resolve_completed_candle_trade_step()`, but it did not persist or apply the
+`momentum_exit_pending` state. Result: paper/live silently ignored the momentum-confirm exit rule.
+
+### Fix Applied
+
+- `engine/paper_runtime.py`: stores `momentum_exit_pending` in `trail_state` when bar 1 closes
+  adverse and closes at bar 2 open with `exit_reason="MOMENTUM_FAIL"`.
+- `tests/test_paper_runtime.py`: added regression test for bar-1 adverse close -> bar-2 open
+  `MOMENTUM_FAIL` close.
+
+Validation:
+- `.venv\Scripts\python.exe -m pytest tests/test_paper_runtime.py::test_advance_open_position_honors_momentum_confirm_exit tests/test_paper_runtime.py::test_advance_open_position_preserves_initial_sl_for_trail_transition -q` -> `2 passed`
+- `.venv\Scripts\python.exe -m ruff check engine/paper_runtime.py tests/test_paper_runtime.py` -> clean
+
+### Remaining Apr-28 Parity Blockers
+
+This fix does not make the already-archived Apr-28 Kite sessions clean parity targets:
+
+- The live feed audit starts at 09:30, while backtest has 09:20 and 09:25 entries.
+- LONG session metadata shows a 13:40 restart/flatten lifecycle and is not a clean uninterrupted
+  live session.
+- Live sessions used a 749-symbol prefiltered runtime universe; promoted baselines use the `u2029`
+  stable baseline universe and then apply setup/entry filters.
+
+Next validation should use a fresh replay or tomorrow's supervised live session after this fix.
+
+---
+
 ## 2026-04-28 — PROCESS: costly baseline reruns started before isolating the mismatch
 
 **Status:** OPEN — process guard needed
