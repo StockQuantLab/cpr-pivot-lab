@@ -31,6 +31,94 @@ PYTHONUNBUFFERED=1 doppler run -- uv run pivot-paper-trading daily-live \
 - Inspect saved snapshots with `pivot-paper-trading universes` or
   `pivot-paper-trading universes --name full_YYYY_MM_DD`.
 
+## Today's Live-Paper Dry-Run Checklist
+
+Use this compact checklist on live-paper days when validating real-trading safety behaviour.
+The commands below are paper/dry-run only; real Zerodha order placement remains disabled.
+
+**Pre-market gate:**
+```bash
+doppler run -- uv run pivot-data-quality --date today
+doppler run -- uv run python scripts/test_kite_websocket.py
+doppler run -- uv run pivot-paper-trading status
+doppler run -- uv run pivot-paper-trading universes
+```
+
+Required result:
+- `pivot-data-quality` prints `Ready YES`.
+- Kite REST and WebSocket both print `OK`.
+- `status` shows no unexpected active sessions before launch.
+- `universes` includes today's `full_YYYY_MM_DD` snapshot.
+
+**Pre-market broker dry-run checks:**
+```bash
+doppler run -- uv run pivot-paper-trading pilot-check \
+  --symbols SBIN \
+  --order-quantity 1 \
+  --estimated-notional 5000 \
+  --acknowledgement I_ACCEPT_REAL_ORDER_RISK \
+  --strict
+
+doppler run -- uv run pivot-paper-trading real-dry-run-order \
+  --session-id premarket-dryrun-YYYY-MM-DD \
+  --symbol SBIN \
+  --side BUY \
+  --quantity 1 \
+  --role premarket_probe \
+  --event-time YYYY-MM-DDT06:25:00+05:30
+```
+
+Expected result:
+- `pilot-check` returns `ok=true` and `real_orders_enabled=false`.
+- `real-dry-run-order` prints a Zerodha payload with `mode=REAL_DRY_RUN`.
+- Do not run `broker-reconcile` against this standalone premarket dry-run id unless you also
+  created a matching paper session row. Without a session row, `SESSION_MISSING` is expected.
+
+**Start live paper:**
+```bash
+PYTHONUNBUFFERED=1 doppler run -- uv run pivot-paper-trading daily-live \
+  --multi --strategy CPR_LEVELS --trade-date today \
+  >> .tmp_logs/live_YYYYMMDD.log 2>&1
+```
+
+**In-session safety drills after LONG/SHORT session IDs exist:**
+```bash
+doppler run -- uv run pivot-paper-trading reconcile --session-id <LONG_SESSION_ID> --strict
+doppler run -- uv run pivot-paper-trading reconcile --session-id <SHORT_SESSION_ID> --strict
+
+doppler run -- uv run pivot-paper-trading send-command \
+  --session-id <SESSION_ID> --action pause_entries --reason dry_run_drill
+doppler run -- uv run pivot-paper-trading send-command \
+  --session-id <SESSION_ID> --action resume_entries --reason dry_run_drill
+
+doppler run -- uv run pivot-paper-trading send-command \
+  --session-id <SESSION_ID> --action set_risk_budget \
+  --portfolio-value 500000 --max-positions 5 --reason dry_run_reduce_risk
+```
+
+If an open position exists and you intentionally want to test manual exit parity:
+```bash
+doppler run -- uv run pivot-paper-trading send-command \
+  --session-id <SESSION_ID> --action close_positions \
+  --symbols <SYMBOL> --reason dry_run_close_one
+```
+
+For emergency/market-regime drills only:
+```bash
+doppler run -- uv run pivot-paper-trading send-command \
+  --session-id <SESSION_ID> --action close_all --reason dry_run_flatten_one
+
+doppler run -- uv run pivot-paper-trading flatten-both \
+  --trade-date today --reason dry_run_flatten_both
+```
+
+Operational notes:
+- `close_positions`, `close_all`, and `flatten-both` close using the latest live mark/LTP when
+  available; they do not wait for the next 5-minute strategy candle.
+- `set_risk_budget` changes future entries only. Existing open positions keep normal exits unless
+  you also send `close_positions` or `close_all`.
+- Dashboard `/paper_ledger` exposes the same controls and refreshes active paper state every 3s.
+
 ### Universe naming convention (`full_YYYY_MM_DD`)
 
 **The date in the name is the TRADE date — the day you will trade on, not the day the data came from.**
