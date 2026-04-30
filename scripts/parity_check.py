@@ -11,7 +11,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 
-from db.duckdb import get_db
+from db.backtest_db import get_backtest_db
 from engine.cli_setup import configure_windows_stdio
 
 configure_windows_stdio(line_buffering=True, write_through=True)
@@ -34,7 +34,7 @@ class Metrics:
 
 
 def _fetch_metrics(run_id: str) -> Metrics:
-    db = get_db()
+    db = get_backtest_db()
     row = db.con.execute(
         """
         SELECT
@@ -76,7 +76,7 @@ def _fetch_metrics(run_id: str) -> Metrics:
 def _trade_key_stats(
     expected_run_id: str, actual_run_id: str, pl_epsilon: float
 ) -> dict[str, float]:
-    db = get_db()
+    db = get_backtest_db()
     row = db.con.execute(
         """
         WITH expected AS (

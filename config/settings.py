@@ -8,6 +8,8 @@ from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy.engine import URL
 
+from engine.execution_defaults import DEFAULT_MAX_POSITION_PCT, DEFAULT_MAX_POSITIONS
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(case_sensitive=False, extra="ignore")
@@ -38,8 +40,8 @@ class Settings(BaseSettings):
     paper_default_symbols: str | None = Field(default=None)
     paper_max_daily_loss_pct: float = Field(default=0.03)
     paper_max_drawdown_pct: float = Field(default=0.10)
-    paper_max_positions: int = Field(default=10)
-    paper_max_position_pct: float = Field(default=0.10)
+    paper_max_positions: int = Field(default=DEFAULT_MAX_POSITIONS)
+    paper_max_position_pct: float = Field(default=DEFAULT_MAX_POSITION_PCT)
     paper_stale_feed_timeout_sec: int = Field(default=120)
     paper_flatten_time: str = Field(default="15:15:00")
     paper_live_poll_interval_sec: float = Field(default=1.0)

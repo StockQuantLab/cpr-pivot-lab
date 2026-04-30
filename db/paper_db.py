@@ -27,6 +27,11 @@ import polars as pl
 
 from db.replica import ReplicaSync
 from db.replica_consumer import ReplicaConsumer
+from engine.execution_defaults import (
+    DEFAULT_MAX_POSITION_PCT,
+    DEFAULT_MAX_POSITIONS,
+    DEFAULT_PORTFOLIO_VALUE,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -78,11 +83,11 @@ class PaperSession:
     name: str | None = None
     created_by: str | None = None
     stale_feed_timeout_sec: int = 30
-    portfolio_value: float = 1_000_000.0
+    portfolio_value: float = DEFAULT_PORTFOLIO_VALUE
     max_daily_loss_pct: float = 0.03
     max_drawdown_pct: float = 0.10
-    max_positions: int = 10
-    max_position_pct: float = 0.10
+    max_positions: int = DEFAULT_MAX_POSITIONS
+    max_position_pct: float = DEFAULT_MAX_POSITION_PCT
     flatten_time: str = "15:15"
     daily_pnl_used: float = 0.0
     total_pnl: float = 0.0
@@ -295,8 +300,8 @@ class PaperDB:
                 portfolio_value DOUBLE DEFAULT 1000000,
                 max_daily_loss_pct DOUBLE DEFAULT 0.03,
                 max_drawdown_pct DOUBLE DEFAULT 0.10,
-                max_positions  INT DEFAULT 10,
-                max_position_pct DOUBLE DEFAULT 0.10,
+                max_positions  INT DEFAULT 5,
+                max_position_pct DOUBLE DEFAULT 0.20,
                 flatten_time   VARCHAR(10) DEFAULT '15:15',
                 daily_pnl_used DOUBLE DEFAULT 0,
                 total_pnl      DOUBLE DEFAULT 0,
@@ -339,6 +344,16 @@ class PaperDB:
             )
         """)
         self.con.execute("CREATE INDEX IF NOT EXISTS idx_pp_session ON paper_positions(session_id)")
+        self.con.execute(
+            """
+            -- DuckDB does not support partial indexes currently.
+            -- Unique(session_id, symbol, status) is a safe approximation:
+            -- prevents duplicate OPEN rows and still preserves a single closed record
+            -- per symbol for the same session.
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_pp_session_symbol_status
+            ON paper_positions(session_id, symbol, status)
+            """
+        )
 
         self.con.execute("""
             CREATE TABLE IF NOT EXISTS paper_orders (
@@ -377,7 +392,7 @@ class PaperDB:
         )
         self.con.execute("CREATE INDEX IF NOT EXISTS idx_po_session ON paper_orders(session_id)")
         self.con.execute(
-            "CREATE INDEX IF NOT EXISTS idx_po_idempotency ON paper_orders(idempotency_key)"
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_po_idempotency ON paper_orders(idempotency_key)"
         )
 
         self.con.execute("""
@@ -505,11 +520,11 @@ class PaperDB:
         strategy_params: dict | None = None,
         created_by: str | None = None,
         stale_feed_timeout_sec: int = 30,
-        portfolio_value: float = 1_000_000.0,
+        portfolio_value: float = DEFAULT_PORTFOLIO_VALUE,
         max_daily_loss_pct: float = 0.03,
         max_drawdown_pct: float = 0.10,
-        max_positions: int = 10,
-        max_position_pct: float = 0.10,
+        max_positions: int = DEFAULT_MAX_POSITIONS,
+        max_position_pct: float = DEFAULT_MAX_POSITION_PCT,
         flatten_time: str = "15:15",
         mode: str = "replay",
         notes: str | None = None,
@@ -682,11 +697,11 @@ class PaperDB:
             execution_mode=d.get("execution_mode", "LIVE"),
             created_by=d.get("created_by"),
             stale_feed_timeout_sec=d.get("stale_feed_timeout_sec", 120) or 120,
-            portfolio_value=d.get("portfolio_value", 1_000_000.0),
+            portfolio_value=d.get("portfolio_value", DEFAULT_PORTFOLIO_VALUE),
             max_daily_loss_pct=d.get("max_daily_loss_pct", 0.03),
             max_drawdown_pct=d.get("max_drawdown_pct", 0.10),
-            max_positions=d.get("max_positions", 10),
-            max_position_pct=d.get("max_position_pct", 0.10),
+            max_positions=d.get("max_positions", DEFAULT_MAX_POSITIONS),
+            max_position_pct=d.get("max_position_pct", DEFAULT_MAX_POSITION_PCT),
             flatten_time=d.get("flatten_time", "15:15"),
             daily_pnl_used=d.get("daily_pnl_used", 0.0),
             total_pnl=d.get("total_pnl", 0.0),
@@ -728,34 +743,53 @@ class PaperDB:
         qty_value = round(quantity if quantity is not None else (qty or 0))
         current_qty_value = current_qty if current_qty is not None else float(qty_value)
         entry_ts = opened_at or entry_time or now
-        self.con.execute(
-            """
-            INSERT INTO paper_positions (
-                position_id, session_id, symbol, direction, status,
-                entry_price, stop_loss, target_price, pnl, qty,
-                trail_state, entry_time, exit_time, opened_by, current_qty,
-                last_price, signal_id, closed_by, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, 'OPEN', ?, ?, ?, 0, ?, ?, ?, NULL, ?, ?, ?, ?, NULL, ?, ?)
-            """,
-            [
-                pid,
-                session_id,
-                symbol,
-                direction,
-                entry_price,
-                stop_loss,
-                target_price,
-                qty_value,
-                json.dumps(trail_state or {}),
-                entry_ts,
-                opened_by,
-                current_qty_value,
-                last_price,
-                signal_id,
-                now,
-                now,
-            ],
-        )
+        try:
+            self.con.execute(
+                """
+                INSERT INTO paper_positions (
+                    position_id, session_id, symbol, direction, status,
+                    entry_price, stop_loss, target_price, pnl, qty,
+                    trail_state, entry_time, exit_time, opened_by, current_qty,
+                    last_price, signal_id, closed_by, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, 'OPEN', ?, ?, ?, 0, ?, ?, ?, NULL, ?, ?, ?, ?, NULL, ?, ?)
+                """,
+                [
+                    pid,
+                    session_id,
+                    symbol,
+                    direction,
+                    entry_price,
+                    stop_loss,
+                    target_price,
+                    qty_value,
+                    json.dumps(trail_state or {}),
+                    entry_ts,
+                    opened_by,
+                    current_qty_value,
+                    last_price,
+                    signal_id,
+                    now,
+                    now,
+                ],
+            )
+        except duckdb.ConstraintException:
+            existing = self.con.execute(
+                """
+                SELECT
+                    position_id, session_id, symbol, direction, status,
+                    entry_price, stop_loss, target_price, exit_price, exit_reason, pnl,
+                    qty, trail_state, entry_time, exit_time, opened_by, current_qty,
+                    last_price, signal_id, closed_by, created_at, updated_at
+                FROM paper_positions
+                WHERE session_id = ? AND symbol = ? AND status = 'OPEN'
+                ORDER BY updated_at DESC
+                LIMIT 1
+                """,
+                [session_id, symbol],
+            ).fetchone()
+            if existing:
+                return self._row_to_position(existing)
+            raise
         self._after_write()
         return PaperPosition(
             position_id=pid,
@@ -968,16 +1002,51 @@ class PaperDB:
         broker_payload: str | None = None,
         notes: str | None = None,
     ) -> str:
+        oid = f"ord-{uuid.uuid4().hex[:8]}"
+        now = _utcnow_iso()
         if idempotency_key:
+            self.con.execute(
+                """
+                INSERT OR IGNORE INTO paper_orders (
+                    order_id, session_id, position_id, signal_id, symbol, side,
+                    order_type, requested_qty, request_price, fill_price, fill_qty,
+                    status, requested_at, filled_at, exchange_order_id, idempotency_key,
+                    broker_mode, broker_payload, notes,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    oid,
+                    session_id,
+                    position_id,
+                    signal_id,
+                    symbol,
+                    side,
+                    order_type,
+                    requested_qty,
+                    request_price,
+                    fill_price,
+                    fill_qty,
+                    status,
+                    requested_at or now,
+                    filled_at,
+                    exchange_order_id,
+                    idempotency_key,
+                    broker_mode,
+                    broker_payload,
+                    notes,
+                    now,
+                    now,
+                ],
+            )
             existing = self.con.execute(
                 "SELECT order_id FROM paper_orders WHERE idempotency_key = ? LIMIT 1",
                 [idempotency_key],
             ).fetchone()
             if existing and existing[0]:
+                self._after_write()
                 return str(existing[0])
 
-        oid = f"ord-{uuid.uuid4().hex[:8]}"
-        now = _utcnow_iso()
         self.con.execute(
             """
             INSERT INTO paper_orders (
@@ -1451,32 +1520,40 @@ class PaperDB:
         return counts
 
     def cleanup_stale_sessions(self) -> int:
-        """Mark abandoned STOPPING sessions as CANCELLED on startup.
-
-        ACTIVE sessions are intentionally left alone because this code path does
-        not yet have process-level ownership tracking.
-        """
+        """Mark abandoned STOPPING/PLANNING sessions as CANCELLED on startup."""
+        stale_planning_cutoff = "CURRENT_TIMESTAMP - INTERVAL '1 day'"
         count = int(
             self.con.execute(
                 """
                 SELECT COUNT(*)
                 FROM paper_sessions
-                WHERE status = 'STOPPING'
-                  AND updated_at < CURRENT_TIMESTAMP - INTERVAL '15 minutes'
+                WHERE (
+                    status = 'STOPPING'
+                    AND updated_at < CURRENT_TIMESTAMP - INTERVAL '15 minutes'
+                ) OR (
+                    status = 'PLANNING'
+                    AND updated_at < """
+                + stale_planning_cutoff
+                + """
+                )
                 """
             ).fetchone()[0]
             or 0
         )
         if not count:
             return 0
-        self.con.execute("""
+        self.con.execute(
+            """
             UPDATE paper_sessions
             SET status = 'CANCELLED',
                 notes = 'auto-cancelled: stale session from previous run',
                 updated_at = CURRENT_TIMESTAMP
-            WHERE status = 'STOPPING'
-              AND updated_at < CURRENT_TIMESTAMP - INTERVAL '15 minutes'
-        """)
+            WHERE (status = 'STOPPING' AND updated_at < CURRENT_TIMESTAMP - INTERVAL '15 minutes')
+               OR (status = 'PLANNING' AND updated_at < """
+            + stale_planning_cutoff
+            + """)
+        """
+        )
         self._after_write()
         return count
 

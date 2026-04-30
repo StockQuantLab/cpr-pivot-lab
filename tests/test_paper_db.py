@@ -28,6 +28,28 @@ def test_cleanup_stale_sessions_only_cancels_stopping_rows(tmp_path: Path) -> No
         db.close()
 
 
+def test_cleanup_stale_sessions_cancels_old_planning_rows(tmp_path: Path) -> None:
+    db = PaperDB(db_path=tmp_path / "paper.duckdb")
+    try:
+        planning = db.create_session(
+            session_id="paper-planning-old",
+            status="PLANNING",
+        )
+        db.con.execute(
+            "UPDATE paper_sessions SET updated_at = CURRENT_TIMESTAMP - INTERVAL '2 days' "
+            "WHERE session_id = ?",
+            [planning.session_id],
+        )
+
+        changed = db.cleanup_stale_sessions()
+
+        assert changed == 1
+        assert db.get_session(planning.session_id).status == "CANCELLED"
+        assert "auto-cancelled: stale session" in (db.get_session(planning.session_id).notes or "")
+    finally:
+        db.close()
+
+
 def test_delete_all_rows_clears_every_paper_table(tmp_path: Path) -> None:
     db = PaperDB(db_path=tmp_path / "paper.duckdb")
     try:

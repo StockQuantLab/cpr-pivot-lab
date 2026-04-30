@@ -121,6 +121,44 @@ def test_select_entries_for_bar_prioritizes_higher_quality_over_alphabetical_ord
     assert [item["symbol"] for item in selected] == ["AAA"]
 
 
+def test_select_entries_for_bar_limits_cumulative_cash_within_session_budget() -> None:
+    tracker = SessionPositionTracker(
+        max_positions=5,
+        portfolio_value=4_000_000.0,
+    )
+    # Set an explicit cash budget to create over-spend pressure without slot caps.
+    tracker.cash_available = 800_000.0
+    candidates = [
+        {
+            "symbol": "BBB",
+            "rr_ratio": 2.5,
+            "or_atr_ratio": 1.0,
+            "entry_price": 100.0,
+            "position_size": 3000,
+        },
+        {
+            "symbol": "AAA",
+            "rr_ratio": 2.5,
+            "or_atr_ratio": 1.0,
+            "entry_price": 100.0,
+            "position_size": 3000,
+        },
+        {
+            "symbol": "CCC",
+            "rr_ratio": 2.5,
+            "or_atr_ratio": 1.0,
+            "entry_price": 100.0,
+            "position_size": 3000,
+        },
+    ]
+
+    selected = select_entries_for_bar(candidates, tracker)
+
+    # With a 300k estimated notional per candidate, only 2 can fit in 800k.
+    # Without cumulative headroom, all 3 would be selected before execution and 1 would later fail.
+    assert [item["symbol"] for item in selected] == ["AAA", "BBB"]
+
+
 def test_candidate_quality_score_uses_shared_scalar_score() -> None:
     candidate = {
         "symbol": "SBIN",

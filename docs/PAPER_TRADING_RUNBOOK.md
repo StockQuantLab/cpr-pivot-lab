@@ -32,19 +32,25 @@ PYTHONUNBUFFERED=1 doppler run -- uv run pivot-paper-trading daily-live \
   If the child exits silently, inspect the heartbeat JSONL first; it records PID, return code,
   elapsed time, log sizes, log tails, and Windows memory counters when available.
 - `PYTHONUNBUFFERED=1` is required for real-time log visibility when using the direct command.
-- Pre-market (8:30–9:10 AM): run `pivot-refresh --since <prev_trading_date>` then
-  `pivot-paper-trading daily-prepare --trade-date today --all-symbols` before starting live.
+- Pre-market (8:30–9:10 AM): `daily-prepare --trade-date today --all-symbols` must pass
+  before live starts. If EOD was not completed, run `pivot-refresh --since <prev_trading_date>
+  --prepare-paper --trade-date today` and wait for it to complete.
+- `pivot-data-quality --date today` must print `Ready YES` before live starts. In pre-market
+  mode this checks today's saved universe against the previous completed trading day's
+  `v_daily`, `v_5min`, `atr_intraday`, and `cpr_thresholds` data; it does not require today's
+  intraday candles or future-dated `market_day_state` rows.
 - Start `daily-live --feed-source kite` at/after 09:16 IST. The CLI now fails fast before
   09:16 unless `--wait-for-open` is explicitly supplied; do not use the wait mode for normal ops.
 - Do not run backtests while live is running — `market.duckdb` write lock will block startup.
-- Optional reproducibility: `daily-prepare --all-symbols` now auto-saves the resolved symbol
-  list as `full_YYYY_MM_DD` in `backtest_universe` inside the canonical `market.duckdb`.
+- Reproducibility: `daily-prepare --all-symbols` uses the stable `canonical_full` universe and
+  saves that same list as `full_YYYY_MM_DD` in `backtest_universe` inside the canonical
+  `market.duckdb`.
   You can still override the name with `--snapshot-universe-name full_YYYY_MM_DD` if needed,
   and then reuse that exact list with `--universe-name full_YYYY_MM_DD` in live / replay /
   daily-sim / baseline commands.
 - `daily-live`, `daily-replay`, and `daily-sim` now default to the dated saved universe when
-  `--symbols`, `--all-symbols`, and `--universe-name` are all omitted. `--all-symbols` is the
-  explicit dynamic-universe override.
+  `--symbols`, `--all-symbols`, and `--universe-name` are all omitted, falling back to
+  `canonical_full` only if the dated snapshot is missing.
 - Snapshot rows live in DuckDB, not as files on disk. If you want to trim old ad hoc
   snapshots, use `pivot-paper-trading universes --prune-before YYYY-MM-DD --apply`. Do not
   prune the dated archive if you still need it for audit comparisons.
@@ -58,6 +64,7 @@ The commands below are paper/dry-run only; real Zerodha order placement remains 
 
 **Pre-market gate:**
 ```bash
+doppler run -- uv run pivot-paper-trading daily-prepare --trade-date today --all-symbols
 doppler run -- uv run pivot-data-quality --date today
 doppler run -- uv run python scripts/test_kite_websocket.py
 doppler run -- uv run pivot-paper-trading status
@@ -65,7 +72,8 @@ doppler run -- uv run pivot-paper-trading universes
 ```
 
 Required result:
-- `pivot-data-quality` prints `Ready YES`.
+- `daily-prepare` succeeds and saves/uses today's `full_YYYY_MM_DD` universe.
+- `pivot-data-quality` prints `Ready YES` for previous completed-day live prerequisites.
 - Kite REST and WebSocket both print `OK`.
 - `status` shows no unexpected active sessions before launch.
 - `universes` includes today's `full_YYYY_MM_DD` snapshot.
@@ -138,7 +146,18 @@ Operational notes:
   you also send `close_positions` or `close_all`.
 - Dashboard `/paper_ledger` exposes the same controls and refreshes active paper state every 3s.
 
-### Universe naming convention (`full_YYYY_MM_DD`)
+### Universe policy (`canonical_full` → `full_YYYY_MM_DD`)
+
+`canonical_full` is the stable full-universe source of truth. Daily snapshots must not shrink just
+because a few symbols are suspended, delisted, or missing data on one date. `daily-prepare
+--all-symbols` creates `canonical_full` once if missing, then copies it to the dated
+`full_YYYY_MM_DD` snapshot for that trade date. Date-specific readiness/pre-filtering skips symbols
+that lack required rows for that day; broad gaps still fail closed.
+
+Rerun guard: if `full_YYYY_MM_DD` already exists and differs from `canonical_full`,
+`daily-prepare --all-symbols` refuses to overwrite it. Repair requires an explicit operator action:
+`--refresh-universe-snapshot`. Normal repeated `daily-prepare` runs are idempotent when the dated
+snapshot already matches canonical.
 
 **The date in the name is the TRADE date — the day you will trade on, not the day the data came from.**
 
@@ -176,7 +195,7 @@ every time you build a backtest command — a constant source of off-by-one erro
    ```
    The date in `--universe-name` always matches `--start`/`--end`.
 
-4. **Never use `--all-symbols` for live** — non-deterministic; Kite master changes intraday.
+4. **Never use `--all-symbols` for live** — use the dated saved snapshot or default resolution.
 
 ---
 
@@ -355,9 +374,10 @@ on the same evolving capital base.
 similar dust position. The shared minimum trade notional is 5% of the per-position slot capital
 with a hard floor of Rs.1,000.
 
-**Position-limit note**: `max_positions=10` is a cap on concurrent open positions, not a cap on
-total trades in a day. A session can take more than 10 trades if earlier positions close and later
-signals open new ones.
+**Position-limit note**: canonical CPR presets now use `max_positions=5`,
+`portfolio_value=₹10L`, and `max_position_pct=0.20`, so each slot can allocate up to ₹2L. This is
+a cap on concurrent open positions, not a cap on total trades in a day. A session can take more
+than 5 trades if earlier positions close and later signals open new ones.
 
 **Filter note**: paper replay/live do not add a paper-only narrowing filter. If the matching
 backtest run used `--narrowing-filter`, pass it here too.
@@ -436,12 +456,31 @@ The lock is command-level only. Read-only commands still run without it.
 
 ### 1. Ingest fresh market data (EOD or pre-market)
 
+Use the guarded single-command EOD path by default. It prevents skipped instrument refreshes and
+out-of-order build/prepare steps:
+
 ```bash
-doppler run -- uv run pivot-kite-ingest --refresh-instruments --exchange NSE
-doppler run -- uv run pivot-kite-ingest --from 2026-03-30 --to 2026-03-30
-doppler run -- uv run pivot-kite-ingest --from 2026-03-30 --to 2026-03-30 --5min --resume
-doppler run -- uv run pivot-build --refresh-since 2026-03-30
+doppler run -- uv run pivot-refresh \
+  --eod-ingest \
+  --date <today> \
+  --trade-date <next_trading_date>
 ```
+
+For example, after close on 2026-04-29:
+
+```bash
+doppler run -- uv run pivot-refresh \
+  --eod-ingest \
+  --date 2026-04-29 \
+  --trade-date 2026-04-30
+```
+
+The command runs: refresh instruments → daily ingest → 5-min ingest → runtime build →
+daily-prepare → final `pivot-data-quality --date <next_trading_date>`. The final gate must show
+`Ready YES`. Do not hand-run the individual steps unless debugging a failed stage.
+Ingestion stages are rerun-safe by default: the wrapper passes `--skip-existing` to daily and
+5-minute Kite ingestion, so existing parquet is logged as skipped. Add `--force-ingest` only for
+an intentional refetch.
 
 ### 1b. Pre-market setup and readiness check (8:30–9:10 AM)
 
@@ -449,11 +488,10 @@ doppler run -- uv run pivot-build --refresh-since 2026-03-30
 `daily-live` does not auto-build runtime tables.
 
 ```bash
-# Step 1 — Build today's setup rows from yesterday's close data (8:30–8:45 AM)
-# Replace <prev_trading_date> with the last NSE trading day (e.g. 2026-04-10)
-doppler run -- uv run pivot-refresh --since <prev_trading_date>
+# Step 1 — Complete the previous trading day's EOD pipeline if EOD did not finish.
+doppler run -- uv run pivot-refresh --since <prev_trading_date> --prepare-paper --trade-date today
 
-# Step 2 — Verify runtime table coverage for prior trading date (must pass before starting live)
+# Step 2 — Verify previous-day live prerequisites (must pass before starting live)
 doppler run -- uv run pivot-paper-trading daily-prepare --trade-date today --all-symbols
 
 # Step 3 — Scan for today's narrow-CPR candidates (informational — 8:45–9:10 AM)
@@ -462,17 +500,20 @@ doppler run -- uv run pivot-signal-alert --universe gold_51 --condition narrow-c
 doppler run -- uv run pivot-signal-alert --all-symbols --condition narrow-cpr
 ```
 
-**Pre-market build (fixed Apr 2026)**: `market_day_state` is now buildable pre-market.
-`pivot-refresh` uses an ASOF JOIN for ATR (finds the most recent prior-day ATR when today's
-bars don't yet exist) so today's CPR rows appear in `market_day_state` pre-market.
-`--allow-late-start-fallback` is no longer required; direction is resolved from the live
-9:15 candle when the DB row has `or_close_5 = NULL`.
+**Live setup contract (fixed Apr 2026)**: do not build future-date setup rows before market open.
+Live uses the latest completed trading day's CPR/ATR inputs and resolves today's direction from
+the live 9:15 opening-range candle. `--allow-late-start-fallback` is no longer required for normal
+startup.
+If `market_day_state` or `strategy_day_state` rows exist for a live/current trade date while
+same-day `intraday_day_pack` is absent, `daily-prepare` / `pivot-data-quality --date today` now
+fail closed. Those rows are treated as accidental future-state data and must be cleaned instead of
+used by live.
 
 **Dashboard note**: The dashboard can remain open during live sessions — the `paper.duckdb` replica avoids
 file-lock conflicts.
 
 **If `daily-prepare` fails with "Runtime coverage incomplete":**
-- Re-run `pivot-refresh --since <prev_trading_date>` and check for errors
+- Re-run `pivot-refresh --since <prev_trading_date> --prepare-paper --trade-date today` and check for errors
 - Do NOT start `daily-live` until `daily-prepare` reports coverage ready
 
 **Kite WebSocket STALE recovery**: Current sessions emit `FEED_STALE` when the session-wide feed
@@ -508,13 +549,14 @@ LIVE_DIRECTION_PREFLIGHT session=CPR_LEVELS_SHORT-2026-04-15 resolved=5 pending=
 - `pending` — symbols whose direction is NONE or not yet populated. These are **not rejected**;
   the session stays alive and retries resolution on every bar via
   `refresh_pending_setup_rows_for_bar()`.
-- `missing` — symbols with no setup row at all (excluded from trading).
+- `missing` — symbols with no exact-date materialized setup row at startup. In live Kite mode
+  these are retried from previous-day data plus live candles; they are excluded only if fallback
+  cannot resolve a valid setup row.
 - There is no 80% hard gate on direction coverage at startup. Stage B direction filter applies
   once setup rows exist; symbols without a resolved direction pass through and get retried.
 - `evaluate_candle()` calls `refresh_pending_setup_rows_for_bar()` on each 5-minute bar, which
   re-queries `strategy_day_state` for any symbol still at `direction_pending=True`. Once the
-  live 9:15 candle data is available (or the DB row is updated by a parallel build), the
-  direction resolves and the symbol becomes tradeable.
+  live 9:15 candle data is available, the direction resolves and the symbol becomes tradeable.
 - `TICKER_HEALTH` telemetry is logged per-bar when a WebSocket adapter is active, showing:
   `connected`, `ticks`, `last_tick_age`, `closes`, `reconnects`, `subs`, `coverage`, `stale`,
   and `missing` counts. Use this to diagnose whether direction resolution failures are caused
@@ -587,7 +629,7 @@ Use the canonical CPR preset bundle by default. Start from a named preset for ev
 only use explicit flags when you are intentionally doing ad hoc analysis. The dated saved universe
 is the default for canonical live/replay/sim runs; `--all-symbols` scans the dynamic full universe;
 the Kite adapter batches 500 symbols per API call, which stays within rate limits for the full
-tradable set. `max_positions=10` caps concurrent open trades, not total trades per day.
+tradable set. `max_positions=5` caps concurrent open trades, not total trades per day.
 The snapshot-universe path does not change EOD ingestion; it only adds an optional
 post-prepare freeze/reuse layer for reproducible live runs.
 
@@ -598,9 +640,9 @@ doppler run -- uv run pivot-paper-trading daily-live \
   --trade-date today
 ```
 
-`--allow-late-start-fallback` is no longer required. `pivot-refresh` now builds
-`market_day_state` pre-market using prev-day ATR (ASOF JOIN). Direction is resolved from
-the live 9:15 candle automatically when `or_close_5` is NULL in the DB row.
+`--allow-late-start-fallback` is no longer required for normal startup. Live does not build or
+require future-date `market_day_state` rows; it derives setup from the previous completed trading
+day and resolves direction from the live 9:15 candle.
 
 Add `--no-alerts` only for silent validation runs. Add explicit CPR flags only when you are
 intentionally overriding the canonical preset.

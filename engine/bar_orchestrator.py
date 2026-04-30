@@ -286,6 +286,8 @@ def select_entries_for_bar(
     slots = tracker.slots_available()
     if slots <= 0:
         return []
+    running_cost = 0.0
+    validated: list[dict[str, Any]] = []
     # Quality-sort: best effective_rr / (1 + or_atr) wins the slot.
     # Break ties by symbol so the result stays deterministic even when live and
     # backtest feed candidates in a different iteration order.
@@ -293,7 +295,24 @@ def select_entries_for_bar(
         candidates,
         key=lambda c: (-candidate_quality_score(c), str(c.get("symbol", ""))),
     )
-    return ordered[:slots]
+    for candidate in ordered[:slots]:
+        inner = candidate.get("candidate") or candidate
+        entry_price = float(inner.get("entry_price") or 0.0)
+        position_size = float(inner.get("position_size") or 0.0)
+        candidate_notional = min(tracker.slot_capital, tracker.cash_available)
+        if position_size > 0 and entry_price > 0:
+            candidate_notional = min(candidate_notional, position_size * entry_price)
+        # Respect tracker capital headroom when multiple candidates arrive in the
+        # same bar. This prevents cumulative over-spend when all entries individually
+        # pass a plain cash check.
+        est_notional = candidate_notional
+        if est_notional <= 0:
+            continue
+        if running_cost + est_notional > tracker.cash_available + 1e-9:
+            continue
+        validated.append(candidate)
+        running_cost += est_notional
+    return validated
 
 
 async def check_bar_risk_controls(

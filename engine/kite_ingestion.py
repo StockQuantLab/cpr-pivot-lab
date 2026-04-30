@@ -1274,7 +1274,6 @@ def run_ingestion(
             skipped = sorted(set(skipped) | set(already_ingested))
             processable_symbols = need_fetch
 
-    client = get_kite_client()
     errors: dict[str, str] = dict(state.get("errors", {}))
     completed_symbols = list(completed_from_checkpoint)
     rows_written = 0
@@ -1326,6 +1325,37 @@ def run_ingestion(
         )
 
     _emit_progress(symbol=None, status="start", processed_count=0)
+
+    if not processable_symbols:
+        state["completed_symbols"] = sorted(set(completed_symbols))
+        state["errors"] = errors
+        _write_checkpoint(checkpoint_path, state)
+        checkpoint_path.unlink(missing_ok=True)
+        logger.info(
+            "Kite %s ingestion skipped: all %d processable symbols already covered for %s",
+            request.mode,
+            len(all_processable_symbols),
+            request.end_date,
+        )
+        _emit_progress(symbol=None, status="skipped_existing", processed_count=0)
+        _emit_progress(symbol=None, status="finished", processed_count=0)
+        return KiteIngestionResult(
+            mode=request.mode,
+            start_date=request.start_date.isoformat(),
+            end_date=request.end_date.isoformat(),
+            exchange=request.exchange,
+            requested_symbols=target_symbols,
+            completed_symbols=sorted(set(completed_symbols)),
+            skipped_symbols=skipped,
+            missing_instruments=missing_instruments,
+            errors=errors,
+            rows_written=0,
+            raw_snapshot_count=0,
+            checkpoint_path=None,
+            checkpoint_cleared=True,
+        )
+
+    client = get_kite_client()
 
     for index, symbol in enumerate(processable_symbols, start=1):
         token = instrument_tokens[symbol]

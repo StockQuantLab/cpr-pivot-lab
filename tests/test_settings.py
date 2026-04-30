@@ -64,8 +64,8 @@ def test_paper_trading_settings_defaults_are_present() -> None:
     assert settings.paper_default_strategy == "CPR_LEVELS"
     assert settings.paper_default_symbols is None
     assert settings.paper_max_daily_loss_pct == 0.03
-    assert settings.paper_max_positions == 10
-    assert settings.paper_max_position_pct == 0.10
+    assert settings.paper_max_positions == 5
+    assert settings.paper_max_position_pct == 0.20
     assert settings.paper_stale_feed_timeout_sec == 120
     assert settings.paper_flatten_time == "15:15:00"
     assert settings.paper_live_poll_interval_sec == 1.0

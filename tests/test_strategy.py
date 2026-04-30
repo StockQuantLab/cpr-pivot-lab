@@ -24,6 +24,7 @@ from engine.cpr_atr_strategy import (
     TradeResult,
     VirginCPRParams,
 )
+from engine.execution_defaults import DEFAULT_EXECUTION_SIZING
 from engine.strategy_presets import (
     CPR_LEVELS_PRESETS,
     FBR_PRESETS,
@@ -101,6 +102,11 @@ class TestBacktestParams:
         assert long_cfg.cpr_levels.cpr_min_close_atr == 0.5
         assert long_cfg.cpr_levels.use_narrowing_filter is True
         assert long_cfg.cpr_levels.momentum_confirm is True
+        assert long_cfg.capital == 200_000
+        assert long_cfg.risk_pct == 0.01
+        assert long_cfg.portfolio_value == 1_000_000
+        assert long_cfg.max_positions == 5
+        assert long_cfg.max_position_pct == 0.20
         assert short_cfg.direction_filter == "SHORT"
         assert short_cfg.risk_based_sizing is True
         assert short_cfg.skip_rvol_check is True
@@ -108,6 +114,9 @@ class TestBacktestParams:
         assert short_cfg.cpr_levels.use_narrowing_filter is True
         assert short_cfg.cpr_levels.momentum_confirm is True
         assert short_cfg.short_trail_atr_multiplier == 1.25
+        assert short_cfg.capital == 200_000
+        assert short_cfg.max_positions == 5
+        assert short_cfg.max_position_pct == 0.20
 
         std_long = build_strategy_config_from_preset("CPR_LEVELS_STANDARD_LONG")
         std_short = build_strategy_config_from_preset("CPR_LEVELS_STANDARD_SHORT")
@@ -150,10 +159,7 @@ class TestBacktestParams:
         # Mirror the argparse defaults exactly as they appear in run_backtest.py
         # with no explicit flags set (i.e. user typed: pivot-backtest --preset CPR_LEVELS_RISK_LONG)
         preset_cli_overrides: dict[str, Any] = {
-            "portfolio_value": 1_000_000,
-            "capital": 100_000,
-            "max_positions": 10,
-            "max_position_pct": 0.1,
+            **DEFAULT_EXECUTION_SIZING,
             "runtime_batch_size": 512,
             "commission_model": "zerodha",
             "slippage_bps": 5.0,
@@ -1036,11 +1042,11 @@ class TestPortfolioExecutionOverlay:
 
         assert len(executed) == 1
         assert executed[0].symbol == "SBIN"
-        assert executed[0].position_value == 10_000.0
-        assert executed[0].position_size == 100
-        assert executed[0].gross_pnl == 200.0
-        assert executed[0].total_costs == 50.89
-        assert executed[0].profit_loss == 149.11
+        assert executed[0].position_value == 20_000.0
+        assert executed[0].position_size == 200
+        assert executed[0].gross_pnl == 400.0
+        assert executed[0].total_costs == 54.59
+        assert executed[0].profit_loss == 345.41
         assert stats["candidate_trade_count"] == 2
         assert stats["executed_trade_count"] == 1
         assert stats["not_executed_portfolio"] == 1
@@ -1175,8 +1181,8 @@ class TestPortfolioExecutionOverlay:
         executed, stats = bt._apply_portfolio_constraints(trades)
 
         assert len(executed) == 1
-        assert executed[0].position_size == 100
-        assert executed[0].position_value == 10_000.0
+        assert executed[0].position_size == 200
+        assert executed[0].position_value == 20_000.0
         assert executed[0].profit_loss_pct != pytest.approx(99.9)
         assert executed[0].profit_loss_pct == pytest.approx(
             executed[0].profit_loss / executed[0].position_value * 100,

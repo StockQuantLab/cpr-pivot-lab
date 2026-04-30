@@ -12,11 +12,13 @@ from dataclasses import replace
 from typing import Any
 
 from engine.cpr_atr_strategy import StrategyConfig
+from engine.execution_defaults import DEFAULT_EXECUTION_SIZING
 
 CPR_LEVELS_PRESETS: dict[str, dict[str, Any]] = {
     "CPR_LEVELS_RISK_LONG": {
         "strategy": "CPR_LEVELS",
         "overrides": {
+            **DEFAULT_EXECUTION_SIZING,
             "direction_filter": "LONG",
             "min_price": 50.0,
             "cpr_min_close_atr": 0.5,
@@ -29,6 +31,7 @@ CPR_LEVELS_PRESETS: dict[str, dict[str, Any]] = {
     "CPR_LEVELS_RISK_SHORT": {
         "strategy": "CPR_LEVELS",
         "overrides": {
+            **DEFAULT_EXECUTION_SIZING,
             "direction_filter": "SHORT",
             "min_price": 50.0,
             "cpr_min_close_atr": 0.5,
@@ -42,6 +45,7 @@ CPR_LEVELS_PRESETS: dict[str, dict[str, Any]] = {
     "CPR_LEVELS_STANDARD_LONG": {
         "strategy": "CPR_LEVELS",
         "overrides": {
+            **DEFAULT_EXECUTION_SIZING,
             "direction_filter": "LONG",
             "min_price": 50.0,
             "cpr_min_close_atr": 0.5,
@@ -54,6 +58,7 @@ CPR_LEVELS_PRESETS: dict[str, dict[str, Any]] = {
     "CPR_LEVELS_STANDARD_SHORT": {
         "strategy": "CPR_LEVELS",
         "overrides": {
+            **DEFAULT_EXECUTION_SIZING,
             "direction_filter": "SHORT",
             "min_price": 50.0,
             "cpr_min_close_atr": 0.5,

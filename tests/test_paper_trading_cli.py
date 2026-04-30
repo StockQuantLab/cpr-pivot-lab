@@ -8,10 +8,13 @@ from types import SimpleNamespace
 import polars as pl
 import pytest
 
+from engine.strategy_presets import ALL_STRATEGY_PRESETS
 from scripts.paper_trading import (
     PAPER_STANDARD_MATRIX,
+    _apply_default_saved_universe,
     _cmd_daily_prepare,
     _parse_json,
+    _prepare_paper_multi_strategy_params,
     _resolve_paper_strategy_params,
     _run_sim_variant,
     build_parser,
@@ -25,8 +28,8 @@ def test_paper_trading_parser_supports_start_and_status() -> None:
     assert start_args.command == "start"
     assert start_args.strategy == "CPR_LEVELS"
     assert start_args.symbols == "SBIN,TCS"
-    assert start_args.max_positions == 10
-    assert start_args.max_position_pct == 0.1
+    assert start_args.max_positions == 5
+    assert start_args.max_position_pct == 0.2
 
     status_args = parser.parse_args(["status"])
     assert status_args.command == "status"
@@ -34,6 +37,40 @@ def test_paper_trading_parser_supports_start_and_status() -> None:
 
     status_summary_args = parser.parse_args(["status", "--summary"])
     assert status_summary_args.summary is True
+
+
+def test_default_saved_universe_falls_back_to_canonical(monkeypatch: pytest.MonkeyPatch) -> None:
+    import scripts.paper_trading as pt
+
+    monkeypatch.setattr(
+        pt,
+        "load_universe_symbols",
+        lambda name, read_only=True: ["SBIN"] if name == pt.CANONICAL_FULL_UNIVERSE_NAME else [],
+    )
+
+    args = SimpleNamespace(symbols=None, all_symbols=False, universe_name=None)
+    _apply_default_saved_universe(args, "2026-04-30")
+
+    assert args.universe_name == pt.CANONICAL_FULL_UNIVERSE_NAME
+
+
+def test_default_saved_universe_refuses_dated_canonical_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import scripts.paper_trading as pt
+
+    def fake_load(name: str, read_only: bool = True) -> list[str]:
+        if name == "full_2026_04_30":
+            return ["SBIN"]
+        if name == pt.CANONICAL_FULL_UNIVERSE_NAME:
+            return ["RELIANCE", "SBIN"]
+        return []
+
+    monkeypatch.setattr(pt, "load_universe_symbols", fake_load)
+
+    args = SimpleNamespace(symbols=None, all_symbols=False, universe_name=None)
+    with pytest.raises(SystemExit, match="Refusing default universe"):
+        _apply_default_saved_universe(args, "2026-04-30")
 
 
 def test_paper_trading_parser_supports_cleanup() -> None:
@@ -315,24 +352,93 @@ def test_paper_standard_matrix_uses_cpr_canonical_params() -> None:
         if strategy == "CPR_LEVELS"
     }
 
-    assert cpr_variants["CPR_LEVELS_LONG"] == {
-        "direction_filter": "LONG",
-        "min_price": 50,
-        "cpr_min_close_atr": 0.5,
-        "momentum_confirm": True,
-        "narrowing_filter": True,
-        "risk_based_sizing": True,
-        "skip_rvol_check": False,
+    assert (
+        cpr_variants["CPR_LEVELS_LONG"] == ALL_STRATEGY_PRESETS["CPR_LEVELS_RISK_LONG"]["overrides"]
+    )
+    assert (
+        cpr_variants["CPR_LEVELS_SHORT"]
+        == ALL_STRATEGY_PRESETS["CPR_LEVELS_RISK_SHORT"]["overrides"]
+    )
+
+
+def test_paper_multi_params_persist_resolved_config_metadata() -> None:
+    params = _prepare_paper_multi_strategy_params(
+        "CPR_LEVELS_SHORT",
+        "CPR_LEVELS",
+        ALL_STRATEGY_PRESETS["CPR_LEVELS_RISK_SHORT"]["overrides"],
+    )
+
+    assert params["_canonical_preset"] == "CPR_LEVELS_RISK_SHORT"
+    assert params["_strategy_config_fingerprint"]
+    assert params["_resolved_strategy_config"]["cpr_levels_config"]["momentum_confirm"] is True
+    assert params["_resolved_strategy_config"]["capital"] == 200_000
+    assert params["_resolved_strategy_config"]["max_positions"] == 5
+    assert params["_resolved_strategy_config"]["max_position_pct"] == 0.2
+
+
+def test_paper_multi_params_fail_fast_on_preset_drift() -> None:
+    drifted = {
+        **ALL_STRATEGY_PRESETS["CPR_LEVELS_RISK_LONG"]["overrides"],
+        "momentum_confirm": False,
     }
-    assert cpr_variants["CPR_LEVELS_SHORT"] == {
-        "direction_filter": "SHORT",
-        "skip_rvol_check": True,
-        "min_price": 50,
-        "cpr_min_close_atr": 0.5,
-        "momentum_confirm": True,
-        "narrowing_filter": True,
-        "risk_based_sizing": True,
-    }
+
+    with pytest.raises(SystemExit, match="do not match preset CPR_LEVELS_RISK_LONG"):
+        _prepare_paper_multi_strategy_params("CPR_LEVELS_LONG", "CPR_LEVELS", drifted)
+
+
+def test_single_preset_params_are_marked_canonical() -> None:
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "daily-live",
+            "--trade-date",
+            "2026-04-30",
+            "--symbols",
+            "SBIN",
+            "--preset",
+            "CPR_LEVELS_RISK_LONG",
+        ]
+    )
+
+    params = _resolve_paper_strategy_params(args.strategy, args.strategy_params, args)
+
+    assert params["_canonical_preset"] == "CPR_LEVELS_RISK_LONG"
+    assert params["capital"] == 200_000
+    assert params["max_positions"] == 5
+    assert params["max_position_pct"] == 0.20
+
+
+def test_canonical_preset_rejects_stale_embedded_sizing() -> None:
+    import scripts.paper_trading as pt
+
+    with pytest.raises(SystemExit, match="non-canonical overrides"):
+        pt._with_resolved_strategy_metadata(
+            "CPR_LEVELS",
+            {
+                "_canonical_preset": "CPR_LEVELS_RISK_LONG",
+                "capital": 100_000,
+                "max_positions": 10,
+                "max_position_pct": 0.10,
+                "feed_source": "kite",
+            },
+            canonical_preset="CPR_LEVELS_RISK_LONG",
+        )
+
+
+def test_canonical_preset_expands_from_marker_and_preserves_feed_source() -> None:
+    import scripts.paper_trading as pt
+
+    params = pt._with_resolved_strategy_metadata(
+        "CPR_LEVELS",
+        {"_canonical_preset": "CPR_LEVELS_RISK_SHORT", "feed_source": "kite"},
+        canonical_preset="CPR_LEVELS_RISK_SHORT",
+    )
+
+    assert params["_canonical_preset"] == "CPR_LEVELS_RISK_SHORT"
+    assert params["feed_source"] == "kite"
+    assert params["_resolved_strategy_config"]["capital"] == 200_000
+    assert params["_resolved_strategy_config"]["max_positions"] == 5
+    assert params["_resolved_strategy_config"]["max_position_pct"] == 0.20
 
 
 def test_parse_json_accepts_powershell_style_object() -> None:
@@ -506,6 +612,13 @@ async def test_cmd_daily_prepare_runs_readiness_gate(monkeypatch: pytest.MonkeyP
     class _FakeDB:
         con = _FakeCon()
 
+    class _LockCtx:
+        def __enter__(self):
+            return None
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
         def con_execute(self, *a, **kw):
             return SimpleNamespace(fetchone=lambda: (1,))
 
@@ -584,6 +697,13 @@ async def test_cmd_daily_prepare_snapshots_universe(monkeypatch: pytest.MonkeyPa
     class _FakeDB:
         con = _FakeCon()
 
+    class _LockCtx:
+        def __enter__(self):
+            return None
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
     def fake_prepare_runtime_for_daily_paper(*, trade_date: str, symbols: list[str], mode: str):
         calls.append(("prepare", trade_date, list(symbols), mode))
         return {
@@ -611,6 +731,12 @@ async def test_cmd_daily_prepare_snapshots_universe(monkeypatch: pytest.MonkeyPa
         calls.append(("print", report["trade_date"]))
 
     monkeypatch.setattr(pt, "get_db", lambda: _FakeDB())
+    monkeypatch.setattr(pt, "acquire_command_lock", lambda *args, **kwargs: _LockCtx())
+    monkeypatch.setattr(
+        pt,
+        "ensure_canonical_universe",
+        lambda trade_date=None: (["RELIANCE", "SBIN"], False),
+    )
     monkeypatch.setattr(pt, "resolve_trade_date", lambda value: value)
     monkeypatch.setattr(
         pt,
@@ -681,6 +807,13 @@ async def test_cmd_daily_prepare_auto_snapshots_all_symbols(
     class _FakeDB:
         con = _FakeCon()
 
+    class _LockCtx:
+        def __enter__(self):
+            return None
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
     def fake_prepare_runtime_for_daily_paper(*, trade_date: str, symbols: list[str], mode: str):
         calls.append(("prepare", trade_date, list(symbols), mode))
         return {
@@ -708,6 +841,12 @@ async def test_cmd_daily_prepare_auto_snapshots_all_symbols(
         calls.append(("print", report["trade_date"]))
 
     monkeypatch.setattr(pt, "get_db", lambda: _FakeDB())
+    monkeypatch.setattr(pt, "acquire_command_lock", lambda *args, **kwargs: _LockCtx())
+    monkeypatch.setattr(
+        pt,
+        "ensure_canonical_universe",
+        lambda trade_date=None: (["RELIANCE", "SBIN"], False),
+    )
     monkeypatch.setattr(pt, "resolve_trade_date", lambda value: value)
     monkeypatch.setattr(
         pt,
@@ -761,6 +900,56 @@ async def test_cmd_daily_prepare_auto_snapshots_all_symbols(
         ("dq", "2024-01-01"),
         ("print", "2024-01-01"),
     ]
+
+
+@pytest.mark.asyncio
+async def test_cmd_daily_prepare_refuses_mismatched_snapshot_without_force(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import scripts.paper_trading as pt
+
+    class _FakeCon:
+        def execute(self, query: str, params: list[object]):
+            return SimpleNamespace(fetchone=lambda: (1,))
+
+    class _FakeDB:
+        con = _FakeCon()
+
+    monkeypatch.setattr(pt, "get_db", lambda: _FakeDB())
+    monkeypatch.setattr(pt, "acquire_command_lock", lambda *args, **kwargs: _DummyLock())
+    monkeypatch.setattr(
+        pt,
+        "ensure_canonical_universe",
+        lambda trade_date=None: (["RELIANCE", "SBIN"], False),
+    )
+    monkeypatch.setattr(pt, "resolve_trade_date", lambda value: value)
+    monkeypatch.setattr(
+        pt,
+        "resolve_prepare_symbols",
+        lambda symbols, raw, universe_name=None, all_symbols=False, read_only=True: [
+            "RELIANCE",
+            "SBIN",
+        ],
+    )
+    monkeypatch.setattr(
+        pt,
+        "load_universe_symbols",
+        lambda universe_name, read_only=True: ["SBIN"]
+        if universe_name == "full_2024_01_01"
+        else [],
+    )
+
+    with pytest.raises(SystemExit, match="Refusing to overwrite existing universe"):
+        await _cmd_daily_prepare(
+            SimpleNamespace(
+                trade_date="2024-01-01",
+                symbols=None,
+                universe_name=None,
+                all_symbols=True,
+                snapshot_universe_name=None,
+                refresh_universe_snapshot=False,
+            )
+        )
 
 
 @pytest.mark.asyncio
@@ -891,6 +1080,11 @@ async def test_cmd_daily_replay_defaults_to_saved_universe(
         return ["SBIN"]
 
     monkeypatch.setattr(pt, "acquire_command_lock", lambda *args, **kwargs: _LockCtx())
+    monkeypatch.setattr(
+        pt,
+        "load_universe_symbols",
+        lambda name, read_only=True: ["SBIN"] if name == "full_2024_01_02" else [],
+    )
     monkeypatch.setattr(pt, "_resolve_cli_symbols", fake_resolve_cli_symbols)
     monkeypatch.setattr(
         pt,
@@ -1022,6 +1216,11 @@ async def test_cmd_daily_live_defaults_to_saved_universe(
         return ["SBIN"]
 
     monkeypatch.setattr(pt, "resolve_trade_date", lambda value: value)
+    monkeypatch.setattr(
+        pt,
+        "load_universe_symbols",
+        lambda name, read_only=True: ["SBIN"] if name == "full_2026_04_09" else [],
+    )
     monkeypatch.setattr(pt, "_resolve_cli_symbols", fake_resolve_cli_symbols)
     monkeypatch.setattr(
         pt,
@@ -1085,6 +1284,7 @@ async def test_cmd_daily_live_kite_feed_waits_until_market_ready(
     monkeypatch.setattr(pt, "set_alerts_suppressed", lambda value: None)
     monkeypatch.setattr(pt, "_wait_until_market_ready", fake_wait_until_market_ready)
     monkeypatch.setattr(pt, "_run_daily_workflow", fake_run_daily_workflow)
+    monkeypatch.setattr(pt, "_enforce_kite_live_setup_gate", lambda *args, **kwargs: None)
 
     await pt._cmd_daily_live(
         SimpleNamespace(

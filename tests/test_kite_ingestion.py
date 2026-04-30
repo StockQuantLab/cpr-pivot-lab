@@ -293,6 +293,57 @@ def test_run_ingestion_resume_skips_completed_symbols(
     assert checkpoint_path.exists() is False
 
 
+def test_run_ingestion_skip_existing_bypasses_kite_client_when_complete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = _tmp_kite_paths(tmp_path)
+    monkeypatch.setattr(kite_ingestion, "get_kite_paths", lambda: paths)
+    daily_dir = paths.parquet_root / "daily" / "SBIN"
+    daily_dir.mkdir(parents=True, exist_ok=True)
+    pl.DataFrame(
+        {
+            "symbol": ["SBIN"],
+            "date": [date(2026, 3, 10)],
+            "open": [100.0],
+            "high": [101.0],
+            "low": [99.0],
+            "close": [100.5],
+            "volume": [1000],
+        }
+    ).write_parquet(daily_dir / "kite.parquet")
+    monkeypatch.setattr(
+        kite_ingestion,
+        "resolve_instrument_tokens",
+        lambda symbols, exchange="NSE": ({"SBIN": 1}, []),
+    )
+    monkeypatch.setattr(
+        kite_ingestion,
+        "get_kite_client",
+        lambda: pytest.fail("Kite client should not be created when all symbols are skipped"),
+    )
+
+    events: list[dict[str, object]] = []
+    request = KiteIngestionRequest(
+        mode="daily",
+        start_date=date(2026, 3, 10),
+        end_date=date(2026, 3, 10),
+        exchange="NSE",
+        symbols=["SBIN"],
+        skip_existing=True,
+    )
+
+    result = run_ingestion(request, progress_hook=events.append)
+
+    assert result.rows_written == 0
+    assert result.skipped_symbols == ["SBIN"]
+    assert result.checkpoint_cleared is True
+    assert [event["status"] for event in events] == [
+        "start",
+        "skipped_existing",
+        "finished",
+    ]
+
+
 def _make_instrument_csv(path: Path, symbols: list[str], segment: str = "NSE") -> None:
     header = (
         "exchange,exchange_token,expiry,instrument_token,instrument_type,"

@@ -244,17 +244,17 @@ BREAKEVEN phase of the trailing stop.
 
 **Risk-Based Sizing** · `ON` or `OFF`
 *What:* When ON, position size is calculated to risk exactly `risk_pct` (default 1%) of
-portfolio per trade, bounded by `max_position_pct` (10%).
-*Formula:* `qty = floor(portfolio × risk_pct / sl_distance_in_₹)` capped at 10%.
-*Example:* Portfolio ₹1,000,000. Risk 1% = ₹10,000. SL = 4.93/share.
-qty = floor(10,000 / 4.93) = **2,028** shares (capped at 10% = ₹100,000 / 529.4 = 189 if SL is tight enough).
-*When OFF (standard sizing):* qty = floor(portfolio × max_position_pct / entry_price) — fixed 10% capital per trade regardless of SL distance.
+slot capital per trade, bounded by `max_position_pct` (20% in the canonical CPR presets).
+*Formula:* `qty = floor(capital × risk_pct / sl_distance_in_₹)` capped by the slot allocation.
+*Example:* Capital ₹200,000. Risk 1% = ₹2,000. SL = 4.93/share.
+qty = floor(2,000 / 4.93) = **405** shares, then capped by the ₹2L slot if needed.
+*When OFF (standard sizing):* qty = floor(portfolio × max_position_pct / entry_price) — fixed slot capital per trade regardless of SL distance.
 
-**Max Positions** · default `10`
+**Max Positions** · default `5`
 *What:* Maximum number of positions that can be open **concurrently** at any moment.
 *This is NOT a daily trade cap.* Once a position closes (SL, target, breakeven), a new
 one can open. On a typical day with many early BREAKEVEN exits, 20-35 total trades with
-max 10 concurrent is normal.
+max 5 concurrent is possible.
 *Live vs Backtest:* Competing entries now use the same quality-sort in both engines, with
 symbol tie-breaks for determinism. Remaining live/backtest differences mostly come from the
 input candles themselves, not the slot-allocation rule.

@@ -26,6 +26,13 @@ from engine.cpr_atr_strategy import (
     CPRLevelsParams,
     FBRParams,
 )
+from engine.execution_defaults import (
+    DEFAULT_MAX_POSITION_PCT,
+    DEFAULT_MAX_POSITIONS,
+    DEFAULT_PORTFOLIO_VALUE,
+    DEFAULT_POSITION_CAPITAL,
+    DEFAULT_RISK_PCT,
+)
 from engine.paper_runtime import summarize_paper_positions, write_admin_command
 
 logger = logging.getLogger(__name__)
@@ -134,11 +141,11 @@ def run_backtest(
     buffer_pct: float = 0.0005,
     rvol_threshold: float = 1.0,
     rr_ratio: float = 2.0,
-    capital: float = 100_000,
-    risk_pct: float = 0.01,
-    portfolio_value: float = 1_000_000,
-    max_positions: int = 10,
-    max_position_pct: float = 0.10,
+    capital: float = DEFAULT_POSITION_CAPITAL,
+    risk_pct: float = DEFAULT_RISK_PCT,
+    portfolio_value: float = DEFAULT_PORTFOLIO_VALUE,
+    max_positions: int = DEFAULT_MAX_POSITIONS,
+    max_position_pct: float = DEFAULT_MAX_POSITION_PCT,
     risk_based_sizing: bool = False,
     time_exit: str = "15:15",
     entry_window_end: str = "10:15",
@@ -249,11 +256,11 @@ def run_multi_stock_backtest(
     cpr_percentile: float = 33.0,
     cpr_max_width_pct: float = 2.0,
     rr_ratio: float = 2.0,
-    capital: float = 100_000,
-    risk_pct: float = 0.01,
-    portfolio_value: float = 1_000_000,
-    max_positions: int = 10,
-    max_position_pct: float = 0.10,
+    capital: float = DEFAULT_POSITION_CAPITAL,
+    risk_pct: float = DEFAULT_RISK_PCT,
+    portfolio_value: float = DEFAULT_PORTFOLIO_VALUE,
+    max_positions: int = DEFAULT_MAX_POSITIONS,
+    max_position_pct: float = DEFAULT_MAX_POSITION_PCT,
     risk_based_sizing: bool = False,
     time_exit: str = "15:15",
     entry_window_end: str = "10:15",

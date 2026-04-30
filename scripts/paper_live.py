@@ -71,6 +71,13 @@ _ORIGINAL_LOAD_SETUP_ROW = load_setup_row
 _WEBSOCKET_RECONNECT_ALERT_ATTEMPTS = 3
 _WEBSOCKET_RECOVERY_AFTER_SEC = 20.0
 _WEBSOCKET_RECOVERY_COOLDOWN_SEC = 30.0
+_GLOBAL_FLATTEN_SIGNAL = Path(".tmp_logs") / "flatten_all.signal"
+_ADMIN_COMMAND_MAX_AGE_SEC = 300.0
+_FEED_AUDIT_CLEANUP_INTERVAL_SEC = 30 * 60
+try:
+    _FEED_STALE_ALERT_COOLDOWN_SEC = float(os.getenv("PIVOT_FEED_STALE_ALERT_COOLDOWN_SEC", "900"))
+except ValueError:
+    _FEED_STALE_ALERT_COOLDOWN_SEC = 900.0
 
 
 @dataclass(slots=True)
@@ -168,6 +175,79 @@ def _cancel_pending_admin_commands(cmd_dir: Path, current_file: Path) -> int:
         except OSError:
             logger.debug("Failed to delete pending admin command %s", pending_file, exc_info=True)
     return cancelled
+
+
+def _is_admin_command_stale(
+    cmd_file: Path,
+    now: datetime,
+    *,
+    max_age_sec: float = _ADMIN_COMMAND_MAX_AGE_SEC,
+) -> bool:
+    """Return True when a command file is older than the configured expiry window."""
+    try:
+        age_seconds = now.timestamp() - cmd_file.stat().st_mtime
+    except OSError:
+        return False
+    return age_seconds > max_age_sec
+
+
+def _has_closed_positions(
+    session_id: str,
+    *,
+    paper_db: Any,
+) -> bool:
+    try:
+        positions = paper_db.get_session_positions(session_id, statuses=["CLOSED"])
+        return len(positions) > 0
+    except Exception:
+        logger.debug("Failed to load closed positions for session %s", session_id, exc_info=True)
+        return False
+
+
+def _is_zero_trade_restart_session(
+    session_id: str,
+    *,
+    terminal_reason: str | None,
+    paper_db: Any,
+) -> bool:
+    if terminal_reason is None:
+        return False
+    if terminal_reason not in {"no_trades_entry_window_closed", "NO_TRADES_ENTRY_WINDOW_CLOSED"}:
+        return False
+    return not _has_closed_positions(session_id=session_id, paper_db=paper_db)
+
+
+def _should_use_global_flatten_signal() -> bool:
+    return _GLOBAL_FLATTEN_SIGNAL.exists()
+
+
+def _cleanup_feed_audit_if_needed(
+    *,
+    now: datetime,
+    last_cleanup: datetime | None,
+    settings: Any,
+) -> tuple[datetime | None, int]:
+    """Purge old feed-audit rows if retention is configured and interval elapsed."""
+    retention_days = int(getattr(settings, "feed_audit_retention_days", 0) or 0)
+    if retention_days <= 0:
+        return last_cleanup, 0
+    if (
+        last_cleanup is not None
+        and (now - last_cleanup).total_seconds() < _FEED_AUDIT_CLEANUP_INTERVAL_SEC
+    ):
+        return last_cleanup, 0
+    try:
+        deleted = get_paper_db().cleanup_feed_audit_older_than(retention_days)
+        if deleted:
+            logger.info(
+                "run_live_session purged %d paper_feed_audit rows older than %d day(s)",
+                deleted,
+                retention_days,
+            )
+        return now, deleted
+    except Exception:
+        logger.debug("Feed audit retention cleanup skipped due to error", exc_info=True)
+        return last_cleanup, 0
 
 
 def _reconcile_live_session(
@@ -874,6 +954,7 @@ async def run_live_session(
     complete_on_exit: bool = False,
     auto_flatten_on_abnormal_exit: bool = True,
     allow_late_start_fallback: bool = False,
+    allow_live_setup_fallback: bool = True,
     notes: str | None = None,
     deps: LiveSessionDeps | None = None,
 ) -> dict[str, Any]:
@@ -954,7 +1035,7 @@ async def run_live_session(
     direction_filter = str(getattr(params, "direction_filter", "BOTH") or "BOTH").upper()
 
     runtime_state = PaperRuntimeState(
-        allow_live_setup_fallback=allow_late_start_fallback,
+        allow_live_setup_fallback=allow_live_setup_fallback,
         bar_end_offset=timedelta(minutes=5)
         if getattr(ticker_adapter, "_local_feed", False)
         else None,
@@ -984,6 +1065,29 @@ async def run_live_session(
         float(direction_readiness["coverage_pct"]),
         len(active_symbols),
     )
+    if (
+        deps is None
+        and active_symbols
+        and int(direction_readiness["with_setup"]) == 0
+        and not runtime_state.allow_live_setup_fallback
+    ):
+        reason = "startup_missing_trade_date_setup_rows"
+        logger.error("[%s] No market_day_state setup rows loaded for %s", session_id, trade_date)
+        await _update_session(session_id, deps, status="FAILED", notes=reason)
+        force_paper_db_sync(get_paper_db())
+        return {
+            "session_id": session_id,
+            "final_status": "FAILED",
+            "terminal_reason": reason,
+            "cycles": 0,
+        }
+    if deps is None and active_symbols and int(direction_readiness["with_setup"]) == 0:
+        logger.warning(
+            "[%s] No exact-date market_day_state rows loaded for %s; live setup will be derived "
+            "from previous completed-day data plus live opening-range candles",
+            session_id,
+            trade_date,
+        )
     tracker = SessionPositionTracker(
         max_positions=int(getattr(session, "max_positions", 1) or 1),
         portfolio_value=float(getattr(params, "portfolio_value", 0.0) or 0.0),
@@ -1061,7 +1165,7 @@ async def run_live_session(
     last_stale_alert_ts: datetime | None = None
     entries_disabled = False
     alerts_enabled = True if deps is None else bool(deps.alerts_enabled)
-    _stale_alert_cooldown_sec = 300  # 5 min between repeated FEED_STALE alerts
+    last_feed_audit_cleanup: datetime | None = None
     audit_feed_source = "kite"
     audit_transport = "websocket" if use_websocket else "rest"
 
@@ -1074,10 +1178,46 @@ async def run_live_session(
         while max_cycles is None or cycles < max_cycles:
             cycles += 1
             now = _session_now(deps)
+            last_feed_audit_cleanup, _ = _cleanup_feed_audit_if_needed(
+                now=now,
+                last_cleanup=last_feed_audit_cleanup,
+                settings=settings,
+            )
             current_session = await _load_session(session_id, deps)
             if current_session is None:
                 final_status = "MISSING"
                 terminal_reason = "session_missing"
+                break
+            if _should_use_global_flatten_signal():
+                logger.info(
+                    "[%s] Global flatten signal detected — closing all positions and completing session",
+                    session_id,
+                )
+                live_feed_state = _live_mark_feed_state(
+                    session_id=session_id,
+                    symbol_last_prices=symbol_last_prices,
+                    ticker_adapter=ticker_adapter if use_websocket else None,
+                    symbols=list(tracker._open.keys()) or active_symbols,
+                )
+                await flatten_session_positions(
+                    session_id,
+                    notes="global_flatten_signal",
+                    feed_state=live_feed_state,
+                    emit_summary=False,
+                )
+                if _reconcile_live_session(
+                    session_id=session_id,
+                    reason="global_flatten_signal",
+                    alerts_enabled=alerts_enabled,
+                ):
+                    final_status = "FAILED"
+                    terminal_reason = "reconciliation_failed_after_global_flatten"
+                    complete_on_exit = False
+                else:
+                    final_status = "COMPLETED"
+                    terminal_reason = "global_flatten_signal"
+                    complete_on_exit = True
+                stop_requested = True
                 break
             if current_session.status == "PAUSED":
                 await _write_feed_state(
@@ -1199,7 +1339,7 @@ async def run_live_session(
                         _failed_cooldown_ok = (
                             last_disconnect_alert_ts is None
                             or (now - last_disconnect_alert_ts).total_seconds()
-                            >= _stale_alert_cooldown_sec
+                            >= _FEED_STALE_ALERT_COOLDOWN_SEC
                         )
                         if alerts_enabled and _failed_cooldown_ok:
                             last_disconnect_alert_ts = now
@@ -1377,7 +1517,10 @@ async def run_live_session(
                         terminal_reason = "risk_control_triggered"
                         stop_requested = True
 
-                    if _reconcile_live_session(
+                    should_reconcile = bool(driver_result["triggered"]) or (
+                        bar_end.minute % 15 == 0
+                    )
+                    if should_reconcile and _reconcile_live_session(
                         session_id=session_id,
                         reason=f"bar:{bar_end.isoformat()}",
                         alerts_enabled=alerts_enabled,
@@ -1446,6 +1589,22 @@ async def run_live_session(
             _cmd_dir = Path(".tmp_logs") / f"cmd_{session_id}"
             if _cmd_dir.exists():
                 for _cmd_file in sorted(_cmd_dir.glob("*.json")):
+                    if _is_admin_command_stale(_cmd_file, now):
+                        logger.warning(
+                            "[%s] Stale admin command dropped: %s",
+                            session_id,
+                            _cmd_file.name,
+                        )
+                        try:
+                            _cmd_file.unlink()
+                        except OSError:
+                            logger.debug(
+                                "[%s] Failed to delete stale admin command %s",
+                                session_id,
+                                _cmd_file,
+                                exc_info=True,
+                            )
+                        continue
                     try:
                         import json as _json
 
@@ -1683,8 +1842,13 @@ async def run_live_session(
                     break
 
             stale = False
-            if not local_feed and last_snapshot_ts is not None:
-                elapsed = (now - last_snapshot_ts).total_seconds()
+            freshness_ts = last_snapshot_ts
+            if use_websocket and ticker_adapter is not None:
+                ws_last_tick_ts = getattr(ticker_adapter, "last_tick_ts", None)
+                if ws_last_tick_ts is not None:
+                    freshness_ts = ws_last_tick_ts
+            if not local_feed and freshness_ts is not None:
+                elapsed = (now - freshness_ts).total_seconds()
                 # Zombie check: runs regardless of stale_timeout config.
                 # stale_feed_timeout_sec may be NULL/0 in the DB (common for live sessions),
                 # which previously caused the entire stale block to be skipped. A WebSocket
@@ -1706,7 +1870,7 @@ async def run_live_session(
                     deps,
                     session_id=session_id,
                     status="STALE",
-                    last_event_ts=last_snapshot_ts,
+                    last_event_ts=freshness_ts,
                     last_bar_ts=last_bar_ts,
                     last_price=last_price,
                     stale_reason="No market-data snapshots within timeout",
@@ -1717,9 +1881,7 @@ async def run_live_session(
                             "skipped": runtime_state.skipped_setup_rows,
                             "invalid": runtime_state.invalid_setup_rows,
                         },
-                        "last_snapshot_ts": last_snapshot_ts.isoformat()
-                        if last_snapshot_ts
-                        else None,
+                        "last_snapshot_ts": freshness_ts.isoformat() if freshness_ts else None,
                         "stale_timeout_sec": stale_timeout,
                     },
                 )
@@ -1751,7 +1913,7 @@ async def run_live_session(
                         deps,
                         session_id=session_id,
                         status="OK",
-                        last_event_ts=last_snapshot_ts,
+                        last_event_ts=freshness_ts,
                         last_bar_ts=last_bar_ts,
                         last_price=last_price,
                         stale_reason=None,
@@ -1770,7 +1932,7 @@ async def run_live_session(
                         deps,
                         session_id=session_id,
                         status="OK",
-                        last_event_ts=last_snapshot_ts,
+                        last_event_ts=freshness_ts,
                         last_bar_ts=last_bar_ts,
                         last_price=last_price,
                         stale_reason=None,
@@ -1783,7 +1945,7 @@ async def run_live_session(
             if not local_feed and no_snapshot_streak >= 3:
                 _stale_cooldown_ok = (
                     last_stale_alert_ts is None
-                    or (now - last_stale_alert_ts).total_seconds() > _stale_alert_cooldown_sec
+                    or (now - last_stale_alert_ts).total_seconds() > _FEED_STALE_ALERT_COOLDOWN_SEC
                 )
                 if alerts_enabled and not stale_alerted and _stale_cooldown_ok:
                     stale_alerted = True
@@ -1801,12 +1963,10 @@ async def run_live_session(
                     ]
                     dispatch_feed_stale_alert(
                         session_id=session_id,
-                        last_tick_ts=last_snapshot_ts,
+                        last_tick_ts=freshness_ts,
                         open_positions=open_pos_data,
                     )
-                stale_duration_sec = (
-                    (now - last_snapshot_ts).total_seconds() if last_snapshot_ts else 0
-                )
+                stale_duration_sec = (now - freshness_ts).total_seconds() if freshness_ts else 0
                 if stale_duration_sec > stale_exit_sec:
                     logger.warning(
                         "[%s] market data stale for %.0fs (limit %ds) — terminating",
@@ -2034,12 +2194,12 @@ async def run_live_session(
         # closed positions are visible in the dashboard without manual intervention.
         # store_backtest_results has a PAPER dedup guard so re-archiving is safe.
         # Skip archiving zero-trade restart sessions (entry window already closed) —
-        # they have no trades and create spurious entries in the dashboard dropdown.
-        _is_zero_trade_restart = (
-            terminal_reason in ("no_trades_entry_window_closed", "NO_TRADES_ENTRY_WINDOW_CLOSED")
-            and len(tracker._closed_today) == 0
-            and "-" in session_id
-            and len(session_id.split("-")[-1]) == 6  # suffix pattern: -abc123
+        # they have no closed trades and create spurious entries in the dashboard
+        # dropdown.
+        _is_zero_trade_restart = _is_zero_trade_restart_session(
+            session_id=session_id,
+            terminal_reason=terminal_reason,
+            paper_db=get_paper_db(),
         )
         if _is_zero_trade_restart:
             logger.info(

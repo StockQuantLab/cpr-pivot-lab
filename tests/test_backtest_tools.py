@@ -43,7 +43,8 @@ def test_agent_tool_defaults_match_backtest_params() -> None:
     assert run_backtest_sig.parameters["min_sl_atr_ratio"].default == 0.5
     assert run_backtest_sig.parameters["risk_pct"].default == 0.01
     assert run_backtest_sig.parameters["portfolio_value"].default == 1_000_000
-    assert run_backtest_sig.parameters["max_positions"].default == 10
+    assert run_backtest_sig.parameters["max_positions"].default == 5
+    assert run_backtest_sig.parameters["max_position_pct"].default == 0.20
     assert run_backtest_sig.parameters["entry_window_end"].default == "10:15"
     assert run_backtest_sig.parameters["long_max_gap_pct"].default is None
     assert run_multi_sig.parameters["cpr_percentile"].default == 33.0
@@ -51,6 +52,8 @@ def test_agent_tool_defaults_match_backtest_params() -> None:
     assert run_multi_sig.parameters["min_sl_atr_ratio"].default == 0.5
     assert run_multi_sig.parameters["risk_pct"].default == 0.01
     assert run_multi_sig.parameters["portfolio_value"].default == 1_000_000
+    assert run_multi_sig.parameters["max_positions"].default == 5
+    assert run_multi_sig.parameters["max_position_pct"].default == 0.20
     assert run_multi_sig.parameters["entry_window_end"].default == "10:15"
     assert run_multi_sig.parameters["long_max_gap_pct"].default is None
     assert rebuild_sig.parameters["cpr_percentile"].default == 33.0

@@ -7,6 +7,163 @@ Supersedes: `docs/PARITY_INCIDENT_LOG.md` (contents migrated below).
 
 ---
 
+## 2026-04-29 — DQ GAP: EOD readiness does not validate full baseline-window runtime coverage
+
+**Status:** OPEN
+**Severity:** Medium — live readiness can pass while historical baseline reruns still have runtime-table gaps
+
+### Symptom
+
+After Apr29 EOD ingestion and Apr30 readiness showed green, a read-only baseline preflight for
+`canonical_full` (`2038` symbols) over `2025-01-01 -> 2026-04-29` still found missing runtime
+symbol-days where `v_5min` data exists:
+
+- `intraday_day_pack`: 3 missing source symbol-days
+- `atr_intraday`: 838 missing source symbol-days
+- `cpr_daily`: 170 missing source symbol-days
+- `market_day_state`: 30,212 missing source symbol-days
+- `strategy_day_state`: 30,212 missing source symbol-days
+
+### Root Cause
+
+Current `pivot-data-quality --date <trade_date>` is a live-readiness gate. It validates today's or
+tomorrow's operational readiness and sparse symbol/day gaps, but it does not validate historical
+baseline-window completeness for a named universe.
+
+### Required Fix
+
+Add a baseline preflight mode, for example:
+
+```bash
+pivot-data-quality --baseline-window \
+  --universe-name canonical_full \
+  --start 2025-01-01 \
+  --end <current_date>
+```
+
+The gate must fail when runtime tables are missing rows for `(symbol, date)` pairs where source
+parquet (`v_5min` / `v_daily`) exists. This should run before any canonical baseline rerun.
+
+---
+
+## 2026-04-29 — BUG: live resilience gaps in live loop + alert dedupe (tracking)
+
+**Status:** IMPLEMENTED (high-priority)
+**Severity:** High — affects crash response and multi-session containment
+
+### Scope
+
+The live-paper hardening review identified still-open resilience gaps:
+
+- Global kill signal is currently per-session-only (`flatten_<session_id>.signal`) and does not close all active sessions from one file.
+- Admin command queue files can persist and execute after restart because there is no stale-file expiry.
+- Reconciliation runs on every bar group, increasing per-bar latency under large universes.
+- WebSocket stale detection mixes `last_snapshot_ts` with tick-age signals and can produce false positives on quiet feeds.
+- `FLATTEN_EOD` dedupe for alerts is in-memory only during long-lived process restarts.
+- Session `PLANNING` rows can linger long after the day starts.
+
+### Implemented Fixes
+
+- Added session-wide flatten signal path: `.tmp_logs/flatten_all.signal`.
+- Added stale admin-command cleanup based on file mtime.
+- Throttled in-loop reconciliation to trigger events and 15-minute boundaries.
+- Switched websocket stale-freshness to websocket tick timestamps when present.
+- Added persisted `FLATTEN_EOD` dedupe guard in `alert_log` (in addition to existing in-memory guard).
+- Added periodic `paper_feed_audit` cleanup in live loop (every 30 minutes).
+- Added `cleanup_stale_sessions()` handling for `PLANNING` rows older than 1 day.
+- Added external process supervision in `scripts/paper_supervisor.py`:
+  - `--watch` mode relaunches `daily-live` when no active session exists for target trade date.
+  - Added explicit signal handling to terminate active child sessions on SIGINT/SIGTERM/SIGBREAK.
+
+### Validation
+
+- Added/updated tests:
+  - `tests/test_paper_live_polling.py` (global signal + stale admin command expiry + feed-audit retention scheduling).
+  - `tests/test_paper_runtime.py` (DB-backed `FLATTEN_EOD` dedupe).
+  - `tests/test_bar_orchestrator.py` (multi-entry cumulative cash capacity regression).
+  - `tests/test_paper_db.py` (stale `PLANNING` sessions auto-cancelled).
+  - `tests/test_paper_supervisor.py` (`trade_date` parsing, active session detection, and defaults).
+
+### Deferred / Out-of-Scope
+
+- **H2 (external supervisor/watchdog):** implemented via `pivot-paper-supervisor --watch`.
+
+### Pending / Skipped with rationale
+
+- **L1 (TrailingStop reconstruction on every candle):** implemented via session-position `TrailingStop` cache in `engine/paper_runtime.py` to avoid re-instantiation during per-candle advances.
+- **L2 (FEED_STALE rate-limit window):** implemented in `scripts/paper_live.py` as a shared cooldown constant (`PIVOT_FEED_STALE_ALERT_COOLDOWN_SEC`) to make repeated alerts less noisy and configurable.
+- **L3 (archive zero-trade `archive_completed_session` fragility):** fixed to use persisted closed-position count (via `get_session_positions`) instead of suffix heuristics.
+- **L4 (compute_position_qty float precision):** N/A — partial-share execution is intentionally out of scope for this environment. Paper sizing remains integer as expected by current broker/order path and risk policy.
+- **M5 (market DB lock contention):** low-priority and no clear improvement without measurable benchmark evidence; left as is.
+
+### 2026-04-29 Follow-up Decisions
+
+- Confirmed all critical/high items (C1–C4, H1–H3, H4, H5, H1/2/3 etc.) are implemented.
+- Confirmed mid-priority resilience fixes M1–M4 are implemented.
+- Kept M5 deferred by design; L1/L2/L3 moved to implemented after this pass.
+- Additional parity hardening (2026-04-29 follow-up): removed redundant CPR entry prefilter logic in
+  `CPRATRBacktest._simulate_day_cpr_levels()` so OR/ATR and gap screening uses the same
+  shared `scan_cpr_levels_entry()` path as live/replay. This removes the last backtest-only
+  duplicate gate in the parity-critical entry path.
+- Follow-up regression checks run locally (with writable cache override):
+  - `$env:UV_CACHE_DIR = Join-Path (Get-Location) '.tmp_logs/uv-cache'; uv run pytest tests/test_paper_supervisor.py tests/test_bar_orchestrator.py tests/test_paper_live_polling.py tests/test_paper_db.py -q`
+  - `$env:UV_CACHE_DIR = Join-Path (Get-Location) '.tmp_logs/uv-cache'; uv run ruff check scripts/paper_supervisor.py scripts/paper_live.py engine/paper_runtime.py engine/bar_orchestrator.py db/paper_db.py tests/test_paper_supervisor.py tests/test_paper_live_polling.py tests/test_bar_orchestrator.py tests/test_paper_db.py`
+
+### Notes
+
+- Constraints for idempotent paper orders and single-open-position-per-symbol are now enforced in code:
+  `idx_po_idempotency` is unique, and `idx_pp_session_symbol_status` enforces the open-symbol/session
+  uniqueness contract in DuckDB-compatible form (unique session+symbol+status).
+
+### 2026-04-29 Follow-up: parity/config parity sweep
+
+- **Status:** FIXED IN CODE — historical Apr-29 live sessions remain non-canonical evidence
+- **Severity:** Medium
+- **Scope:** live-vs-replay-vs-backtest configuration uniformity and parity precision
+
+#### Findings
+
+1) `CPR_LEVELS_LONG-2026-04-29-live-kite` and `CPR_LEVELS_SHORT-2026-04-29-live-kite`:
+   - Marked `_canonical_preset=CPR_LEVELS_RISK_LONG / CPR_LEVELS_RISK_SHORT`
+   - Session-level DB columns still show `max_positions=10`, `max_position_pct=0.10`, `portfolio_value=1000000`
+   - Session strategy fingerprint in `paper_sessions.strategy_params` still resolves to:
+     - `capital=100000`
+     - `risk_pct=0.01`
+     - `max_positions=10`
+     - `max_position_pct=0.1`
+   - Expected canonical sizing for CPR risk presets is:
+     - `capital=200000`
+     - `max_positions=5`
+     - `max_position_pct=0.20`
+   - Impact: these two sessions are not replay/parity comparable to canonical backtest presets despite preset labels.
+
+2) 2026-04-27 replay-vs-backtest canonical validation:
+   - `CPR_LEVELS_LONG-2026-04-27-replay-historical-8e14c9` vs `04f545178f9b`
+   - `11` expected / `11` actual trades matched; `matched_within_eps=9` with two penny-level row drifts
+     (`±₹0.01`, `total_abs_delta=₹0.0200`, `2` rows).
+   - Impact: residual is operationally negligible but should be tracked as a parity guard threshold to prevent silent expansion.
+
+3) Same-day backtest target for live 2026-04-29 is still missing.
+   - No `run_metadata`/`backtest_results` run currently matched `trade_date=2026-04-29` for direct backtest parity.
+   - Impact: complete-day live-vs-backtest parity for 2026-04-29 remains blocked until a canonical backtest run for that date exists.
+
+#### Action
+
+- Fixed future-session enforcement:
+  - Single `--preset` paper runs now stamp `_canonical_preset` only when resolved params exactly
+    match the named preset.
+  - `_with_resolved_strategy_metadata()` now expands `_canonical_preset` from
+    `engine/strategy_presets.py` and refuses stale embedded sizing overrides.
+  - A future session can no longer be labelled canonical while carrying old sizing such as
+    `capital=100000`, `max_positions=10`, or `max_position_pct=0.10`.
+- Remaining parity work:
+  - Treat the two Apr-29 live sessions as non-canonical historical sessions.
+  - Run a fresh canonical replay/live/backtest comparison after the next clean session.
+  - Live-vs-backtest parity for 2026-04-29 is still blocked until a canonical same-day backtest
+    target exists.
+
+---
+
 ## 2026-04-28 — BUG: pivot-baselines parent process blocks child backtests
 
 **Status:** FIXED
@@ -86,7 +243,7 @@ the 2026-04-28 trading day.
 
 ## 2026-04-28 — POLICY/BUG: Canonical universe must not shrink daily because a few symbols are missing
 
-**Status:** OPEN — fix before the next canonical baseline refresh
+**Status:** FIXED IN CODE — needs next EOD/live validation and baseline rerun
 **Severity:** High — shrinking the baseline/live universe makes backtests non-comparable and can hide live-trading coverage gaps
 
 ### Symptom
@@ -99,35 +256,38 @@ Daily universe shrink is the wrong default for canonical baselines. A few symbol
 suspended, or missing records on a day should not cause the entire canonical universe to be reduced
 and historical runs to become non-comparable.
 
-### Required Policy
+### Policy Implemented 2026-04-29
 
-- Create a stable canonical CPR baseline/live universe tomorrow, expected around the full available
-  symbol set (~2105 symbols; exact count to be confirmed from current market data).
-- Use the same canonical universe for:
-  - baseline backtests
-  - daily replay / local-feed parity
-  - live paper trading candidate preparation
-- Do not regenerate canonical baseline identity from only today's tradeable/missing-data subset.
-- Treat missing data for a small number of symbols as symbol/day sparsity, not a reason to shrink the
-  whole canonical universe.
+- `canonical_full` is now the stable full-universe source of truth.
+- `daily-prepare --all-symbols` creates `canonical_full` once if missing, then copies that same
+  list to the dated `full_YYYY_MM_DD` snapshot.
+- `daily-live`, `daily-replay`, and `daily-sim` default to the dated snapshot and fall back to
+  `canonical_full` only if the dated snapshot is missing.
+- `pivot-data-quality --date <trade_date>` also falls back from `full_YYYY_MM_DD` to
+  `canonical_full` for setup-only readiness.
+- `_resolve_all_local_symbols()` no longer intersects with the current Kite instrument master;
+  the universe is not reduced because one day's instrument/data availability changed.
+- Repeated `daily-prepare --all-symbols` is now guarded: if the dated `full_YYYY_MM_DD` snapshot
+  already exists and differs from `canonical_full`, the command fails unless the operator passes
+  `--refresh-universe-snapshot`.
+- Default live/replay/sim universe resolution now refuses a mismatched dated snapshot instead of
+  silently using a smaller universe than `canonical_full`.
+- Sparse symbol/day gaps remain warnings; broad gaps still fail readiness.
+
+### Remaining Follow-Up
+
+- Validate the next EOD `daily-prepare` preserves the canonical count in `full_YYYY_MM_DD`.
+- Rerun baselines only after the baseline promotion/overlap gate policy is finalized.
 
 ### Required Code Behaviour
 
-- Backtest and live preparation should load the canonical universe and skip only symbols that lack
+- Backtest and live preparation load the canonical universe and skip only symbols that lack
   the required setup/candle rows for the specific day being processed.
-- Live/paper should continue with the available symbols when a few symbols are missing data.
-- Missing-symbol/day counts should be logged and surfaced in readiness/quality output.
+- Live/paper continues with the available symbols when a few symbols are missing data.
+- Missing-symbol/day counts are logged and surfaced in readiness/quality output.
 - Baseline comparison should store and display the universe name and symbol count clearly.
 - `pivot-baselines` should block promotion if the new run uses a different universe from the
   previous canonical baseline unless the operator explicitly opts into a universe migration.
-
-### Tomorrow's Action
-
-1. Build/save a canonical universe snapshot around the full available symbol set (~2105 symbols).
-2. Make canonical baseline and live commands use that universe by default.
-3. Confirm missing records are skipped per symbol/day without aborting the whole run.
-4. Rerun all 8 baselines from `2025-01-01` to `2026-04-28` on that stable universe only after the
-   universe policy/code path is verified.
 
 ---
 
@@ -4782,3 +4942,104 @@ comparison contract or explicit pilot scope gate.
 - `uv run ruff check engine\broker_adapter.py engine\broker_reconciliation.py scripts\paper_trading.py tests\test_broker_adapter.py tests\test_broker_reconciliation.py` → clean
 - `uv run pivot-paper-trading broker-reconcile --help` → command registered
 - `uv run pivot-paper-trading pilot-check --help` → command registered
+
+---
+
+## 2026-04-29 — INCIDENT: live sessions started with zero setup rows after false data-readiness pass
+
+**Status:** FIXED IN CODE — needs next market-day validation
+**Severity:** Critical — one live-paper trading day lost because sessions were connected but unable to evaluate trades
+
+### Symptom
+
+`CPR_LEVELS_LONG` and `CPR_LEVELS_SHORT` live sessions for 2026-04-29 started and received live
+bars, but setup prefetch had zero usable trade-date rows. The live loop skipped symbols instead
+of evaluating entries, so the entry window was lost.
+
+### Root Cause
+
+Pre-market validation checked the wrong contract. Today's intraday candles are not expected before
+market open, and future/current-day materialized setup rows are not required either. Live CPR setup
+must be derived from the latest completed trading day's daily/ATR inputs plus the live 09:15
+opening-range candle. `pivot-data-quality --date today` could pass with an empty same-day
+5-minute symbol set, while `daily-live` still failed because startup incorrectly required
+exact-date `market_day_state` rows.
+
+### Fix Applied
+
+- `pivot-data-quality --date today` now uses the dated saved universe in pre-market/setup-only
+  mode and fails unless previous completed-day `v_daily`, `v_5min`, `atr_intraday`, and
+  `cpr_thresholds` cover that universe. Sparse symbol/day gaps up to 5% are warnings; broad gaps
+  still fail closed.
+- `daily-prepare` live validation now checks the same previous completed-day live prerequisites
+  and does not require future-date `cpr_daily`, `market_day_state`, or `strategy_day_state` rows.
+- Live CPR pre-filter keeps the full universe when only an older completed `cpr_daily` date exists,
+  avoiding a false block before the live day starts.
+- `daily-live` no longer fails solely because exact-date `market_day_state` rows are absent; it
+  retries setup resolution from previous completed-day data plus live opening-range candles.
+- Added `engine/execution_defaults.py` as the shared sizing source for backtest, replay, live,
+  paper DB sessions, settings, and agent backtest tools.
+- Updated canonical CPR presets to `portfolio_value=₹10L`, `capital=₹2L`, `risk_pct=1%`,
+  `max_positions=5`, and `max_position_pct=0.20`; risk per position is therefore ₹2,000.
+- Paper `--multi` now verifies LONG/SHORT params against the named backtest presets and persists
+  a resolved strategy-config fingerprint in `paper_sessions.strategy_params`.
+- Existing live sessions are refused if their stored strategy fingerprint differs from the
+  requested preset/config, preventing silent live/backtest drift such as a missing
+  `momentum_confirm`.
+- Ingestion docs now require `pivot-refresh --prepare-paper --trade-date <next_trading_date>` and
+  previous completed-day DQ readiness as the automated live-readiness gate.
+- Added `pivot-refresh --eod-ingest --date <today> --trade-date <next_trading_date>` as the
+  guarded single-command EOD path. It enforces refresh-instruments -> daily ingest -> 5-min ingest
+  -> build -> daily-prepare -> final DQ in one process and stops on first failure.
+- `pivot-refresh --eod-ingest` now passes `--skip-existing` to daily and 5-minute Kite ingestion
+  by default, logs skipped/rerun behavior clearly, and exposes `--force-ingest` for deliberate
+  refetches.
+- `pivot-refresh` now streams child stdout/stderr directly, so redirected EOD logs show live Kite
+  ingestion/build progress instead of staying silent until a subprocess exits.
+
+### Validation
+
+- `uv run pytest tests/test_data_quality_cli.py tests/test_paper_prepare.py tests/test_paper_trading_workflow.py tests/test_live_market_data.py tests/test_paper_trading_cli.py tests/test_strategy.py tests/test_backtest_tools.py tests/test_settings.py -q` → `158 passed`
+- `uv run pytest tests/test_data_quality_cli.py tests/test_paper_prepare.py -q` → `20 passed` after sparse full-universe tolerance
+- `uv run pytest tests/test_refresh.py -q` → `6 passed`
+- `uv run pytest tests/test_refresh.py tests/test_data_quality_cli.py tests/test_paper_prepare.py -q` → `25 passed`
+- `uv run ruff check engine/execution_defaults.py engine/strategy_presets.py engine/cpr_atr_strategy.py engine/run_backtest.py engine/cpr_atr_utils.py agent/tools/backtest_tools.py config/settings.py db/paper_db.py scripts/data_quality.py scripts/paper_prepare.py scripts/paper_trading.py scripts/paper_live.py tests/test_data_quality_cli.py tests/test_paper_prepare.py tests/test_paper_trading_workflow.py tests/test_live_market_data.py tests/test_paper_trading_cli.py tests/test_strategy.py tests/test_backtest_tools.py tests/test_settings.py` → clean
+- `uv run ruff check scripts/data_quality.py scripts/paper_prepare.py tests/test_data_quality_cli.py tests/test_paper_prepare.py docs/KITE_INGESTION.md docs/ISSUES.md` → clean
+- `uv run ruff check scripts/refresh.py scripts/data_quality.py scripts/paper_prepare.py tests/test_refresh.py tests/test_data_quality_cli.py tests/test_paper_prepare.py` → clean
+- `uv run ruff check scripts/refresh.py tests/test_refresh.py` → clean
+- `uv run pytest tests/test_data_quality_cli.py tests/test_paper_prepare.py tests/test_live_market_data.py tests/test_paper_trading_workflow.py tests/test_paper_trading_cli.py tests/test_refresh.py -q` → `93 passed`
+- `uv run ruff check scripts/data_quality.py scripts/paper_prepare.py scripts/paper_trading.py scripts/paper_live.py scripts/refresh.py tests/test_data_quality_cli.py tests/test_paper_prepare.py tests/test_live_market_data.py tests/test_paper_trading_workflow.py tests/test_paper_trading_cli.py tests/test_refresh.py` → clean
+- `uv run pytest tests/test_data_quality_cli.py tests/test_paper_prepare.py tests/test_paper_runtime.py tests/test_live_market_data.py tests/test_paper_trading_workflow.py tests/test_paper_trading_cli.py tests/test_refresh.py -q` → `120 passed`
+- `uv run ruff check engine/paper_runtime.py scripts/data_quality.py scripts/paper_prepare.py scripts/paper_trading.py scripts/paper_live.py scripts/refresh.py tests/test_data_quality_cli.py tests/test_paper_prepare.py tests/test_paper_runtime.py tests/test_live_market_data.py tests/test_paper_trading_workflow.py tests/test_paper_trading_cli.py tests/test_refresh.py` → clean
+
+---
+
+## 2026-04-30 — DATA GAP FOLLOW-UP: historical CPR/ATR/state sparse gaps remain after pack repair
+
+**Status:** OPEN — deferred; not blocking 2026-04-30 live paper
+**Severity:** Medium — baseline-window completeness follow-up
+
+### Symptom
+
+After the interrupted canonical-full runtime rebuild was repaired, `intraday_day_pack` coverage
+was fully restored for the `canonical_full` universe, but small historical gaps still remain in
+derived CPR/ATR/state tables for sparse symbol-days.
+
+### Current Verified State
+
+- `intraday_day_pack` is repaired for the baseline window `2025-01-01` → `2026-04-29`.
+- Missing pack rows where source 5-minute data exists: `0`.
+- Duplicate pack `(symbol, trade_date)` rows: `0`.
+- No future `2026-04-30+` runtime rows were created.
+- Remaining derived-table gaps where source 5-minute data exists:
+  - `atr_intraday`: `573` symbol-days across `491` symbols.
+  - `cpr_daily`: `170` symbol-days across `166` symbols.
+  - `market_day_state`: `552` symbol-days across `448` symbols.
+  - `strategy_day_state`: `552` symbol-days across `448` symbols.
+
+### Follow-Up
+
+Investigate whether the remaining derived-table gaps are expected sparse symbol-days
+(suspended/no daily candle/no ATR lookback) or repairable runtime gaps. Do this before final
+baseline promotion, but do not rerun broad Kite ingestion unless raw parquet coverage is proven
+missing.

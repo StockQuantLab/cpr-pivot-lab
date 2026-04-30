@@ -9,6 +9,7 @@ import json
 import logging
 import re
 import time
+from collections.abc import Mapping
 from dataclasses import asdict
 from datetime import datetime
 from typing import Any
@@ -30,6 +31,11 @@ from engine.broker_reconciliation import (
 from engine.cli_setup import configure_windows_asyncio, configure_windows_stdio, run_asyncio
 from engine.command_lock import acquire_command_lock
 from engine.cpr_atr_strategy import BacktestResult, CPRATRBacktest
+from engine.execution_defaults import (
+    DEFAULT_MAX_POSITION_PCT,
+    DEFAULT_MAX_POSITIONS,
+    DEFAULT_PORTFOLIO_VALUE,
+)
 from engine.kite_ticker_adapter import KiteTickerAdapter
 from engine.live_market_data import IST
 from engine.paper_reconciliation import reconcile_paper_session
@@ -44,12 +50,19 @@ from engine.paper_runtime import (
     set_alerts_suppressed,
     write_admin_command,
 )
-from engine.strategy_presets import ALL_STRATEGY_PRESETS, list_strategy_preset_names
+from engine.strategy_presets import (
+    ALL_STRATEGY_PRESETS,
+    build_strategy_config_from_preset,
+    list_strategy_preset_names,
+)
 from scripts import data_quality as _data_quality
 from scripts.paper_archive import archive_completed_session
 from scripts.paper_feed_audit import compare_feed_audit
 from scripts.paper_live import run_live_session
 from scripts.paper_prepare import (
+    CANONICAL_FULL_UNIVERSE_NAME,
+    ensure_canonical_universe,
+    load_universe_symbols,
     pre_filter_symbols_for_strategy,
     prepare_runtime_for_daily_paper,
     resolve_prepare_symbols,
@@ -112,6 +125,17 @@ async def get_feed_state(session_id: str):
 
 
 async def create_paper_session(**kwargs):
+    strategy = str(kwargs.get("strategy") or "CPR_LEVELS")
+    strategy_params = kwargs.get("strategy_params") or {}
+    kwargs["strategy_params"] = _with_resolved_strategy_metadata(
+        strategy,
+        strategy_params,
+        canonical_preset=strategy_params.get("_canonical_preset")
+        if isinstance(strategy_params, dict)
+        else None,
+    )
+    for key, value in _session_execution_kwargs(strategy, kwargs["strategy_params"]).items():
+        kwargs.setdefault(key, value)
     return _pdb().create_session(**kwargs)
 
 
@@ -184,6 +208,9 @@ def _variant_params(base: dict[str, Any], **overrides: Any) -> dict[str, Any]:
 CPR_CANONICAL_PARAMS: dict[str, Any] = dict(
     ALL_STRATEGY_PRESETS["CPR_LEVELS_RISK_LONG"]["overrides"]
 )
+CPR_CANONICAL_SHORT_PARAMS: dict[str, Any] = dict(
+    ALL_STRATEGY_PRESETS["CPR_LEVELS_RISK_SHORT"]["overrides"]
+)
 
 PAPER_ALLOWED_STRATEGIES: tuple[str, ...] = ("CPR_LEVELS",)
 PAPER_ALLOWED_PRESETS: tuple[str, ...] = tuple(list_strategy_preset_names("CPR_LEVELS"))
@@ -217,13 +244,164 @@ PAPER_STANDARD_MATRIX: tuple[tuple[str, str, dict[str, Any]], ...] = (
         "CPR_LEVELS",
         _variant_params(CPR_CANONICAL_PARAMS, direction_filter="LONG"),
     ),
-    # CPR SHORT: same recipe, but RVOL is skipped for the bearish setup.
+    # CPR SHORT: exact canonical SHORT preset, including SHORT-only trailing config.
     (
         "CPR_LEVELS_SHORT",
         "CPR_LEVELS",
-        _variant_params(CPR_CANONICAL_PARAMS, direction_filter="SHORT", skip_rvol_check=True),
+        _variant_params(CPR_CANONICAL_SHORT_PARAMS, direction_filter="SHORT"),
     ),
 )
+
+
+_STRATEGY_METADATA_KEYS = {
+    "_canonical_preset",
+    "_strategy_config_fingerprint",
+    "_resolved_strategy_config",
+}
+_NON_STRATEGY_PARAM_KEYS = {"feed_source"}
+
+
+def _strip_strategy_metadata(params: Mapping[str, Any] | None) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in dict(params or {}).items()
+        if key not in _STRATEGY_METADATA_KEYS
+    }
+
+
+def _resolved_strategy_config_dict(
+    strategy: str,
+    strategy_params: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    config = build_backtest_params_from_overrides(
+        strategy, _strip_strategy_metadata(strategy_params)
+    )
+    return json.loads(json.dumps(asdict(config), sort_keys=True, default=str))
+
+
+def _strategy_config_fingerprint(resolved_config: Mapping[str, Any]) -> str:
+    payload = json.dumps(resolved_config, sort_keys=True, default=str, separators=(",", ":"))
+    return hashlib.sha256(payload.encode()).hexdigest()[:16]
+
+
+def _with_resolved_strategy_metadata(
+    strategy: str,
+    strategy_params: Mapping[str, Any] | None,
+    *,
+    canonical_preset: str | None = None,
+) -> dict[str, Any]:
+    params = _strip_strategy_metadata(strategy_params)
+    preset_name = str(canonical_preset or "").strip().upper()
+    if preset_name:
+        preset = ALL_STRATEGY_PRESETS.get(preset_name)
+        if preset is None:
+            raise ValueError(f"Unknown strategy preset: {preset_name}")
+        resolved_preset_strategy = _assert_cpr_only_strategy(
+            str(preset["strategy"]), source=f"preset {preset_name}"
+        )
+        passthrough = {
+            key: value for key, value in params.items() if key in _NON_STRATEGY_PARAM_KEYS
+        }
+        supplied_config_overrides = {
+            key: value for key, value in params.items() if key not in _NON_STRATEGY_PARAM_KEYS
+        }
+        if supplied_config_overrides:
+            preset_config = asdict(build_strategy_config_from_preset(preset_name))
+            supplied_config = asdict(
+                build_backtest_params_from_overrides(
+                    resolved_preset_strategy,
+                    {**dict(preset["overrides"]), **supplied_config_overrides},
+                )
+            )
+            if supplied_config != preset_config:
+                diffs = _strategy_config_diffs(supplied_config, preset_config)
+                detail = "; ".join(diffs[:8])
+                raise SystemExit(
+                    f"Canonical preset {preset_name} received non-canonical overrides"
+                    f"{': ' + detail if detail else ''}. "
+                    "Do not mark ad hoc params as canonical."
+                )
+        strategy = resolved_preset_strategy
+        params = {**dict(preset["overrides"]), **passthrough}
+        params["_canonical_preset"] = preset_name
+    resolved = _resolved_strategy_config_dict(strategy, params)
+    params["_resolved_strategy_config"] = resolved
+    params["_strategy_config_fingerprint"] = _strategy_config_fingerprint(resolved)
+    return normalize_strategy_params(params)
+
+
+def _paper_multi_preset_for_label(label: str) -> str:
+    normalized = str(label or "").strip().upper()
+    if normalized == "CPR_LEVELS_LONG":
+        return "CPR_LEVELS_RISK_LONG"
+    if normalized == "CPR_LEVELS_SHORT":
+        return "CPR_LEVELS_RISK_SHORT"
+    raise ValueError(f"No canonical paper preset mapping for {label!r}")
+
+
+def _strategy_config_diffs(
+    left: Mapping[str, Any],
+    right: Mapping[str, Any],
+    *,
+    prefix: str = "",
+) -> list[str]:
+    diffs: list[str] = []
+    keys = sorted(set(left) | set(right))
+    for key in keys:
+        left_value = left.get(key)
+        right_value = right.get(key)
+        path = f"{prefix}.{key}" if prefix else key
+        if isinstance(left_value, dict) and isinstance(right_value, dict):
+            diffs.extend(_strategy_config_diffs(left_value, right_value, prefix=path))
+        elif left_value != right_value:
+            diffs.append(f"{path}: {left_value!r} != {right_value!r}")
+    return diffs
+
+
+def _assert_paper_multi_params_match_preset(
+    label: str,
+    strategy: str,
+    strategy_params: Mapping[str, Any],
+) -> str:
+    preset_name = _paper_multi_preset_for_label(label)
+    preset = ALL_STRATEGY_PRESETS[preset_name]
+    preset_config = asdict(build_strategy_config_from_preset(preset_name))
+    params_config = asdict(
+        build_backtest_params_from_overrides(strategy, _strip_strategy_metadata(strategy_params))
+    )
+    if str(preset["strategy"]).upper() != str(strategy).upper() or params_config != preset_config:
+        diffs = _strategy_config_diffs(params_config, preset_config)
+        detail = "; ".join(diffs[:8])
+        suffix = f": {detail}" if detail else ""
+        raise SystemExit(
+            f"{label} paper params do not match preset {preset_name}{suffix}. "
+            "Fix the shared preset, not live-only params."
+        )
+    return preset_name
+
+
+def _prepare_paper_multi_strategy_params(
+    label: str,
+    strategy: str,
+    base_params: Mapping[str, Any],
+) -> dict[str, Any]:
+    normalized = apply_paper_strategy_defaults(
+        strategy, normalize_strategy_params(dict(base_params))
+    )
+    preset_name = _assert_paper_multi_params_match_preset(label, strategy, normalized)
+    return _with_resolved_strategy_metadata(strategy, normalized, canonical_preset=preset_name)
+
+
+def _session_execution_kwargs(
+    strategy: str,
+    strategy_params: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    resolved = _resolved_strategy_config_dict(strategy, strategy_params)
+    return {
+        "portfolio_value": float(resolved.get("portfolio_value") or DEFAULT_PORTFOLIO_VALUE),
+        "max_positions": int(resolved.get("max_positions") or DEFAULT_MAX_POSITIONS),
+        "max_position_pct": float(resolved.get("max_position_pct") or DEFAULT_MAX_POSITION_PCT),
+    }
 
 
 def _parse_json(value: str | None) -> dict:
@@ -332,7 +510,15 @@ def _resolve_paper_strategy_params(
         params = _parse_json(raw_value)
     if args is not None:
         params.update(_collect_strategy_cli_overrides(args, has_preset=bool(preset_name)))
-    return apply_paper_strategy_defaults(resolved_strategy, normalize_strategy_params(params))
+    normalized = apply_paper_strategy_defaults(resolved_strategy, normalize_strategy_params(params))
+    if preset_name:
+        preset_config = asdict(build_strategy_config_from_preset(preset_name))
+        normalized_config = asdict(
+            build_backtest_params_from_overrides(resolved_strategy, normalized)
+        )
+        if normalized_config == preset_config:
+            normalized["_canonical_preset"] = preset_name
+    return normalized
 
 
 def _parse_symbols_arg(value: str | None) -> list[str] | None:
@@ -347,15 +533,52 @@ def _default_full_universe_name(trade_date: str) -> str:
     return f"full_{trade_date.replace('-', '_')}"
 
 
+def _load_saved_universe_for_guard(universe_name: str) -> list[str]:
+    """Best-effort saved-universe load for defaulting and safety guards."""
+    try:
+        return load_universe_symbols(universe_name, read_only=True)
+    except Exception:
+        return []
+
+
+def _universe_diff_summary(left: list[str], right: list[str]) -> str:
+    left_set = set(left)
+    right_set = set(right)
+    only_left = sorted(left_set - right_set)
+    only_right = sorted(right_set - left_set)
+    parts = [f"counts {len(left_set)} != {len(right_set)}"]
+    if only_left:
+        parts.append(f"only_left={only_left[:5]}{'...' if len(only_left) > 5 else ''}")
+    if only_right:
+        parts.append(f"only_right={only_right[:5]}{'...' if len(only_right) > 5 else ''}")
+    return "; ".join(parts)
+
+
 def _apply_default_saved_universe(args: argparse.Namespace, trade_date: str) -> None:
-    """Default paper runs to the dated saved universe unless an override is explicit."""
+    """Default paper runs to dated snapshot, then canonical fallback."""
     if _parse_symbols_arg(getattr(args, "symbols", None)):
         return
     if bool(getattr(args, "all_symbols", False)):
         return
     if str(getattr(args, "universe_name", "") or "").strip():
         return
-    args.universe_name = _default_full_universe_name(trade_date)
+    dated_name = _default_full_universe_name(trade_date)
+    dated_symbols = _load_saved_universe_for_guard(dated_name)
+    canonical_symbols = _load_saved_universe_for_guard(CANONICAL_FULL_UNIVERSE_NAME)
+    if dated_symbols and canonical_symbols and set(dated_symbols) != set(canonical_symbols):
+        raise SystemExit(
+            f"Refusing default universe for {trade_date}: {dated_name} differs from "
+            f"{CANONICAL_FULL_UNIVERSE_NAME} ({_universe_diff_summary(dated_symbols, canonical_symbols)}). "
+            "Repair explicitly with daily-prepare --refresh-universe-snapshot, or pass "
+            "--universe-name intentionally."
+        )
+    if dated_symbols:
+        args.universe_name = dated_name
+        return
+    if canonical_symbols:
+        args.universe_name = CANONICAL_FULL_UNIVERSE_NAME
+        return
+    args.universe_name = dated_name
 
 
 def _resolve_cli_symbols(
@@ -413,12 +636,16 @@ def _count_duckdb_rows_for_run_ids(run_ids: list[str]) -> dict[str, int]:
 
 def _build_runtime_coverage_fix_lines(missing_counts: dict[str, Any]) -> list[str]:
     lines: list[str] = []
+    if int(missing_counts.get("cpr_daily") or 0) > 0:
+        lines.append("doppler run -- uv run pivot-build --table cpr --refresh-date <trade-date>")
     if int(missing_counts.get("market_day_state") or 0) > 0:
-        lines.append("doppler run -- uv run pivot-build --table state --force")
+        lines.append("doppler run -- uv run pivot-build --table state --refresh-date <trade-date>")
     if int(missing_counts.get("strategy_day_state") or 0) > 0:
-        lines.append("doppler run -- uv run pivot-build --table strategy --force")
+        lines.append(
+            "doppler run -- uv run pivot-build --table strategy --refresh-date <trade-date>"
+        )
     if int(missing_counts.get("intraday_day_pack") or 0) > 0:
-        lines.append("doppler run -- uv run pivot-build --table pack --force")
+        lines.append("doppler run -- uv run pivot-build --table pack --refresh-since <trade-date>")
     return lines or ["doppler run -- uv run pivot-data-quality --date <trade-date>"]
 
 
@@ -471,16 +698,24 @@ async def _ensure_daily_session(
     notes: str | None,
     mode: str = "replay",
 ) -> PaperSession:
+    requested_params = _with_resolved_strategy_metadata(
+        strategy,
+        strategy_params,
+        canonical_preset=strategy_params.get("_canonical_preset")
+        if isinstance(strategy_params, dict)
+        else None,
+    )
+    execution_kwargs = _session_execution_kwargs(strategy, requested_params)
     requested_session_id = session_id or _default_session_id(
         "paper",
         trade_date,
         strategy,
-        strategy_params,
+        requested_params,
         mode,
     )
     session = await get_session(requested_session_id)
 
-    direction = str((strategy_params or {}).get("direction_filter", "BOTH") or "BOTH").upper()
+    direction = str((requested_params or {}).get("direction_filter", "BOTH") or "BOTH").upper()
     direction_label = f" {direction}" if direction != "BOTH" else ""
     session_name = f"{strategy}{direction_label} {trade_date}"
 
@@ -491,13 +726,49 @@ async def _ensure_daily_session(
             strategy=strategy,
             symbols=symbols,
             status="ACTIVE",
-            strategy_params=strategy_params,
+            strategy_params=requested_params,
             trade_date=trade_date,
             mode=mode,
             notes=notes,
+            **execution_kwargs,
         )
 
     if mode == "live":
+        session_execution_diffs: list[str] = []
+        for key, requested_value in execution_kwargs.items():
+            existing_value = getattr(session, key, None)
+            if existing_value is not None and float(existing_value) != float(requested_value):
+                session_execution_diffs.append(f"{key}: {existing_value!r} != {requested_value!r}")
+        if session_execution_diffs:
+            raise SystemExit(
+                f"Existing live session {requested_session_id} execution sizing differs from "
+                f"requested params: {'; '.join(session_execution_diffs)}. "
+                "Stop/recreate the session; refusing drift."
+            )
+        existing_params = getattr(session, "strategy_params", {}) or {}
+        existing_fingerprint = (
+            existing_params.get("_strategy_config_fingerprint")
+            if isinstance(existing_params, dict)
+            else None
+        )
+        requested_fingerprint = requested_params.get("_strategy_config_fingerprint")
+        if existing_fingerprint and existing_fingerprint != requested_fingerprint:
+            raise SystemExit(
+                f"Existing live session {requested_session_id} was created with different "
+                "strategy params. Stop/recreate the session; refusing silent live/backtest drift."
+            )
+        if not existing_fingerprint:
+            existing_config = _resolved_strategy_config_dict(
+                str(getattr(session, "strategy", strategy) or strategy),
+                existing_params if isinstance(existing_params, dict) else {},
+            )
+            requested_config = requested_params["_resolved_strategy_config"]
+            diffs = _strategy_config_diffs(existing_config, requested_config)
+            if diffs:
+                raise SystemExit(
+                    f"Existing live session {requested_session_id} params differ from requested "
+                    f"params: {'; '.join(diffs[:8])}. Stop/recreate the session; refusing drift."
+                )
         logger.info(
             "paper session_id %s already exists (status=%s); reusing existing live session",
             requested_session_id,
@@ -518,10 +789,11 @@ async def _ensure_daily_session(
         strategy=strategy,
         symbols=symbols,
         status="ACTIVE",
-        strategy_params=strategy_params,
+        strategy_params=requested_params,
         trade_date=trade_date,
         mode=mode,
         notes=notes,
+        **execution_kwargs,
     )
 
 
@@ -529,12 +801,60 @@ def _handle_coverage_gaps(preparation: dict[str, Any], *, trade_date: str, mode:
     """Handle runtime coverage gaps for paper sessions.
 
     Strategy:
+    - live/current-day checks use previous completed-day `v_daily`, `v_5min`,
+      `atr_intraday`, and `cpr_thresholds`; they must not require future-date state rows.
     - `intraday_day_pack` gaps are warnings only — missing symbols simply didn't
       trade that day and will produce no positions. Never a blocker.
-    - `market_day_state` / `strategy_day_state` gaps are hard errors — CPR/ATR
-      setup data is absent so the strategy cannot run for those symbols.
+    - `cpr_daily` / `market_day_state` / `strategy_day_state` gaps are hard errors —
+      CPR/ATR setup data is absent so the strategy cannot run for those symbols.
     """
     inner_coverage = preparation.get("coverage") or {}
+    if mode == "live" and "missing_by_symbol" in inner_coverage:
+        if bool(inner_coverage.get("unexpected_trade_date_state_rows")):
+            counts = dict(inner_coverage.get("exact_trade_date_counts") or {})
+            raise SystemExit(
+                f"Unexpected future/current-day state rows exist for {trade_date} while "
+                "same-day intraday_day_pack is absent.\n"
+                f"  market_day_state={int(counts.get('market_day_state') or 0)}\n"
+                f"  strategy_day_state={int(counts.get('strategy_day_state') or 0)}\n"
+                f"  intraday_day_pack={int(counts.get('intraday_day_pack') or 0)}\n\n"
+                "Do not build live-day market_day_state/strategy_day_state before market open. "
+                "Clean those rows and rerun:\n"
+                "  doppler run -- uv run pivot-refresh --eod-ingest "
+                "--date <prev_trading_date> --trade-date <trade_date>"
+            )
+        missing_by_symbol = dict(inner_coverage.get("missing_by_symbol") or {})
+        sparse_missing_by_table = dict(inner_coverage.get("sparse_missing_by_table") or {})
+        if sparse_missing_by_table:
+            summary = ", ".join(
+                f"{table}={len(symbols)}"
+                for table, symbols in sorted(sparse_missing_by_table.items())
+            )
+            print(
+                f"[coverage] WARNING: sparse previous-day live prerequisite gaps for "
+                f"{trade_date}: {summary}. Missing symbols will be skipped.",
+                flush=True,
+            )
+        if not missing_by_symbol:
+            return
+
+        missing_by_table: dict[str, list[str]] = {}
+        for symbol, missing_items in missing_by_symbol.items():
+            for item in missing_items:
+                missing_by_table.setdefault(str(item), []).append(str(symbol))
+        detail_lines = [
+            f"  {table}: {len(symbols)} missing"
+            + (f" — {', '.join(sorted(symbols))}" if len(symbols) <= 20 else "")
+            for table, symbols in sorted(missing_by_table.items())
+        ]
+        raise SystemExit(
+            f"Live prerequisites incomplete for {trade_date}.\n"
+            + "\n".join(detail_lines)
+            + "\n\nLive uses the previous completed trading day; do not build future-date "
+            "market_day_state rows.\n" + "Fix:\n  doppler run -- uv run pivot-refresh --eod-ingest "
+            "--date <prev_trading_date> --trade-date <trade_date>"
+        )
+
     raw_coverage = inner_coverage.get("coverage") or inner_coverage
     missing_symbols: dict[str, list[str]] = {}
     missing_counts: dict[str, int] = inner_coverage.get("missing_counts") or {}
@@ -549,6 +869,7 @@ def _handle_coverage_gaps(preparation: dict[str, Any], *, trade_date: str, mode:
                 missing_symbols[str(table)] = list(values)
 
     pack_missing = int(missing_counts.get("intraday_day_pack") or 0)
+    cpr_missing = int(missing_counts.get("cpr_daily") or 0)
     mds_missing = int(missing_counts.get("market_day_state") or 0)
     sds_missing = int(missing_counts.get("strategy_day_state") or 0)
 
@@ -562,13 +883,13 @@ def _handle_coverage_gaps(preparation: dict[str, Any], *, trade_date: str, mode:
             flush=True,
         )
 
-    # Block only on state-table gaps.
-    if mds_missing == 0 and sds_missing == 0:
+    # Block on setup-table gaps.
+    if cpr_missing == 0 and mds_missing == 0 and sds_missing == 0:
         return
 
     detail_lines: list[str] = []
     blocking: dict[str, int] = {}
-    for table in ("market_day_state", "strategy_day_state"):
+    for table in ("cpr_daily", "market_day_state", "strategy_day_state"):
         count = int(missing_counts.get(table) or 0)
         if count:
             blocking[table] = count
@@ -596,6 +917,19 @@ def _handle_coverage_gaps(preparation: dict[str, Any], *, trade_date: str, mode:
         + "\n  ".join(fix_lines)
         + pre_market_hint
     )
+
+
+def _enforce_kite_live_setup_gate(trade_date: str, symbols: list[str], *, feed_source: str) -> None:
+    """Fail before live pre-filter/session creation if previous-day prerequisites are missing."""
+    if str(feed_source or "").strip().lower() != "kite":
+        return
+    preparation = prepare_runtime_for_daily_paper(
+        trade_date=trade_date,
+        symbols=symbols,
+        mode="live",
+    )
+    if not preparation.get("coverage_ready", False):
+        _handle_coverage_gaps(preparation, trade_date=trade_date, mode="live")
 
 
 async def _run_daily_workflow(
@@ -692,23 +1026,56 @@ def _last_available_trade_date(db) -> str:
 
 async def _cmd_daily_prepare(args: argparse.Namespace) -> None:
     trade_date = resolve_trade_date(args.trade_date)
+    canonical_symbols: list[str] = []
+    canonical_created = False
+    if (
+        bool(getattr(args, "all_symbols", False))
+        and not _parse_symbols_arg(getattr(args, "symbols", None))
+        and not str(getattr(args, "universe_name", "") or "").strip()
+    ):
+        with acquire_command_lock("runtime-writer", detail="runtime writer"):
+            canonical_symbols, canonical_created = ensure_canonical_universe(trade_date=trade_date)
+        if canonical_symbols:
+            print(
+                f"Using canonical universe '{CANONICAL_FULL_UNIVERSE_NAME}' "
+                f"with {len(canonical_symbols)} symbols"
+                + (" (created)." if canonical_created else "."),
+                flush=True,
+            )
     symbols = _resolve_cli_symbols(build_parser(), args, read_only=True)
     snapshot_universe_name = str(getattr(args, "snapshot_universe_name", "") or "").strip()
     if not snapshot_universe_name and bool(getattr(args, "all_symbols", False)):
         snapshot_universe_name = f"full_{trade_date.replace('-', '_')}"
     if snapshot_universe_name:
-        with acquire_command_lock("runtime-writer", detail="runtime writer"):
-            saved_count = snapshot_candidate_universe(
-                snapshot_universe_name,
-                symbols,
-                trade_date=trade_date,
-                source="paper-daily-prepare",
-                notes=f"snapshot from daily-prepare trade_date={trade_date}",
+        existing_symbols = _load_saved_universe_for_guard(snapshot_universe_name)
+        refresh_snapshot = bool(getattr(args, "refresh_universe_snapshot", False))
+        if existing_symbols and set(existing_symbols) != set(symbols) and not refresh_snapshot:
+            raise SystemExit(
+                f"Refusing to overwrite existing universe '{snapshot_universe_name}' during "
+                f"daily-prepare: it differs from resolved canonical symbols "
+                f"({_universe_diff_summary(existing_symbols, symbols)}). "
+                "Use --refresh-universe-snapshot only after confirming the canonical universe."
             )
-        print(
-            f"Saved universe '{snapshot_universe_name}' with {saved_count} symbols.",
-            flush=True,
-        )
+        if existing_symbols and set(existing_symbols) == set(symbols):
+            saved_count = len(existing_symbols)
+            print(
+                f"Universe '{snapshot_universe_name}' already matches canonical "
+                f"({saved_count} symbols); not rewriting.",
+                flush=True,
+            )
+        else:
+            with acquire_command_lock("runtime-writer", detail="runtime writer"):
+                saved_count = snapshot_candidate_universe(
+                    snapshot_universe_name,
+                    symbols,
+                    trade_date=trade_date,
+                    source="paper-daily-prepare",
+                    notes=f"snapshot from daily-prepare trade_date={trade_date}",
+                )
+            print(
+                f"Saved universe '{snapshot_universe_name}' with {saved_count} symbols.",
+                flush=True,
+            )
     # Detect whether this is a future/live date (no 5-min data yet) or a historical replay date.
     db = get_db()
     has_intraday = bool(
@@ -726,20 +1093,20 @@ async def _cmd_daily_prepare(args: argparse.Namespace) -> None:
     if snapshot_universe_name:
         payload["snapshot_universe_name"] = snapshot_universe_name
         payload["snapshot_universe_count"] = saved_count
-    # For readiness reporting use the last available data date when the requested date
-    # is in the future (live mode: today's candles don't exist yet).
-    db = get_db()
-    dq_date = trade_date if has_intraday else _last_available_trade_date(db)
-    if dq_date != trade_date:
+    if bool(getattr(args, "all_symbols", False)):
+        payload["canonical_universe_name"] = CANONICAL_FULL_UNIVERSE_NAME
+        payload["canonical_universe_count"] = len(canonical_symbols) or len(symbols)
+        payload["canonical_universe_created"] = canonical_created
+    if not has_intraday:
         print(
             f"\nNote: {trade_date} has no intraday data yet (live session).\n"
-            f"Reporting runtime readiness for prior trading date: {dq_date}\n"
-            f"All runtime tables must be current through {dq_date} before market open.\n"
+            "Checking previous completed-day live prerequisites only. "
+            "daily-prepare does not build future/current-day market_day_state rows.\n"
         )
-    readiness = _data_quality.build_trade_date_readiness_report(dq_date)  # type: ignore[attr-defined]
+    readiness = _data_quality.build_trade_date_readiness_report(trade_date)  # type: ignore[attr-defined]
     _data_quality.print_trade_date_readiness_report(readiness)  # type: ignore[attr-defined]
     payload["dq_readiness"] = readiness
-    payload["dq_date"] = dq_date
+    payload["dq_date"] = trade_date
     print(json.dumps(payload, default=str, indent=2))
     if not readiness.get("ready", False):
         raise SystemExit(1)
@@ -911,7 +1278,15 @@ async def _cmd_daily_live(args: argparse.Namespace) -> None:
         if bool(getattr(args, "wait_for_open", False)):
             await _wait_until_market_ready(trade_date)
 
-    filtered = pre_filter_symbols_for_strategy(trade_date, symbols, args.strategy, strategy_params)
+    _enforce_kite_live_setup_gate(trade_date, symbols, feed_source=feed_source)
+
+    filtered = pre_filter_symbols_for_strategy(
+        trade_date,
+        symbols,
+        args.strategy,
+        strategy_params,
+        require_trade_date_rows=feed_source == "kite",
+    )
     if not filtered:
         raise SystemExit(
             "No symbols remain after live pre-filtering. "
@@ -1100,12 +1475,17 @@ async def _run_multi_variants(
 
     # Pre-compute normalized params + filtered symbols per variant.
     variant_setup: list[tuple[str, str, dict[str, Any], list[str]]] = []
+    require_trade_date_rows = (
+        mode == "live" and str(getattr(args, "feed_source", "kite")).strip().lower() == "kite"
+    )
     for label, strategy, base_params in variants:
-        normalized_params = apply_paper_strategy_defaults(
-            strategy, normalize_strategy_params(base_params)
-        )
+        normalized_params = _prepare_paper_multi_strategy_params(label, strategy, base_params)
         filtered = pre_filter_symbols_for_strategy(
-            trade_date, all_symbols, strategy, normalized_params
+            trade_date,
+            all_symbols,
+            strategy,
+            normalized_params,
+            require_trade_date_rows=require_trade_date_rows,
         )
         variant_setup.append((label, strategy, normalized_params, filtered))
 
@@ -1301,6 +1681,7 @@ async def _cmd_daily_live_multi(args: argparse.Namespace) -> None:
             trade_date,
             wait_for_open=bool(getattr(args, "wait_for_open", False)),
         )
+        _enforce_kite_live_setup_gate(trade_date, all_symbols, feed_source=feed_source)
 
     local_union_symbols: list[str] | None = None
     strategy_upper = _assert_cpr_only_strategy(
@@ -1314,11 +1695,13 @@ async def _cmd_daily_live_multi(args: argparse.Namespace) -> None:
     ]
     variant_setup: list[tuple[str, str, dict[str, Any], list[str]]] = []
     for label, strategy, base_params in raw_variants:
-        normalized_params = apply_paper_strategy_defaults(
-            strategy, normalize_strategy_params(base_params)
-        )
+        normalized_params = _prepare_paper_multi_strategy_params(label, strategy, base_params)
         filtered = pre_filter_symbols_for_strategy(
-            trade_date, all_symbols, strategy, normalized_params
+            trade_date,
+            all_symbols,
+            strategy,
+            normalized_params,
+            require_trade_date_rows=feed_source == "kite",
         )
         variant_setup.append((label, strategy, normalized_params, filtered))
 
@@ -1346,6 +1729,7 @@ async def _cmd_daily_live_multi(args: argparse.Namespace) -> None:
                     trade_date=trade_date,
                     mode="live",
                     notes="Waiting for 09:16 market open",
+                    **_session_execution_kwargs(strategy, normalized_params),
                 )
                 print(f"  [pre-create] {session_id} (PLANNING)", flush=True)
         # Force a single replica sync after all sessions are written so the
@@ -1468,9 +1852,7 @@ async def _cmd_daily_replay_multi(args: argparse.Namespace) -> None:
 
     variant_setup: list[tuple[str, str, dict[str, Any], list[str]]] = []
     for label, strategy, base_params in raw_variants:
-        normalized_params = apply_paper_strategy_defaults(
-            strategy, normalize_strategy_params(base_params)
-        )
+        normalized_params = _prepare_paper_multi_strategy_params(label, strategy, base_params)
         normalized_params = {**normalized_params, "feed_source": "historical"}
         filtered = pre_filter_symbols_for_strategy(
             trade_date, all_symbols, strategy, normalized_params
@@ -1636,8 +2018,8 @@ async def _cmd_daily_sim(args: argparse.Namespace) -> None:
         else:
             # Run both canonical CPR variants (LONG + SHORT)
             variants = [
-                (strategy, apply_paper_strategy_defaults(strategy, dict(params)))
-                for _, strategy, params in PAPER_STANDARD_MATRIX
+                (strategy, _prepare_paper_multi_strategy_params(label, strategy, params))
+                for label, strategy, params in PAPER_STANDARD_MATRIX
             ]
 
         results = []
@@ -1669,13 +2051,15 @@ async def _cmd_daily_sim(args: argparse.Namespace) -> None:
 
 async def _cmd_start(args: argparse.Namespace) -> None:
     strategy = _assert_cpr_only_strategy(args.strategy, source="strategy")
+    strategy_params = _resolve_paper_strategy_params(strategy, args.strategy_params, args)
+    strategy_params = _with_resolved_strategy_metadata(strategy, strategy_params)
     session = _pdb().create_session(
         session_id=args.session_id,
         name=args.name,
         strategy=strategy,
         symbols=[s.strip() for s in args.symbols.split(",") if s.strip()],
         status="ACTIVE" if args.activate else "PLANNING",
-        strategy_params=_resolve_paper_strategy_params(strategy, args.strategy_params, args),
+        strategy_params=strategy_params,
         created_by=args.created_by,
         flatten_time=args.flatten_time,
         stale_feed_timeout_sec=args.stale_feed_timeout_sec,
@@ -2481,13 +2865,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-positions",
         type=int,
         default=settings.paper_max_positions,
-        help="Max concurrent positions (default: 10)",
+        help=f"Max concurrent positions (default: {DEFAULT_MAX_POSITIONS})",
     )
     start.add_argument(
         "--max-position-pct",
         type=float,
         default=settings.paper_max_position_pct,
-        help="Max allocation per position (default: 0.10)",
+        help=f"Max allocation per position (default: {DEFAULT_MAX_POSITION_PCT:.2f})",
     )
     start.add_argument("--notes", default=None, help="Optional free-text annotation")
     start.add_argument(
@@ -2799,6 +3183,14 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Optional saved-universe name to persist the resolved symbol list into "
             "backtest_universe for later reuse."
+        ),
+    )
+    daily_prepare.add_argument(
+        "--refresh-universe-snapshot",
+        action="store_true",
+        help=(
+            "Explicitly overwrite an existing dated full_YYYY_MM_DD snapshot when it differs "
+            "from canonical_full. Normal reruns refuse mismatched overwrites."
         ),
     )
     _add_symbol_args(daily_prepare)

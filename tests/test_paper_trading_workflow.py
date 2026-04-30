@@ -403,8 +403,8 @@ async def test_run_daily_workflow_skips_when_coverage_is_not_ready(
 
     assert calls == ["prepare"]
     assert "Runtime coverage incomplete" in str(exc.value)
-    assert "pivot-build --table strategy --force" in str(exc.value)
-    assert "pivot-build --table pack --force" in str(exc.value)
+    assert "pivot-build --table strategy --refresh-date <trade-date>" in str(exc.value)
+    assert "pivot-build --table pack --refresh-since <trade-date>" in str(exc.value)
 
 
 @pytest.mark.asyncio
@@ -461,7 +461,15 @@ async def test_ensure_daily_session_reuses_existing_live_session(
 ) -> None:
     import scripts.paper_trading as pt
 
-    existing = SimpleNamespace(session_id="paper-live-1", status="FAILED")
+    requested_params = paper_trading._with_resolved_strategy_metadata(
+        "CPR_LEVELS", {"rr_ratio": 1.8}
+    )
+    existing = SimpleNamespace(
+        session_id="paper-live-1",
+        status="FAILED",
+        strategy="CPR_LEVELS",
+        strategy_params=requested_params,
+    )
     calls: list[str] = []
 
     async def fake_get_session(session_id: str):
@@ -486,6 +494,128 @@ async def test_ensure_daily_session_reuses_existing_live_session(
 
     assert session is existing
     assert calls == ["paper-live-1"]
+
+
+@pytest.mark.asyncio
+async def test_ensure_daily_session_creates_with_strategy_sizing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import scripts.paper_trading as pt
+
+    calls: list[dict[str, object]] = []
+
+    async def fake_get_session(session_id: str):
+        return None
+
+    async def fake_create_paper_session(**kwargs):
+        calls.append(dict(kwargs))
+        return SimpleNamespace(session_id=kwargs["session_id"])
+
+    monkeypatch.setattr(pt, "get_session", fake_get_session)
+    monkeypatch.setattr(pt, "create_paper_session", fake_create_paper_session)
+
+    await pt._ensure_daily_session(
+        session_id="paper-live-1",
+        trade_date="2024-01-03",
+        strategy="CPR_LEVELS",
+        symbols=["SBIN"],
+        strategy_params={
+            "capital": 200_000,
+            "portfolio_value": 1_000_000,
+            "max_positions": 5,
+            "max_position_pct": 0.20,
+        },
+        notes="live",
+        mode="live",
+    )
+
+    assert calls[0]["portfolio_value"] == 1_000_000
+    assert calls[0]["max_positions"] == 5
+    assert calls[0]["max_position_pct"] == 0.20
+    assert calls[0]["strategy_params"]["_strategy_config_fingerprint"]
+
+
+@pytest.mark.asyncio
+async def test_ensure_daily_session_rejects_live_param_drift(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import scripts.paper_trading as pt
+
+    existing_params = pt._with_resolved_strategy_metadata(
+        "CPR_LEVELS",
+        {"rr_ratio": 1.8},
+    )
+    existing = SimpleNamespace(
+        session_id="paper-live-1",
+        status="ACTIVE",
+        strategy="CPR_LEVELS",
+        strategy_params=existing_params,
+    )
+
+    async def fake_get_session(session_id: str):
+        return existing
+
+    async def fake_create_paper_session(**kwargs):
+        raise AssertionError(f"create_paper_session should not be called: {kwargs}")
+
+    monkeypatch.setattr(pt, "get_session", fake_get_session)
+    monkeypatch.setattr(pt, "create_paper_session", fake_create_paper_session)
+
+    with pytest.raises(SystemExit, match="different strategy params"):
+        await pt._ensure_daily_session(
+            session_id="paper-live-1",
+            trade_date="2024-01-03",
+            strategy="CPR_LEVELS",
+            symbols=["SBIN"],
+            strategy_params={"rr_ratio": 2.0},
+            notes="retry",
+            mode="live",
+        )
+
+
+@pytest.mark.asyncio
+async def test_ensure_daily_session_rejects_live_sizing_drift(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import scripts.paper_trading as pt
+
+    requested_params = pt._with_resolved_strategy_metadata(
+        "CPR_LEVELS",
+        {
+            "portfolio_value": 1_000_000,
+            "max_positions": 5,
+            "max_position_pct": 0.20,
+        },
+    )
+    existing = SimpleNamespace(
+        session_id="paper-live-1",
+        status="ACTIVE",
+        strategy="CPR_LEVELS",
+        strategy_params=requested_params,
+        portfolio_value=1_000_000,
+        max_positions=10,
+        max_position_pct=0.10,
+    )
+
+    async def fake_get_session(session_id: str):
+        return existing
+
+    async def fake_create_paper_session(**kwargs):
+        raise AssertionError(f"create_paper_session should not be called: {kwargs}")
+
+    monkeypatch.setattr(pt, "get_session", fake_get_session)
+    monkeypatch.setattr(pt, "create_paper_session", fake_create_paper_session)
+
+    with pytest.raises(SystemExit, match="execution sizing differs"):
+        await pt._ensure_daily_session(
+            session_id="paper-live-1",
+            trade_date="2024-01-03",
+            strategy="CPR_LEVELS",
+            symbols=["SBIN"],
+            strategy_params=requested_params,
+            notes="retry",
+            mode="live",
+        )
 
 
 async def test_ensure_daily_session_creates_fallback_for_replay_collisions(

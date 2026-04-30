@@ -23,7 +23,7 @@ from typing import Any
 
 from db.duckdb import get_db
 from engine.command_lock import acquire_command_lock
-from scripts.paper_prepare import resolve_trade_date
+from scripts.paper_prepare import CANONICAL_FULL_UNIVERSE_NAME, resolve_trade_date
 
 _IST = timezone(timedelta(hours=5, minutes=30))
 
@@ -36,6 +36,7 @@ def _is_pre_market(trade_date: str) -> bool:
 
 
 _SEVERITY_ORDER = {"CRITICAL": 0, "WARNING": 1, "INFO": 2}
+_SPARSE_MISSING_MAX_RATIO = 0.05
 
 # Human-readable labels for each issue code
 _ISSUE_LABELS: dict[str, str] = {
@@ -93,6 +94,138 @@ def _preview_symbols(symbols: list[str], limit: int = 10) -> str:
     if len(symbols) > limit:
         preview += f" ... (+{len(symbols) - limit} more)"
     return preview
+
+
+def _default_full_universe_name(trade_date: str) -> str:
+    return f"full_{trade_date.replace('-', '_')}"
+
+
+def _load_default_universe_symbols(db: Any, trade_date: str) -> tuple[str, list[str]]:
+    """Load dated paper universe, falling back to the stable canonical universe."""
+    if not hasattr(db, "get_universe_symbols"):
+        return "none", []
+    for universe_name in (_default_full_universe_name(trade_date), CANONICAL_FULL_UNIVERSE_NAME):
+        try:
+            symbols = db.get_universe_symbols(universe_name)
+        except Exception:
+            continue
+        resolved = sorted({str(symbol).upper() for symbol in symbols if str(symbol or "").strip()})
+        if resolved:
+            return universe_name, resolved
+    return "none", []
+
+
+def _symbols_missing_for_exact_table(
+    db: Any,
+    table: str,
+    symbols: list[str],
+    trade_date: str,
+) -> list[str]:
+    """Return requested symbols with no exact trade_date row in a runtime table."""
+    if not symbols:
+        return []
+    placeholders = ", ".join("?" for _ in symbols)
+    try:
+        rows = db.con.execute(
+            f"""
+            SELECT DISTINCT symbol
+            FROM {table}
+            WHERE trade_date = ?::DATE
+              AND symbol IN ({placeholders})
+            """,
+            [trade_date, *symbols],
+        ).fetchall()
+    except Exception:
+        return list(symbols)
+    present = {str(row[0]).upper() for row in rows if row and row[0]}
+    return [symbol for symbol in symbols if symbol not in present]
+
+
+def _coverage_status(
+    *,
+    requested_count: int,
+    missing_count: int,
+) -> str:
+    """Classify sparse symbol/day gaps as warnings, not hard readiness failures."""
+    if missing_count <= 0:
+        return "ok"
+    if requested_count <= 0:
+        return "blocking"
+    missing_ratio = missing_count / requested_count
+    return "warning" if missing_ratio <= _SPARSE_MISSING_MAX_RATIO else "blocking"
+
+
+def _coverage_blocking_tables(
+    coverage: dict[str, list[str]],
+    *,
+    requested_count: int,
+    tables: tuple[str, ...],
+) -> dict[str, str]:
+    return {
+        table: _coverage_status(
+            requested_count=requested_count,
+            missing_count=len(coverage.get(table) or []),
+        )
+        for table in tables
+    }
+
+
+def _live_prereq_coverage(db: Any, symbols: list[str], trade_date: str) -> dict[str, list[str]]:
+    """Return live prerequisites missing for current/future trade date setup."""
+    coverage = {
+        "v_daily": [],
+        "v_5min": [],
+        "atr_intraday": [],
+        "cpr_thresholds": [],
+        "atr_date_mismatch": [],
+        "cpr_threshold_date_mismatch": [],
+    }
+    if not symbols:
+        return coverage
+    placeholders = ", ".join("?" for _ in symbols)
+    params = [*symbols, trade_date]
+    daily_rows = db.con.execute(
+        f"SELECT symbol, MAX(date)::VARCHAR FROM v_daily WHERE symbol IN ({placeholders}) AND date < ?::DATE GROUP BY symbol",
+        params,
+    ).fetchall()
+    five_min_rows = db.con.execute(
+        f"SELECT symbol, MAX(date)::VARCHAR FROM v_5min WHERE symbol IN ({placeholders}) AND date < ?::DATE GROUP BY symbol",
+        params,
+    ).fetchall()
+    atr_rows = db.con.execute(
+        f"SELECT symbol, MAX(trade_date)::VARCHAR FROM atr_intraday WHERE symbol IN ({placeholders}) AND trade_date < ?::DATE GROUP BY symbol",
+        params,
+    ).fetchall()
+    threshold_rows = db.con.execute(
+        f"SELECT symbol, MAX(trade_date)::VARCHAR FROM cpr_thresholds WHERE symbol IN ({placeholders}) AND trade_date < ?::DATE GROUP BY symbol",
+        params,
+    ).fetchall()
+    daily_map = {str(row[0]): str(row[1]) if row[1] is not None else None for row in daily_rows}
+    five_min_map = {
+        str(row[0]): str(row[1]) if row[1] is not None else None for row in five_min_rows
+    }
+    atr_map = {str(row[0]): str(row[1]) if row[1] is not None else None for row in atr_rows}
+    threshold_map = {
+        str(row[0]): str(row[1]) if row[1] is not None else None for row in threshold_rows
+    }
+    for symbol in symbols:
+        prev_daily = daily_map.get(symbol)
+        prev_5min = five_min_map.get(symbol)
+        prev_atr = atr_map.get(symbol)
+        prev_threshold = threshold_map.get(symbol)
+        if prev_daily is None:
+            coverage["v_daily"].append(symbol)
+        if prev_5min is None:
+            coverage["v_5min"].append(symbol)
+        if prev_atr is None:
+            coverage["atr_intraday"].append(symbol)
+        if prev_threshold is None:
+            coverage["cpr_thresholds"].append(symbol)
+        if prev_daily is not None and prev_atr is not None and prev_daily != prev_atr:
+            coverage["atr_date_mismatch"].append(symbol)
+        if prev_daily is not None and prev_threshold is not None and prev_daily != prev_threshold:
+            coverage["cpr_threshold_date_mismatch"].append(symbol)
+    return coverage
 
 
 def _print_window_report(start_date: str, end_date: str) -> None:
@@ -183,7 +316,13 @@ def _print_window_report(start_date: str, end_date: str) -> None:
 def build_trade_date_readiness_report(trade_date: str) -> dict[str, Any]:
     """Build a readiness report for a specific trade date."""
     db = get_db()
+    pre_market = _is_pre_market(trade_date)
     candidate_symbols = sorted(db.get_symbols_with_parquet_data([trade_date]))
+    symbol_source = "same-day_5min_parquet"
+    setup_only_mode = False
+    if not candidate_symbols:
+        symbol_source, candidate_symbols = _load_default_universe_symbols(db, trade_date)
+        setup_only_mode = bool(candidate_symbols)
 
     freshness_tables = [
         "or_daily",
@@ -206,9 +345,11 @@ def build_trade_date_readiness_report(trade_date: str) -> dict[str, Any]:
         elif max_date == pack_date:
             status = "OK"
         elif max_date > pack_date:
-            # State tables ahead of pack — expected pre-market on a live trading day.
-            # Pack only contains historical data; state tables are built one day ahead.
-            status = f"AHEAD of pack ({max_date} > {pack_date})"
+            if setup_only_mode and table in {"market_day_state", "strategy_day_state"}:
+                status = f"UNEXPECTED FUTURE STATE ({max_date} > {pack_date})"
+                freshness_blocking = True
+            else:
+                status = f"AHEAD of pack ({max_date} > {pack_date})"
         else:
             # State table is BEHIND pack — genuine staleness problem.
             status = f"OUT OF SYNC vs {pack_date}"
@@ -226,8 +367,11 @@ def build_trade_date_readiness_report(trade_date: str) -> dict[str, Any]:
         if left_date is not None and right_date is not None and left_date == right_date:
             status = f"OK ({left_date})"
         elif left_date is not None and right_date is not None and left_date > right_date:
-            # Left (state) is ahead of right (pack) — expected pre-market for live day.
-            status = f"AHEAD ({left_date} > {right_date})"
+            if setup_only_mode and left in {"market_day_state", "strategy_day_state"}:
+                status = f"UNEXPECTED FUTURE STATE ({left_date} > {right_date})"
+                freshness_blocking = True
+            else:
+                status = f"AHEAD ({left_date} > {right_date})"
         else:
             status = f"OUT OF SYNC ({left_date or 'None'} vs {right_date or 'None'})"
             freshness_blocking = True
@@ -257,17 +401,30 @@ def build_trade_date_readiness_report(trade_date: str) -> dict[str, Any]:
         symbol for symbol in candidate_symbols if symbol not in set(setup_capable_symbols)
     ]
 
-    coverage = db.get_runtime_trade_date_coverage(candidate_symbols, trade_date)
+    if setup_only_mode:
+        coverage = _live_prereq_coverage(db, candidate_symbols, trade_date)
+    else:
+        coverage = db.get_runtime_trade_date_coverage(candidate_symbols, trade_date)
     missing_counts = {table: len(symbols) for table, symbols in coverage.items()}
 
-    coverage_blocking = any(
-        missing_counts[table] > 0
-        for table in (
-            "market_day_state",
-            "strategy_day_state",
-            "intraday_day_pack",
+    blocking_tables = (
+        (
+            "v_daily",
+            "v_5min",
+            "atr_intraday",
+            "cpr_thresholds",
+            "atr_date_mismatch",
+            "cpr_threshold_date_mismatch",
         )
+        if setup_only_mode
+        else ("cpr_daily", "market_day_state", "strategy_day_state", "intraday_day_pack")
     )
+    coverage_status = _coverage_blocking_tables(
+        coverage,
+        requested_count=len(candidate_symbols),
+        tables=blocking_tables,
+    )
+    coverage_blocking = any(status == "blocking" for status in coverage_status.values())
 
     # Direction coverage: how many strategy_day_state rows for this date have
     # direction_5 resolved to LONG/SHORT vs NONE. Pre-market this is expected
@@ -293,10 +450,10 @@ def build_trade_date_readiness_report(trade_date: str) -> dict[str, Any]:
     except Exception:
         pass
 
-    pre_market = _is_pre_market(trade_date)
-    if pre_market:
-        # Pre-market: no 5-min parquet exists yet for today. Gate only on state table coverage.
-        ready = not freshness_blocking and not coverage_blocking
+    if setup_only_mode:
+        # Setup-only: current/future live day has no 5-min parquet yet. Gate on the
+        # latest completed trading day's daily + ATR data plus a non-empty dated universe.
+        ready = bool(candidate_symbols) and not freshness_blocking and not coverage_blocking
     else:
         ready = (
             bool(candidate_symbols)
@@ -308,6 +465,7 @@ def build_trade_date_readiness_report(trade_date: str) -> dict[str, Any]:
     return {
         "trade_date": trade_date,
         "requested_symbols": candidate_symbols,
+        "symbol_source": symbol_source,
         "freshness_tables": freshness_tables,
         "table_max_trade_dates": table_max_dates,
         "freshness_rows": freshness_rows,
@@ -317,9 +475,11 @@ def build_trade_date_readiness_report(trade_date: str) -> dict[str, Any]:
         "setup_query_failed": setup_query_failed,
         "coverage": coverage,
         "missing_counts": missing_counts,
+        "coverage_status": coverage_status,
         "coverage_blocking": coverage_blocking,
         "freshness_blocking": freshness_blocking,
         "pre_market": pre_market,
+        "setup_only_mode": setup_only_mode,
         "ready": ready,
     }
 
@@ -334,15 +494,24 @@ def print_trade_date_readiness_report(report: dict[str, Any]) -> None:
     late_starting_symbols = list(report.get("late_starting_symbols") or [])
     setup_query_failed = bool(report.get("setup_query_failed", False))
     coverage = report.get("coverage") or {}
+    coverage_status = report.get("coverage_status") or {}
     ready = bool(report.get("ready", False))
 
     pre_market = bool(report.get("pre_market", False))
+    setup_only_mode = bool(report.get("setup_only_mode", False))
+    symbol_source = str(report.get("symbol_source") or "unknown")
 
-    print(f"\nTrade-date readiness ({trade_date}){' [PRE-MARKET MODE]' if pre_market else ''}:")
+    mode_label = " [SETUP-ONLY MODE]" if setup_only_mode else ""
     if pre_market:
+        mode_label = " [PRE-MARKET MODE]"
+    print(f"\nTrade-date readiness ({trade_date}){mode_label}:")
+    if setup_only_mode:
         print(
-            "  Pre-market: 5-min parquet for today does not exist yet — checking state tables only."
+            "  Setup-only: same-day 5-min parquet is not expected yet — checking previous completed-day data."
         )
+        print(f"  Symbol source: {symbol_source} ({len(candidate_symbols):,} symbols)")
+        if not candidate_symbols:
+            print("  No dated universe found for the requested trade date.")
     else:
         print(f"  5-min symbols on date: {len(candidate_symbols):,}")
         if not candidate_symbols:
@@ -379,9 +548,22 @@ def print_trade_date_readiness_report(report: dict[str, Any]) -> None:
     print("\nRuntime coverage:")
     print(f"  {'Table':<20} Missing symbols")
     print("  " + "-" * 40)
-    for table in ("market_day_state", "strategy_day_state", "intraday_day_pack"):
+    coverage_tables = (
+        (
+            "v_daily",
+            "v_5min",
+            "atr_intraday",
+            "cpr_thresholds",
+            "atr_date_mismatch",
+            "cpr_threshold_date_mismatch",
+        )
+        if setup_only_mode
+        else ("market_day_state", "strategy_day_state", "intraday_day_pack")
+    )
+    for table in coverage_tables:
         missing = list((coverage or {}).get(table, []))
-        marker = " [BLOCKING]" if missing else ""
+        status = str((coverage_status or {}).get(table) or "ok").upper()
+        marker = f" [{status}]" if missing else ""
         print(f"  {table:<20} {len(missing):>14,}{marker}")
         if missing:
             print(f"    sample: {_preview_symbols(missing)}")
@@ -389,10 +571,15 @@ def print_trade_date_readiness_report(report: dict[str, Any]) -> None:
     print("\nReadiness:")
     print(f"  {'Ready':<10} {'YES' if ready else 'NO'}")
     if not ready:
-        if pre_market:
-            print("  Check: market_day_state and strategy_day_state must cover today.")
+        if setup_only_mode:
             print(
-                "  Fix:   doppler run -- uv run pivot-paper-trading daily-prepare --trade-date today --all-symbols"
+                "  Check: previous completed trading day must have v_daily, v_5min, "
+                "atr_intraday, and cpr_thresholds coverage. Sparse symbol/day gaps are "
+                "warnings; broad gaps block."
+            )
+            print(
+                "  Fix:   doppler run -- uv run pivot-refresh --eod-ingest "
+                "--date <prev_trading_date> --trade-date <trade_date>"
             )
         else:
             print(

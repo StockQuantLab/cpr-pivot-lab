@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import polars as pl
 
+from engine.execution_defaults import DEFAULT_POSITION_CAPITAL, DEFAULT_RISK_PCT
+
 # ---------------------------------------------------------------------------
 # TrailingStop: 4-phase SL management
 # ---------------------------------------------------------------------------
@@ -358,8 +360,8 @@ def check_entry_setup(
     min_sl_atr_ratio: float = 0.5,
     max_sl_atr_ratio: float = 2.0,
     rr_ratio: float = 2.0,
-    capital: float = 100_000,
-    risk_pct: float = 0.01,
+    capital: float = DEFAULT_POSITION_CAPITAL,
+    risk_pct: float = DEFAULT_RISK_PCT,
     atr_sl_buffer: float = 0.0,
 ) -> dict | None:
     """

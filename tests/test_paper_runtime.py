@@ -326,7 +326,7 @@ def test_load_setup_row_falls_back_to_live_intraday_context(
             if "FROM atr_intraday" in query:
                 return SimpleNamespace(fetchone=lambda: ("2024-01-05", 4.0))
             if "FROM cpr_thresholds" in query:
-                return SimpleNamespace(fetchone=lambda: (1.5,))
+                return SimpleNamespace(fetchone=lambda: ("2024-01-05", 1.5))
             raise AssertionError(f"Unexpected query: {query}")
 
     class _FakeDB:
@@ -375,7 +375,7 @@ def test_load_setup_row_waits_for_full_opening_range_window(
             if "FROM atr_intraday" in query:
                 return SimpleNamespace(fetchone=lambda: ("2024-01-05", 4.0))
             if "FROM cpr_thresholds" in query:
-                return SimpleNamespace(fetchone=lambda: (1.5,))
+                return SimpleNamespace(fetchone=lambda: ("2024-01-05", 1.5))
             raise AssertionError(f"Unexpected query: {query}")
 
     class _FakeDB:

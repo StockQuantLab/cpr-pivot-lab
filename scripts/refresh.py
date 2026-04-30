@@ -7,6 +7,7 @@ import datetime as dt
 import subprocess
 import sys
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from db.duckdb import close_dashboard_db, get_dashboard_db
 from engine.cli_setup import configure_windows_stdio
@@ -24,7 +25,17 @@ _RUNTIME_TABLES = [
     "intraday_day_pack",
 ]
 
+_EOD_STAGE_DESCRIPTIONS = {
+    "refresh_instruments": "Refresh Kite instrument master",
+    "ingest_daily": "Ingest daily candles for EOD date",
+    "ingest_5min": "Ingest 5-minute candles for EOD date",
+    "build_runtime": "Build runtime DuckDB tables through EOD date",
+    "daily_prepare": "Create dated universe and validate live prerequisites",
+    "data_quality": "Final trade-date readiness gate",
+}
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+IST = ZoneInfo("Asia/Kolkata")
 
 
 def _detect_refresh_since() -> str | None:
@@ -42,14 +53,14 @@ def _detect_refresh_since() -> str | None:
     return (dates[-1] + dt.timedelta(days=1)).isoformat()
 
 
-def _run(cmd: list[str], *, dry_run: bool, timeout: int = 3600) -> int:
+def _run(cmd: list[str], *, dry_run: bool, timeout: int | None = 3600) -> int:
     """Run a subprocess with the standard contract.
 
-    Uses sys.executable, shell=False, cwd pinned to project root,
-    capture_output=True, text=True, with configurable timeout.
+    Uses sys.executable, shell=False, cwd pinned to project root, and streams
+    child stdout/stderr directly so redirected wrapper logs show live progress.
     """
     pretty = " ".join(cmd)
-    print(f"$ {pretty}")
+    print(f"$ {pretty}", flush=True)
     if dry_run:
         return 0
     close_dashboard_db()
@@ -57,14 +68,31 @@ def _run(cmd: list[str], *, dry_run: bool, timeout: int = 3600) -> int:
         cmd,
         shell=False,
         cwd=str(PROJECT_ROOT),
-        capture_output=True,
         text=True,
         timeout=timeout,
     )
-    if completed.returncode != 0 and completed.stderr:
-        for line in completed.stderr.strip().splitlines()[-3:]:
-            print(f"  stderr: {line}")
     return int(completed.returncode)
+
+
+def _run_stage(
+    *,
+    index: int,
+    total: int,
+    name: str,
+    cmd: list[str],
+    dry_run: bool,
+) -> None:
+    description = _EOD_STAGE_DESCRIPTIONS.get(name, name)
+    print(f"\n[{index}/{total}] START {name}: {description}", flush=True)
+    started_at = dt.datetime.now(IST)
+    code = _run(cmd, dry_run=dry_run, timeout=None)
+    elapsed = (dt.datetime.now(IST) - started_at).total_seconds()
+    if code != 0:
+        print(
+            f"[{index}/{total}] FAILED {name}: exit_code={code} elapsed={elapsed:.1f}s", flush=True
+        )
+        raise SystemExit(code)
+    print(f"[{index}/{total}] DONE {name}: elapsed={elapsed:.1f}s", flush=True)
 
 
 def _daily_prepare_cmd(*, trade_date: str) -> list[str]:
@@ -79,8 +107,155 @@ def _daily_prepare_cmd(*, trade_date: str) -> list[str]:
     ]
 
 
+def _data_quality_cmd(*, trade_date: str) -> list[str]:
+    return [
+        sys.executable,
+        "-m",
+        "scripts.data_quality",
+        "--date",
+        trade_date,
+    ]
+
+
+def _kite_ingest_cmd(
+    *,
+    ingest_date: str,
+    five_min: bool = False,
+    skip_existing: bool = True,
+) -> list[str]:
+    cmd = [
+        sys.executable,
+        "-m",
+        "scripts.kite_ingest",
+        "--from",
+        ingest_date,
+        "--to",
+        ingest_date,
+    ]
+    if five_min:
+        cmd.extend(["--5min", "--resume"])
+    if skip_existing:
+        cmd.append("--skip-existing")
+    return cmd
+
+
+def _refresh_instruments_cmd() -> list[str]:
+    return [
+        sys.executable,
+        "-m",
+        "scripts.kite_ingest",
+        "--refresh-instruments",
+        "--exchange",
+        "NSE",
+    ]
+
+
+def _build_cmd(*, since: str, batch_size: int) -> list[str]:
+    return [
+        sys.executable,
+        "-m",
+        "scripts.build_tables",
+        "--refresh-since",
+        since,
+        "--batch-size",
+        str(batch_size),
+    ]
+
+
+def _resolve_date_arg(value: str | None, *, default_today: bool = False) -> str | None:
+    if value is None:
+        if not default_today:
+            return None
+        return dt.datetime.now(IST).date().isoformat()
+    normalized = str(value).strip().lower()
+    today = dt.datetime.now(IST).date()
+    if normalized == "today":
+        return today.isoformat()
+    if normalized == "tomorrow":
+        return (today + dt.timedelta(days=1)).isoformat()
+    return dt.date.fromisoformat(str(value)).isoformat()
+
+
+def _run_eod_ingestion(
+    *,
+    ingest_date: str,
+    trade_date: str,
+    batch_size: int,
+    dry_run: bool,
+    skip_existing: bool = True,
+) -> None:
+    """Run the complete EOD ingestion contract in the only valid order."""
+    stages = [
+        ("refresh_instruments", _refresh_instruments_cmd()),
+        (
+            "ingest_daily",
+            _kite_ingest_cmd(
+                ingest_date=ingest_date,
+                five_min=False,
+                skip_existing=skip_existing,
+            ),
+        ),
+        (
+            "ingest_5min",
+            _kite_ingest_cmd(
+                ingest_date=ingest_date,
+                five_min=True,
+                skip_existing=skip_existing,
+            ),
+        ),
+        ("build_runtime", _build_cmd(since=ingest_date, batch_size=batch_size)),
+        ("daily_prepare", _daily_prepare_cmd(trade_date=trade_date)),
+        ("data_quality", _data_quality_cmd(trade_date=trade_date)),
+    ]
+    print(
+        f"EOD pipeline: ingest_date={ingest_date} -> live_trade_date={trade_date} "
+        f"(skip_existing_ingest={skip_existing})",
+        flush=True,
+    )
+    if skip_existing:
+        print(
+            "EOD idempotency: daily/5-min ingestion stages pass --skip-existing; "
+            "use --force-ingest to refetch already-covered symbols.",
+            flush=True,
+        )
+    else:
+        print(
+            "EOD idempotency: --force-ingest enabled; ingestion will refetch symbols.", flush=True
+        )
+    print(
+        "EOD date contract: --date is the completed market-data date; --trade-date is the "
+        "next actual trading day. Pass it explicitly for weekends/holidays.",
+        flush=True,
+    )
+    for index, (name, cmd) in enumerate(stages, start=1):
+        _run_stage(
+            index=index,
+            total=len(stages),
+            name=name,
+            cmd=cmd,
+            dry_run=dry_run,
+        )
+    print(
+        f"\nEOD pipeline complete: ingest_date={ingest_date} prepared_trade_date={trade_date}",
+        flush=True,
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Refresh runtime tables and optional paper prep")
+    parser.add_argument(
+        "--eod-ingest",
+        action="store_true",
+        help=(
+            "Run the full EOD pipeline in order: refresh instruments, daily ingest, "
+            "5-min ingest, build, daily-prepare, and final data-quality gate."
+        ),
+    )
+    parser.add_argument(
+        "--date",
+        default=None,
+        help="EOD ingestion date (YYYY-MM-DD, today). Required for --eod-ingest unless using today.",
+    )
     parser.add_argument(
         "--since",
         default=None,
@@ -113,11 +288,35 @@ def main() -> None:
         help="Paper-trading date to prepare. Defaults to the resolved refresh date.",
     )
     parser.add_argument(
+        "--force-ingest",
+        action="store_true",
+        help=(
+            "With --eod-ingest, fetch daily and 5-min data even when local parquet already "
+            "covers the ingestion date. Default is to pass --skip-existing."
+        ),
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Print the commands without executing them.",
     )
     args = parser.parse_args()
+
+    if args.eod_ingest:
+        ingest_date = _resolve_date_arg(args.date, default_today=True)
+        trade_date = _resolve_date_arg(args.trade_date)
+        if trade_date is None:
+            parser.error("--eod-ingest requires --trade-date <next_trading_date>")
+        if trade_date <= ingest_date:
+            parser.error("--trade-date must be after --date for --eod-ingest")
+        _run_eod_ingestion(
+            ingest_date=ingest_date,
+            trade_date=trade_date,
+            batch_size=args.batch_size,
+            dry_run=bool(args.dry_run),
+            skip_existing=not bool(args.force_ingest),
+        )
+        return
 
     since = args.since
     if since is None and not args.no_auto:
@@ -125,15 +324,7 @@ def main() -> None:
     if since is None:
         parser.error("Unable to determine refresh start date. Pass --since explicitly.")
 
-    build_cmd = [
-        sys.executable,
-        "-m",
-        "scripts.build_tables",
-        "--refresh-since",
-        since,
-        "--batch-size",
-        str(args.batch_size),
-    ]
+    build_cmd = _build_cmd(since=since, batch_size=args.batch_size)
     build_required = True
     prepare_cmd: list[str] | None = None
     if args.prepare_paper or args.paper_sim:

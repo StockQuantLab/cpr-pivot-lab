@@ -2387,7 +2387,6 @@ class MarketDB:
         batch_size = max(1, int(batch_size))
         batches = self._iter_symbol_batches(build_symbols, batch_size)
         total_batches = len(batches)
-        log_every = 1 if total_batches <= 2 else 2
         started = time.time()
         _log(
             "intraday_day_pack build start:"
@@ -2398,7 +2397,9 @@ class MarketDB:
 
         phase_times = {
             "delete": 0.0,
+            "source": 0.0,
             "insert": 0.0,
+            "commit": 0.0,
             "index": 0.0,
         }
 
@@ -2406,17 +2407,29 @@ class MarketDB:
         # from already-committed batches after a failure or interruption.
         for idx, batch in enumerate(batches, start=1):
             batch_started = time.time()
+            batch_phase = "start"
+            done_before = min((idx - 1) * batch_size, len(build_symbols))
+            done_after = min(done_before + len(batch), len(build_symbols))
             tx_open = False
+            _log(
+                f"  [pack] batch {idx}/{total_batches} START"
+                f" | symbols={done_before + 1:,}-{done_after:,}/{len(build_symbols):,}"
+                f" | count={len(batch):,}"
+                f" | first={batch[0]} last={batch[-1]}"
+            )
             try:
+                batch_phase = "begin"
                 self.con.execute("BEGIN TRANSACTION")
                 tx_open = True
 
                 # Refresh only the requested symbols when doing a partial build.
                 if symbols:
+                    batch_phase = "delete"
                     delete_started = time.time()
+                    _log(f"  [pack] batch {idx}/{total_batches} DELETE start")
                     placeholders = ", ".join("?" for _ in batch)
                     if since_date_iso:
-                        self.con.execute(
+                        delete_result = self.con.execute(
                             f"""
                             DELETE FROM intraday_day_pack
                             WHERE symbol IN ({placeholders})
@@ -2425,18 +2438,36 @@ class MarketDB:
                             [*batch, since_date_iso],
                         )
                     else:
-                        self.con.execute(
+                        delete_result = self.con.execute(
                             f"DELETE FROM intraday_day_pack WHERE symbol IN ({placeholders})",
                             batch,
                         )
-                    phase_times["delete"] += time.time() - delete_started
+                    delete_elapsed = time.time() - delete_started
+                    phase_times["delete"] += delete_elapsed
+                    deleted_rows = delete_result.rowcount
+                    deleted_display = f"{deleted_rows:,}" if deleted_rows >= 0 else "unknown"
+                    _log(
+                        f"  [pack] batch {idx}/{total_batches} DELETE done"
+                        f" | rows={deleted_display} | elapsed={delete_elapsed:.1f}s"
+                    )
 
+                batch_phase = "source"
+                source_started = time.time()
+                _log(f"  [pack] batch {idx}/{total_batches} SOURCE start")
                 source_sql = (
                     self._build_parquet_source_sql(batch, manifest=manifest)
                     if manifest is not None
                     else self._build_parquet_source_sql(batch)
                 )
+                source_elapsed = time.time() - source_started
+                phase_times["source"] += source_elapsed
+                _log(
+                    f"  [pack] batch {idx}/{total_batches} SOURCE done"
+                    f" | elapsed={source_elapsed:.1f}s"
+                )
+                batch_phase = "insert"
                 insert_started = time.time()
+                _log(f"  [pack] batch {idx}/{total_batches} INSERT start")
                 if use_compact_schema:
                     self.con.execute(
                         f"""
@@ -2516,31 +2547,44 @@ class MarketDB:
                     """,
                         window_params,
                     )
-                phase_times["insert"] += time.time() - insert_started
+                insert_elapsed = time.time() - insert_started
+                phase_times["insert"] += insert_elapsed
+                _log(
+                    f"  [pack] batch {idx}/{total_batches} INSERT done"
+                    f" | elapsed={insert_elapsed:.1f}s"
+                )
 
+                batch_phase = "commit"
+                commit_started = time.time()
+                _log(f"  [pack] batch {idx}/{total_batches} COMMIT start")
                 self.con.execute("COMMIT")
+                commit_elapsed = time.time() - commit_started
+                phase_times["commit"] += commit_elapsed
                 tx_open = False
+                _log(
+                    f"  [pack] batch {idx}/{total_batches} COMMIT done"
+                    f" | elapsed={commit_elapsed:.1f}s"
+                )
             except Exception as e:
                 if tx_open:
                     self.con.execute("ROLLBACK")
+                _log(f"  [pack] batch {idx}/{total_batches} FAILED phase={batch_phase}")
                 logger.exception("Failed while building intraday_day_pack batch: %s", e)
                 raise
 
             batch_elapsed = time.time() - batch_started
-            if idx == 1 or idx == total_batches or idx % log_every == 0:
-                elapsed = time.time() - started
-                done = min(idx * batch_size, len(build_symbols))
-                avg_per_batch = elapsed / idx
-                remaining_batches = total_batches - idx
-                eta_s = avg_per_batch * remaining_batches
-                eta_min = eta_s / 60
-                _log(
-                    f"  [pack] batch {idx}/{total_batches}"
-                    f" | symbols={done:,}/{len(build_symbols):,}"
-                    f" | batch={batch_elapsed:.1f}s"
-                    f" | elapsed={elapsed:.0f}s"
-                    f" | ETA={eta_min:.1f}min"
-                )
+            elapsed = time.time() - started
+            avg_per_batch = elapsed / idx
+            remaining_batches = total_batches - idx
+            eta_s = avg_per_batch * remaining_batches
+            eta_min = eta_s / 60
+            _log(
+                f"  [pack] batch {idx}/{total_batches} DONE"
+                f" | symbols={done_after:,}/{len(build_symbols):,}"
+                f" | batch={batch_elapsed:.1f}s"
+                f" | elapsed={elapsed:.0f}s"
+                f" | ETA={eta_min:.1f}min"
+            )
 
         _log("  [pack] index build start...")
         index_started = time.time()
@@ -2555,7 +2599,9 @@ class MarketDB:
         _log(
             "intraday_day_pack phase timings:"
             f" delete={phase_times['delete']:.2f}s"
+            f" source={phase_times['source']:.2f}s"
             f" insert={phase_times['insert']:.2f}s"
+            f" commit={phase_times['commit']:.2f}s"
             f" index={phase_times['index']:.2f}s"
         )
         self._publish_replica(force=True)

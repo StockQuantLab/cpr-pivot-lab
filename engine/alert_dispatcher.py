@@ -153,16 +153,28 @@ class AlertDispatcher:
         """Enqueue an alert for delivery. Non-blocking; drops if queue is full."""
         if not self._running:
             await self.start()
+        event = AlertEvent(
+            alert_type=alert_type,
+            subject=subject,
+            body=body,
+            retries=0,
+        )
         try:
-            event = AlertEvent(
-                alert_type=alert_type,
-                subject=subject,
-                body=body,
-                retries=0,
-            )
             self._queue.put_nowait(event)
         except asyncio.QueueFull:
-            logger.error("Alert queue full, dropping: %s", subject)
+            if alert_type in {AlertType.SESSION_ERROR, AlertType.FEED_STALE}:
+                logger.warning(
+                    "Alert queue full — sending critical alert synchronously: %s", subject
+                )
+                try:
+                    await self._send_with_retry(event)
+                    return
+                except Exception:
+                    logger.error(
+                        "Synchronous critical alert fallback failed: %s", subject, exc_info=True
+                    )
+            else:
+                logger.error("Alert queue full, dropping: %s", subject)
             self.paper_db.log_alert(
                 alert_type,
                 subject,

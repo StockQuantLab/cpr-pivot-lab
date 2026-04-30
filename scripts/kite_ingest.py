@@ -273,6 +273,13 @@ def main() -> int:
                 )
                 return
 
+            if status == "skipped_existing":
+                print(
+                    f"[KITE] skipped ingestion fetch: all processable symbols already have "
+                    f"local {request.mode} parquet through {request.end_date.isoformat()}"
+                )
+                return
+
             if status == "error":
                 print(
                     f"[KITE] {processed}/{total}{symbol_txt} ERROR errors={errors_count} "

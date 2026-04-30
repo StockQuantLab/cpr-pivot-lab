@@ -255,8 +255,14 @@ call Kite and they do not assume a fixed start year like 2015; the effective dat
 whatever local parquet exists at the time you run them.
 
 ```bash
-doppler run -- uv run pivot-build --table pack --refresh-since 2026-03-21
+doppler run -- uv run pivot-build --refresh-since 2026-03-21
 ```
+
+Do **not** use `--table pack` for the normal EOD/live-prep path. `--table pack` only refreshes
+`intraday_day_pack`; it does not advance `cpr_daily`, `atr_intraday`, `cpr_thresholds`,
+`market_day_state`, or `strategy_day_state`. Live paper does **not** need future-dated setup rows;
+it needs the latest completed trading day's daily, 5-minute, and ATR data so the live runtime can
+derive today's CPR setup from previous-day data plus live opening-range candles.
 
 Only use a full-history rebuild when runtime state is inconsistent. That rebuild scans all local
 parquet history already in this repo, not just the newly ingested Kite window. Bare `--force` alone
@@ -274,10 +280,57 @@ doppler run -- uv run pivot-build \
   --batch-size 128
 ```
 
-If you are running the daily ingestion wrapper (`pivot-refresh`) for paper/live prep, it now
-checks `daily-prepare` first and skips `pivot-build` when the runtime tables are already current
-for the target trade date. Only run the rebuild when that readiness check reports missing
-coverage or stale runtime tables.
+If you are running the daily EOD pipeline for paper/live prep, use the guarded one-command path.
+This prevents agents/operators from skipping `--refresh-instruments` or running the build before
+today's candles are ingested:
+
+```bash
+doppler run -- uv run pivot-refresh \
+  --eod-ingest \
+  --date <today> \
+  --trade-date <next_trading_date>
+```
+
+For example, after the market closes on 2026-04-29:
+
+```bash
+doppler run -- uv run pivot-refresh \
+  --eod-ingest \
+  --date 2026-04-29 \
+  --trade-date 2026-04-30
+```
+
+`--eod-ingest` always runs this exact order and stops on the first failure:
+
+1. `pivot-kite-ingest --refresh-instruments --exchange NSE`
+2. `pivot-kite-ingest --from <today> --to <today> --skip-existing`
+3. `pivot-kite-ingest --from <today> --to <today> --5min --resume --skip-existing`
+4. `pivot-build --refresh-since <today>`
+5. `pivot-paper-trading daily-prepare --trade-date <next_trading_date> --all-symbols`
+6. `pivot-data-quality --date <next_trading_date>`
+
+The final command must return `Ready YES`. Do not hand-run the individual steps unless you are
+debugging a failed stage.
+When redirected to a file, `pivot-refresh --eod-ingest` streams child command output directly, so
+the log should show Kite ingestion progress instead of staying silent until a stage exits.
+The command is rerun-safe by default: daily and 5-minute ingestion pass `--skip-existing`, so
+already-covered parquet symbols are logged as skipped instead of fetched again. Use
+`--force-ingest` only when you intentionally want to refetch existing candles.
+
+If today's candles are already ingested and you only need to rebuild runtime tables, use
+`pivot-refresh --prepare-paper` as the build/prepare gate:
+
+```bash
+doppler run -- uv run pivot-refresh \
+  --since <today> \
+  --prepare-paper \
+  --trade-date <next_trading_date>
+```
+
+`pivot-refresh --prepare-paper` first runs `daily-prepare`. If previous completed-day
+prerequisites are already present it skips the build; otherwise it runs the full runtime-table
+refresh and re-runs `daily-prepare`. This is the preferred automation path because it fails closed
+before live trading without asking operators to build future-date rows.
 
 ## Step 5: Validate the loaded data
 
@@ -311,16 +364,49 @@ doppler run -- uv run pivot-data-quality --refresh
 
 ## Step 7: Pre-filter symbols for next trading day
 
-After ingestion and validation, pre-filter symbols so the next day's `daily-live` session
-only polls ~200 candidates instead of ~2100:
+After ingestion and validation, run the paper readiness gate for the next trading day:
 
 ```bash
 doppler run -- uv run pivot-paper-trading daily-prepare \
   --trade-date <next_trading_date> --all-symbols
 ```
 
-This uses today's CPR/ATR setup data from `market_day_state` to determine which symbols
-are eligible for trading. Run it after step 6 so runtime tables are current.
+This saves the dated universe snapshot and fails unless live setup prerequisites exist. For a
+future/current live date, those prerequisites are previous completed-day data, not future rows:
+
+- previous-trading-day `v_daily` history for the requested symbols
+- previous-trading-day `v_5min` history for the requested symbols
+- previous-trading-day `atr_intraday` history for the requested symbols
+- previous-trading-day `cpr_thresholds` history for the requested symbols
+
+Universe policy is stable by default. `daily-prepare --all-symbols` uses `canonical_full` as the
+source of truth, creating it once from the broad local universe if needed, then copies the same list
+to `full_YYYY_MM_DD` for the requested trade date. Do not shrink `canonical_full` or the dated
+snapshot just because a few symbols have no data for that day.
+If the dated snapshot already exists with a different symbol list, `daily-prepare` fails instead of
+silently overwriting it. Use `--refresh-universe-snapshot` only after explicitly confirming the
+canonical universe count and intended repair.
+
+Full-universe runs intentionally tolerate sparse symbol/day gaps. If a few symbols have no
+previous-day data or are suspended, the gate treats them as warnings and live/backtest skips those
+symbols for that day. Broad gaps still fail closed: if more than 5% of the requested universe is
+missing required previous-day data, treat it as an ingestion/runtime-table issue and fix it before
+live.
+
+Pre-market does not require today's intraday candles and must not require tomorrow's/today's
+materialized state rows. A successful `daily-prepare` is now the automated gate; do not start
+`daily-live` if it fails.
+If current/future-date `market_day_state` or `strategy_day_state` rows exist while same-day
+`intraday_day_pack` is absent, readiness fails closed because those rows are accidental
+future-state data.
+
+Run the fast readiness check as the final close-out gate:
+
+```bash
+doppler run -- uv run pivot-data-quality --date <next_trading_date>
+```
+
+Required result: `Ready YES`.
 
 ## Background execution on Windows
 
@@ -357,14 +443,15 @@ Get-Content .tmp_logs\pack_rebuild.err.log -Tail 40
 doppler run -- uv run pivot-kite-ingest --compact-daily
 ```
 
-6. Refresh local runtime tables with `pivot-build --refresh-since <window-start>`.
+6. Refresh all local runtime tables with `pivot-build --refresh-since <window-start>`.
 7. Run `pivot-data-validate`.
 8. Run `pivot-data-quality --refresh --full` to update the DQ issue table.
-9. Pre-filter symbols for the next trading day's live paper session:
+9. Run the live setup gate for the next trading day's live paper session:
 
 ```bash
 doppler run -- uv run pivot-paper-trading daily-prepare \
   --trade-date <next_trading_date> --all-symbols
+doppler run -- uv run pivot-data-quality --date <next_trading_date>
 ```
 
 10. If validation looks acceptable, run walk-forward validation:

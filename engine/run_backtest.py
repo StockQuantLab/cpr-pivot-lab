@@ -36,6 +36,13 @@ from engine.cpr_atr_strategy import (
     BacktestResult,
     CPRATRBacktest,
 )
+from engine.execution_defaults import (
+    DEFAULT_MAX_POSITION_PCT,
+    DEFAULT_MAX_POSITIONS,
+    DEFAULT_PORTFOLIO_VALUE,
+    DEFAULT_POSITION_CAPITAL,
+    DEFAULT_RISK_PCT,
+)
 from engine.progress import append_progress_event
 from engine.strategy_presets import (
     build_strategy_config_from_overrides,
@@ -301,10 +308,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--capital",
         type=float,
-        default=100_000,
+        default=DEFAULT_POSITION_CAPITAL,
         help=(
             "Per-trade capital base for position sizing "
-            "(paper runtime only; no-op in portfolio-overlay mode, default 100000)"
+            f"(paper runtime only; no-op in portfolio-overlay mode, default {DEFAULT_POSITION_CAPITAL:.0f})"
         ),
     )
     parser.add_argument(
@@ -322,14 +329,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--risk-pct",
         type=float,
-        default=0.01,
+        default=DEFAULT_RISK_PCT,
         help="Risk %% per trade for position sizing (paper runtime only; no-op in portfolio-overlay backtests)",
     )
     parser.add_argument(
         "--portfolio-value",
         type=float,
-        default=1_000_000.0,
-        help="Initial portfolio value for shared-cash execution and run metrics (default 1000000)",
+        default=DEFAULT_PORTFOLIO_VALUE,
+        help=(
+            "Initial portfolio value for shared-cash execution and run metrics "
+            f"(default {DEFAULT_PORTFOLIO_VALUE:.0f})"
+        ),
     )
     parser.add_argument(
         "--compound-equity",
@@ -340,14 +350,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-positions",
         type=int,
-        default=10,
-        help="Max concurrent positions sharing the same portfolio cash pool (default 10)",
+        default=DEFAULT_MAX_POSITIONS,
+        help=(
+            "Max concurrent positions sharing the same portfolio cash pool "
+            f"(default {DEFAULT_MAX_POSITIONS})"
+        ),
     )
     parser.add_argument(
         "--max-position-pct",
         type=float,
-        default=0.10,
-        help="Max capital allocated to a single position as portfolio fraction (default 0.10)",
+        default=DEFAULT_MAX_POSITION_PCT,
+        help=(
+            "Max capital allocated to a single position as portfolio fraction "
+            f"(default {DEFAULT_MAX_POSITION_PCT:.2f})"
+        ),
     )
     parser.add_argument(
         "--risk-based-sizing",

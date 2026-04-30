@@ -889,6 +889,63 @@ async def test_run_live_session_survives_all_pending_startup(
 
 
 @pytest.mark.asyncio
+async def test_run_live_session_fails_closed_when_setup_prefetch_loads_no_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import scripts.paper_live as paper_live
+
+    session = SimpleNamespace(
+        session_id="sess-no-setup",
+        status="PLANNING",
+        symbols=["SBIN"],
+        strategy="CPR_LEVELS",
+        strategy_params={"direction_filter": "LONG"},
+        stale_feed_timeout_sec=30,
+        max_positions=1,
+        portfolio_value=100000.0,
+        max_position_pct=0.1,
+    )
+    updates: list[dict[str, object]] = []
+
+    async def fake_load_session(session_id: str, deps=None):
+        assert session_id == "sess-no-setup"
+        return session
+
+    async def fake_update_session(session_id: str, deps=None, **kwargs):
+        assert session_id == "sess-no-setup"
+        updates.append(dict(kwargs))
+        for key, value in kwargs.items():
+            setattr(session, key, value)
+        return session
+
+    monkeypatch.setattr(paper_live, "_load_session", fake_load_session)
+    monkeypatch.setattr(paper_live, "_update_session", fake_update_session)
+    monkeypatch.setattr(
+        paper_live, "pre_filter_symbols_for_strategy", lambda *args, **kwargs: ["SBIN"]
+    )
+    monkeypatch.setattr(paper_live, "_prefetch_setup_rows", lambda **kwargs: None)
+    monkeypatch.setattr(paper_live, "register_session_start", lambda: None)
+    monkeypatch.setattr(paper_live, "_start_alert_dispatcher", lambda: None)
+    monkeypatch.setattr(paper_live, "get_paper_db", lambda: object())
+    monkeypatch.setattr(paper_live, "force_paper_db_sync", lambda db: None)
+
+    result = await run_live_session(
+        session_id="sess-no-setup",
+        symbols=["SBIN"],
+        max_cycles=1,
+        allow_live_setup_fallback=False,
+    )
+
+    assert result == {
+        "session_id": "sess-no-setup",
+        "final_status": "FAILED",
+        "terminal_reason": "startup_missing_trade_date_setup_rows",
+        "cycles": 0,
+    }
+    assert any(update.get("status") == "FAILED" for update in updates)
+
+
+@pytest.mark.asyncio
 async def test_run_live_session_fails_closed_when_bar_processing_raises(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

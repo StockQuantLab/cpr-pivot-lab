@@ -75,6 +75,13 @@ from engine.day_pack_sources import (
     is_feed_audit_pack_source,
     load_feed_audit_day_pack_records,
 )
+from engine.execution_defaults import (
+    DEFAULT_MAX_POSITION_PCT,
+    DEFAULT_MAX_POSITIONS,
+    DEFAULT_PORTFOLIO_VALUE,
+    DEFAULT_POSITION_CAPITAL,
+    DEFAULT_RISK_PCT,
+)
 from engine.progress import BacktestProgress
 
 logger = logging.getLogger(__name__)
@@ -196,11 +203,15 @@ class StrategyConfig:
     short_trail_atr_multiplier: float = 1.0  # SHORT trailing SL ATR multiplier
 
     # Position sizing
-    capital: float = 100_000  # Risk-based sizing base for candidate trades
-    risk_pct: float = 0.01  # Risk sizing; portfolio overlay is the default execution path
-    portfolio_value: float = 1_000_000.0  # Shared portfolio base for execution + reporting
-    max_positions: int = 10  # Max concurrent intraday positions
-    max_position_pct: float = 0.10  # Max capital allocated to one position
+    capital: float = DEFAULT_POSITION_CAPITAL  # Risk-based sizing base for candidate trades
+    risk_pct: float = (
+        DEFAULT_RISK_PCT  # Risk sizing; portfolio overlay is the default execution path
+    )
+    portfolio_value: float = (
+        DEFAULT_PORTFOLIO_VALUE  # Shared portfolio base for execution/reporting
+    )
+    max_positions: int = DEFAULT_MAX_POSITIONS  # Max concurrent intraday positions
+    max_position_pct: float = DEFAULT_MAX_POSITION_PCT  # Max capital allocated to one position
     risk_based_sizing: bool = False  # Use per-trade risk-based sizing before portfolio overlay
     compound_equity: bool = False  # Carry forward equity across days (True = old behavior)
 
@@ -2067,26 +2078,6 @@ class CPRATRBacktest:
         # or_minutes=5 → direction set by 09:15 close → scan from 09:20.
         # Explicit override via cpr_entry_start takes precedence.
         entry_start = get_cpr_entry_scan_start(p.or_minutes, cpr_cfg.cpr_entry_start)
-        _cpr_width_pct = float(setup_row["cpr_width_pct"])
-        _cpr_threshold = float(setup_row["cpr_threshold"])
-
-        or_high = float(setup_row["high_915"])
-        or_low = float(setup_row["low_915"])
-        open_915 = float(setup_row["open_915"])
-
-        # OR/ATR ratio filter (diagnostic — kept for consistency with other strategies)
-        _or_atr_ratio = calculate_or_atr_ratio(or_high, or_low, atr)
-        if _or_atr_ratio < p.or_atr_min or _or_atr_ratio > p.or_atr_max:
-            return None
-
-        # Gap filter
-        prev_close = setup_row.get("prev_day_close")
-        _gap_pct = calculate_gap_pct(open_915, prev_close)
-        if abs(_gap_pct) > p.max_gap_for_direction(direction):
-            return None
-        if direction == "SHORT" and p.short_open_to_cpr_atr_min > 0:
-            if float(setup_row.get("open_to_cpr_atr") or 0.0) < p.short_open_to_cpr_atr_min:
-                return None
 
         # CPR band touch entry — replaces ORB breakout trigger
         tc = float(setup_row["tc"])

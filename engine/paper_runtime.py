@@ -53,6 +53,7 @@ BacktestParams = StrategyConfig
 _alert_dispatcher: AlertDispatcher | None = None
 _background_tasks: set[asyncio.Task] = set()
 _active_session_count = 0
+_active_session_lock = threading.Lock()
 _suppress_alerts = False
 _alert_sink: Callable[[AlertType, str, str], Any] | None = None
 # In-memory dedup guard: session IDs that have already dispatched FLATTEN_EOD.
@@ -61,6 +62,54 @@ _flatten_eod_sent: set[str] = set()
 # In-memory dedup guard for session-start notifications. A retry/restart inside the same
 # process should not spam duplicate "session started" alerts for the same session_id.
 _session_started_sent: set[str] = set()
+_TRAILING_STOP_CACHE: dict[str, TrailingStop] = {}
+_TRAILING_STOP_CACHE_KEYS: dict[str, tuple[Any, ...]] = {}
+
+
+def _has_flatten_eod_in_alert_log(session_id: str, *, trade_date: str | None = None) -> bool:
+    """Return True when a persisted FLATTEN_EOD row already exists for this session.
+
+    This makes EOD alert dedupe resilient across process restarts. Keep the session-id
+    prefix match to avoid false positives from different sessions with similar suffixes.
+    """
+    try:
+        con = _db().con
+    except Exception:
+        return False
+    try:
+        pattern = f"%{session_id}%"
+        if trade_date:
+            row = con.execute(
+                """
+                SELECT 1
+                FROM alert_log
+                WHERE alert_type='FLATTEN_EOD'
+                  AND (subject LIKE ? OR body LIKE ?)
+                  AND (subject LIKE ? OR body LIKE ?)
+                LIMIT 1
+                """,
+                [pattern, pattern, f"%{trade_date}%", f"%{trade_date}%"],
+            ).fetchone()
+        else:
+            row = con.execute(
+                """
+                SELECT 1
+                FROM alert_log
+                WHERE alert_type='FLATTEN_EOD'
+                  AND (subject LIKE ? OR body LIKE ?)
+                LIMIT 1
+                """,
+                [pattern, pattern],
+            ).fetchone()
+        if not row:
+            return False
+        first = row[0]
+        if isinstance(first, int | float):
+            return bool(first)
+        return True
+    except Exception:
+        logger.debug("Failed to check FLATTEN_EOD alert dedupe from alert_log", exc_info=True)
+        return False
 
 
 def set_alerts_suppressed(suppress: bool) -> None:
@@ -77,15 +126,25 @@ def set_alert_sink(sink: Callable[[AlertType, str, str], Any] | None) -> None:
 
 def register_session_start() -> None:
     global _active_session_count
-    _active_session_count += 1
+    with _active_session_lock:
+        _active_session_count += 1
+
+
+def _decrement_active_session_count() -> None:
+    global _active_session_count
+    with _active_session_lock:
+        _active_session_count -= 1
 
 
 async def maybe_shutdown_alert_dispatcher() -> None:
     global _active_session_count
-    _active_session_count -= 1
-    if _active_session_count <= 0:
+    _decrement_active_session_count()
+    with _active_session_lock:
+        if _active_session_count <= 0:
+            _active_session_count = 0
+    should_shutdown = _active_session_count <= 0
+    if should_shutdown:
         await shutdown_alert_dispatcher()
-        _active_session_count = 0
 
 
 def _get_alert_dispatcher() -> AlertDispatcher:
@@ -187,7 +246,17 @@ async def append_order_event(**kwargs: Any) -> Any:
 
 async def update_position(position_id: str, **kwargs: Any) -> PaperPosition | None:
     with _PAPER_DB_IO_LOCK:
-        return _db().update_position(position_id, **kwargs)
+        position = _db().update_position(position_id, **kwargs)
+    status = str(kwargs.get("status") or "").upper()
+    if status in {"CLOSED", "FLATTENED"}:
+        _clear_trailing_stop_cache(position_id)
+    return position
+
+
+def _clear_trailing_stop_cache(position_id: str) -> None:
+    key = str(position_id)
+    _TRAILING_STOP_CACHE.pop(key, None)
+    _TRAILING_STOP_CACHE_KEYS.pop(key, None)
 
 
 def force_paper_db_sync(paper_db: Any | None = None) -> None:
@@ -888,7 +957,7 @@ def _load_live_setup_row(
     with _MARKET_DB_READ_LOCK:
         threshold_row = db.con.execute(
             """
-            SELECT cpr_threshold_pct
+            SELECT trade_date::VARCHAR, cpr_threshold_pct
             FROM cpr_thresholds
             WHERE symbol = ? AND trade_date < ?::DATE
             ORDER BY trade_date DESC
@@ -896,9 +965,19 @@ def _load_live_setup_row(
             """,
             [symbol, trade_date],
         ).fetchone()
-    cpr_threshold = (
-        float(threshold_row[0]) if threshold_row and threshold_row[0] is not None else 2.0
-    )
+    if not threshold_row or threshold_row[0] is None or threshold_row[1] is None:
+        return None
+    threshold_prev_date = str(threshold_row[0])
+    if threshold_prev_date != prev_date:
+        logger.warning(
+            "Live setup row for %s on %s: daily prev_date=%s != threshold prev_date=%s — skipping",
+            symbol,
+            trade_date,
+            prev_date,
+            threshold_prev_date,
+        )
+        return None
+    cpr_threshold = float(threshold_row[1])
 
     intraday = _build_intraday_summary(
         live_candles, or_minutes=or_minutes, bar_end_offset=bar_end_offset
@@ -1563,16 +1642,27 @@ async def flatten_session_positions(
                     "FLATTEN_EOD already sent for session %s — skipping duplicate", session_id
                 )
             else:
-                _flatten_eod_sent.add(session_id)
-                subject, body = _format_risk_alert(
-                    reason=notes or "session flatten",
-                    net_pnl=total_realized,
-                    session_id=session_id,
-                    positions_closed=len(closed),
-                    total_trades=total_trades,
-                    trade_date=getattr(session, "trade_date", None),
-                )
-                _dispatch_alert(AlertType.FLATTEN_EOD, subject, body)
+                # Persisted alert log dedupe protects against duplicate EOD summaries
+                # across a restart, while _flatten_eod_sent protects this process.
+                if _has_flatten_eod_in_alert_log(
+                    session_id, trade_date=getattr(session, "trade_date", None)
+                ):
+                    _flatten_eod_sent.add(session_id)
+                    logger.debug(
+                        "FLATTEN_EOD already persisted for session %s — skipping duplicate",
+                        session_id,
+                    )
+                else:
+                    _flatten_eod_sent.add(session_id)
+                    subject, body = _format_risk_alert(
+                        reason=notes or "session flatten",
+                        net_pnl=total_realized,
+                        session_id=session_id,
+                        positions_closed=len(closed),
+                        total_trades=total_trades,
+                        trade_date=getattr(session, "trade_date", None),
+                    )
+                    _dispatch_alert(AlertType.FLATTEN_EOD, subject, body)
     except Exception:
         logger.debug("Alert dispatch for flatten failed (best-effort)", exc_info=True)
     return {"session_id": session_id, "closed_positions": len(closed), "positions": closed}
@@ -1861,6 +1951,87 @@ def _updated_trail_state(
     }
 
 
+def _trailing_stop_cache_key(
+    *,
+    position: PaperPosition,
+    trail_state: dict[str, Any],
+    params: BacktestParams,
+) -> tuple[Any, ...]:
+    entry_price = float(trail_state.get("entry_price") or position.entry_price)
+    direction = str(trail_state.get("direction") or position.direction).upper()
+    initial_sl = trail_state.get("initial_sl")
+    if initial_sl is None:
+        initial_sl = position.stop_loss if position.stop_loss is not None else entry_price
+    return (
+        position.position_id,
+        direction,
+        float(entry_price),
+        float(initial_sl),
+        float(trail_state.get("atr") or 0.0),
+        float(trail_state.get("trail_atr_multiplier") or 1.0),
+        float(trail_state.get("rr_ratio") or params.rr_ratio),
+        float(trail_state.get("breakeven_r") or params.breakeven_r),
+    )
+
+
+def _build_trailing_stop(
+    *,
+    position: PaperPosition,
+    trail_state: dict[str, Any],
+    params: BacktestParams,
+) -> TrailingStop:
+    entry_price = float(trail_state.get("entry_price") or position.entry_price)
+    direction = str(trail_state.get("direction") or position.direction).upper()
+    initial_sl = trail_state.get("initial_sl")
+    if initial_sl is None:
+        initial_sl = position.stop_loss if position.stop_loss is not None else entry_price
+    return TrailingStop(
+        entry_price=entry_price,
+        direction=direction,
+        # Preserve lifecycle geometry from the original risk leg. Using current_sl
+        # here collapses sl_distance after breakeven and causes premature
+        # TRAIL transitions.
+        sl_price=float(initial_sl),
+        atr=float(trail_state.get("atr") or 0.0),
+        trail_atr_multiplier=float(trail_state.get("trail_atr_multiplier") or 1.0),
+        rr_ratio=float(trail_state.get("rr_ratio") or params.rr_ratio),
+        breakeven_r=float(trail_state.get("breakeven_r") or params.breakeven_r),
+    )
+
+
+def _get_trailing_stop(
+    position: PaperPosition,
+    params: BacktestParams,
+    trail_state: dict[str, Any],
+) -> TrailingStop:
+    key = str(position.position_id)
+    cache_key = _trailing_stop_cache_key(
+        position=position,
+        trail_state=trail_state,
+        params=params,
+    )
+    cached = _TRAILING_STOP_CACHE.get(key)
+    if cached is None or _TRAILING_STOP_CACHE_KEYS.get(key) != cache_key:
+        cached = _build_trailing_stop(
+            position=position,
+            trail_state=trail_state,
+            params=params,
+        )
+        _TRAILING_STOP_CACHE[key] = cached
+        _TRAILING_STOP_CACHE_KEYS[key] = cache_key
+
+    # Re-sync mutable runtime-derived fields from the persisted trail_state.
+    cached.current_sl = float(trail_state.get("current_sl") or cached.current_sl)
+    cached.phase = str(trail_state.get("phase") or cached.phase)
+    cached.highest_since_entry = float(
+        trail_state.get("highest_since_entry") or cached.highest_since_entry
+    )
+    cached.lowest_since_entry = float(
+        trail_state.get("lowest_since_entry") or cached.lowest_since_entry
+    )
+    return cached
+
+
 async def _open_position_from_candidate(
     *,
     session: PaperSession,
@@ -1990,28 +2161,7 @@ async def _advance_open_position(
         if scale_out_pct > 0 and not scaled_out
         else None
     )
-    initial_sl = _float_or_none(trail_state.get("initial_sl"))
-    if initial_sl is None:
-        initial_sl = _float_or_none(position.stop_loss)
-    if initial_sl is None:
-        initial_sl = float(position.entry_price)
-    current_sl = _float_or_none(trail_state.get("current_sl"))
-    ts = TrailingStop(
-        entry_price=float(trail_state.get("entry_price") or position.entry_price),
-        direction=str(trail_state.get("direction") or position.direction),
-        # Preserve lifecycle geometry from the original risk leg. Using current_sl here
-        # collapses sl_distance after breakeven and causes premature TRAIL transitions.
-        sl_price=float(initial_sl),
-        atr=float(trail_state.get("atr") or 0.0),
-        trail_atr_multiplier=float(trail_state.get("trail_atr_multiplier") or 1.0),
-        rr_ratio=float(trail_state.get("rr_ratio") or params.rr_ratio),
-        breakeven_r=float(trail_state.get("breakeven_r") or params.breakeven_r),
-    )
-    if current_sl is not None:
-        ts.current_sl = float(current_sl)
-    ts.phase = str(trail_state.get("phase") or ts.phase)
-    ts.highest_since_entry = float(trail_state.get("highest_since_entry") or ts.highest_since_entry)
-    ts.lowest_since_entry = float(trail_state.get("lowest_since_entry") or ts.lowest_since_entry)
+    ts = _get_trailing_stop(position, params, trail_state=trail_state)
     candle_count = int(trail_state.get("candle_count") or 0) + 1
 
     mark_price = float(candle["close"])
