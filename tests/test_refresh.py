@@ -124,12 +124,17 @@ def test_eod_ingest_runs_strict_order(monkeypatch) -> None:
     refresh.main()
 
     assert [cmd[2] for cmd in captured] == [
-        "scripts.kite_ingest",
-        "scripts.kite_ingest",
-        "scripts.kite_ingest",
-        "scripts.build_tables",
-        "scripts.paper_trading",
-        "scripts.data_quality",
+        "scripts.kite_ingest",  # 0: refresh_instruments
+        "scripts.kite_ingest",  # 1: ingest_daily
+        "scripts.kite_ingest",  # 2: ingest_5min
+        "scripts.build_tables",  # 3: build_runtime
+        "scripts.build_tables",  # 4: build_next_day_cpr
+        "scripts.build_tables",  # 5: build_next_day_thresholds
+        "scripts.build_tables",  # 6: build_next_day_state
+        "scripts.build_tables",  # 7: build_next_day_strategy
+        "scripts.sync_replica",  # 8: sync_replica
+        "scripts.paper_trading",  # 9: daily_prepare
+        "scripts.data_quality",  # 10: data_quality
     ]
     assert captured[0][3:] == ["--refresh-instruments", "--exchange", "NSE"]
     assert captured[1][3:] == [
@@ -150,12 +155,45 @@ def test_eod_ingest_runs_strict_order(monkeypatch) -> None:
     ]
     assert captured[3][3:] == ["--refresh-since", "2026-04-29", "--batch-size", "128"]
     assert captured[4][3:] == [
+        "--table",
+        "cpr",
+        "--refresh-date",
+        "2026-04-30",
+        "--batch-size",
+        "128",
+    ]
+    assert captured[5][3:] == [
+        "--table",
+        "thresholds",
+        "--refresh-date",
+        "2026-04-30",
+        "--batch-size",
+        "128",
+    ]
+    assert captured[6][3:] == [
+        "--table",
+        "state",
+        "--refresh-date",
+        "2026-04-30",
+        "--batch-size",
+        "128",
+    ]
+    assert captured[7][3:] == [
+        "--table",
+        "strategy",
+        "--refresh-date",
+        "2026-04-30",
+        "--batch-size",
+        "128",
+    ]
+    assert captured[8][3:] == ["--verify", "--trade-date", "2026-04-30"]
+    assert captured[9][3:] == [
         "daily-prepare",
         "--trade-date",
         "2026-04-30",
         "--all-symbols",
     ]
-    assert captured[5][3:] == ["--date", "2026-04-30"]
+    assert captured[10][3:] == ["--date", "2026-04-30"]
 
 
 def test_eod_ingest_logs_stage_names(monkeypatch, capsys) -> None:
@@ -184,6 +222,11 @@ def test_eod_ingest_logs_stage_names(monkeypatch, capsys) -> None:
     assert "START ingest_daily" in out
     assert "START ingest_5min" in out
     assert "START build_runtime" in out
+    assert "START build_next_day_cpr" in out
+    assert "START build_next_day_thresholds" in out
+    assert "START build_next_day_state" in out
+    assert "START build_next_day_strategy" in out
+    assert "START sync_replica" in out
     assert "START daily_prepare" in out
     assert "START data_quality" in out
     assert "EOD pipeline complete" in out

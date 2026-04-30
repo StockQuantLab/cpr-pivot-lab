@@ -322,10 +322,11 @@ def validate_live_runtime_coverage(*, trade_date: str, symbols: list[str]) -> di
             exact_state_counts[table] = int(row[0] or 0) if row else 0
         except Exception:
             exact_state_counts[table] = 0
-    unexpected_trade_date_state_rows = exact_state_counts.get("intraday_day_pack", 0) == 0 and (
-        exact_state_counts.get("market_day_state", 0) > 0
-        or exact_state_counts.get("strategy_day_state", 0) > 0
-    )
+    # Removed: unexpected_trade_date_state_rows check.
+    # Having market_day_state/strategy_day_state rows for trade_date with no intraday_day_pack
+    # is the EXPECTED state after a correct EOD run (next-day CPR is built; candles don't exist
+    # yet). The old check incorrectly blocked live sessions after a valid EOD pipeline.
+    # Positive validation (next-day rows MUST exist) now lives in data_quality and daily-prepare.
     missing_by_symbol: dict[str, list[str]] = {}
     sparse_missing_by_symbol: dict[str, list[str]] = {}
     warning_by_symbol: dict[str, list[str]] = {}
@@ -438,8 +439,7 @@ def validate_live_runtime_coverage(*, trade_date: str, symbols: list[str]) -> di
         "sparse_missing_total": sum(len(missing) for missing in sparse_missing_by_symbol.values()),
         "warning_total": sum(len(warnings) for warnings in warning_by_symbol.values()),
         "exact_trade_date_counts": exact_state_counts,
-        "unexpected_trade_date_state_rows": unexpected_trade_date_state_rows,
-        "coverage_ready": not missing_by_symbol and not unexpected_trade_date_state_rows,
+        "coverage_ready": not missing_by_symbol,
     }
 
 

@@ -22,6 +22,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from db.duckdb import get_db
+from engine.cli_setup import configure_windows_stdio
 from engine.command_lock import acquire_command_lock
 from scripts.paper_prepare import CANONICAL_FULL_UNIVERSE_NAME, resolve_trade_date
 
@@ -324,8 +325,20 @@ def build_trade_date_readiness_report(trade_date: str) -> dict[str, Any]:
         symbol_source, candidate_symbols = _load_default_universe_symbols(db, trade_date)
         setup_only_mode = bool(candidate_symbols)
 
+    # Tables expected to be at trade_date after a correct EOD build (one day ahead of pack).
+    # Being at exactly trade_date with pack behind = valid post-EOD state.
+    # Being BEYOND trade_date = genuinely unexpected / accidental future build.
+    _next_day_setup_tables = {
+        "cpr_daily",
+        "cpr_thresholds",
+        "market_day_state",
+        "strategy_day_state",
+    }
+
     freshness_tables = [
         "or_daily",
+        "cpr_daily",
+        "cpr_thresholds",
         "market_day_state",
         "strategy_day_state",
         "intraday_day_pack",
@@ -345,9 +358,14 @@ def build_trade_date_readiness_report(trade_date: str) -> dict[str, Any]:
         elif max_date == pack_date:
             status = "OK"
         elif max_date > pack_date:
-            if setup_only_mode and table in {"market_day_state", "strategy_day_state"}:
-                status = f"UNEXPECTED FUTURE STATE ({max_date} > {pack_date})"
-                freshness_blocking = True
+            if setup_only_mode and table in _next_day_setup_tables:
+                # Being at exactly trade_date is expected after EOD (next-day setup built).
+                # Being beyond trade_date is genuinely unexpected.
+                if max_date == trade_date:
+                    status = f"OK next-day ({max_date})"
+                else:
+                    status = f"UNEXPECTED FUTURE STATE ({max_date} > {trade_date})"
+                    freshness_blocking = True
             else:
                 status = f"AHEAD of pack ({max_date} > {pack_date})"
         else:
@@ -359,6 +377,8 @@ def build_trade_date_readiness_report(trade_date: str) -> dict[str, Any]:
     freshness_comparisons: list[dict[str, str | None]] = []
     for left, right in [
         ("or_daily", "intraday_day_pack"),
+        ("cpr_daily", "intraday_day_pack"),
+        ("cpr_thresholds", "intraday_day_pack"),
         ("market_day_state", "intraday_day_pack"),
         ("strategy_day_state", "intraday_day_pack"),
     ]:
@@ -367,9 +387,12 @@ def build_trade_date_readiness_report(trade_date: str) -> dict[str, Any]:
         if left_date is not None and right_date is not None and left_date == right_date:
             status = f"OK ({left_date})"
         elif left_date is not None and right_date is not None and left_date > right_date:
-            if setup_only_mode and left in {"market_day_state", "strategy_day_state"}:
-                status = f"UNEXPECTED FUTURE STATE ({left_date} > {right_date})"
-                freshness_blocking = True
+            if setup_only_mode and left in _next_day_setup_tables:
+                if left_date == trade_date:
+                    status = f"OK next-day ({left_date})"
+                else:
+                    status = f"UNEXPECTED FUTURE STATE ({left_date} > {trade_date})"
+                    freshness_blocking = True
             else:
                 status = f"AHEAD ({left_date} > {right_date})"
         else:
@@ -450,10 +473,45 @@ def build_trade_date_readiness_report(trade_date: str) -> dict[str, Any]:
     except Exception:
         pass
 
+    # For live/future dates: assert market_day_state and cpr_daily have rows for trade_date.
+    # This catches the "EOD did not build next-day CPR rows" failure that causes zero trades.
+    next_day_mds_count = 0
+    next_day_cpr_count = 0
+    next_day_rows_missing = False
+    if setup_only_mode:
+        try:
+            next_day_mds_count = int(
+                (
+                    db.con.execute(
+                        "SELECT COUNT(*) FROM market_day_state WHERE trade_date = ?::DATE",
+                        [trade_date],
+                    ).fetchone()
+                    or [0]
+                )[0]
+            )
+            next_day_cpr_count = int(
+                (
+                    db.con.execute(
+                        "SELECT COUNT(*) FROM cpr_daily WHERE trade_date = ?::DATE",
+                        [trade_date],
+                    ).fetchone()
+                    or [0]
+                )[0]
+            )
+            next_day_rows_missing = next_day_mds_count == 0 or next_day_cpr_count == 0
+        except Exception:
+            pass
+
     if setup_only_mode:
         # Setup-only: current/future live day has no 5-min parquet yet. Gate on the
         # latest completed trading day's daily + ATR data plus a non-empty dated universe.
-        ready = bool(candidate_symbols) and not freshness_blocking and not coverage_blocking
+        # Also require that next-day CPR and market_day_state rows exist (built by EOD pipeline).
+        ready = (
+            bool(candidate_symbols)
+            and not freshness_blocking
+            and not coverage_blocking
+            and not next_day_rows_missing
+        )
     else:
         ready = (
             bool(candidate_symbols)
@@ -480,6 +538,9 @@ def build_trade_date_readiness_report(trade_date: str) -> dict[str, Any]:
         "freshness_blocking": freshness_blocking,
         "pre_market": pre_market,
         "setup_only_mode": setup_only_mode,
+        "next_day_mds_count": next_day_mds_count,
+        "next_day_cpr_count": next_day_cpr_count,
+        "next_day_rows_missing": next_day_rows_missing,
         "ready": ready,
     }
 
@@ -568,6 +629,25 @@ def print_trade_date_readiness_report(report: dict[str, Any]) -> None:
         if missing:
             print(f"    sample: {_preview_symbols(missing)}")
 
+    if setup_only_mode:
+        next_day_mds = int(report.get("next_day_mds_count") or 0)
+        next_day_cpr = int(report.get("next_day_cpr_count") or 0)
+        next_day_missing = bool(report.get("next_day_rows_missing", False))
+        marker = " [MISSING - BLOCKING]" if next_day_missing else " [OK]"
+        print(f"\nNext-day setup rows ({trade_date}):")
+        print(f"  market_day_state : {next_day_mds:>6,}{marker}")
+        print(f"  cpr_daily        : {next_day_cpr:>6,}{marker if next_day_cpr == 0 else ' [OK]'}")
+        if next_day_missing:
+            print(
+                f"\n  [CRITICAL] EOD pipeline did not build next-day CPR/state rows.\n"
+                f"  Fix (targeted table rebuild + replica sync):\n"
+                f"    doppler run -- uv run pivot-build --table cpr --refresh-date {trade_date}\n"
+                f"    doppler run -- uv run pivot-build --table thresholds --refresh-date {trade_date}\n"
+                f"    doppler run -- uv run pivot-build --table state --refresh-date {trade_date}\n"
+                f"    doppler run -- uv run pivot-build --table strategy --refresh-date {trade_date}\n"
+                f"    doppler run -- uv run pivot-sync-replica --verify --trade-date {trade_date}"
+            )
+
     print("\nReadiness:")
     print(f"  {'Ready':<10} {'YES' if ready else 'NO'}")
     if not ready:
@@ -577,10 +657,20 @@ def print_trade_date_readiness_report(report: dict[str, Any]) -> None:
                 "atr_intraday, and cpr_thresholds coverage. Sparse symbol/day gaps are "
                 "warnings; broad gaps block."
             )
-            print(
-                "  Fix:   doppler run -- uv run pivot-refresh --eod-ingest "
-                "--date <prev_trading_date> --trade-date <trade_date>"
-            )
+            if bool(report.get("next_day_rows_missing")):
+                print(
+                    f"  Fix (next-day rows):\n"
+                    f"    doppler run -- uv run pivot-build --table cpr --refresh-date {trade_date}\n"
+                    f"    doppler run -- uv run pivot-build --table thresholds --refresh-date {trade_date}\n"
+                    f"    doppler run -- uv run pivot-build --table state --refresh-date {trade_date}\n"
+                    f"    doppler run -- uv run pivot-build --table strategy --refresh-date {trade_date}\n"
+                    f"    doppler run -- uv run pivot-sync-replica --verify --trade-date {trade_date}"
+                )
+            else:
+                print(
+                    "  Fix (prev-day data): doppler run -- uv run pivot-refresh --eod-ingest "
+                    "--date <prev_trading_date> --trade-date <trade_date>"
+                )
         else:
             print(
                 f"  Suggested fix: doppler run -- uv run pivot-build --refresh-since {trade_date}"
@@ -595,6 +685,7 @@ def _print_trade_date_report(trade_date: str) -> bool:
 
 
 def main() -> int:
+    configure_windows_stdio(line_buffering=True, write_through=True)
     parser = argparse.ArgumentParser(description="Inspect and refresh backtest data quality issues")
     parser.add_argument(
         "--refresh",

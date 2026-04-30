@@ -934,9 +934,9 @@ async def test_cmd_daily_prepare_refuses_mismatched_snapshot_without_force(
     monkeypatch.setattr(
         pt,
         "load_universe_symbols",
-        lambda universe_name, read_only=True: ["SBIN"]
-        if universe_name == "full_2024_01_01"
-        else [],
+        lambda universe_name, read_only=True: (
+            ["SBIN"] if universe_name == "full_2024_01_01" else []
+        ),
     )
 
     with pytest.raises(SystemExit, match="Refusing to overwrite existing universe"):

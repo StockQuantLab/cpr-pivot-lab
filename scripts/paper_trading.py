@@ -638,6 +638,9 @@ def _build_runtime_coverage_fix_lines(missing_counts: dict[str, Any]) -> list[st
     lines: list[str] = []
     if int(missing_counts.get("cpr_daily") or 0) > 0:
         lines.append("doppler run -- uv run pivot-build --table cpr --refresh-date <trade-date>")
+        lines.append(
+            "doppler run -- uv run pivot-build --table thresholds --refresh-date <trade-date>"
+        )
     if int(missing_counts.get("market_day_state") or 0) > 0:
         lines.append("doppler run -- uv run pivot-build --table state --refresh-date <trade-date>")
     if int(missing_counts.get("strategy_day_state") or 0) > 0:
@@ -810,19 +813,6 @@ def _handle_coverage_gaps(preparation: dict[str, Any], *, trade_date: str, mode:
     """
     inner_coverage = preparation.get("coverage") or {}
     if mode == "live" and "missing_by_symbol" in inner_coverage:
-        if bool(inner_coverage.get("unexpected_trade_date_state_rows")):
-            counts = dict(inner_coverage.get("exact_trade_date_counts") or {})
-            raise SystemExit(
-                f"Unexpected future/current-day state rows exist for {trade_date} while "
-                "same-day intraday_day_pack is absent.\n"
-                f"  market_day_state={int(counts.get('market_day_state') or 0)}\n"
-                f"  strategy_day_state={int(counts.get('strategy_day_state') or 0)}\n"
-                f"  intraday_day_pack={int(counts.get('intraday_day_pack') or 0)}\n\n"
-                "Do not build live-day market_day_state/strategy_day_state before market open. "
-                "Clean those rows and rerun:\n"
-                "  doppler run -- uv run pivot-refresh --eod-ingest "
-                "--date <prev_trading_date> --trade-date <trade_date>"
-            )
         missing_by_symbol = dict(inner_coverage.get("missing_by_symbol") or {})
         sparse_missing_by_table = dict(inner_coverage.get("sparse_missing_by_table") or {})
         if sparse_missing_by_table:
@@ -1098,10 +1088,43 @@ async def _cmd_daily_prepare(args: argparse.Namespace) -> None:
         payload["canonical_universe_count"] = len(canonical_symbols) or len(symbols)
         payload["canonical_universe_created"] = canonical_created
     if not has_intraday:
+        mds_count = int(
+            (
+                db.con.execute(
+                    "SELECT COUNT(*) FROM market_day_state WHERE trade_date = ?::DATE",
+                    [trade_date],
+                ).fetchone()
+                or [0]
+            )[0]
+        )
+        cpr_count = int(
+            (
+                db.con.execute(
+                    "SELECT COUNT(*) FROM cpr_daily WHERE trade_date = ?::DATE",
+                    [trade_date],
+                ).fetchone()
+                or [0]
+            )[0]
+        )
+        if mds_count == 0 or cpr_count == 0:
+            raise SystemExit(
+                f"\n[CRITICAL] daily-prepare: next-day setup rows missing for {trade_date}.\n"
+                f"  market_day_state = {mds_count} rows\n"
+                f"  cpr_daily        = {cpr_count} rows\n\n"
+                "The EOD pivot-build did not create forward-looking CPR rows.\n"
+                "Fix (run in order):\n"
+                f"  doppler run -- uv run pivot-build --table cpr --refresh-date {trade_date}\n"
+                f"  doppler run -- uv run pivot-build --table thresholds --refresh-date {trade_date}\n"
+                f"  doppler run -- uv run pivot-build --table state --refresh-date {trade_date}\n"
+                f"  doppler run -- uv run pivot-build --table strategy --refresh-date {trade_date}\n"
+                f"  doppler run -- uv run pivot-sync-replica --verify --trade-date {trade_date}\n"
+                f"  doppler run -- uv run pivot-paper-trading daily-prepare --trade-date {trade_date} --all-symbols"
+            )
         print(
             f"\nNote: {trade_date} has no intraday data yet (live session).\n"
-            "Checking previous completed-day live prerequisites only. "
-            "daily-prepare does not build future/current-day market_day_state rows.\n"
+            "Checking previous completed-day live prerequisites only.\n"
+            f"  market_day_state rows for {trade_date}: {mds_count} ✓\n"
+            f"  cpr_daily rows for {trade_date}: {cpr_count} ✓\n"
         )
     readiness = _data_quality.build_trade_date_readiness_report(trade_date)  # type: ignore[attr-defined]
     _data_quality.print_trade_date_readiness_report(readiness)  # type: ignore[attr-defined]

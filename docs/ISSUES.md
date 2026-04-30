@@ -7,6 +7,274 @@ Supersedes: `docs/PARITY_INCIDENT_LOG.md` (contents migrated below).
 
 ---
 
+## 2026-04-30 — FIXED: `pivot-data-quality` Windows encoding failure on readiness checkmark
+
+**Status:** FIXED — non-data bug; final readiness passed when rerun with UTF-8 output
+**Severity:** Medium — can make a successful EOD pipeline exit non-zero on Windows
+
+### Symptom
+
+During `pivot-refresh --eod-ingest --date 2026-04-30 --trade-date 2026-05-04`, stages 1–10
+completed and `daily-prepare` printed `Ready YES`, but stage 11 failed while printing the
+final data-quality report:
+
+`UnicodeEncodeError: 'charmap' codec can't encode character '\u2713'`
+
+The failure was caused by the `✓` readiness marker in `scripts/data_quality.py` under a
+Windows `cp1252` console. Rerunning with `PYTHONIOENCODING=utf-8` returned exit code 0 and
+confirmed `Ready YES`.
+
+### Fix
+
+`scripts/data_quality.py` now configures Windows stdio via `configure_windows_stdio()` and
+uses ASCII `[OK]` / `[MISSING - BLOCKING]` markers for next-day setup rows. The EOD pipeline
+should not fail after a successful readiness calculation because of console encoding.
+
+---
+
+## 2026-04-30 — OPEN: Live path reads market data through dashboard replica accessor
+
+**Status:** OPEN — design hardening required
+**Severity:** High — live trading should not depend on an implicit "latest dashboard replica"
+
+### Problem
+
+The live paper path currently uses `get_dashboard_db()` for read-only market setup queries
+(`market_day_state`, `cpr_daily`, `atr_intraday`, `intraday_day_pack`, and related views).
+That function reads the latest versioned file under `data/market_replica/`.
+
+This is lock-safe for DuckDB on Windows, but the naming and ownership are wrong for live
+trading. Dashboard replicas exist so dashboard/ad-hoc readers do not affect critical paths.
+Live trading should not silently depend on a dashboard-oriented "latest replica" contract.
+
+### Risk
+
+If `market.duckdb` is repaired or rebuilt but the replica is stale, live can start from old
+setup rows unless startup gates catch it. The new row-count and replica verification guards
+reduce this risk, but the architecture is still ambiguous.
+
+### Target design
+
+- `market.duckdb` remains the source of truth.
+- Live startup should read the source DB directly for trade-date setup validation/preload,
+  then close the source DB before the trading loop starts; dashboard/ad-hoc queries continue
+  to use replicas.
+- If a copied DB is needed for live lock isolation, create an explicit verified and pinned
+  `live_market_snapshot_<trade_date>.duckdb`, not the dashboard replica.
+- Replace live uses of `get_dashboard_db()` with a clearly named live market accessor such as
+  `get_live_market_db(trade_date)`.
+- Startup logs must print source/snapshot path, snapshot version if any, trade date, created
+  time, and CPR/state row counts before allowing the session to run.
+
+### Required follow-up
+
+Audit `engine/paper_runtime.py`, `scripts/paper_live.py`, and `engine/local_ticker_adapter.py`
+for all `get_dashboard_db()` call sites and split dashboard reads from live market reads.
+
+---
+
+## 2026-04-30 — OPEN: Historical sparse gaps in runtime tables (deferred post-EOD)
+
+**Status:** OPEN — do not fix until after today's EOD ingestion
+**Severity:** Low — does not block live trading or baseline reruns (gaps are on first-day IPO dates)
+
+### Counts (as of 2026-04-30)
+
+| Table | Missing symbol-days | Affected symbols | Date range |
+|-------|--------------------|--------------------|------------|
+| `atr_intraday` | 3,247 | 1,482 | 2015-02-02 → 2026-04-22 |
+| `market_day_state` | 10,653 | 1,548 | 2015-02-02 → 2026-04-22 |
+| `strategy_day_state` | 10,653 | 1,548 | 2015-02-02 → 2026-04-22 |
+
+**Note:** `cpr_daily` gaps not separately counted (market_day_state gaps are superset).
+
+### Root cause (primary — ~90% of gaps)
+
+Newly-listed symbols on their **first trading day** (IPO date). The CPR build uses
+`LEAD(date) OVER (PARTITION BY symbol ORDER BY date)` to assign `trade_date`. For the first
+row in v_daily (no prior-day OHLC), `LEAD()` returns NULL → no CPR row → no `market_day_state`
+row → `intraday_day_pack` has candle but runtime table is absent.
+
+Recent examples (2024): DIGIDRIVE, EPACK, EXICOM, NOVAAGRI, RKSWAMY — all IPO first days.
+
+This is a **structural limitation** for the first trading day of any new symbol. These gaps
+are safe to accept: the live engine skips symbols without CPR data (entry gate requires
+valid tc/bc/pivot), so no trades fire on IPO day anyway.
+
+### 2019 anomaly (requires investigation)
+
+2019 has 3,554 missing symbol-days across 211 symbols — disproportionately large vs other years
+(which have 100-400 each). Possible causes: batch ingestion gap, instrument master change,
+or a pivot-build run that was interrupted. Investigate after EOD is stable.
+
+### Fix plan (post-EOD)
+
+1. **IPO first-day gaps**: Mark as acceptable in `data_quality_issues` with `severity=INFO`
+   and `issue_code=FIRST_DAY_IPO_NO_PREV_OHLC`. Suppressed from blocking checks.
+   Implement via: `pivot-data-quality --classify-first-day-gaps` (new command needed).
+
+2. **2019 anomaly**: Run `pivot-data-quality --date <affected-dates>` to identify the date
+   range, then `pivot-build --refresh-since 2019-01-01 --until 2019-12-31` to rebuild if
+   the source parquet exists.
+
+3. **Baseline promotion gate**: Before promoting any baseline run, require
+   `pivot-data-quality --baseline-window --universe-name canonical_full --start 2025-01-01`
+   to pass with zero blocking gaps. (Tracked in 2026-04-29 DQ GAP issue above.)
+
+---
+
+## 2026-04-30 — INCIDENT: Zero trades on live session due to missing Apr30 CPR rows + stale replica
+
+**Status:** FIXED (code), DOCUMENTED (root cause), PROCESS UPDATE REQUIRED
+**Severity:** Critical — complete washout, zero trades taken for the full trading day
+
+### Symptom
+
+`daily-live --multi --strategy CPR_LEVELS` launched at 09:16 IST with:
+- `with_setup=0 missing=2038 coverage=0%` at LIVE_STARTUP_READY
+- Zero trades for the entire 09:16–10:15 entry window
+- `closes=0` in every TICKER_HEALTH log line
+
+### Root Cause Chain (4 layers)
+
+**Layer 1 — EOD pipeline did not build Apr30 CPR rows:**
+`pivot-refresh --eod-ingest --date 2026-04-29 --trade-date 2026-04-30` was not run on Apr29 evening.
+Without this, `cpr_daily` and `market_day_state` had no rows for `trade_date=2026-04-30`.
+The `cpr_daily` build uses `LEAD(date) OVER (PARTITION BY symbol ORDER BY date)` to determine
+the next trading date. Since v_daily has no Apr30 rows at EOD, `LEAD()` returns NULL for Apr29
+rows → no Apr30 CPR rows are created. The `--trade-date 2026-04-30` flag to EOD is what tells
+the build to use `COALESCE(LEAD, '2026-04-30'::DATE)` for this purpose.
+
+**Layer 2 — Pre-launch validation did not detect the gap:**
+`daily-prepare` and `pivot-data-quality` check `max(trade_date) = previous_trading_day`. Since
+Apr29 data was fresh, both reported OK. Neither checked `market_day_state has rows for today`.
+
+**Layer 3 — `allow_live_setup_fallback` circular dependency:**
+`_load_live_setup_row` (the designed fallback for missing market_day_state rows) requires
+`live_candles != []` to work. At session startup, `state.candles` is always empty. The fallback
+returns `None` for all symbols → all 2038 symbols marked `missing` → zero setups forever.
+Code: `engine/paper_runtime.py:892` — `if not live_candles: return None`.
+
+**Layer 4 — market_replica not synced after pivot-build:**
+After manually running `pivot-build --refresh-date 2026-04-30` to repair the CPR data,
+the live session still showed `with_setup=0` because `get_dashboard_db()` reads from
+`data/market_replica/` (versioned snapshot) not `data/market.duckdb` directly. DuckDB on
+Windows uses exclusive file locking — no second process can open the same file even read-only.
+The replica was not updated by the manual build because: (a) the build process was killed before
+completing its replica sync step, and (b) the live session held market.duckdb exclusively,
+blocking any subsequent sync attempt.
+
+### Fixes Applied (2026-04-30)
+
+**Fix 1 — `--skip-coverage` bypass in `--multi` path (scripts/paper_trading.py):**
+`_enforce_kite_live_setup_gate` was called unconditionally in `_cmd_daily_live_multi`
+and in `_run_multi_variants`. Both call sites now respect `--skip-coverage`.
+
+**Fix 2 — Startup fail-fast when market_day_state has 0 rows (scripts/paper_live.py):**
+After `LIVE_STARTUP_READY` with `with_setup=0`, the engine now queries the replica directly
+for `market_day_state` row count. If count=0, session fails immediately with the exact
+`pivot-build --refresh-date <date>` + `pivot-sync-replica` fix commands.
+
+**Fix 3 — Remove circular dependency in `_load_live_setup_row` (engine/paper_runtime.py):**
+Removed `if not live_candles: return None` guard. CPR/ATR are computed from `v_daily` +
+`atr_intraday` without needing candles. Direction stays NONE (pending) until first candle.
+This allows the fallback to work at startup even with empty candle buffers.
+
+**Fix 4 — EOD pipeline builds next-day CPR/state rows (scripts/refresh.py):**
+Added two targeted stages after `build_runtime`:
+- `build_next_day_cpr` → `pivot-build --table cpr --refresh-date <trade_date>`
+- `build_next_day_state` → `pivot-build --table state --refresh-date <trade_date>`
+These use `COALESCE(LEAD, trade_date)` to create Apr30 CPR rows from Apr29 OHLC.
+Also added `sync_replica` stage → `pivot-sync-replica --verify --trade-date <trade_date>`.
+
+**Fix 5 — `daily-prepare` asserts next-day rows exist (scripts/paper_trading.py):**
+When in live mode (no intraday data), `daily-prepare` now queries `market_day_state` and
+`cpr_daily` row counts for trade_date. Raises `SystemExit(1)` with exact fix commands if
+either is 0.
+
+**Fix 6 — `data_quality` readiness gate includes next-day row check (scripts/data_quality.py):**
+In `setup_only_mode`, the readiness report now checks `market_day_state` and `cpr_daily`
+row counts for the target trade_date. `ready=False` if either is 0. Printed in the report
+as "Next-day setup rows (YYYY-MM-DD): [count] [OK / MISSING - BLOCKING]".
+
+**Fix 7 — `pivot-sync-replica` CLI command (scripts/sync_replica.py + pyproject.toml):**
+New command: `doppler run -- uv run pivot-sync-replica --verify --trade-date <date>`
+Syncs `market_replica/` with current `market.duckdb`, then verifies row counts for the
+given trade_date. Exits 1 with fix commands if rows are missing.
+
+### Required Fixes (not yet implemented)
+
+**Fix 2 — Startup fail-fast when market_day_state has 0 rows for trade_date:**
+In `scripts/paper_live.py`, when `with_setup=0` at `LIVE_STARTUP_READY`, add an explicit
+DB query `SELECT COUNT(*) FROM market_day_state WHERE trade_date = ?` and fail fast with
+the fix command if count=0:
+```
+[STARTUP BLOCKED] No market_day_state rows for 2026-04-30.
+Fix: doppler run -- uv run pivot-build --refresh-date 2026-04-30
+     doppler run -- uv run python -c "from db.duckdb import ...; sync_replica()"
+Then restart daily-live.
+```
+
+**Fix 3 — Pre-launch validation: assert today's market_day_state rows exist:**
+`daily-prepare` and `pivot-data-quality --date <trade_date>` must check:
+`SELECT COUNT(*) FROM market_day_state WHERE trade_date = ?` > 0.
+Currently only checks max_date freshness, not forward-looking row existence.
+
+**Fix 4 — Remove circular dependency in `_load_live_setup_row`:**
+`engine/paper_runtime.py:892` — remove `if not live_candles: return None`. The function
+already computes CPR from `v_daily` and ATR from `atr_intraday` without needing candles.
+Direction would resolve as "NONE" (pending) on first candle. This makes the fallback
+work at startup even with empty candle state.
+
+**Fix 5 — Replica sync as part of pre-market checklist:**
+After any `pivot-build`, `pivot-refresh`, or manual data repair, explicitly sync the
+market replica before starting `daily-live`:
+```bash
+doppler run -- uv run python -c "
+from db.duckdb import get_db, DUCKDB_FILE, REPLICA_DIR
+from db.replica import ReplicaSync
+db = get_db()
+sync = ReplicaSync(DUCKDB_FILE, REPLICA_DIR)
+sync.mark_dirty()
+sync.maybe_sync(source_conn=db.con)
+print('Replica synced')
+"
+```
+Or add a `pivot-sync-replica` CLI command.
+
+**Fix 6 — EOD pipeline guard: verify cpr_daily has next-day rows after build:**
+`_run_eod_ingestion` in `scripts/refresh.py` should assert after `pivot-build`:
+`SELECT COUNT(*) FROM cpr_daily WHERE trade_date = ?::DATE` > 0.
+If 0, re-run `pivot-build --refresh-date <trade_date>` before proceeding.
+
+### Pre-market Checklist Update (add these steps)
+
+Before running `daily-live` each morning, verify:
+```bash
+# Must be > 0 (not just max_date freshness):
+doppler run -- uv run python -c "
+from db.duckdb import get_db
+db = get_db()
+import datetime
+today = datetime.date.today().isoformat()
+r = db.con.execute(f\"SELECT COUNT(*) FROM market_day_state WHERE trade_date = '{today}'\").fetchone()
+print(f'market_day_state rows for {today}:', r[0])
+assert r[0] > 1000, f'MISSING market_day_state rows for {today} — run pivot-build --refresh-date {today}'
+"
+# Then sync replica:
+doppler run -- uv run python -c "
+from db.duckdb import get_db, DUCKDB_FILE, REPLICA_DIR
+from db.replica import ReplicaSync
+db = get_db()
+sync = ReplicaSync(DUCKDB_FILE, REPLICA_DIR)
+sync.mark_dirty()
+sync.maybe_sync(source_conn=db.con)
+print('Replica synced — safe to start daily-live')
+"
+```
+
+---
+
 ## 2026-04-29 — DQ GAP: EOD readiness does not validate full baseline-window runtime coverage
 
 **Status:** OPEN

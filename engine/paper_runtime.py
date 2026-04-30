@@ -889,9 +889,14 @@ def _load_live_setup_row(
     or_minutes: int,
     bar_end_offset: timedelta | None = None,
 ) -> dict[str, Any] | None:
-    if not live_candles:
-        return None
-
+    # Removed early-return guard `if not live_candles: return None`.
+    # CPR levels (tc/bc/pivot/r1/s1) and ATR are derived from v_daily + atr_intraday and
+    # do not require candles. With empty candles, direction stays "NONE" (pending) and
+    # or_close_5/open_915 are None; they resolve from the first live tick. This allows
+    # the per-symbol fallback path to produce a partial setup row at session startup
+    # instead of returning None and permanently skipping the symbol.
+    # Note: this fallback is defense-in-depth. The primary fix is the EOD pipeline building
+    # market_day_state rows so the batch prefetch succeeds (no per-symbol fallback needed).
     db = get_dashboard_db()
     with _MARKET_DB_READ_LOCK:
         prev_daily = db.con.execute(

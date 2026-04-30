@@ -1082,6 +1082,35 @@ async def run_live_session(
             "cycles": 0,
         }
     if deps is None and active_symbols and int(direction_readiness["with_setup"]) == 0:
+        from db.duckdb import get_dashboard_db as _get_mdb
+
+        _mdb_row_count = (
+            _get_mdb()
+            .con.execute(
+                "SELECT COUNT(*) FROM market_day_state WHERE trade_date = ?::DATE", [trade_date]
+            )
+            .fetchone()
+        )
+        _mds_count = int(_mdb_row_count[0] if _mdb_row_count else 0)
+        if _mds_count == 0:
+            reason = "startup_missing_trade_date_setup_rows"
+            logger.error(
+                "[STARTUP BLOCKED] %s: market_day_state has 0 rows for %s in replica. "
+                "Fix: pivot-build --table cpr, --table thresholds, --table state, --table strategy "
+                "(all with --refresh-date %s), then pivot-sync-replica --verify --trade-date %s",
+                session_id,
+                trade_date,
+                trade_date,
+                trade_date,
+            )
+            await _update_session(session_id, deps, status="FAILED", notes=reason)
+            force_paper_db_sync(get_paper_db())
+            return {
+                "session_id": session_id,
+                "final_status": "FAILED",
+                "terminal_reason": reason,
+                "cycles": 0,
+            }
         logger.warning(
             "[%s] No exact-date market_day_state rows loaded for %s; live setup will be derived "
             "from previous completed-day data plus live opening-range candles",

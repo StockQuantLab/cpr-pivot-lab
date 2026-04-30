@@ -306,7 +306,14 @@ def test_validate_live_runtime_coverage_uses_prior_market_history(monkeypatch):
     assert payload["missing_by_symbol"]["TCS"] == ["v_5min"]
 
 
-def test_validate_live_runtime_coverage_blocks_unexpected_trade_date_state_rows(monkeypatch):
+def test_validate_live_runtime_coverage_allows_state_rows_without_pack(monkeypatch):
+    """Having market_day_state rows with no intraday_day_pack is valid after a correct EOD run.
+
+    The old 'unexpected_trade_date_state_rows' check was removed because the EOD pipeline now
+    intentionally builds next-day market_day_state rows while leaving pack empty (tomorrow's
+    candles don't exist yet). coverage_ready should be True in this scenario.
+    """
+
     class _FakeCon:
         def execute(self, query: str, params: list[object]):
             if "FROM intraday_day_pack" in query:
@@ -334,8 +341,9 @@ def test_validate_live_runtime_coverage_blocks_unexpected_trade_date_state_rows(
         symbols=["SBIN"],
     )
 
-    assert payload["coverage_ready"] is False
-    assert payload["unexpected_trade_date_state_rows"] is True
+    # State rows without pack = expected post-EOD state. Must NOT block.
+    assert payload["coverage_ready"] is True
+    assert "unexpected_trade_date_state_rows" not in payload
     assert payload["exact_trade_date_counts"] == {
         "intraday_day_pack": 0,
         "market_day_state": 2,

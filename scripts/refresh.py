@@ -30,6 +30,11 @@ _EOD_STAGE_DESCRIPTIONS = {
     "ingest_daily": "Ingest daily candles for EOD date",
     "ingest_5min": "Ingest 5-minute candles for EOD date",
     "build_runtime": "Build runtime DuckDB tables through EOD date",
+    "build_next_day_cpr": "Build next-day CPR rows via COALESCE(LEAD, trade_date)",
+    "build_next_day_thresholds": "Build next-day cpr_thresholds (rolling P50 for narrowing filter)",
+    "build_next_day_state": "Build next-day market_day_state (ATR via ASOF JOIN)",
+    "build_next_day_strategy": "Build next-day strategy_day_state",
+    "sync_replica": "Sync market_replica with new next-day rows and verify",
     "daily_prepare": "Create dated universe and validate live prerequisites",
     "data_quality": "Final trade-date readiness gate",
 }
@@ -93,6 +98,31 @@ def _run_stage(
         )
         raise SystemExit(code)
     print(f"[{index}/{total}] DONE {name}: elapsed={elapsed:.1f}s", flush=True)
+
+
+def _build_table_cmd(*, table: str, trade_date: str, batch_size: int) -> list[str]:
+    return [
+        sys.executable,
+        "-m",
+        "scripts.build_tables",
+        "--table",
+        table,
+        "--refresh-date",
+        trade_date,
+        "--batch-size",
+        str(batch_size),
+    ]
+
+
+def _sync_replica_cmd(*, trade_date: str) -> list[str]:
+    return [
+        sys.executable,
+        "-m",
+        "scripts.sync_replica",
+        "--verify",
+        "--trade-date",
+        trade_date,
+    ]
 
 
 def _daily_prepare_cmd(*, trade_date: str) -> list[str]:
@@ -204,6 +234,23 @@ def _run_eod_ingestion(
             ),
         ),
         ("build_runtime", _build_cmd(since=ingest_date, batch_size=batch_size)),
+        (
+            "build_next_day_cpr",
+            _build_table_cmd(table="cpr", trade_date=trade_date, batch_size=batch_size),
+        ),
+        (
+            "build_next_day_thresholds",
+            _build_table_cmd(table="thresholds", trade_date=trade_date, batch_size=batch_size),
+        ),
+        (
+            "build_next_day_state",
+            _build_table_cmd(table="state", trade_date=trade_date, batch_size=batch_size),
+        ),
+        (
+            "build_next_day_strategy",
+            _build_table_cmd(table="strategy", trade_date=trade_date, batch_size=batch_size),
+        ),
+        ("sync_replica", _sync_replica_cmd(trade_date=trade_date)),
         ("daily_prepare", _daily_prepare_cmd(trade_date=trade_date)),
         ("data_quality", _data_quality_cmd(trade_date=trade_date)),
     ]

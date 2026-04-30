@@ -88,6 +88,8 @@ pivot-refresh = "scripts.refresh:main"
 pivot-campaign = "scripts.run_campaign:main"
 # Data hygiene: detect and purge dead (delisted) symbols
 pivot-hygiene = "scripts.data_hygiene:main"
+# Sync market_replica with latest market.duckdb (run after pivot-build, before daily-live)
+pivot-sync-replica = "scripts.sync_replica:main"
 
 [build-system]
 requires = ["hatchling"]
