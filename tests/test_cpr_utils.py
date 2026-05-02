@@ -298,9 +298,9 @@ class TestTrailingStop:
         ts.update(93.0, candle_low=88.0)
         assert ts.phase == "TRAIL"
         assert ts.current_sl == pytest.approx(100.0, abs=0.01)  # Deferred
-        # Next bar: lowest_since_entry=93, new_sl=93+3=96 < 100 → SL tightens
+        # Next bar: lowest_since_entry honors the prior candle low=88, new_sl=88+3=91.
         ts.update(93.0)
-        assert ts.current_sl == pytest.approx(96.0, abs=0.01)
+        assert ts.current_sl == pytest.approx(91.0, abs=0.01)
 
     def test_short_same_bar_multi_transition_protect_to_trail(self):
         """SHORT: single candle crossing both 1R close and 2R low fires both transitions."""
@@ -316,9 +316,9 @@ class TestTrailingStop:
         ts.update(95.0, candle_low=88.0)
         assert ts.phase == "TRAIL"
         assert ts.current_sl == pytest.approx(100.0, abs=0.01)  # Deferred (close>target=90)
-        # Next bar: lowest_since_entry=94, new_sl=94+3=97 < 100 → tightens
+        # Next bar: lowest_since_entry honors the prior candle low=88, new_sl=88+3=91.
         ts.update(94.0)
-        assert ts.current_sl == pytest.approx(97.0, abs=0.01)
+        assert ts.current_sl == pytest.approx(91.0, abs=0.01)
 
     def test_short_trail_multiplier_can_loosen_stop(self):
         """SHORT trail multiplier should widen the post-activation stop distance."""
@@ -334,7 +334,7 @@ class TestTrailingStop:
         ts.update(95.0)  # → BREAKEVEN
         ts.update(93.0, candle_low=88.0)  # → TRAIL, SL deferred
         ts.update(93.0)  # trailing branch now uses 1.5x ATR
-        assert ts.current_sl == pytest.approx(97.5, abs=0.01)
+        assert ts.current_sl == pytest.approx(92.5, abs=0.01)
 
 
 class TestValidateAndAdjustSLDistance:

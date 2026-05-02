@@ -169,6 +169,16 @@ class BacktestDB:
         self.con.execute(
             "CREATE INDEX IF NOT EXISTS idx_br_run_symbol_date ON backtest_results(run_id, symbol, trade_date)"
         )
+        try:
+            self.con.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_br_unique_trade "
+                "ON backtest_results(run_id, symbol, trade_date, entry_time)"
+            )
+        except Exception as e:
+            logger.warning(
+                "Could not enforce backtest_results uniqueness; existing duplicates may need cleanup: %s",
+                e,
+            )
         # Add any columns that may have been added in later schema versions
         for col, col_type in (
             ("session_id", "VARCHAR"),
@@ -451,27 +461,22 @@ class BacktestDB:
             )
             if transactional:
                 self.con.execute("BEGIN TRANSACTION")
-            # For PAPER runs, run_id == session_id — re-archiving must not duplicate rows.
-            # Delete existing rows for this run_id before inserting so a second call is
-            # idempotent (backtest run_ids are UUIDs so this branch is never hit for them).
             run_id_for_dedup: str | None = None
             if "run_id" in working_df.columns:
                 run_id_for_dedup = str(working_df["run_id"][0])
-            if "execution_mode" in working_df.columns and run_id_for_dedup:
-                mode_val = str(working_df["execution_mode"][0]).upper()
-                if mode_val == "PAPER":
-                    self.con.execute(
-                        "DELETE FROM backtest_results WHERE run_id = ?", [run_id_for_dedup]
-                    )
+            if run_id_for_dedup:
+                self.con.execute(
+                    "DELETE FROM backtest_results WHERE run_id = ?", [run_id_for_dedup]
+                )
             self.con.execute(insert_sql)
 
             run_id_val: str | None = None
             if "run_id" in working_df.columns:
                 run_id_val = str(working_df["run_id"][0])
-            if run_id_val:
-                self.refresh_run_metrics([run_id_val])
             if transactional:
                 self.con.execute("COMMIT")
+            if run_id_val:
+                self.refresh_run_metrics([run_id_val])
             self._after_write()
         except Exception as e:
             if transactional:
@@ -491,31 +496,37 @@ class BacktestDB:
         run_id = funnel.get("run_id", "")
         if not run_id:
             return
-        self.con.execute("DELETE FROM setup_funnel WHERE run_id = ?", [run_id])
-        self.con.execute(
-            """
-            INSERT INTO setup_funnel (
-                run_id, strategy, universe_count,
-                after_cpr_width, after_direction, after_dir_filter,
-                after_min_price, after_gap, after_or_atr,
-                after_narrowing, after_shift, entry_triggered
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            [
-                run_id,
-                funnel.get("strategy", ""),
-                funnel.get("universe_count", 0),
-                funnel.get("after_cpr_width", 0),
-                funnel.get("after_direction", 0),
-                funnel.get("after_dir_filter", 0),
-                funnel.get("after_min_price", 0),
-                funnel.get("after_gap", 0),
-                funnel.get("after_or_atr", 0),
-                funnel.get("after_narrowing", 0),
-                funnel.get("after_shift", 0),
-                funnel.get("entry_triggered", 0),
-            ],
-        )
+        self.con.execute("BEGIN TRANSACTION")
+        try:
+            self.con.execute("DELETE FROM setup_funnel WHERE run_id = ?", [run_id])
+            self.con.execute(
+                """
+                INSERT INTO setup_funnel (
+                    run_id, strategy, universe_count,
+                    after_cpr_width, after_direction, after_dir_filter,
+                    after_min_price, after_gap, after_or_atr,
+                    after_narrowing, after_shift, entry_triggered
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    run_id,
+                    funnel.get("strategy", ""),
+                    funnel.get("universe_count", 0),
+                    funnel.get("after_cpr_width", 0),
+                    funnel.get("after_direction", 0),
+                    funnel.get("after_dir_filter", 0),
+                    funnel.get("after_min_price", 0),
+                    funnel.get("after_gap", 0),
+                    funnel.get("after_or_atr", 0),
+                    funnel.get("after_narrowing", 0),
+                    funnel.get("after_shift", 0),
+                    funnel.get("entry_triggered", 0),
+                ],
+            )
+            self.con.execute("COMMIT")
+        except Exception:
+            self.con.execute("ROLLBACK")
+            raise
         self._after_write()
 
     def delete_runs(self, run_ids: list[str]) -> dict[str, int]:
@@ -1119,7 +1130,7 @@ class BacktestDB:
                         if raw is None:
                             return default
                         return float(raw)
-                    except (TypeError, ValueError):
+                    except TypeError, ValueError:
                         return default
 
                 def _int_from_param(raw: object, default: int) -> int:
@@ -1133,7 +1144,7 @@ class BacktestDB:
                         if isinstance(raw, float):
                             return int(raw)
                         return int(str(raw).strip())
-                    except (TypeError, ValueError):
+                    except TypeError, ValueError:
                         return default
 
                 returned_ids = {r["run_id"] for r in result}

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from dataclasses import asdict
 
 from db.duckdb import get_db
@@ -606,6 +607,11 @@ def paper_send_command(
         Dict with 'command_file' path and 'action' confirmation.
     """
     try:
+        if os.getenv("PIVOT_AGENT_ALLOW_MUTATIONS") != "1":
+            return _internal_error(
+                "paper_send_command is disabled. Set PIVOT_AGENT_ALLOW_MUTATIONS=1 "
+                "to allow live paper-session mutations."
+            )
         allowed_actions = {
             "close_positions",
             "close_all",

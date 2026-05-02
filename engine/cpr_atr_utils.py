@@ -128,7 +128,10 @@ class TrailingStop:
                     self.current_sl = new_sl
 
         else:  # SHORT
-            self.lowest_since_entry = min(self.lowest_since_entry, current_price)
+            # SHORT trailing should honor the completed bar's full favorable excursion,
+            # mirroring LONG's use of candle_high.
+            bar_low = current_price if candle_low is None else min(current_price, candle_low)
+            self.lowest_since_entry = min(self.lowest_since_entry, bar_low)
 
             trail_trigger = (
                 min(current_price, candle_low) if candle_low is not None else current_price

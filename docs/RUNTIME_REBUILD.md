@@ -37,6 +37,10 @@ intraday_day_pack  ← 5-min parquet (full candle arrays per day)
 virgin_cpr_flags   ← intraday_day_pack (built LAST — uses pack arrays, not raw parquet)
 ```
 
+Writer lock note: runtime rebuilds still rely on single-writer operator discipline plus the
+DuckDB write lock helper. The lock removes stale PID files on retry, but it is not a durable
+distributed lock. Do not launch `pivot-build`, `pivot-backtest`, or runtime writers in parallel.
+
 > **Note on virgin**: `market_day_state` is built before `virgin_cpr_flags` (because virgin
 > needs `intraday_day_pack` first). On a fresh build, `prev_is_virgin` is initially `FALSE`.
 > After the full build completes, run `--table state` once more to backfill correct values.

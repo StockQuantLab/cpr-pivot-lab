@@ -232,6 +232,39 @@ def test_eod_ingest_logs_stage_names(monkeypatch, capsys) -> None:
     assert "EOD pipeline complete" in out
 
 
+def test_eod_ingest_can_resume_from_stage(monkeypatch) -> None:
+    captured: list[list[str]] = []
+
+    def fake_run(cmd, *, dry_run, timeout=3600):
+        del dry_run, timeout
+        captured.append(cmd)
+        return 0
+
+    monkeypatch.setattr(refresh, "_run", fake_run)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "pivot-refresh",
+            "--eod-ingest",
+            "--date",
+            "2026-04-29",
+            "--trade-date",
+            "2026-04-30",
+            "--start-from-stage",
+            "sync_replica",
+        ],
+    )
+
+    refresh.main()
+
+    assert [cmd[2] for cmd in captured] == [
+        "scripts.sync_replica",
+        "scripts.paper_trading",
+        "scripts.data_quality",
+    ]
+
+
 def test_eod_ingest_requires_next_trade_date(monkeypatch) -> None:
     monkeypatch.setattr(
         sys,

@@ -159,6 +159,38 @@ def test_select_entries_for_bar_limits_cumulative_cash_within_session_budget() -
     assert [item["symbol"] for item in selected] == ["AAA", "BBB"]
 
 
+def test_select_entries_for_bar_continues_after_unaffordable_top_candidate() -> None:
+    tracker = SessionPositionTracker(max_positions=2, portfolio_value=200_000.0)
+    tracker.cash_available = 55_000.0
+    candidates = [
+        {
+            "symbol": "HIGH",
+            "rr_ratio": 5.0,
+            "or_atr_ratio": 0.1,
+            "entry_price": 1_000.0,
+            "position_size": 90,
+        },
+        {
+            "symbol": "FIT1",
+            "rr_ratio": 3.0,
+            "or_atr_ratio": 0.5,
+            "entry_price": 100.0,
+            "position_size": 250,
+        },
+        {
+            "symbol": "FIT2",
+            "rr_ratio": 2.5,
+            "or_atr_ratio": 0.5,
+            "entry_price": 100.0,
+            "position_size": 250,
+        },
+    ]
+
+    selected = select_entries_for_bar(candidates, tracker)
+
+    assert [item["symbol"] for item in selected] == ["FIT1", "FIT2"]
+
+
 def test_candidate_quality_score_uses_shared_scalar_score() -> None:
     candidate = {
         "symbol": "SBIN",

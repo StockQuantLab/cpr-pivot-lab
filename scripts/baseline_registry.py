@@ -19,6 +19,11 @@ DEFAULT_REGISTRY = PROJECT_ROOT / "config" / "baselines" / "cpr_current.yaml"
 
 
 def load_registry(path: Path = DEFAULT_REGISTRY) -> dict[str, Any]:
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Baseline registry not found: {path}. "
+            "Create config/baselines/cpr_current.yaml or pass --registry."
+        )
     with path.open("r", encoding="utf-8") as handle:
         payload = yaml.safe_load(handle) or {}
     if not isinstance(payload, dict):

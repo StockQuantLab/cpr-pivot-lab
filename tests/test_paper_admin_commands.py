@@ -55,6 +55,13 @@ def test_write_admin_command_writes_risk_budget(tmp_path, monkeypatch) -> None:
     assert payload["max_position_pct"] == 0.10
 
 
+def test_write_admin_command_rejects_path_traversal_session_id(tmp_path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    with pytest.raises(ValueError, match="session_id contains unsupported characters"):
+        write_admin_command("..\\..\\Windows\\Temp\\x", "close_all")
+
+
 def test_cancel_pending_admin_commands_deletes_other_files(tmp_path) -> None:
     from scripts.paper_live import _cancel_pending_admin_commands
 
@@ -76,6 +83,7 @@ def test_cancel_pending_admin_commands_deletes_other_files(tmp_path) -> None:
 
 def test_paper_send_command_validates_and_forwards(tmp_path, monkeypatch) -> None:
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PIVOT_AGENT_ALLOW_MUTATIONS", "1")
 
     result = backtest_tools.paper_send_command(
         "CPR_LEVELS_LONG-2026-04-24-live-kite",
@@ -90,7 +98,8 @@ def test_paper_send_command_validates_and_forwards(tmp_path, monkeypatch) -> Non
     assert Path(result["command_file"]).exists()
 
 
-def test_paper_send_command_rejects_invalid_action() -> None:
+def test_paper_send_command_rejects_invalid_action(monkeypatch) -> None:
+    monkeypatch.setenv("PIVOT_AGENT_ALLOW_MUTATIONS", "1")
     result = backtest_tools.paper_send_command(
         "CPR_LEVELS_LONG-2026-04-24-live-kite",
         "close_one",
@@ -103,8 +112,20 @@ def test_paper_send_command_rejects_invalid_action() -> None:
     )
 
 
+def test_paper_send_command_requires_mutation_env(monkeypatch) -> None:
+    monkeypatch.delenv("PIVOT_AGENT_ALLOW_MUTATIONS", raising=False)
+
+    result = backtest_tools.paper_send_command(
+        "CPR_LEVELS_LONG-2026-04-24-live-kite",
+        "close_all",
+    )
+
+    assert "PIVOT_AGENT_ALLOW_MUTATIONS=1" in result["error"]
+
+
 def test_paper_send_command_accepts_set_risk_budget(tmp_path, monkeypatch) -> None:
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PIVOT_AGENT_ALLOW_MUTATIONS", "1")
 
     result = backtest_tools.paper_send_command(
         "CPR_LEVELS_SHORT-2026-04-24-live-kite",
@@ -125,6 +146,7 @@ def test_paper_send_command_accepts_entry_pause_resume_and_cancel(
     monkeypatch,
 ) -> None:
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PIVOT_AGENT_ALLOW_MUTATIONS", "1")
 
     for action in ("pause_entries", "resume_entries", "cancel_pending_intents"):
         result = backtest_tools.paper_send_command(

@@ -39,6 +39,31 @@ def test_paper_trading_parser_supports_start_and_status() -> None:
     assert status_summary_args.summary is True
 
 
+@pytest.mark.asyncio
+async def test_resend_eod_rejects_sessions_with_open_positions(monkeypatch) -> None:
+    import engine.paper_runtime as runtime
+    import scripts.paper_trading as paper_trading
+
+    class FakePaperDb:
+        def get_session(self, session_id: str):
+            assert session_id == "session-1"
+            return SimpleNamespace(session_id=session_id, trade_date="2026-04-30")
+
+    async def fake_get_session_positions(session_id: str, statuses=None):
+        assert session_id == "session-1"
+        if statuses == ["CLOSED"]:
+            return [SimpleNamespace(realized_pnl=100.0, pnl=100.0)]
+        if statuses == ["OPEN"]:
+            return [SimpleNamespace(symbol="SBIN")]
+        return []
+
+    monkeypatch.setattr(paper_trading, "_pdb", lambda: FakePaperDb())
+    monkeypatch.setattr(runtime, "get_session_positions", fake_get_session_positions)
+
+    with pytest.raises(SystemExit, match="still has 1 OPEN position"):
+        await paper_trading._cmd_resend_eod(SimpleNamespace(session_id="session-1", notes="retry"))
+
+
 def test_default_saved_universe_falls_back_to_canonical(monkeypatch: pytest.MonkeyPatch) -> None:
     import scripts.paper_trading as pt
 

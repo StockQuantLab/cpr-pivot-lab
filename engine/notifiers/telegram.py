@@ -73,7 +73,18 @@ class TelegramNotifier:
                     safe_url,
                     resp.status_code,
                 )
-                resp.raise_for_status()  # Let dispatcher retry on 429 / transient errors
+                safe_request = httpx.Request("POST", safe_url)
+                safe_response = httpx.Response(
+                    resp.status_code,
+                    headers=resp.headers,
+                    content=resp.content,
+                    request=safe_request,
+                )
+                raise httpx.HTTPStatusError(
+                    f"Telegram send failed: HTTP {resp.status_code}",
+                    request=safe_request,
+                    response=safe_response,
+                )
 
     @staticmethod
     def _chart_button(subject: str) -> dict | None:

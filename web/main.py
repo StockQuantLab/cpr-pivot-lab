@@ -137,6 +137,7 @@ def main() -> None:
     asyncio_logger.setLevel(logging.CRITICAL + 1)
 
     ui.run(
+        host="127.0.0.1",
         port=9999,
         reload=False,
         show=False,

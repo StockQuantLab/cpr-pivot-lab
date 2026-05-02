@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+from datetime import datetime
+
 import pytest
 
 from scripts.paper_supervisor import (
     _extract_trade_date,
     _has_active_session_for_trade_date,
     _normalize_live_args,
+    _warn_if_clock_drift,
+    _watch_relaunch_allowed,
 )
 
 
@@ -87,3 +91,20 @@ def test_supervisor_accepts_optional_daily_live_prefix() -> None:
         "--trade-date",
         "2026-04-29",
     ]
+
+
+def test_supervisor_watch_relaunch_cutoff() -> None:
+    assert _watch_relaunch_allowed(datetime(2026, 5, 2, 15, 29, 59))
+    assert not _watch_relaunch_allowed(datetime(2026, 5, 2, 15, 30, 0))
+
+
+def test_supervisor_clock_drift_warning(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(
+        "scripts.paper_supervisor._measure_clock_drift_sec",
+        lambda **kwargs: 45.0,
+    )
+
+    drift = _warn_if_clock_drift(warn_threshold_sec=30.0)
+
+    assert drift == 45.0
+    assert "WARNING: local clock drift" in capsys.readouterr().out

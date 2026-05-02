@@ -27,6 +27,7 @@ source_conn to maybe_sync() so the copy uses the existing connection
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from pathlib import Path
@@ -127,7 +128,7 @@ class ReplicaSync:
             try:
                 content = self.latest_pointer.read_text().strip()
                 return int(content.replace("v", ""))
-            except (ValueError, OSError):
+            except ValueError, OSError:
                 pass
         return self._current_version
 
@@ -243,7 +244,10 @@ class ReplicaSync:
 
             # Atomic pointer write (write-to-tmp, rename)
             pointer_tmp = self.latest_pointer.with_suffix(".latest.tmp")
-            pointer_tmp.write_text(f"v{version}")
+            with pointer_tmp.open("w", encoding="utf-8") as handle:
+                handle.write(f"v{version}")
+                handle.flush()
+                os.fsync(handle.fileno())
             self._replace_with_retry(pointer_tmp, self.latest_pointer)
 
             with self._sync_lock:
@@ -269,5 +273,5 @@ class ReplicaSync:
                 ver = int(ver_str)
                 if ver <= cutoff:
                     f.unlink(missing_ok=True)
-            except (ValueError, IndexError, OSError):
+            except ValueError, IndexError, OSError:
                 pass

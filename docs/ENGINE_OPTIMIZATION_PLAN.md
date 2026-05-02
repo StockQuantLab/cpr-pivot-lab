@@ -500,10 +500,10 @@ Current interpretation:
 
 | Run | Calmar | WR | PF | P/L |
 |---|---:|---:|---:|---:|
-| STD_LONG `6a4fca8525c0` | 206.9 | 33.5% | 3.39 | ~₹1.71M |
-| RISK_LONG `88fe02668a5f` | 209.1 | 33.4% | 3.44 | ~₹1.70M |
-| STD_SHORT `b057ede867a7` | 90.8 | 29.6% | 2.59 | ~₹1.63M |
-| RISK_SHORT `a4faf0e2ba5f` | 96.7 | 29.8% | 2.65 | ~₹1.65M |
+| STD_LONG `e811f5bb01e5` | 206.9 | 33.5% | 3.39 | ~₹1.71M |
+| RISK_LONG `638b343959ad` | 209.5 | 33.5% | 3.45 | ~₹1.71M |
+| STD_SHORT `9a2ccbd93c5b` | 90.8 | 29.6% | 2.59 | ~₹1.63M |
+| RISK_SHORT `307c3e175a16` | 96.4 | 29.9% | 2.64 | ~₹1.64M |
 
 #### What this means
 
@@ -551,7 +551,7 @@ Current interpretation:
 5. **Compound-risk validation COMPLETE (2026-05-01)**
    - Backtest compound-risk now uses the same shared `SessionPositionTracker.compute_position_qty()`
      sizing helper as paper/live.
-   - Active compound-risk baselines: LONG `08104818d54d`, SHORT `14beb06cadca`.
+   - Active compound-risk baselines: LONG `480a14f8aa26`, SHORT `f377d33a9157`.
    - Earlier compound-risk runs created before the sizing-path fix were deleted and must not be
      used as references.
 

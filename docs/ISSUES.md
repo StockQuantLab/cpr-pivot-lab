@@ -7,6 +7,49 @@ Supersedes: `docs/PARITY_INCIDENT_LOG.md` (contents migrated below).
 
 ---
 
+## 2026-05-02 — FIXED: BUG: Review batch correctness and paper-runtime hardening
+
+**Status:** FIXED
+**Severity:** High
+
+### Symptom
+
+The 2026-05-02 project review identified multiple high-priority drift and integrity risks:
+live setup fallback used a stale CPR TC formula, SHORT trailing stops ignored candle lows,
+entry selection truncated candidates before validating cash, CPR/setup-funnel refreshes used
+DELETE+INSERT without transactions, `resend-eod` could summarize sessions with OPEN positions,
+and supervisor watch mode could relaunch after the trading day.
+
+### Root Cause
+
+Several live/replay/backtest decision paths had duplicated or stale logic, and some operator
+retry paths were missing idempotency, transaction, or cutoff guards. The paper-control surface
+also allowed mutation commands without an explicit environment gate.
+
+### Fix
+
+Implemented the review batch across `engine/`, `db/`, `scripts/`, `agent/`, and `web/`:
+shared min-notional constants, fixed CPR fallback TC, corrected SHORT trailing anchors,
+cash-validates all same-bar candidates before slot truncation, transaction-wrapped critical
+DELETE+INSERT paths, added replay date-boundary reset, added EOD resume and supervisor cutoff,
+bounded alert-log retention, hardened admin command paths and agent mutation ACL, escaped
+Telegram HTML fields, pinned the dashboard host to `127.0.0.1`, and added focused regression
+coverage.
+
+Follow-up P2 completion added direct `AlertDispatcher` tests, explicit alert dedupe reset
+coverage, live fallback query consolidation, SNTP drift warning in the supervisor, supported
+MCP query limits/read-only defaults, active `or_daily` wording, and the Doppler parent-process
+contract note.
+
+### Related
+
+`docs/REVIEW_2026-05-02.md`; focused tests: 173 passed. Full CPR baseline verification
+completed and promoted on 2026-05-02:
+`e811f5bb01e5`, `9a2ccbd93c5b`, `638b343959ad`, `307c3e175a16`,
+`8bbabe422f9c`, `a700bb027f24`, `480a14f8aa26`, `f377d33a9157`.
+
+---
+
 ## 2026-05-01 — OPEN: CPR risk baseline reference is not reproducible after runtime rebuild
 
 **Status:** OPEN — baseline promotion guard required before accepting new CPR baseline family
@@ -106,10 +149,11 @@ capped before tracking instead of preserving raw risk quantity.
 
 ### Follow-up
 
-Fixed reruns on `full_2026_04_30`:
+Fixed reruns on `full_2026_04_30` were superseded by the 2026-05-02 review-batch canonical
+promotion:
 
-- `CPR_LEVELS_RISK_LONG` compound: `08104818d54d`, 2,381 trades, ₹1,707,747 PnL.
-- `CPR_LEVELS_RISK_SHORT` compound: `14beb06cadca`, 3,130 trades, ₹1,669,177 PnL.
+- `CPR_LEVELS_RISK_LONG` compound: `480a14f8aa26`, 2,376 trades, ₹1,710,760 PnL.
+- `CPR_LEVELS_RISK_SHORT` compound: `f377d33a9157`, 3,116 trades, ₹1,652,271 PnL.
 
 The earlier post-fix candidate runs `18c9f0587fd7` and `46b91b4c2842` should not be promoted.
 
@@ -3263,18 +3307,18 @@ CPR comparison set. The old 2026-04-28 rows were deleted after the runtime rebui
 surface non-reproducible. This promotion also adopts canonical 5-position / ₹2L sizing:
 `max_positions=5`, `capital=200000`, `max_position_pct=0.2`.
 
-New canonical CPR baseline set:
+Superseded by the 2026-05-02 review-batch canonical CPR baseline set:
 
 | Mode | Preset | Run ID | Window | P/L | Calmar |
 |------|--------|--------|--------|-----|--------|
-| Daily Reset | `CPR_LEVELS_STANDARD_LONG` | `6a4fca8525c0` | 2025-01-01 → 2026-04-30 | ₹1,710,015 | 207 |
-| Daily Reset | `CPR_LEVELS_STANDARD_SHORT` | `b057ede867a7` | 2025-01-01 → 2026-04-30 | ₹1,626,701 | 91 |
-| Daily Reset | `CPR_LEVELS_RISK_LONG` | `88fe02668a5f` | 2025-01-01 → 2026-04-30 | ₹1,703,478 | 209 |
-| Daily Reset | `CPR_LEVELS_RISK_SHORT` | `a4faf0e2ba5f` | 2025-01-01 → 2026-04-30 | ₹1,647,622 | 97 |
-| Compound | `CPR_LEVELS_STANDARD_LONG` | `9ad2c9922bea` | 2025-01-01 → 2026-04-30 | ₹5,387,307 | 397 |
-| Compound | `CPR_LEVELS_STANDARD_SHORT` | `64d05abd46e2` | 2025-01-01 → 2026-04-30 | ₹5,049,227 | 179 |
-| Compound | `CPR_LEVELS_RISK_LONG` | `08104818d54d` | 2025-01-01 → 2026-04-30 | ₹1,707,747 | 207 |
-| Compound | `CPR_LEVELS_RISK_SHORT` | `14beb06cadca` | 2025-01-01 → 2026-04-30 | ₹1,669,177 | 88 |
+| Daily Reset | `CPR_LEVELS_STANDARD_LONG` | `e811f5bb01e5` | 2025-01-01 → 2026-04-30 | ₹1,710,015 | 207 |
+| Daily Reset | `CPR_LEVELS_STANDARD_SHORT` | `9a2ccbd93c5b` | 2025-01-01 → 2026-04-30 | ₹1,626,569 | 91 |
+| Daily Reset | `CPR_LEVELS_RISK_LONG` | `638b343959ad` | 2025-01-01 → 2026-04-30 | ₹1,706,953 | 210 |
+| Daily Reset | `CPR_LEVELS_RISK_SHORT` | `307c3e175a16` | 2025-01-01 → 2026-04-30 | ₹1,643,730 | 96 |
+| Compound | `CPR_LEVELS_STANDARD_LONG` | `8bbabe422f9c` | 2025-01-01 → 2026-04-30 | ₹5,459,694 | 401 |
+| Compound | `CPR_LEVELS_STANDARD_SHORT` | `a700bb027f24` | 2025-01-01 → 2026-04-30 | ₹5,028,099 | 178 |
+| Compound | `CPR_LEVELS_RISK_LONG` | `480a14f8aa26` | 2025-01-01 → 2026-04-30 | ₹1,710,760 | 207 |
+| Compound | `CPR_LEVELS_RISK_SHORT` | `f377d33a9157` | 2025-01-01 → 2026-04-30 | ₹1,652,271 | 87 |
 
 Future universe changes are migrations and must be labelled separately. Do not compare future
 universe totals against this `full_2026_04_30` family as a daily extension.

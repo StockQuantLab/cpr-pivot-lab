@@ -1319,6 +1319,32 @@ class PaperDB:
             raise
         return deleted
 
+    def cleanup_alert_log_older_than(self, retention_days: int) -> int:
+        """Delete alert_log rows older than the retention window."""
+
+        retention_days = int(retention_days or 0)
+        if retention_days <= 0:
+            return 0
+
+        cutoff = datetime.now(UTC) - timedelta(days=retention_days)
+        count_row = self.con.execute(
+            "SELECT COUNT(*) FROM alert_log WHERE created_at < ?",
+            [cutoff],
+        ).fetchone()
+        deleted = int(count_row[0] or 0) if count_row else 0
+        if deleted == 0:
+            return 0
+
+        self.con.execute("BEGIN TRANSACTION")
+        try:
+            self.con.execute("DELETE FROM alert_log WHERE created_at < ?", [cutoff])
+            self.con.execute("COMMIT")
+            self._after_write()
+        except Exception:
+            self.con.execute("ROLLBACK")
+            raise
+        return deleted
+
     def get_feed_state(self, session_id: str) -> FeedState | None:
         row = self.con.execute(
             "SELECT * FROM paper_feed_state WHERE session_id = ?", [session_id]
@@ -1451,7 +1477,27 @@ class PaperDB:
         self.con.execute("BEGIN TRANSACTION")
         try:
             for table in tables:
-                self.con.execute(f"DELETE FROM {table}")
+                if table != "alert_log":
+                    self.con.execute(f"DELETE FROM {table}")
+            self.con.execute("DROP TABLE IF EXISTS alert_log")
+            self.con.execute("DROP SEQUENCE IF EXISTS alert_log_seq")
+            self.con.execute("CREATE SEQUENCE alert_log_seq START 1")
+            self.con.execute("""
+                CREATE TABLE alert_log (
+                    id             BIGINT PRIMARY KEY DEFAULT nextval('alert_log_seq'),
+                    alert_type     VARCHAR(50) NOT NULL,
+                    alert_level    VARCHAR(10) NOT NULL DEFAULT 'INFO'
+                                    CHECK (alert_level IN ('INFO','WARN','ERROR','CRITICAL')),
+                    subject        VARCHAR(200),
+                    body           TEXT,
+                    channel        VARCHAR(20) NOT NULL DEFAULT 'BOTH'
+                                    CHECK (channel IN ('TELEGRAM','EMAIL','BOTH','LOG')),
+                    status         VARCHAR(20) DEFAULT 'queued'
+                                    CHECK (status IN ('sent','failed','queued')),
+                    error_msg      TEXT,
+                    created_at     TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
             self.con.execute("COMMIT")
             if self._sync is not None:
                 self._sync.mark_dirty()

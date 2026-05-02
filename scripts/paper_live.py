@@ -237,14 +237,18 @@ def _cleanup_feed_audit_if_needed(
     ):
         return last_cleanup, 0
     try:
-        deleted = get_paper_db().cleanup_feed_audit_older_than(retention_days)
-        if deleted:
+        paper_db = get_paper_db()
+        deleted = paper_db.cleanup_feed_audit_older_than(retention_days)
+        deleted_alerts = paper_db.cleanup_alert_log_older_than(retention_days)
+        total_deleted = deleted + deleted_alerts
+        if total_deleted:
             logger.info(
-                "run_live_session purged %d paper_feed_audit rows older than %d day(s)",
+                "run_live_session purged %d paper_feed_audit rows and %d alert_log rows older than %d day(s)",
                 deleted,
+                deleted_alerts,
                 retention_days,
             )
-        return now, deleted
+        return now, total_deleted
     except Exception:
         logger.debug("Feed audit retention cleanup skipped due to error", exc_info=True)
         return last_cleanup, 0
@@ -2090,7 +2094,7 @@ async def run_live_session(
                     ),
                 )
             except Exception:
-                logger.debug("Final EOD flatten/summary failed (best-effort)", exc_info=True)
+                logger.warning("Final EOD flatten/summary failed (best-effort)", exc_info=True)
         elif final_status in {"STALE", "FAILED"} and tracker.open_count > 0:
             if auto_flatten_on_abnormal_exit:
                 # Auto-flatten on abnormal exit so positions don't linger overnight.

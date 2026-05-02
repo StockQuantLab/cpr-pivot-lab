@@ -13,6 +13,11 @@
 
 ## Canonical Commands
 
+Run parent workflows under Doppler. For example, `doppler run -- uv run pivot-refresh
+--eod-ingest ...` is the secret boundary; `scripts/refresh.py` intentionally launches its child
+stages as Python module calls inside that already-wrapped parent process. Do not add nested
+`doppler run` calls to the child stage definitions.
+
 ```bash
 doppler run -- uv run pivot-convert
 doppler run -- uv run pivot-build --force --full-history --staged-full-rebuild --duckdb-threads 4 --duckdb-max-memory 24GB --batch-size 128

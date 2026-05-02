@@ -50,7 +50,7 @@ def _fetch(url: str, timeout: float) -> dict[str, Any]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Smoke-test dashboard HTTP pages.")
-    parser.add_argument("--base-url", default="http://127.0.0.1:8080", help="Dashboard base URL.")
+    parser.add_argument("--base-url", default="http://127.0.0.1:9999", help="Dashboard base URL.")
     parser.add_argument(
         "--paths",
         default=",".join(DEFAULT_PATHS),

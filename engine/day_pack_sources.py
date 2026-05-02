@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -10,6 +11,7 @@ from engine.live_market_data import IST
 
 _PACK_SOURCE_INTRADAY = "intraday_day_pack"
 _PACK_SOURCE_FEED_AUDIT = "paper_feed_audit"
+logger = logging.getLogger(__name__)
 
 
 def normalize_pack_source(value: str | None) -> str:
@@ -84,9 +86,19 @@ def _load_rvol_lookup(
             times = [_minute_to_time_str(t) for t in raw_times]
         else:
             times = [str(t) for t in raw_times]
+        if len(times) != len(baselines):
+            logger.warning(
+                "Skipping rvol baseline lookup with mismatched array lengths: symbol=%s "
+                "trade_date=%s times=%d baselines=%d",
+                key[0],
+                key[1],
+                len(times),
+                len(baselines),
+            )
+            continue
         lookup[key] = {
             time_str: (float(value) if value is not None else None)
-            for time_str, value in zip(times, baselines, strict=False)
+            for time_str, value in zip(times, baselines, strict=True)
         }
     return lookup
 

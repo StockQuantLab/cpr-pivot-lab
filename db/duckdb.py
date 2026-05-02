@@ -51,6 +51,7 @@ logger = logging.getLogger(__name__)
 # Symbol name validation: NSE symbols are uppercase letters, digits, spaces, &, ., and - (e.g., M&M, BAJAJ-AUTO, JK AGRI)
 _SYMBOL_RE = re.compile(r"^[A-Z0-9& .-]{1,32}$")
 _UNIVERSE_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
+_SQL_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 # Threshold for using simple DELETE+INSERT vs complex temp table rebuild
 # For small symbol sets, DELETE+INSERT is faster than temp table pattern
@@ -75,6 +76,13 @@ def _validate_universe_name(name: str) -> str:
     if not _UNIVERSE_RE.match(name):
         raise ValueError(f"Invalid universe name: '{name}'. Must match {_UNIVERSE_RE.pattern}")
     return name
+
+
+def _validate_table_identifier(table: str) -> str:
+    """Validate internal table names before interpolating them into SQL."""
+    if not _SQL_IDENTIFIER_RE.fullmatch(table):
+        raise ValueError(f"Invalid SQL table identifier: {table!r}")
+    return table
 
 
 def _date_window_clause(
@@ -127,6 +135,7 @@ def _incremental_delete(
     log_prefix: str,
 ) -> int:
     """Delete rows matching the incremental window and return deleted count."""
+    table = _validate_table_identifier(table)
     delete_parts = ["trade_date >= ?::DATE"]
     delete_params: list[object] = [since_date]
     if until_date:
@@ -158,6 +167,7 @@ def _symbol_scoped_upsert(
     _INCREMENTAL_BUILD_THRESHOLD symbols, and a temp-table keep/refresh/swap pattern
     for larger sets to avoid scanning the entire table.
     """
+    table = _validate_table_identifier(table)
     symbol_list = _sql_symbol_list(symbols)
     use_simple_path = len(symbols) < _INCREMENTAL_BUILD_THRESHOLD
     con.execute("BEGIN TRANSACTION")
@@ -586,7 +596,8 @@ class MarketDB:
         # the COALESCE fallback so the last available parquet date generates a CPR row.
         if next_trading_date is None and since_date_iso and since_date_iso == until_date_iso:
             has_data = self.con.execute(
-                f"SELECT COUNT(*) FROM v_daily WHERE date::DATE = '{since_date_iso}'"
+                "SELECT COUNT(*) FROM v_daily WHERE date::DATE = ?::DATE",
+                [since_date_iso],
             ).fetchone()[0]
             if has_data == 0:
                 next_trading_date = since_date_iso
@@ -714,18 +725,24 @@ class MarketDB:
         """
 
         if target_symbols is not None:
-            if table_exists:
-                delete_parts = [f"symbol IN ({_sql_symbol_list(target_symbols)})"]
-                if since_date_iso:
-                    delete_parts.append(f"trade_date >= '{since_date_iso}'::DATE")
-                if until_date_iso:
-                    delete_parts.append(f"trade_date <= '{until_date_iso}'::DATE")
-                self.con.execute("DELETE FROM cpr_daily WHERE " + " AND ".join(delete_parts))
-            self.con.execute(
-                f"INSERT INTO cpr_daily {insert_sql}"
-                if table_exists
-                else f"CREATE TABLE cpr_daily AS {insert_sql}"
-            )
+            self.con.execute("BEGIN TRANSACTION")
+            try:
+                if table_exists:
+                    delete_parts = [f"symbol IN ({_sql_symbol_list(target_symbols)})"]
+                    if since_date_iso:
+                        delete_parts.append(f"trade_date >= '{since_date_iso}'::DATE")
+                    if until_date_iso:
+                        delete_parts.append(f"trade_date <= '{until_date_iso}'::DATE")
+                    self.con.execute("DELETE FROM cpr_daily WHERE " + " AND ".join(delete_parts))
+                self.con.execute(
+                    f"INSERT INTO cpr_daily {insert_sql}"
+                    if table_exists
+                    else f"CREATE TABLE cpr_daily AS {insert_sql}"
+                )
+                self.con.execute("COMMIT")
+            except Exception:
+                self.con.execute("ROLLBACK")
+                raise
             n = self.con.execute("SELECT COUNT(*) FROM cpr_daily").fetchone()[0]
             scope = f"symbols={len(target_symbols)}"
             if since_date_iso:
@@ -739,14 +756,20 @@ class MarketDB:
         # ── Incremental mode ──────────────────────────────────────────────
         if since_date_iso and not force:
             if table_exists:
-                _incremental_delete(
-                    self.con,
-                    table="cpr_daily",
-                    since_date=since_date_iso,
-                    until_date=until_date_iso,
-                    log_prefix="cpr",
-                )
-                self.con.execute(f"INSERT INTO cpr_daily {insert_sql}")
+                self.con.execute("BEGIN TRANSACTION")
+                try:
+                    _incremental_delete(
+                        self.con,
+                        table="cpr_daily",
+                        since_date=since_date_iso,
+                        until_date=until_date_iso,
+                        log_prefix="cpr",
+                    )
+                    self.con.execute(f"INSERT INTO cpr_daily {insert_sql}")
+                    self.con.execute("COMMIT")
+                except Exception:
+                    self.con.execute("ROLLBACK")
+                    raise
                 n = self.con.execute("SELECT COUNT(*) FROM cpr_daily").fetchone()[0]
                 window_label = since_date_iso
                 if until_date_iso and until_date_iso != since_date_iso:
@@ -2015,7 +2038,8 @@ class MarketDB:
     def get_table_max_trade_dates(self, tables: list[str]) -> dict[str, str | None]:
         """Return the latest trade_date value for each requested table."""
         result: dict[str, str | None] = {}
-        for table in tables:
+        for raw_table in tables:
+            table = _validate_table_identifier(raw_table)
             if not self._table_exists(table):
                 result[table] = None
                 continue
@@ -2030,6 +2054,7 @@ class MarketDB:
     def _symbols_missing_for_trade_date(
         self, table: str, symbols: list[str], trade_date: str
     ) -> list[str]:
+        table = _validate_table_identifier(table)
         if not symbols:
             return []
         if not self._table_exists(table):
@@ -2378,7 +2403,8 @@ class MarketDB:
                     low_arr DOUBLE[],
                     close_arr DOUBLE[],
                     volume_arr DOUBLE[],
-                    rvol_baseline_arr DOUBLE[]
+                    rvol_baseline_arr DOUBLE[],
+                    PRIMARY KEY (symbol, trade_date)
                 )
             """)
         use_compact_schema = self._table_has_column("intraday_day_pack", "minute_arr")
@@ -2422,34 +2448,34 @@ class MarketDB:
                 self.con.execute("BEGIN TRANSACTION")
                 tx_open = True
 
-                # Refresh only the requested symbols when doing a partial build.
-                if symbols:
-                    batch_phase = "delete"
-                    delete_started = time.time()
-                    _log(f"  [pack] batch {idx}/{total_batches} DELETE start")
-                    placeholders = ", ".join("?" for _ in batch)
-                    if since_date_iso:
-                        delete_result = self.con.execute(
-                            f"""
-                            DELETE FROM intraday_day_pack
-                            WHERE symbol IN ({placeholders})
-                              AND trade_date >= ?::DATE
-                            """,
-                            [*batch, since_date_iso],
-                        )
-                    else:
-                        delete_result = self.con.execute(
-                            f"DELETE FROM intraday_day_pack WHERE symbol IN ({placeholders})",
-                            batch,
-                        )
-                    delete_elapsed = time.time() - delete_started
-                    phase_times["delete"] += delete_elapsed
-                    deleted_rows = delete_result.rowcount
-                    deleted_display = f"{deleted_rows:,}" if deleted_rows >= 0 else "unknown"
-                    _log(
-                        f"  [pack] batch {idx}/{total_batches} DELETE done"
-                        f" | rows={deleted_display} | elapsed={delete_elapsed:.1f}s"
+                batch_phase = "delete"
+                delete_started = time.time()
+                _log(f"  [pack] batch {idx}/{total_batches} DELETE start")
+                placeholders = ", ".join("?" for _ in batch)
+                if since_date_iso:
+                    delete_result = self.con.execute(
+                        f"""
+                        DELETE FROM intraday_day_pack
+                        WHERE symbol IN ({placeholders})
+                          AND trade_date >= ?::DATE
+                        """,
+                        [*batch, since_date_iso],
                     )
+                elif symbols or force:
+                    delete_result = self.con.execute(
+                        f"DELETE FROM intraday_day_pack WHERE symbol IN ({placeholders})",
+                        batch,
+                    )
+                else:
+                    delete_result = None
+                delete_elapsed = time.time() - delete_started
+                phase_times["delete"] += delete_elapsed
+                deleted_rows = delete_result.rowcount if delete_result is not None else 0
+                deleted_display = f"{deleted_rows:,}" if deleted_rows >= 0 else "unknown"
+                _log(
+                    f"  [pack] batch {idx}/{total_batches} DELETE done"
+                    f" | rows={deleted_display} | elapsed={delete_elapsed:.1f}s"
+                )
 
                 batch_phase = "source"
                 source_started = time.time()
@@ -2591,6 +2617,16 @@ class MarketDB:
         self.con.execute(
             "CREATE INDEX IF NOT EXISTS idx_intraday_day_pack ON intraday_day_pack(symbol, trade_date)"
         )
+        try:
+            self.con.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_intraday_day_pack_unique "
+                "ON intraday_day_pack(symbol, trade_date)"
+            )
+        except Exception as e:
+            logger.warning(
+                "Could not enforce intraday_day_pack uniqueness; existing duplicates may need cleanup: %s",
+                e,
+            )
         phase_times["index"] = time.time() - index_started
         _log(f"  [pack] index build done in {phase_times['index']:.2f}s")
         n = self.con.execute("SELECT COUNT(*) FROM intraday_day_pack").fetchone()[0]

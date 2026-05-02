@@ -127,7 +127,14 @@ def build_report(ingest_date: str, trade_date: str) -> dict[str, Any]:
         elif symbols and count < len(symbols):
             warnings.append(f"{table} has sparse completed-date coverage: {count}/{len(symbols)}.")
 
-    setup_tables = ("cpr_daily", "cpr_thresholds", "market_day_state", "strategy_day_state")
+    setup_tables = (
+        "cpr_daily",
+        "cpr_thresholds",
+        "or_daily",
+        "virgin_cpr_flags",
+        "market_day_state",
+        "strategy_day_state",
+    )
     for table in setup_tables:
         count = table_counts.get(table)
         if count is None:

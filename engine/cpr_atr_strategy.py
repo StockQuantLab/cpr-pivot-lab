@@ -122,7 +122,7 @@ def _int_from_mapping(
             return default
     try:
         return int(str(value))
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return default
 
 
@@ -931,6 +931,9 @@ class CPRATRBacktest:
             )
 
         def _per_share_pnl(trade: TradeResult) -> float:
+            # Portfolio sizing expects TradeResult.exit_price to be the final realized exit.
+            # Future partial scale-out paths must provide a weighted realized exit before
+            # this overlay recalculates cash and PnL.
             if trade.direction == "LONG":
                 return float(trade.exit_price - trade.entry_price)
             return float(trade.entry_price - trade.exit_price)
@@ -956,7 +959,12 @@ class CPRATRBacktest:
                 max_position_pct=max_position_pct,
                 capital_base=day_start_equity,
             )
-            min_notional = max(1_000.0, slot_capital * 0.05)
+            min_notional = minimum_trade_notional_for(
+                max_positions=max_positions,
+                portfolio_value=day_start_equity,
+                max_position_pct=max_position_pct,
+                capital_base=day_start_equity,
+            )
             open_positions: list[dict[str, float | str]] = []
 
             for trade in sorted(trades_by_day[trade_date], key=_sort_key):
@@ -1729,7 +1737,7 @@ class CPRATRBacktest:
             if pack_time_mode == "minute_arr":
                 try:
                     times = [self._minute_to_time_str(t) for t in raw_times]
-                except (TypeError, ValueError):
+                except TypeError, ValueError:
                     continue
             else:
                 times = [str(t) for t in raw_times]

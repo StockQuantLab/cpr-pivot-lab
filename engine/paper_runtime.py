@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import inspect
 import json
 import logging
+import re
 import threading
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
@@ -43,6 +45,8 @@ from engine.strategy_presets import (
 logger = logging.getLogger(__name__)
 
 _IST = ZoneInfo("Asia/Kolkata")
+_SESSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9_\-:.]+$")
+_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
 BacktestParams = StrategyConfig
 
@@ -64,6 +68,10 @@ _flatten_eod_sent: set[str] = set()
 _session_started_sent: set[str] = set()
 _TRAILING_STOP_CACHE: dict[str, TrailingStop] = {}
 _TRAILING_STOP_CACHE_KEYS: dict[str, tuple[Any, ...]] = {}
+
+
+def _html_text(value: object) -> str:
+    return html.escape(_CONTROL_CHARS.sub("", str(value)), quote=True)
 
 
 def _has_flatten_eod_in_alert_log(session_id: str, *, trade_date: str | None = None) -> bool:
@@ -122,6 +130,17 @@ def set_alert_sink(sink: Callable[[AlertType, str, str], Any] | None) -> None:
     """Override alert dispatch for tests or alternate sinks."""
     global _alert_sink
     _alert_sink = sink
+
+
+def reset_alert_dedupe(session_id: str | None = None) -> None:
+    """Clear in-memory alert dedupe state for an explicit in-process restart."""
+    if session_id is None:
+        _flatten_eod_sent.clear()
+        _session_started_sent.clear()
+        return
+    normalized = str(session_id)
+    _flatten_eod_sent.discard(normalized)
+    _session_started_sent.discard(normalized)
 
 
 def register_session_start() -> None:
@@ -291,17 +310,24 @@ def _format_open_alert(
 ) -> tuple[str, str]:
     """Format TRADE_OPENED alert subject and body (HTML for Telegram)."""
     icon = "🟢" if direction == "LONG" else "🔴"
-    subject = f"{icon} {direction} OPENED: {symbol}"
+    clean_symbol = _CONTROL_CHARS.sub("", str(symbol))
+    clean_direction = _CONTROL_CHARS.sub("", str(direction))
+    safe_strategy = _html_text(strategy)
+    safe_session_id = _html_text(str(session_id)[:16])
+    chart_symbol = re.sub(r"[^A-Za-z0-9_.-]", "", str(symbol).upper())
+    subject = f"{icon} {clean_direction} OPENED: {clean_symbol}"
     time_str = _format_event_time(event_time)
     risk_rupees = sl_distance * position_size
-    chart_link = f"📊 <a href='https://www.tradingview.com/chart/?symbol=NSE:{symbol}'>Chart</a>"
+    chart_link = (
+        f"📊 <a href='https://www.tradingview.com/chart/?symbol=NSE:{chart_symbol}'>Chart</a>"
+    )
     body = (
         f"📥 Entry: <code>₹{entry_price:.2f}</code> | 🛡️ SL: <code>₹{sl_price:.2f}</code>\n"
         f"🎯 Target: <code>₹{target_price:.2f}</code> | 📏 Qty: <code>{position_size}</code>\n"
         f"💰 Risk: ₹{risk_rupees:,.0f} ({rr_ratio:.1f}R)"
         + (f" | 🕒 {time_str}" if time_str else "")
         + f"\n{chart_link}"
-        + f"\n<i>{strategy} · {session_id[:16]}</i>"
+        + f"\n<i>{safe_strategy} · {safe_session_id}</i>"
     )
     return subject, body
 
@@ -320,6 +346,9 @@ def _format_close_alert(
     event_time: datetime | None = None,
 ) -> tuple[str, str]:
     """Format TRADE_CLOSED alert subject and body (HTML for Telegram)."""
+    safe_reason = _html_text(reason)
+    safe_strategy = _html_text(strategy)
+    safe_session_id = _html_text(str(session_id)[:16])
     pnl_pct = (
         ((close_price - entry_price) / entry_price * 100)
         if direction == "LONG"
@@ -329,17 +358,25 @@ def _format_close_alert(
     result_tag = "WIN" if is_win else "LOSS"
     icon = "✅" if is_win else "❌"
     trend_icon = "📈" if is_win else "📉"
-    subject = f"{icon} [{result_tag}] {symbol} {direction} {reason}"
+    subject = (
+        f"{icon} [{result_tag}] "
+        f"{_CONTROL_CHARS.sub('', str(symbol))} "
+        f"{_CONTROL_CHARS.sub('', str(direction))} "
+        f"{_CONTROL_CHARS.sub('', str(reason))}"
+    )
     time_str = _format_event_time(event_time)
     pnl_display = f"{'+' if is_win else '-'}₹{abs(realized_pnl):,.0f}"
-    chart_link = f"📊 <a href='https://www.tradingview.com/chart/?symbol=NSE:{symbol}'>Chart</a>"
+    chart_symbol = re.sub(r"[^A-Za-z0-9_.-]", "", str(symbol).upper())
+    chart_link = (
+        f"📊 <a href='https://www.tradingview.com/chart/?symbol=NSE:{chart_symbol}'>Chart</a>"
+    )
     body = (
         f"💰 P&L: <code>{pnl_display}</code> ({pnl_pct:+.2f}%)\n"
-        f"🏁 Reason: {reason}\n"
+        f"🏁 Reason: {safe_reason}\n"
         f"{trend_icon} Exit: <code>{entry_price:.2f}</code> → <code>{close_price:.2f}</code>"
         + (f"\n🕒 {time_str}" if time_str else "")
         + (f"\n{chart_link}" if chart_link else "")
-        + (f"\n<i>{strategy} · {session_id[:16]}</i>" if strategy else "")
+        + (f"\n<i>{safe_strategy} · {safe_session_id}</i>" if strategy else "")
     )
     return subject, body
 
@@ -361,6 +398,7 @@ def _format_risk_alert(
             When provided, both lines are shown.
         trade_date: Trade date string for the summary header.
     """
+    safe_session_id = _html_text(session_id)
     pnl_emoji = "📈" if net_pnl >= 0 else "📉"
     date_str = trade_date if trade_date else ""
     if date_str and len(date_str) == 10:
@@ -373,7 +411,7 @@ def _format_risk_alert(
     else:
         subject = "📊 EOD Summary"
     body = (
-        f"Session: <code>{session_id}</code>\n"
+        f"Session: <code>{safe_session_id}</code>\n"
         f"Net P&L: <code>{net_pnl:+,.2f}</code> {pnl_emoji}\n"
         f"Trades closed: {total_trades if total_trades is not None else positions_closed}"
     )
@@ -467,7 +505,7 @@ def _parse_session_label(session_id: str) -> tuple[str, str]:
                 d = _date(int(parts[i]), int(parts[i + 1]), int(parts[i + 2]))
                 date_label = d.strftime("%d %b").lstrip("0")
                 break
-            except (ValueError, IndexError):
+            except ValueError, IndexError:
                 pass
         label_parts.append(parts[i])
         i += 1
@@ -630,7 +668,7 @@ def _float_or_none(value: Any) -> float | None:
         return None
     try:
         return float(value)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return None
 
 
@@ -724,15 +762,13 @@ def build_summary_feed_state(
     session_id: str,
     symbol_last_prices: dict[str, float],
     last_price: float | None,
-) -> Any:
+) -> FeedState:
     """Create a lightweight feed-state object for risk control checks.
 
     Used by both replay and live runners to pass current price state
     into enforce_session_risk_controls without a real PostgreSQL feed row.
     """
-    from types import SimpleNamespace
-
-    return SimpleNamespace(
+    return FeedState(
         session_id=session_id,
         status="OK",
         last_event_ts=None,
@@ -740,7 +776,6 @@ def build_summary_feed_state(
         last_price=last_price,
         stale_reason=None,
         raw_state={"symbol_last_prices": dict(symbol_last_prices)},
-        updated_at=None,
     )
 
 
@@ -899,30 +934,54 @@ def _load_live_setup_row(
     # market_day_state rows so the batch prefetch succeeds (no per-symbol fallback needed).
     db = get_dashboard_db()
     with _MARKET_DB_READ_LOCK:
-        prev_daily = db.con.execute(
+        setup_base = db.con.execute(
             """
+            WITH prev_daily AS (
+                SELECT date::VARCHAR AS prev_date, high, low, close
+                FROM v_daily
+                WHERE symbol = ? AND date < ?::DATE
+                ORDER BY date DESC
+                LIMIT 1
+            ),
+            prev_atr AS (
+                SELECT trade_date::VARCHAR AS atr_prev_date, atr
+                FROM atr_intraday
+                WHERE symbol = ? AND trade_date < ?::DATE
+                ORDER BY trade_date DESC
+                LIMIT 1
+            ),
+            prev_threshold AS (
+                SELECT trade_date::VARCHAR AS threshold_prev_date, cpr_threshold_pct
+                FROM cpr_thresholds
+                WHERE symbol = ? AND trade_date < ?::DATE
+                ORDER BY trade_date DESC
+                LIMIT 1
+            )
             SELECT
-                date::VARCHAR,
-                high,
-                low,
-                close
-            FROM v_daily
-            WHERE symbol = ? AND date < ?::DATE
-            ORDER BY date DESC
-            LIMIT 1
+                d.prev_date,
+                d.high,
+                d.low,
+                d.close,
+                a.atr_prev_date,
+                a.atr,
+                t.threshold_prev_date,
+                t.cpr_threshold_pct
+            FROM prev_daily d
+            LEFT JOIN prev_atr a ON TRUE
+            LEFT JOIN prev_threshold t ON TRUE
             """,
-            [symbol, trade_date],
+            [symbol, trade_date, symbol, trade_date, symbol, trade_date],
         ).fetchone()
-    if not prev_daily:
+    if not setup_base:
         return None
 
-    prev_date = str(prev_daily[0])
-    prev_high = float(prev_daily[1] or 0.0)
-    prev_low = float(prev_daily[2] or 0.0)
-    prev_close = float(prev_daily[3] or 0.0)
+    prev_date = str(setup_base[0])
+    prev_high = float(setup_base[1] or 0.0)
+    prev_low = float(setup_base[2] or 0.0)
+    prev_close = float(setup_base[3] or 0.0)
     pivot = (prev_high + prev_low + prev_close) / 3.0
     bc = (prev_high + prev_low) / 2.0
-    tc = 2.0 * pivot - bc
+    tc = (pivot + bc) / 2.0
     cpr_lower, cpr_upper = normalize_cpr_bounds(tc, bc)
     cpr_width_pct = abs(tc - bc) / pivot * 100 if pivot else 0.0
     r1 = 2.0 * pivot - prev_low
@@ -930,22 +989,9 @@ def _load_live_setup_row(
     r2 = pivot + (prev_high - prev_low)
     s2 = pivot - (prev_high - prev_low)
 
-    # Use pre-materialized atr_intraday instead of v_5min to avoid scanning all Parquet files.
-    # v_5min is a glob over 2100+ directories — per-symbol queries at bar close cause OOM.
-    with _MARKET_DB_READ_LOCK:
-        atr_row = db.con.execute(
-            """
-            SELECT trade_date::VARCHAR, atr
-            FROM atr_intraday
-            WHERE symbol = ? AND trade_date < ?::DATE
-            ORDER BY trade_date DESC
-            LIMIT 1
-            """,
-            [symbol, trade_date],
-        ).fetchone()
-    if not atr_row or atr_row[0] is None or atr_row[1] is None:
+    if setup_base[4] is None or setup_base[5] is None:
         return None
-    atr_prev_date = str(atr_row[0])
+    atr_prev_date = str(setup_base[4])
     if atr_prev_date != prev_date:
         logger.warning(
             "Live setup row for %s on %s: daily prev_date=%s != atr prev_date=%s — skipping",
@@ -955,24 +1001,13 @@ def _load_live_setup_row(
             atr_prev_date,
         )
         return None
-    atr = float(atr_row[1] or 0.0)
+    atr = float(setup_base[5] or 0.0)
     if atr <= 0:
         return None
 
-    with _MARKET_DB_READ_LOCK:
-        threshold_row = db.con.execute(
-            """
-            SELECT trade_date::VARCHAR, cpr_threshold_pct
-            FROM cpr_thresholds
-            WHERE symbol = ? AND trade_date < ?::DATE
-            ORDER BY trade_date DESC
-            LIMIT 1
-            """,
-            [symbol, trade_date],
-        ).fetchone()
-    if not threshold_row or threshold_row[0] is None or threshold_row[1] is None:
+    if setup_base[6] is None or setup_base[7] is None:
         return None
-    threshold_prev_date = str(threshold_row[0])
+    threshold_prev_date = str(setup_base[6])
     if threshold_prev_date != prev_date:
         logger.warning(
             "Live setup row for %s on %s: daily prev_date=%s != threshold prev_date=%s — skipping",
@@ -982,7 +1017,7 @@ def _load_live_setup_row(
             threshold_prev_date,
         )
         return None
-    cpr_threshold = float(threshold_row[1])
+    cpr_threshold = float(setup_base[7])
 
     intraday = _build_intraday_summary(
         live_candles, or_minutes=or_minutes, bar_end_offset=bar_end_offset
@@ -1605,7 +1640,7 @@ async def flatten_session_positions(
             )
             _dispatch_alert(AlertType.TRADE_CLOSED, subject, body)
         except Exception:
-            logger.debug(
+            logger.warning(
                 "Alert dispatch for flatten trade %s failed (best-effort)",
                 position.symbol,
                 exc_info=True,
@@ -1669,7 +1704,7 @@ async def flatten_session_positions(
                     )
                     _dispatch_alert(AlertType.FLATTEN_EOD, subject, body)
     except Exception:
-        logger.debug("Alert dispatch for flatten failed (best-effort)", exc_info=True)
+        logger.warning("Alert dispatch for flatten failed (best-effort)", exc_info=True)
     return {"session_id": session_id, "closed_positions": len(closed), "positions": closed}
 
 
@@ -1756,7 +1791,7 @@ async def flatten_positions_subset(
             )
             _dispatch_alert(AlertType.TRADE_CLOSED, subject, body)
         except Exception:
-            logger.debug(
+            logger.warning(
                 "Alert dispatch for partial flatten %s failed", position.symbol, exc_info=True
             )
         closed.append(
@@ -1791,6 +1826,10 @@ def write_admin_command(
     import json as _json
     from pathlib import Path as _Path
 
+    if not _SESSION_ID_PATTERN.fullmatch(str(session_id)):
+        raise ValueError(
+            "session_id contains unsupported characters; allowed: letters, numbers, _, -, :, ."
+        )
     cmd_dir = _Path(".tmp_logs") / f"cmd_{session_id}"
     cmd_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
@@ -1858,12 +1897,12 @@ async def enforce_session_risk_controls(
 ) -> dict[str, Any]:
     positions = await get_session_positions(session.session_id)
     summary = summarize_paper_positions(session, positions, feed_state)
-    net_pnl = float(summary["net_pnl"])
-    await update_session_state(session.session_id, daily_pnl_used=net_pnl)
+    realized_pnl = float(summary.get("realized_pnl", 0.0) or 0.0)
+    await update_session_state(session.session_id, daily_pnl_used=realized_pnl)
 
-    reasons = _risk_limit_reasons(session, as_of, net_pnl)
+    reasons = _risk_limit_reasons(session, as_of, realized_pnl)
     if not reasons:
-        return {"triggered": False, "daily_pnl_used": net_pnl, "reasons": []}
+        return {"triggered": False, "daily_pnl_used": realized_pnl, "reasons": []}
 
     flatten_result = await flatten_session_positions(
         session.session_id,
@@ -1874,7 +1913,7 @@ async def enforce_session_risk_controls(
     # No need to send a second DAILY_LOSS_LIMIT alert here.
     return {
         "triggered": True,
-        "daily_pnl_used": net_pnl,
+        "daily_pnl_used": realized_pnl,
         "reasons": reasons,
         "flatten": flatten_result,
     }
@@ -2131,7 +2170,7 @@ async def _open_position_from_candidate(
         )
         _dispatch_alert(AlertType.TRADE_OPENED, subject, body)
     except Exception:
-        logger.debug("Alert dispatch for trade open failed (best-effort)", exc_info=True)
+        logger.warning("Alert dispatch for trade open failed (best-effort)", exc_info=True)
     return {
         "action": "OPEN",
         "position_id": position.position_id,
@@ -2348,7 +2387,7 @@ async def _advance_open_position(
             body,
         )
     except Exception:
-        logger.debug("Alert dispatch for resolved exit failed (best-effort)", exc_info=True)
+        logger.warning("Alert dispatch for resolved exit failed (best-effort)", exc_info=True)
     return {
         "action": "CLOSE",
         "position_id": position.position_id,
@@ -2705,6 +2744,7 @@ __all__ = [
     "process_closed_candle",
     "refresh_pending_setup_rows_for_bar",
     "register_session_start",
+    "reset_alert_dedupe",
     "runtime_setup_status",
     "set_alert_sink",
     "set_alerts_suppressed",

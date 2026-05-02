@@ -85,20 +85,23 @@ def _pdb():
 
 
 def _cleanup_feed_audit_retention(*, command_name: str) -> int:
-    """Keep the live/replay feed audit bounded to a rolling retention window."""
+    """Keep live/replay audit tables bounded to a rolling retention window."""
 
     retention_days = int(get_settings().feed_audit_retention_days or 0)
     if retention_days <= 0:
         return 0
-    deleted = _pdb().cleanup_feed_audit_older_than(retention_days)
-    if deleted > 0:
+    paper_db = _pdb()
+    deleted = paper_db.cleanup_feed_audit_older_than(retention_days)
+    deleted_alerts = paper_db.cleanup_alert_log_older_than(retention_days)
+    if deleted > 0 or deleted_alerts > 0:
         logger.info(
-            "%s purged %d paper_feed_audit row(s) older than %d day(s)",
+            "%s purged %d paper_feed_audit row(s) and %d alert_log row(s) older than %d day(s)",
             command_name,
             deleted,
+            deleted_alerts,
             retention_days,
         )
-    return deleted
+    return deleted + deleted_alerts
 
 
 async def get_session(session_id: str):
@@ -2234,6 +2237,12 @@ async def _cmd_resend_eod(args: argparse.Namespace) -> None:
     total_trades = len(all_closed)
     if total_trades == 0:
         raise SystemExit(f"No closed positions for {sid!r} — nothing to report")
+    open_positions = await get_session_positions(sid, statuses=["OPEN"])
+    if open_positions:
+        raise SystemExit(
+            f"Session {sid!r} still has {len(open_positions)} OPEN position(s). "
+            "Run `flatten --session-id <id>` first, then retry `resend-eod`."
+        )
 
     total_pnl = sum(float(p.realized_pnl or p.pnl or 0) for p in all_closed)
     subject, body = _format_risk_alert(

@@ -127,6 +127,10 @@ def test_cleanup_feed_audit_retention_skips_when_interval_not_reached(monkeypatc
             calls.append(days)
             return 3
 
+        def cleanup_alert_log_older_than(self, days: int) -> int:
+            calls.append(days)
+            return 2
+
     monkeypatch.setattr("scripts.paper_live.get_paper_db", lambda: FakeDB())
 
     settings = SimpleNamespace(feed_audit_retention_days=7)
@@ -152,6 +156,10 @@ def test_cleanup_feed_audit_retention_runs_on_interval(monkeypatch) -> None:
             calls.append(days)
             return 3
 
+        def cleanup_alert_log_older_than(self, days: int) -> int:
+            calls.append(days)
+            return 2
+
     monkeypatch.setattr("scripts.paper_live.get_paper_db", lambda: FakeDB())
 
     settings = SimpleNamespace(feed_audit_retention_days=7)
@@ -165,8 +173,8 @@ def test_cleanup_feed_audit_retention_runs_on_interval(monkeypatch) -> None:
     )
 
     assert updated == now
-    assert deleted == 3
-    assert calls == [7]
+    assert deleted == 5
+    assert calls == [7, 7]
 
 
 def test_prefetch_setup_rows_skips_invalid_critical_fields(

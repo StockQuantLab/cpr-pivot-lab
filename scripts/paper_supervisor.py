@@ -11,10 +11,13 @@ import argparse
 import json
 import os
 import signal
+import socket
+import struct
 import subprocess
 import sys
 import time
 from datetime import datetime
+from datetime import time as dt_time
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -23,6 +26,8 @@ from scripts.paper_prepare import resolve_trade_date
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_LOG_DIR = PROJECT_ROOT / ".tmp_logs" / "supervisor"
+WATCH_RELAUNCH_CUTOFF = dt_time(15, 30)
+NTP_DELTA = 2_208_988_800
 _ACTIVE_SESSION_STATUSES = ("ACTIVE", "PAUSED", "STOPPING")
 _active_child: subprocess.Popen[str] | None = None
 _child_heartbeat_path: Path | None = None
@@ -35,6 +40,51 @@ def _now_iso() -> str:
 
 def _stamp() -> str:
     return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+def _watch_relaunch_allowed(now: datetime | None = None) -> bool:
+    current = now or datetime.now().astimezone()
+    return current.timetz().replace(tzinfo=None) < WATCH_RELAUNCH_CUTOFF
+
+
+def _measure_clock_drift_sec(*, host: str = "pool.ntp.org", timeout: float = 2.0) -> float:
+    """Return local clock drift versus an SNTP server in seconds."""
+    packet = b"\x1b" + (47 * b"\0")
+    started = time.time()
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        sock.settimeout(float(timeout))
+        sock.sendto(packet, (host, 123))
+        data, _addr = sock.recvfrom(48)
+    received = time.time()
+    if len(data) < 48:
+        raise RuntimeError(f"short SNTP response from {host}: {len(data)} bytes")
+    unpacked = struct.unpack("!12I", data[:48])
+    transmit_sec = unpacked[10] - NTP_DELTA
+    transmit_frac = unpacked[11] / 2**32
+    remote_time = transmit_sec + transmit_frac
+    local_midpoint = started + ((received - started) / 2.0)
+    return float(local_midpoint - remote_time)
+
+
+def _warn_if_clock_drift(
+    *,
+    warn_threshold_sec: float = 30.0,
+    host: str = "pool.ntp.org",
+    timeout: float = 2.0,
+) -> float | None:
+    """Warn when local time is far enough off to affect live bar boundaries."""
+    try:
+        drift = _measure_clock_drift_sec(host=host, timeout=timeout)
+    except Exception as exc:
+        print(f"[clock] SNTP drift check skipped: {exc}", flush=True)
+        return None
+    if abs(drift) > float(warn_threshold_sec):
+        print(
+            f"[clock] WARNING: local clock drift is {drift:+.1f}s vs {host}; "
+            "live bar-boundary decisions may be wrong.",
+            flush=True,
+        )
+    return drift
 
 
 def _append_jsonl(path: Path, payload: dict[str, Any]) -> None:
@@ -294,6 +344,17 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Do not set PYTHONFAULTHANDLER=1 for the child process.",
     )
     parser.add_argument(
+        "--skip-clock-check",
+        action="store_true",
+        help="Skip the SNTP clock-drift preflight warning.",
+    )
+    parser.add_argument(
+        "--clock-drift-warn-sec",
+        type=float,
+        default=30.0,
+        help="Warn when SNTP drift exceeds this many seconds (default 30).",
+    )
+    parser.add_argument(
         "--watch",
         action="store_true",
         help=(
@@ -333,6 +394,8 @@ def main() -> None:
 
     log_dir.mkdir(parents=True, exist_ok=True)
     trade_date = resolve_trade_date(_extract_trade_date(live_args))
+    if not args.skip_clock_check:
+        _warn_if_clock_drift(warn_threshold_sec=float(args.clock_drift_warn_sec))
     heartbeat_path = log_dir / f"{run_name}.heartbeat.jsonl"
     _child_heartbeat_path = heartbeat_path
     _run_loop_active = True
@@ -351,6 +414,7 @@ def main() -> None:
         heartbeat_tick = args.watch_poll_sec
         current_run = 0
         while _run_loop_active:
+            relaunch_allowed = _watch_relaunch_allowed()
             active = _has_active_session_for_trade_date(trade_date=trade_date)
             _append_jsonl(
                 heartbeat_path,
@@ -359,9 +423,16 @@ def main() -> None:
                     "ts": _now_iso(),
                     "trade_date": trade_date,
                     "active_session_exists": bool(active),
+                    "relaunch_allowed": bool(relaunch_allowed),
                     "iteration": current_run,
                 },
             )
+            if not relaunch_allowed:
+                print(
+                    "[watch] relaunch cutoff reached; supervisor will not start another child",
+                    flush=True,
+                )
+                break
             if active:
                 time.sleep(max(5.0, float(args.watch_poll_sec)))
                 current_run += 1

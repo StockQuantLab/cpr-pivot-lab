@@ -213,6 +213,7 @@ def _run_eod_ingestion(
     batch_size: int,
     dry_run: bool,
     skip_existing: bool = True,
+    start_from_stage: str | None = None,
 ) -> None:
     """Run the complete EOD ingestion contract in the only valid order."""
     stages = [
@@ -274,7 +275,24 @@ def _run_eod_ingestion(
         "next actual trading day. Pass it explicitly for weekends/holidays.",
         flush=True,
     )
+    stage_names = [name for name, _cmd in stages]
+    if start_from_stage:
+        if start_from_stage not in stage_names:
+            valid = ", ".join(stage_names)
+            raise SystemExit(
+                f"Unknown --start-from-stage {start_from_stage!r}; valid stages: {valid}"
+            )
+        start_index = stage_names.index(start_from_stage) + 1
+        print(
+            f"EOD resume: skipping stages before {start_from_stage!r} (stage {start_index}).",
+            flush=True,
+        )
+    else:
+        start_index = 1
     for index, (name, cmd) in enumerate(stages, start=1):
+        if index < start_index:
+            print(f"\n[{index}/{len(stages)}] SKIP {name}: {_EOD_STAGE_DESCRIPTIONS[name]}")
+            continue
         _run_stage(
             index=index,
             total=len(stages),
@@ -343,6 +361,12 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--start-from-stage",
+        choices=tuple(_EOD_STAGE_DESCRIPTIONS),
+        default=None,
+        help="With --eod-ingest, skip earlier stages and resume from this stage name.",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Print the commands without executing them.",
@@ -362,6 +386,7 @@ def main() -> None:
             batch_size=args.batch_size,
             dry_run=bool(args.dry_run),
             skip_existing=not bool(args.force_ingest),
+            start_from_stage=args.start_from_stage,
         )
         return
 

@@ -321,12 +321,19 @@ def test_load_setup_row_falls_back_to_live_intraday_context(
         def execute(self, query: str, params: list[object]):
             if "FROM market_day_state" in query:
                 return SimpleNamespace(fetchone=lambda: None)
-            if "FROM v_daily" in query:
-                return SimpleNamespace(fetchone=lambda: ("2024-01-05", 110.0, 100.0, 105.0))
-            if "FROM atr_intraday" in query:
-                return SimpleNamespace(fetchone=lambda: ("2024-01-05", 4.0))
-            if "FROM cpr_thresholds" in query:
-                return SimpleNamespace(fetchone=lambda: ("2024-01-05", 1.5))
+            if "WITH prev_daily AS" in query:
+                return SimpleNamespace(
+                    fetchone=lambda: (
+                        "2024-01-05",
+                        110.0,
+                        100.0,
+                        105.0,
+                        "2024-01-05",
+                        4.0,
+                        "2024-01-05",
+                        1.5,
+                    )
+                )
             raise AssertionError(f"Unexpected query: {query}")
 
     class _FakeDB:
@@ -370,12 +377,19 @@ def test_load_setup_row_waits_for_full_opening_range_window(
         def execute(self, query: str, params: list[object]):
             if "FROM market_day_state" in query:
                 return SimpleNamespace(fetchone=lambda: None)
-            if "FROM v_daily" in query:
-                return SimpleNamespace(fetchone=lambda: ("2024-01-05", 110.0, 100.0, 105.0))
-            if "FROM atr_intraday" in query:
-                return SimpleNamespace(fetchone=lambda: ("2024-01-05", 4.0))
-            if "FROM cpr_thresholds" in query:
-                return SimpleNamespace(fetchone=lambda: ("2024-01-05", 1.5))
+            if "WITH prev_daily AS" in query:
+                return SimpleNamespace(
+                    fetchone=lambda: (
+                        "2024-01-05",
+                        110.0,
+                        100.0,
+                        105.0,
+                        "2024-01-05",
+                        4.0,
+                        "2024-01-05",
+                        1.5,
+                    )
+                )
             raise AssertionError(f"Unexpected query: {query}")
 
     class _FakeDB:
@@ -741,14 +755,7 @@ async def test_process_closed_candle_marks_pending_setups_for_pruning(
     monkeypatch.setattr("engine.paper_runtime.get_session_positions", fake_get_session_positions)
     monkeypatch.setattr(
         "engine.paper_runtime.load_setup_row",
-        lambda symbol,
-        trade_date,
-        live_candles=None,
-        *,
-        or_minutes=5,
-        allow_live_fallback=True,
-        bar_end_offset=None,
-        **kwargs: {
+        lambda symbol, trade_date, live_candles=None, *, or_minutes=5, allow_live_fallback=True, bar_end_offset=None, **kwargs: {
             **_make_cpr_setup_row(),
             "direction": "NONE",
         },
@@ -1111,7 +1118,7 @@ async def test_process_closed_candle_rejects_non_cpr_strategy(
 
 
 @pytest.mark.asyncio
-async def test_enforce_session_risk_controls_flattens_on_daily_loss(
+async def test_enforce_session_risk_controls_ignores_unrealized_daily_loss(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     session = SimpleNamespace(
@@ -1163,6 +1170,66 @@ async def test_enforce_session_risk_controls_flattens_on_daily_loss(
         feed_state=SimpleNamespace(
             raw_state={"symbol_last_prices": {"SBIN": 80.0}}, last_price=80.0
         ),
+    )
+
+    assert result["triggered"] is False
+    assert result["daily_pnl_used"] == pytest.approx(0.0)
+    assert result["reasons"] == []
+    assert session_updates[0]["daily_pnl_used"] == pytest.approx(0.0)
+    assert flatten_calls == []
+
+
+@pytest.mark.asyncio
+async def test_enforce_session_risk_controls_flattens_on_realized_daily_loss(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = SimpleNamespace(
+        session_id="paper-risk-realized",
+        flatten_time=None,
+        max_daily_loss_pct=0.01,
+        strategy_params={"portfolio_value": 100_000},
+    )
+    positions = [
+        SimpleNamespace(
+            symbol="SBIN",
+            status="CLOSED",
+            current_qty=0.0,
+            quantity=100.0,
+            entry_price=100.0,
+            direction="LONG",
+            realized_pnl=-2_000.0,
+            last_price=80.0,
+        )
+    ]
+    session_updates: list[dict[str, object]] = []
+    flatten_calls: list[dict[str, object]] = []
+
+    async def fake_get_session_positions(session_id: str, symbol: str | None = None, statuses=None):
+        await asyncio.sleep(0)
+        return positions
+
+    async def fake_update_session_state(session_id: str, **kwargs):
+        await asyncio.sleep(0)
+        session_updates.append(kwargs)
+        return session
+
+    async def fake_flatten_session_positions(
+        session_id: str, *, notes: str | None = None, feed_state=None
+    ):
+        await asyncio.sleep(0)
+        flatten_calls.append({"notes": notes, "feed_state": feed_state})
+        return {"session_id": session_id, "closed_positions": 0}
+
+    monkeypatch.setattr("engine.paper_runtime.get_session_positions", fake_get_session_positions)
+    monkeypatch.setattr("engine.paper_runtime.update_session_state", fake_update_session_state)
+    monkeypatch.setattr(
+        "engine.paper_runtime.flatten_session_positions", fake_flatten_session_positions
+    )
+
+    result = await enforce_session_risk_controls(
+        session=session,
+        as_of=datetime(2024, 1, 1, 10, 0),
+        feed_state=SimpleNamespace(raw_state={"symbol_last_prices": {}}, last_price=None),
     )
 
     assert result["triggered"] is True
@@ -1223,7 +1290,7 @@ async def test_enforce_session_risk_controls_flattens_at_session_time(
 async def test_enforce_session_risk_controls_flattens_on_max_drawdown(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Max drawdown check triggers flatten when session PnL falls below the drawdown limit."""
+    """Max drawdown check triggers flatten when realized PnL falls below the limit."""
     session = SimpleNamespace(
         session_id="paper-risk-dd",
         flatten_time=None,
@@ -1234,13 +1301,13 @@ async def test_enforce_session_risk_controls_flattens_on_max_drawdown(
     positions = [
         SimpleNamespace(
             symbol="SBIN",
-            status="OPEN",
-            current_qty=100.0,
+            status="CLOSED",
+            current_qty=0.0,
             quantity=100.0,
             entry_price=100.0,
             direction="LONG",
-            realized_pnl=0.0,
-            last_price=None,
+            realized_pnl=-5_500.0,
+            last_price=45.0,
         )
     ]
     session_updates: list[dict[str, object]] = []
@@ -1268,7 +1335,6 @@ async def test_enforce_session_risk_controls_flattens_on_max_drawdown(
         "engine.paper_runtime.flatten_session_positions", fake_flatten_session_positions
     )
 
-    # last_price=45 → unrealized PnL = 100*(45-100) = -5500 → exceeds 5k drawdown limit
     result = await enforce_session_risk_controls(
         session=session,
         as_of=datetime(2024, 1, 1, 10, 0),
@@ -1664,3 +1730,59 @@ def test_dispatch_session_started_alert_dedups_per_session(
     assert started_alerts[0][1].startswith("🟢 Session Started — paper live 1")
     assert "Strategy: <code>CPR_LEVELS</code>" in started_alerts[0][2]
     assert "Direction: <b>LONG</b>" in started_alerts[0][2]
+
+
+def test_reset_alert_dedupe_allows_explicit_in_process_restart(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import engine.paper_runtime as _pm
+
+    dispatched: list[tuple] = []
+    _pm.set_alerts_suppressed(False)
+    _pm.set_alert_sink(lambda t, s, b: dispatched.append((t, s, b)))
+    try:
+        for _ in range(2):
+            _pm.dispatch_session_started_alert(
+                session_id="paper-live-reset",
+                strategy="CPR_LEVELS",
+                direction="LONG",
+                symbol_count=12,
+                trade_date="2026-04-21",
+            )
+        _pm.reset_alert_dedupe("paper-live-reset")
+        _pm.dispatch_session_started_alert(
+            session_id="paper-live-reset",
+            strategy="CPR_LEVELS",
+            direction="LONG",
+            symbol_count=12,
+            trade_date="2026-04-21",
+        )
+    finally:
+        _pm.set_alert_sink(None)
+        _pm.set_alerts_suppressed(False)
+        _pm.reset_alert_dedupe("paper-live-reset")
+
+    started_alerts = [d for d in dispatched if d[0].value == "SESSION_STARTED"]
+    assert len(started_alerts) == 2
+
+
+@pytest.mark.asyncio
+async def test_dispatch_alert_background_tasks_are_removed_when_done(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeDispatcher:
+        async def dispatch(self, alert_type, subject: str, body: str) -> None:
+            await asyncio.sleep(0)
+
+    paper_runtime._background_tasks.clear()
+    paper_runtime.set_alerts_suppressed(False)
+    paper_runtime.set_alert_sink(None)
+    monkeypatch.setattr(paper_runtime, "_get_alert_dispatcher", lambda: FakeDispatcher())
+
+    paper_runtime._dispatch_alert(paper_runtime.AlertType.SESSION_ERROR, "subject", "body")
+
+    tasks = list(paper_runtime._background_tasks)
+    assert len(tasks) == 1
+    await asyncio.gather(*tasks)
+    await asyncio.sleep(0)
+    assert not paper_runtime._background_tasks

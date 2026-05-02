@@ -230,7 +230,7 @@ def _normalize_pack_times(raw_times: list[Any], pack_time_mode: str) -> list[str
     if pack_time_mode == "minute_arr":
         try:
             return [_minute_to_time_str(t) for t in raw_times]
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             return None
     return [str(t) for t in raw_times]
 
@@ -689,6 +689,7 @@ async def replay_session(
     total_dates = len(grouped_days)
     for date_idx, (_trade_date, date_items) in enumerate(grouped_days, 1):
         total_syms = len(date_items)
+        tracker.reset_daily_closures()
 
         # Prefetch setup rows for this date (same pattern as paper_live.py).
         # This ensures all setup rows are available from the first bar (09:15),

@@ -91,7 +91,7 @@ incrementally with `pivot-build --refresh-since YYYY-MM-DD`.
 | `cpr_daily` | symbol, trade_date, pivot, tc, bc, cpr_width_pct, floor_r1..s3, cpr_shift, is_narrowing | CPR levels + floor pivots per day | 1 |
 | `atr_intraday` | symbol, trade_date, atr | ATR from last 12 x 5-min candles of prev day | 2 |
 | `cpr_thresholds` | symbol, trade_date, cpr_threshold_pct | Rolling 252-day CPR width percentile | 3 |
-| `or_daily` | symbol, trade_date, o0915, v0915, ... | Opening range data (LEGACY) | 4 |
+| `or_daily` | symbol, trade_date, o0915, v0915, ... | Opening-range runtime data and compatibility support | 4 |
 | `market_day_state` | symbol, trade_date, prev_close, gap_pct, cpr_width_pct, atr, ... | Joined daily state for all symbols | 5 |
 | `strategy_day_state` | symbol, trade_date, direction_5, or_atr_5, gap_abs_pct, open_side | Per-day strategy inputs | 6 |
 | `intraday_day_pack` | symbol, trade_date, time_arr[], open_arr[], high_arr[], low_arr[], close_arr[], vol_arr[] | Full intraday candles as columnar arrays | 7 |

@@ -7,6 +7,11 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
+from engine.execution_defaults import (
+    MIN_TRADE_NOTIONAL_FLOOR,
+    MIN_TRADE_NOTIONAL_SLOT_FRACTION,
+)
+
 
 def slot_capital_for(
     *,
@@ -41,7 +46,7 @@ def minimum_trade_notional_for(
         max_position_pct=max_position_pct,
         capital_base=capital_base,
     )
-    return max(1_000.0, slot_capital * 0.05)
+    return max(MIN_TRADE_NOTIONAL_FLOOR, slot_capital * MIN_TRADE_NOTIONAL_SLOT_FRACTION)
 
 
 @dataclass(slots=True)
@@ -105,6 +110,10 @@ class SessionPositionTracker:
 
     def has_traded_today(self, symbol: str) -> bool:
         return str(symbol) in self._closed_today
+
+    def reset_daily_closures(self) -> None:
+        """Clear same-day re-entry guards at an explicit trade-date boundary."""
+        self._closed_today.clear()
 
     def can_open_new(self) -> bool:
         return self.open_count < self.max_positions
@@ -295,11 +304,13 @@ def select_entries_for_bar(
         candidates,
         key=lambda c: (-candidate_quality_score(c), str(c.get("symbol", ""))),
     )
-    for candidate in ordered[:slots]:
+    for candidate in ordered:
+        if len(validated) >= slots:
+            break
         inner = candidate.get("candidate") or candidate
         entry_price = float(inner.get("entry_price") or 0.0)
         position_size = float(inner.get("position_size") or 0.0)
-        candidate_notional = min(tracker.slot_capital, tracker.cash_available)
+        candidate_notional = tracker.slot_capital
         if position_size > 0 and entry_price > 0:
             candidate_notional = min(candidate_notional, position_size * entry_price)
         # Respect tracker capital headroom when multiple candidates arrive in the

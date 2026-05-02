@@ -50,7 +50,7 @@ _debounce_timers: dict[str, Any] = {}
 def _client_is_alive() -> bool:
     try:
         client = ui.context.client
-    except (AttributeError, RuntimeError):
+    except AttributeError, RuntimeError:
         return False
     return bool(getattr(client, "has_socket_connection", False))
 
@@ -233,7 +233,7 @@ def _render_overview_tab(detail: dict, status: dict) -> None:
                 "Intraday Day Pack",
                 "Full intraday candle arrays — required for backtesting",
             ),
-            "or_daily": ("OR Daily (legacy)", "Opening Range data (legacy)"),
+            "or_daily": ("OR Daily", "Opening-range runtime data"),
             "backtest_results": ("Backtest Results", "Trade-level backtest output"),
             "run_metrics": ("Run Metrics", "Aggregated performance per run"),
         }
