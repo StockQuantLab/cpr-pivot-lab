@@ -30,7 +30,6 @@ from engine.live_market_data import (
     FiveMinuteCandleBuilder,
     KiteQuoteAdapter,
     MarketDataAdapter,
-    MarketSnapshot,
 )
 from engine.paper_reconciliation import reconcile_paper_session
 from engine.paper_runtime import (
@@ -57,11 +56,25 @@ from engine.paper_runtime import (
     register_session_start,
     runtime_setup_status,
 )
+from scripts import paper_live_helpers as _live_helpers
 from scripts.paper_archive import archive_completed_session
 from scripts.paper_feed_audit import record_closed_candles
 from scripts.paper_prepare import pre_filter_symbols_for_strategy
 
 logger = logging.getLogger(__name__)
+_GLOBAL_FLATTEN_SIGNAL = _live_helpers.GLOBAL_FLATTEN_SIGNAL
+_feed_snapshot_payload = _live_helpers.feed_snapshot_payload
+_closed_candle_payload = _live_helpers.closed_candle_payload
+_live_mark_feed_state = _live_helpers.live_mark_feed_state
+_entry_disabled_symbols = _live_helpers.entry_disabled_symbols
+_cancel_pending_admin_commands = _live_helpers.cancel_pending_admin_commands
+_is_admin_command_stale = _live_helpers.is_admin_command_stale
+_is_zero_trade_restart_session = _live_helpers.is_zero_trade_restart_session
+_should_use_global_flatten_signal = _live_helpers.should_use_global_flatten_signal
+_resolve_poll_interval = _live_helpers.resolve_poll_interval
+_resolve_candle_interval = _live_helpers.resolve_candle_interval
+_resolve_active_symbols = _live_helpers.resolve_active_symbols
+_floor_bucket_start = _live_helpers.floor_bucket_start
 _BOOL_TRUE = {"1", "true", "yes", "on"}
 _PARITY_TRACE_ENABLED = str(os.getenv("PIVOT_LIVE_PARITY_TRACE", "0")).strip().lower() in _BOOL_TRUE
 _SETUP_PARITY_CHECK_ENABLED = (
@@ -71,8 +84,6 @@ _ORIGINAL_LOAD_SETUP_ROW = load_setup_row
 _WEBSOCKET_RECONNECT_ALERT_ATTEMPTS = 3
 _WEBSOCKET_RECOVERY_AFTER_SEC = 20.0
 _WEBSOCKET_RECOVERY_COOLDOWN_SEC = 30.0
-_GLOBAL_FLATTEN_SIGNAL = Path(".tmp_logs") / "flatten_all.signal"
-_ADMIN_COMMAND_MAX_AGE_SEC = 300.0
 _FEED_AUDIT_CLEANUP_INTERVAL_SEC = 30 * 60
 try:
     _FEED_STALE_ALERT_COOLDOWN_SEC = float(os.getenv("PIVOT_FEED_STALE_ALERT_COOLDOWN_SEC", "900"))
@@ -89,136 +100,6 @@ class LiveSessionDeps:
     sleep_fn: Callable[[float], Awaitable[None]] | None = None
     now_fn: Callable[[], datetime] | None = None
     alerts_enabled: bool | None = None
-
-
-def _feed_snapshot_payload(snapshot: MarketSnapshot) -> dict[str, Any]:
-    return {
-        "mode": "live_quote",
-        "symbol": snapshot.symbol,
-        "ts": snapshot.ts.isoformat(),
-        "last_price": snapshot.last_price,
-        "volume": snapshot.volume,
-        "source": snapshot.source,
-    }
-
-
-def _closed_candle_payload(candle: ClosedCandle) -> dict[str, Any]:
-    return {
-        "mode": "closed_bar",
-        "symbol": candle.symbol,
-        "bar_start": candle.bar_start.isoformat(),
-        "bar_end": candle.bar_end.isoformat(),
-        "open": candle.open,
-        "high": candle.high,
-        "low": candle.low,
-        "close": candle.close,
-        "volume": candle.volume,
-        "first_snapshot_ts": candle.first_snapshot_ts.isoformat(),
-        "last_snapshot_ts": candle.last_snapshot_ts.isoformat(),
-    }
-
-
-def _live_mark_feed_state(
-    *,
-    session_id: str,
-    symbol_last_prices: dict[str, float],
-    ticker_adapter: Any = None,
-    symbols: list[str] | set[str] | tuple[str, ...] | None = None,
-) -> Any:
-    """Build a feed-state view using latest live marks for immediate flatten fills."""
-    prices = dict(symbol_last_prices)
-    if ticker_adapter is not None and hasattr(ticker_adapter, "get_last_ltp"):
-        for symbol in symbols or prices.keys():
-            normalized = str(symbol).upper()
-            try:
-                ltp = ticker_adapter.get_last_ltp(normalized)
-            except Exception:
-                logger.debug("Failed to read latest LTP for %s", normalized, exc_info=True)
-                continue
-            if ltp is not None:
-                prices[normalized] = float(ltp)
-    return SimpleNamespace(
-        session_id=session_id,
-        status="LIVE_MARK",
-        last_event_ts=datetime.now(IST),
-        last_bar_ts=None,
-        last_price=None,
-        stale_reason=None,
-        raw_state={"symbol_last_prices": prices, "mark_source": "live_ltp"},
-    )
-
-
-def _open_symbols_from_tracker(tracker: SessionPositionTracker) -> list[str]:
-    return sorted(str(symbol).upper() for symbol in getattr(tracker, "_open", {}).keys())
-
-
-def _entry_disabled_symbols(
-    *,
-    tracker: SessionPositionTracker,
-    active_symbols: list[str],
-) -> list[str]:
-    del active_symbols
-    open_symbols = _open_symbols_from_tracker(tracker)
-    return open_symbols
-
-
-def _cancel_pending_admin_commands(cmd_dir: Path, current_file: Path) -> int:
-    cancelled = 0
-    if not cmd_dir.exists():
-        return cancelled
-    for pending_file in sorted(cmd_dir.glob("*.json")):
-        if pending_file == current_file:
-            continue
-        try:
-            pending_file.unlink()
-            cancelled += 1
-        except OSError:
-            logger.debug("Failed to delete pending admin command %s", pending_file, exc_info=True)
-    return cancelled
-
-
-def _is_admin_command_stale(
-    cmd_file: Path,
-    now: datetime,
-    *,
-    max_age_sec: float = _ADMIN_COMMAND_MAX_AGE_SEC,
-) -> bool:
-    """Return True when a command file is older than the configured expiry window."""
-    try:
-        age_seconds = now.timestamp() - cmd_file.stat().st_mtime
-    except OSError:
-        return False
-    return age_seconds > max_age_sec
-
-
-def _has_closed_positions(
-    session_id: str,
-    *,
-    paper_db: Any,
-) -> bool:
-    try:
-        positions = paper_db.get_session_positions(session_id, statuses=["CLOSED"])
-        return len(positions) > 0
-    except Exception:
-        logger.debug("Failed to load closed positions for session %s", session_id, exc_info=True)
-        return False
-
-
-def _is_zero_trade_restart_session(
-    session_id: str,
-    *,
-    terminal_reason: str | None,
-    paper_db: Any,
-) -> bool:
-    if terminal_reason is None:
-        return False
-    if terminal_reason not in {"no_trades_entry_window_closed", "NO_TRADES_ENTRY_WINDOW_CLOSED"}:
-        return False
-    return not _has_closed_positions(session_id=session_id, paper_db=paper_db)
-
-
-def _should_use_global_flatten_signal() -> bool:
-    return _GLOBAL_FLATTEN_SIGNAL.exists()
 
 
 def _cleanup_feed_audit_if_needed(
@@ -292,64 +173,6 @@ def _reconcile_live_session(
     except Exception:
         logger.debug("[%s] Failed to stamp reconciliation note", session_id, exc_info=True)
     return True
-
-
-def _seconds_until_next_candle_close(now: datetime, candle_interval_minutes: int) -> float:
-    interval_seconds = max(1, int(candle_interval_minutes)) * 60
-    seconds_since_midnight = (
-        now.hour * 3600 + now.minute * 60 + now.second + now.microsecond / 1_000_000.0
-    )
-    remaining = interval_seconds - (seconds_since_midnight % interval_seconds)
-    if remaining <= 0:
-        return float(interval_seconds)
-    return float(remaining)
-
-
-def _resolve_poll_interval(
-    settings: Any,
-    poll_interval_sec: float | None,
-    candle_interval_minutes: int,
-    *,
-    now: datetime | None = None,
-) -> float:
-    base_interval = (
-        settings.paper_live_poll_interval_sec if poll_interval_sec is None else poll_interval_sec
-    )
-    if base_interval <= 0:
-        base_interval = settings.paper_live_poll_interval_sec
-    if candle_interval_minutes <= 0:
-        return base_interval
-
-    current_time = now or datetime.now(IST)
-    seconds_to_close = _seconds_until_next_candle_close(current_time, candle_interval_minutes)
-    if seconds_to_close <= 5.0:
-        return min(base_interval, 0.5)
-    if seconds_to_close <= 20.0:
-        return min(base_interval, 1.0)
-    if seconds_to_close <= 60.0:
-        return min(base_interval, 2.0)
-    return base_interval
-
-
-def _resolve_candle_interval(settings: Any, candle_interval_minutes: int | None) -> int:
-    if candle_interval_minutes is None:
-        return settings.paper_candle_interval_minutes
-    return candle_interval_minutes
-
-
-def _resolve_active_symbols(session: Any, symbols: list[str] | None) -> list[str]:
-    return [s.strip() for s in symbols or session.symbols if s and s.strip()]
-
-
-def _floor_bucket_start(ts: datetime, interval_minutes: int) -> datetime:
-    total_minutes = ts.hour * 60 + ts.minute
-    bucket_minutes = (total_minutes // interval_minutes) * interval_minutes
-    return ts.replace(
-        hour=bucket_minutes // 60,
-        minute=bucket_minutes % 60,
-        second=0,
-        microsecond=0,
-    )
 
 
 def _session_now(deps: LiveSessionDeps | None = None) -> datetime:
