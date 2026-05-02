@@ -104,6 +104,8 @@ doppler run -- uv run pivot-paper-trading real-dry-run-order \
   --side BUY \
   --quantity 1 \
   --role premarket_probe \
+  --order-type LIMIT \
+  --price 800 \
   --event-time YYYY-MM-DDT06:25:00+05:30
 ```
 
@@ -1072,6 +1074,61 @@ This prints and records the Zerodha payload with `broker_mode=REAL_DRY_RUN`.
 It is safe for payload validation because the adapter does not call Kite `place_order`.
 Real order placement remains disabled in this phase.
 
+**Real-order safety model (future broker mode):**
+
+Current production code cannot place real Zerodha orders. The only broker-facing path is
+`REAL_DRY_RUN`, which builds and records the payload but never calls Kite `place_order`.
+
+When real placement is implemented later, the accepted exit/flatten shape is protected LIMIT,
+not raw MARKET:
+
+```text
+LONG position emergency exit:
+  side = SELL
+  order_type = LIMIT
+  reference_price = latest fresh LTP/mark
+  limit_price = reference_price * (1 - max_slippage_pct)
+
+SHORT position emergency exit:
+  side = BUY
+  order_type = LIMIT
+  reference_price = latest fresh LTP/mark
+  limit_price = reference_price * (1 + max_slippage_pct)
+```
+
+Default safety assumptions in code:
+
+- zero, negative, NaN, and infinite prices are rejected before payload generation
+- SL/SL-M require a trigger price
+- MARKET/SL-M require Zerodha `market_protection`
+- exit/close/flatten/emergency roles must use protected LIMIT with a fresh reference price
+- stale reference prices are rejected
+- real order placement remains blocked even if `allow_real_orders=True`
+
+Example protected dry-run flatten payload:
+
+```bash
+doppler run -- uv run pivot-paper-trading real-dry-run-order \
+  --session-id CPR_LEVELS_LONG-2026-04-27-live-kite \
+  --symbol SBIN \
+  --side SELL \
+  --quantity 250 \
+  --role manual_flatten \
+  --order-type LIMIT \
+  --price 784 \
+  --reference-price 800 \
+  --reference-price-age-sec 1 \
+  --max-slippage-pct 2 \
+  --event-time 2026-04-27T10:30:00+05:30
+```
+
+Dashboard visibility:
+
+- `/paper_ledger` shows active sessions, open/closed positions, orders, feed state, and archived ledgers.
+- `/paper_ledger` can queue paper controls: close selected symbols, flatten one session, flatten LONG+SHORT, pause/resume entries, cancel pending intents, set risk budget, and reconcile.
+- `/paper_ledger` does **not** currently show a dedicated real-broker payload preview or broker snapshot comparison panel. Use the CLI dry-run and `broker-reconcile` commands for that.
+- No dashboard control places real Zerodha orders.
+
 **Broker reconciliation check (read-only):**
 ```bash
 doppler run -- uv run pivot-paper-trading broker-reconcile \
@@ -1096,7 +1153,7 @@ doppler run -- uv run pivot-paper-trading pilot-check \
 ```
 
 The guardrail allows at most 2 symbols, quantity 1, up to Rs10,000 notional, MIS product, and
-MARKET orders. Even when it passes, the payload reports `real_orders_enabled=false`; it is a readiness
+LIMIT orders. Even when it passes, the payload reports `real_orders_enabled=false`; it is a readiness
 gate, not a switch that enables Zerodha order placement.
 
 **Offline fallback if the live process is already dead or DB status is stale:**

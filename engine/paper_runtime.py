@@ -20,6 +20,7 @@ from db.duckdb import get_dashboard_db
 from db.paper_db import FeedState, PaperPosition, PaperSession, get_paper_db
 from engine.alert_dispatcher import AlertDispatcher, AlertType, get_alert_config
 from engine.bar_orchestrator import SessionPositionTracker
+from engine.constants import normalize_symbol
 from engine.cpr_atr_shared import (
     CompletedCandleDecision,
     normalize_stop_loss,
@@ -47,6 +48,18 @@ logger = logging.getLogger(__name__)
 _IST = ZoneInfo("Asia/Kolkata")
 _SESSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9_\-:.]+$")
 _CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+_ADMIN_ACTIONS = {
+    "close_positions",
+    "close_all",
+    "set_risk_budget",
+    "pause_entries",
+    "resume_entries",
+    "cancel_pending_intents",
+}
+_ADMIN_TEXT_MAX_LEN = 80
+_ADMIN_MAX_PORTFOLIO_VALUE = 10_000_000.0
+_ADMIN_MAX_POSITIONS = 50
+_ADMIN_MAX_POSITION_PCT = 1.0
 
 BacktestParams = StrategyConfig
 
@@ -1830,13 +1843,42 @@ def write_admin_command(
         raise ValueError(
             "session_id contains unsupported characters; allowed: letters, numbers, _, -, :, ."
         )
+    action = str(action or "").strip()
+    if action not in _ADMIN_ACTIONS:
+        raise ValueError(f"action must be one of: {', '.join(sorted(_ADMIN_ACTIONS))}")
+    clean_symbols = [normalize_symbol(str(s)) for s in (symbols or []) if str(s).strip()]
+    if action == "close_positions" and not clean_symbols:
+        raise ValueError("close_positions requires at least one symbol")
+    if action != "close_positions" and clean_symbols:
+        raise ValueError("symbols are only valid for close_positions")
+    if portfolio_value is not None:
+        portfolio_value = float(portfolio_value)
+        if not 0 < portfolio_value <= _ADMIN_MAX_PORTFOLIO_VALUE:
+            raise ValueError(f"portfolio_value must be > 0 and <= {_ADMIN_MAX_PORTFOLIO_VALUE:g}")
+    if max_positions is not None:
+        max_positions = int(max_positions)
+        if not 1 <= max_positions <= _ADMIN_MAX_POSITIONS:
+            raise ValueError(f"max_positions must be between 1 and {_ADMIN_MAX_POSITIONS}")
+    if max_position_pct is not None:
+        max_position_pct = float(max_position_pct)
+        if not 0 < max_position_pct <= _ADMIN_MAX_POSITION_PCT:
+            raise ValueError(f"max_position_pct must be > 0 and <= {_ADMIN_MAX_POSITION_PCT:g}")
+    if action == "set_risk_budget" and all(
+        value is None for value in (portfolio_value, max_positions, max_position_pct)
+    ):
+        raise ValueError("set_risk_budget requires at least one budget field")
+
     cmd_dir = _Path(".tmp_logs") / f"cmd_{session_id}"
     cmd_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     cmd_file = cmd_dir / f"{ts}_{action}.json"
-    cmd: dict[str, Any] = {"action": action, "reason": reason, "requester": requester}
-    if symbols:
-        cmd["symbols"] = [str(s).upper() for s in symbols]
+    cmd: dict[str, Any] = {
+        "action": action,
+        "reason": _clean_admin_text(reason),
+        "requester": _clean_admin_text(requester),
+    }
+    if clean_symbols:
+        cmd["symbols"] = clean_symbols
     if portfolio_value is not None:
         cmd["portfolio_value"] = float(portfolio_value)
     if max_positions is not None:
@@ -1845,6 +1887,11 @@ def write_admin_command(
         cmd["max_position_pct"] = float(max_position_pct)
     cmd_file.write_text(_json.dumps(cmd))
     return str(cmd_file)
+
+
+def _clean_admin_text(value: object) -> str:
+    text = _CONTROL_CHARS.sub("", str(value or "")).strip()
+    return text[:_ADMIN_TEXT_MAX_LEN] or "unknown"
 
 
 def _current_session_time(as_of: datetime) -> dt_time:

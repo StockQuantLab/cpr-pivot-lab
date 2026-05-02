@@ -84,7 +84,7 @@ class PilotGuardrails:
     max_order_quantity: int = 1
     max_notional: float = 10_000.0
     allowed_products: tuple[str, ...] = ("MIS",)
-    allowed_order_types: tuple[str, ...] = ("MARKET",)
+    allowed_order_types: tuple[str, ...] = ("LIMIT",)
 
     def validate(
         self,
@@ -93,7 +93,7 @@ class PilotGuardrails:
         order_quantity: int,
         estimated_notional: float,
         product: str = "MIS",
-        order_type: str = "MARKET",
+        order_type: str = "LIMIT",
         acknowledgement: str | None = None,
     ) -> dict[str, Any]:
         findings: list[BrokerReconciliationFinding] = []

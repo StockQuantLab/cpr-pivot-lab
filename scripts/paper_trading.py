@@ -835,14 +835,14 @@ def _handle_coverage_gaps(preparation: dict[str, Any], *, trade_date: str, mode:
         for symbol, missing_items in missing_by_symbol.items():
             for item in missing_items:
                 missing_by_table.setdefault(str(item), []).append(str(symbol))
-        detail_lines = [
+        missing_detail_lines = [
             f"  {table}: {len(symbols)} missing"
             + (f" — {', '.join(sorted(symbols))}" if len(symbols) <= 20 else "")
             for table, symbols in sorted(missing_by_table.items())
         ]
         raise SystemExit(
             f"Live prerequisites incomplete for {trade_date}.\n"
-            + "\n".join(detail_lines)
+            + "\n".join(missing_detail_lines)
             + "\n\nLive uses the previous completed trading day; do not build future-date "
             "market_day_state rows.\n" + "Fix:\n  doppler run -- uv run pivot-refresh --eod-ingest "
             "--date <prev_trading_date> --trade-date <trade_date>"
@@ -2509,6 +2509,11 @@ async def _cmd_real_dry_run_order(args: argparse.Namespace) -> None:
         signal_id=args.signal_id,
         order_type=args.order_type,
         price=args.price,
+        trigger_price=args.trigger_price,
+        reference_price=args.reference_price,
+        reference_price_age_sec=args.reference_price_age_sec,
+        max_slippage_pct=args.max_slippage_pct,
+        market_protection=args.market_protection,
         product=args.product,
         exchange=args.exchange,
         variety=args.variety,
@@ -3076,7 +3081,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Estimated total pilot notional",
     )
     pilot_check.add_argument("--product", default="MIS", help="Pilot product")
-    pilot_check.add_argument("--order-type", default="MARKET", help="Pilot order type")
+    pilot_check.add_argument("--order-type", default="LIMIT", help="Pilot order type")
     pilot_check.add_argument(
         "--acknowledgement",
         default=None,
@@ -3127,6 +3132,33 @@ def build_parser() -> argparse.ArgumentParser:
         help="Zerodha order type",
     )
     dry_run_order.add_argument("--price", type=float, default=None, help="Required for LIMIT/SL")
+    dry_run_order.add_argument(
+        "--trigger-price", type=float, default=None, help="Required for SL/SL-M"
+    )
+    dry_run_order.add_argument(
+        "--reference-price",
+        type=float,
+        default=None,
+        help="Fresh LTP/mark used to validate protected exit or flatten orders",
+    )
+    dry_run_order.add_argument(
+        "--reference-price-age-sec",
+        type=float,
+        default=None,
+        help="Age in seconds of --reference-price",
+    )
+    dry_run_order.add_argument(
+        "--max-slippage-pct",
+        type=float,
+        default=2.0,
+        help="Max exit/flatten slippage from reference price (default: 2.0)",
+    )
+    dry_run_order.add_argument(
+        "--market-protection",
+        type=float,
+        default=2.0,
+        help="Zerodha market_protection for MARKET/SL-M orders (default: 2.0)",
+    )
     dry_run_order.add_argument("--product", default="MIS", help="Zerodha product, default MIS")
     dry_run_order.add_argument("--exchange", default="NSE", help="Zerodha exchange, default NSE")
     dry_run_order.add_argument("--variety", default="regular", help="Zerodha variety")

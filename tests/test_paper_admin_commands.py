@@ -62,6 +62,50 @@ def test_write_admin_command_rejects_path_traversal_session_id(tmp_path, monkeyp
         write_admin_command("..\\..\\Windows\\Temp\\x", "close_all")
 
 
+def test_write_admin_command_rejects_invalid_action(tmp_path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    with pytest.raises(ValueError, match="action must be one of"):
+        write_admin_command("CPR_LEVELS_LONG-2026-04-24-live-kite", "../close_all")
+
+
+def test_write_admin_command_rejects_invalid_symbol(tmp_path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    with pytest.raises(ValueError, match="Invalid symbol name"):
+        write_admin_command(
+            "CPR_LEVELS_LONG-2026-04-24-live-kite",
+            "close_positions",
+            symbols=["SBIN;DROP TABLE"],
+        )
+
+
+def test_write_admin_command_rejects_oversized_risk_budget(tmp_path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    with pytest.raises(ValueError, match="portfolio_value"):
+        write_admin_command(
+            "CPR_LEVELS_LONG-2026-04-24-live-kite",
+            "set_risk_budget",
+            portfolio_value=100_000_000,
+        )
+
+
+def test_write_admin_command_strips_control_chars_from_text(tmp_path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    path = write_admin_command(
+        "CPR_LEVELS_LONG-2026-04-24-live-kite",
+        "pause_entries",
+        reason="risk\x00off",
+        requester="operator\x1f",
+    )
+
+    payload = json.loads(Path(path).read_text())
+    assert payload["reason"] == "riskoff"
+    assert payload["requester"] == "operator"
+
+
 def test_cancel_pending_admin_commands_deletes_other_files(tmp_path) -> None:
     from scripts.paper_live import _cancel_pending_admin_commands
 

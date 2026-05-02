@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from typing import Any, Protocol
@@ -19,6 +20,25 @@ class RealOrderPlacementDisabledError(RuntimeError):
     """Raised when a code path attempts real broker placement before it is enabled."""
 
 
+class OrderSafetyError(ValueError):
+    """Raised when a broker order intent violates real-money safety guards."""
+
+
+DEFAULT_EXIT_MAX_SLIPPAGE_PCT = 2.0
+DEFAULT_MAX_QUOTE_AGE_SEC = 5.0
+DEFAULT_MARKET_PROTECTION_PCT = 2.0
+DEFAULT_TICK_SIZE = 0.01
+_PROTECTED_EXIT_ROLES = (
+    "exit",
+    "close",
+    "flatten",
+    "manual_flatten",
+    "emergency",
+    "kill",
+    "stop",
+)
+
+
 @dataclass(frozen=True, slots=True)
 class BrokerOrderIntent:
     session_id: str
@@ -30,6 +50,11 @@ class BrokerOrderIntent:
     signal_id: int | None = None
     order_type: str = "MARKET"
     price: float | None = None
+    trigger_price: float | None = None
+    reference_price: float | None = None
+    reference_price_age_sec: float | None = None
+    max_slippage_pct: float = DEFAULT_EXIT_MAX_SLIPPAGE_PCT
+    market_protection: float | None = DEFAULT_MARKET_PROTECTION_PCT
     product: str = "MIS"
     exchange: str = "NSE"
     variety: str = "regular"
@@ -51,6 +76,25 @@ class BrokerOrderIntent:
             raise ValueError("unsupported order_type")
         if order_type in {"LIMIT", "SL"} and self.price is None:
             raise ValueError(f"{order_type} orders require price")
+        if order_type in {"SL", "SL-M"} and self.trigger_price is None:
+            raise ValueError(f"{order_type} orders require trigger_price")
+        _require_positive_finite(self.price, "price", allow_none=True)
+        _require_positive_finite(self.trigger_price, "trigger_price", allow_none=True)
+        _require_positive_finite(self.reference_price, "reference_price", allow_none=True)
+        _require_non_negative_finite(
+            self.reference_price_age_sec,
+            "reference_price_age_sec",
+            allow_none=True,
+        )
+        _require_positive_finite(self.max_slippage_pct, "max_slippage_pct", allow_none=False)
+        if self.market_protection is not None:
+            _require_non_negative_finite(
+                self.market_protection,
+                "market_protection",
+                allow_none=False,
+            )
+            if self.market_protection > 100:
+                raise ValueError("market_protection must be <= 100")
         return BrokerOrderIntent(
             **{
                 **asdict(self),
@@ -93,7 +137,71 @@ class BrokerOrderIntent:
         }
         if intent.price is not None:
             payload["price"] = float(intent.price)
+        if intent.trigger_price is not None:
+            payload["trigger_price"] = float(intent.trigger_price)
+        if intent.order_type in {"MARKET", "SL-M"} and intent.market_protection is not None:
+            payload["market_protection"] = float(intent.market_protection)
         return payload
+
+    def validate_for_broker(self) -> BrokerOrderIntent:
+        intent = self.normalized()
+        if intent.order_type in {"MARKET", "SL-M"} and (
+            intent.market_protection is None or float(intent.market_protection) <= 0
+        ):
+            raise OrderSafetyError("MARKET and SL-M orders require market_protection > 0")
+
+        if _is_protected_exit_role(intent.role):
+            _validate_protected_exit(intent)
+        return intent
+
+
+def build_protected_flatten_intent(
+    *,
+    session_id: str,
+    symbol: str,
+    side: str,
+    quantity: int,
+    latest_price: float,
+    quote_age_sec: float,
+    role: str = "manual_flatten",
+    position_id: str | None = None,
+    signal_id: int | None = None,
+    product: str = "MIS",
+    exchange: str = "NSE",
+    max_slippage_pct: float = DEFAULT_EXIT_MAX_SLIPPAGE_PCT,
+    tick_size: float = DEFAULT_TICK_SIZE,
+    event_time: str | None = None,
+) -> BrokerOrderIntent:
+    """Build a bounded marketable LIMIT order for emergency/manual exits."""
+    _require_positive_finite(latest_price, "latest_price", allow_none=False)
+    _require_positive_finite(tick_size, "tick_size", allow_none=False)
+    side_upper = side.strip().upper()
+    if side_upper == "SELL":
+        raw_price = latest_price * (1.0 - max_slippage_pct / 100.0)
+        price = math.floor(raw_price / tick_size) * tick_size
+    elif side_upper == "BUY":
+        raw_price = latest_price * (1.0 + max_slippage_pct / 100.0)
+        price = math.ceil(raw_price / tick_size) * tick_size
+    else:
+        raise ValueError("side must be BUY or SELL")
+
+    return BrokerOrderIntent(
+        session_id=session_id,
+        symbol=symbol,
+        side=side_upper,
+        quantity=quantity,
+        role=role,
+        position_id=position_id,
+        signal_id=signal_id,
+        order_type="LIMIT",
+        price=round(price, 4),
+        reference_price=latest_price,
+        reference_price_age_sec=quote_age_sec,
+        max_slippage_pct=max_slippage_pct,
+        product=product,
+        exchange=exchange,
+        event_time=event_time,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -163,8 +271,9 @@ class ZerodhaBrokerAdapter:
 
     async def place_order(self, intent: BrokerOrderIntent) -> BrokerExecutionResult:
         await self._governor.acquire()
-        payload = intent.zerodha_payload()
-        idempotency_key = intent.idempotency_key()
+        safe_intent = intent.validate_for_broker()
+        payload = safe_intent.zerodha_payload()
+        idempotency_key = safe_intent.idempotency_key()
         if self.mode == "REAL_DRY_RUN":
             return BrokerExecutionResult(
                 broker="zerodha",
@@ -253,3 +362,60 @@ def _default_zerodha_tag(session_id: str, role: str) -> str:
 
 def _short_key(value: str) -> str:
     return "".join(ch for ch in value.lower() if ch.isalnum())[:18] or "order"
+
+
+def _is_protected_exit_role(role: str) -> bool:
+    normalized = role.strip().lower().replace("-", "_")
+    return any(token in normalized for token in _PROTECTED_EXIT_ROLES)
+
+
+def _validate_protected_exit(intent: BrokerOrderIntent) -> None:
+    if intent.order_type != "LIMIT":
+        raise OrderSafetyError("exit/flatten roles must use protected LIMIT orders")
+    if intent.reference_price is None:
+        raise OrderSafetyError("exit/flatten roles require a fresh reference_price")
+    if intent.reference_price_age_sec is None:
+        raise OrderSafetyError("exit/flatten roles require reference_price_age_sec")
+    if intent.reference_price_age_sec > DEFAULT_MAX_QUOTE_AGE_SEC:
+        raise OrderSafetyError(
+            f"reference price is stale: {intent.reference_price_age_sec:.2f}s > "
+            f"{DEFAULT_MAX_QUOTE_AGE_SEC:.2f}s"
+        )
+    if intent.price is None:
+        raise OrderSafetyError("protected exit LIMIT order requires price")
+
+    ref = float(intent.reference_price)
+    price = float(intent.price)
+    max_slip = float(intent.max_slippage_pct) / 100.0
+    if intent.side == "SELL":
+        min_price = ref * (1.0 - max_slip)
+        if price < min_price:
+            raise OrderSafetyError(
+                f"SELL exit limit price {price:.4f} is below protected floor {min_price:.4f}"
+            )
+    else:
+        max_price = ref * (1.0 + max_slip)
+        if price > max_price:
+            raise OrderSafetyError(
+                f"BUY exit limit price {price:.4f} is above protected cap {max_price:.4f}"
+            )
+
+
+def _require_positive_finite(value: float | None, field: str, *, allow_none: bool) -> None:
+    if value is None:
+        if allow_none:
+            return
+        raise ValueError(f"{field} is required")
+    numeric = float(value)
+    if not math.isfinite(numeric) or numeric <= 0:
+        raise ValueError(f"{field} must be a positive finite number")
+
+
+def _require_non_negative_finite(value: float | None, field: str, *, allow_none: bool) -> None:
+    if value is None:
+        if allow_none:
+            return
+        raise ValueError(f"{field} is required")
+    numeric = float(value)
+    if not math.isfinite(numeric) or numeric < 0:
+        raise ValueError(f"{field} must be a non-negative finite number")

@@ -125,7 +125,7 @@ Goal: before scaling, verify broker state is the source of truth.
 - Read-only `ZerodhaBrokerAdapter.fetch_position_snapshots()` maps Kite `positions()` into normalized broker position snapshots.
 - `broker-reconcile` compares local paper state against supplied broker order/position snapshots.
 - Critical mismatch examples: missing broker order, side/symbol/quantity mismatch, missing broker position, untracked broker position.
-- `pilot-check` enforces minimal scope before any future pilot: max 2 symbols, quantity 1, max ₹10,000 notional, MIS + MARKET only, and explicit acknowledgement.
+- `pilot-check` enforces minimal scope before any future pilot: max 2 symbols, quantity 1, max ₹10,000 notional, MIS + LIMIT only, and explicit acknowledgement.
 - Real order placement remains impossible in this phase; pilot guardrails report readiness only and return `real_orders_enabled=false`.
 
 Validation:

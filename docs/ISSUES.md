@@ -7,6 +7,53 @@ Supersedes: `docs/PARITY_INCIDENT_LOG.md` (contents migrated below).
 
 ---
 
+## 2026-05-02 — FIXED: LIVE: Broker order intents lacked hard price-safety guards
+
+**Status:** FIXED
+**Severity:** Critical
+
+### Symptom
+
+Future real-order enablement could inherit dry-run payload defaults that allowed unsafe broker
+intents, including zero-priced LIMIT exits, SL/SL-M orders without trigger prices, and raw
+MARKET flatten roles without a fresh reference price or slippage bound.
+
+### Root Cause
+
+`BrokerOrderIntent` validated only basic symbol/side/quantity/order-type shape. The Zerodha
+adapter intentionally blocked real placement, but the payload builder did not encode the
+real-money safety contract that must hold before a future real mode can call Kite.
+
+### Fix
+
+`engine/broker_adapter.py` now validates broker intents before Zerodha dry-run/real paths:
+prices, triggers, reference prices, quote ages, slippage, and market protection must be finite
+and in range; SL/SL-M require triggers; MARKET/SL-M require `market_protection`; and
+exit/close/flatten/emergency roles must use protected LIMIT orders based on a fresh reference
+price. Added `build_protected_flatten_intent()` to construct bounded marketable LIMIT exits from
+latest LTP. `scripts/paper_trading.py real-dry-run-order` now accepts trigger/reference/slippage
+fields for payload drills.
+
+Follow-up audit hardening centralized admin-command validation in `engine/paper_runtime.py`:
+invalid actions, unsafe symbols, oversized risk-budget values, and control characters in
+reason/requester text are rejected or sanitized at the low-level queue writer. The real-pilot
+readiness guard now accepts only LIMIT orders, not raw MARKET orders.
+
+### Related
+
+Focused verification: `uv run pytest tests/test_broker_adapter.py tests/test_execution_safety.py -q`,
+`uv run ruff check engine/broker_adapter.py scripts/paper_trading.py tests/test_broker_adapter.py`,
+and `uv run mypy engine/broker_adapter.py scripts/paper_trading.py --no-error-summary`.
+
+Follow-up audit verification: `uv run pytest tests/test_paper_admin_commands.py
+tests/test_broker_reconciliation.py tests/test_broker_adapter.py tests/test_execution_safety.py -q`,
+`uv run ruff check engine/broker_adapter.py engine/broker_reconciliation.py engine/paper_runtime.py
+scripts/paper_trading.py tests/test_broker_adapter.py tests/test_broker_reconciliation.py
+tests/test_paper_admin_commands.py`, and `uv run mypy engine/broker_adapter.py
+engine/broker_reconciliation.py engine/paper_runtime.py scripts/paper_trading.py --no-error-summary`.
+
+---
+
 ## 2026-05-02 — FIXED: BUG: Review batch correctness and paper-runtime hardening
 
 **Status:** FIXED
