@@ -75,6 +75,12 @@ _resolve_poll_interval = _live_helpers.resolve_poll_interval
 _resolve_candle_interval = _live_helpers.resolve_candle_interval
 _resolve_active_symbols = _live_helpers.resolve_active_symbols
 _floor_bucket_start = _live_helpers.floor_bucket_start
+_normalize_setup_row_direction = _live_helpers.normalize_setup_row_direction
+_log_parity_trace = _live_helpers.log_parity_trace
+_log_bar_heartbeats = _live_helpers.log_bar_heartbeats
+_log_ticker_health = _live_helpers.log_ticker_health
+_ticker_last_tick_age_sec = _live_helpers.ticker_last_tick_age_sec
+_log_direction_readiness = _live_helpers.log_direction_readiness
 _BOOL_TRUE = {"1", "true", "yes", "on"}
 _PARITY_TRACE_ENABLED = str(os.getenv("PIVOT_LIVE_PARITY_TRACE", "0")).strip().lower() in _BOOL_TRUE
 _SETUP_PARITY_CHECK_ENABLED = (
@@ -466,166 +472,6 @@ def _prefetch_setup_rows(
         )
     runtime_state.skipped_setup_rows += len(missing_symbols)
     runtime_state.invalid_setup_rows += len(invalid_symbols)
-
-
-def _normalize_setup_row_direction(setup_row: dict[str, Any]) -> dict[str, Any]:
-    direction = str(setup_row.get("direction") or "").upper()
-    setup_row["direction"] = direction
-    setup_row["direction_pending"] = direction not in {"LONG", "SHORT"}
-    return setup_row
-
-
-def _log_parity_trace(
-    *,
-    session_id: str,
-    candle: ClosedCandle,
-    setup_row: dict[str, Any] | None,
-) -> None:
-    if not _PARITY_TRACE_ENABLED:
-        return
-    logger.info(
-        "PARITY_TRACE session=%s symbol=%s bar_end=%s setup_source=%s tc=%.6f bc=%.6f atr=%.6f"
-        " ohlcv=(%.2f,%.2f,%.2f,%.2f,%.2f)",
-        session_id,
-        candle.symbol,
-        candle.bar_end.isoformat(),
-        str((setup_row or {}).get("setup_source") or "unknown"),
-        float((setup_row or {}).get("tc") or 0.0),
-        float((setup_row or {}).get("bc") or 0.0),
-        float((setup_row or {}).get("atr") or 0.0),
-        candle.open,
-        candle.high,
-        candle.low,
-        candle.close,
-        candle.volume,
-    )
-
-
-def _log_bar_heartbeats(
-    *,
-    session_id: str,
-    active_symbols: list[str],
-    cycle_closed: list[ClosedCandle],
-) -> None:
-    if not cycle_closed:
-        return
-    counts_by_bar: dict[str, int] = {}
-    for candle in cycle_closed:
-        key = candle.bar_end.isoformat()
-        counts_by_bar[key] = counts_by_bar.get(key, 0) + 1
-    for bar_end_iso, closed_count in sorted(counts_by_bar.items()):
-        logger.info(
-            "LIVE_BAR session=%s bar_end=%s closed=%d active=%d",
-            session_id,
-            bar_end_iso,
-            closed_count,
-            len(active_symbols),
-        )
-
-
-def _log_ticker_health(
-    *,
-    session_id: str,
-    ticker_adapter: Any,
-    active_symbols: list[str],
-) -> dict[str, Any] | None:
-    """Emit a one-line ticker health summary. No-op for non-Kite adapters."""
-    if ticker_adapter is None or not hasattr(ticker_adapter, "health_stats"):
-        return None
-    try:
-        stats = ticker_adapter.health_stats()
-        coverage = ticker_adapter.symbol_coverage(active_symbols, within_sec=300.0)
-    except Exception:
-        logger.debug("ticker health_stats failed", exc_info=True)
-        return None
-    logger.info(
-        "TICKER_HEALTH session=%s connected=%s ticks=%d last_tick_age=%s "
-        "closes=%d reconnects=%d subs=%d coverage=%.0f%% (%d/%d) stale=%d missing=%d",
-        session_id,
-        stats["connected"],
-        stats["tick_count"],
-        f"{stats['last_tick_age_sec']:.0f}s" if stats["last_tick_age_sec"] is not None else "none",
-        stats["close_count"],
-        stats["reconnect_count"],
-        stats["subscribed_tokens"],
-        coverage["coverage_pct"],
-        coverage["covered"],
-        coverage["total"],
-        coverage["stale"],
-        coverage["missing"],
-    )
-    return {"stats": stats, "coverage": coverage}
-
-
-def _ticker_last_tick_age_sec(ticker_adapter: Any) -> float | None:
-    """Return last-tick age from either the live or replay adapter API."""
-    if ticker_adapter is None:
-        return None
-
-    stats_fn = getattr(ticker_adapter, "health_stats", None)
-    if callable(stats_fn):
-        try:
-            stats = stats_fn() or {}
-        except Exception:
-            logger.debug("ticker health_stats failed for stale probe", exc_info=True)
-            return None
-        return float(stats.get("last_tick_age_sec") or 0)
-
-    stats_fn = getattr(ticker_adapter, "get_stats", None)
-    if callable(stats_fn):
-        try:
-            stats = stats_fn() or {}
-        except Exception:
-            logger.debug("ticker get_stats failed for stale probe", exc_info=True)
-            return None
-        return float(stats.get("last_tick_age_sec") or 0)
-
-    return None
-
-
-def _log_direction_readiness(
-    *,
-    session_id: str,
-    runtime_state: PaperRuntimeState,
-    active_symbols: list[str],
-) -> dict[str, int | float]:
-    resolved = 0
-    pending = 0
-    missing = 0
-    with_setup = 0
-    for symbol in active_symbols:
-        state = runtime_state.symbols.get(symbol)
-        setup_row = state.setup_row if state is not None else None
-        if setup_row is None:
-            missing += 1
-            continue
-        with_setup += 1
-        if bool(setup_row.get("direction_pending")):
-            pending += 1
-            continue
-        direction = str(setup_row.get("direction") or "").upper()
-        if direction in {"LONG", "SHORT"}:
-            resolved += 1
-        else:
-            pending += 1
-    coverage = (resolved / with_setup) if with_setup else 0.0
-    logger.info(
-        "LIVE_DIRECTION_PREFLIGHT session=%s resolved=%d pending=%d with_setup=%d missing=%d "
-        "coverage=%.0f%%",
-        session_id,
-        resolved,
-        pending,
-        with_setup,
-        missing,
-        coverage * 100,
-    )
-    return {
-        "resolved": resolved,
-        "pending": pending,
-        "missing": missing,
-        "with_setup": with_setup,
-        "coverage_pct": coverage * 100,
-    }
 
 
 async def _process_closed_bar_group(
