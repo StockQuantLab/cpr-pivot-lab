@@ -1,0 +1,48 @@
+name: cpr_current
+description: Active CPR baseline registry promoted on 2026-05-01.
+universe: full_2026_04_30
+symbol_count: 2038
+start_date: 2025-01-01
+end_date: 2026-04-30
+promoted_date: 2026-05-01
+variants:
+  - label: daily_reset_standard_long
+    preset: CPR_LEVELS_STANDARD_LONG
+    direction: LONG
+    compound_equity: false
+    run_id: f4d34a6c2de6
+  - label: daily_reset_standard_short
+    preset: CPR_LEVELS_STANDARD_SHORT
+    direction: SHORT
+    compound_equity: false
+    run_id: d4eae08bb94e
+  - label: daily_reset_risk_long
+    preset: CPR_LEVELS_RISK_LONG
+    direction: LONG
+    compound_equity: false
+    run_id: 5668d519003b
+  - label: daily_reset_risk_short
+    preset: CPR_LEVELS_RISK_SHORT
+    direction: SHORT
+    compound_equity: false
+    run_id: 14eafeeb74e5
+  - label: compound_standard_long
+    preset: CPR_LEVELS_STANDARD_LONG
+    direction: LONG
+    compound_equity: true
+    run_id: fd9481c38098
+  - label: compound_standard_short
+    preset: CPR_LEVELS_STANDARD_SHORT
+    direction: SHORT
+    compound_equity: true
+    run_id: 476eaddfdf1b
+  - label: compound_risk_long
+    preset: CPR_LEVELS_RISK_LONG
+    direction: LONG
+    compound_equity: true
+    run_id: d2a09e41d2b8
+  - label: compound_risk_short
+    preset: CPR_LEVELS_RISK_SHORT
+    direction: SHORT
+    compound_equity: true
+    run_id: 89ef33527ab4

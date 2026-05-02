@@ -66,10 +66,22 @@ pivot-db-init = "scripts.init_postgres:main"
 pivot-paper-trading = "scripts.paper_trading:main"
 # External process supervisor for live paper trading observability
 pivot-paper-supervisor = "scripts.paper_supervisor:main"
+# Canonical paper replay validation bundle
+pivot-paper-validate = "scripts.paper_validate:main"
 # NiceGUI dashboard
 pivot-dashboard = "web.run_nicedash:main"
+# Dashboard HTTP smoke test
+pivot-dashboard-smoke = "scripts.dashboard_smoke:main"
 # Data quality check
 pivot-data-quality = "scripts.data_quality:main"
+# Read-only EOD readiness report
+pivot-eod-status = "scripts.eod_status:main"
+# Inspect writer locks
+pivot-lock-status = "scripts.lock_status:main"
+# Validate machine-readable baseline registry
+pivot-baseline-registry = "scripts.baseline_registry:main"
+# Draft docs/ISSUES.md entries
+pivot-issue-draft = "scripts.issue_draft:main"
 # Gold pipeline
 pivot-gold = "scripts.gold_pipeline:main"
 # Signal alerts

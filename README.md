@@ -134,6 +134,13 @@ doppler run -- uv run pivot-backtest --all --universe-size 0 --strategy CPR_LEVE
 
 # cleanup transient artifacts before rerun
 doppler run -- uv run pivot-clean
+
+# inspect writer locks before retrying failed writers
+uv run pivot-lock-status
+
+# prune bloated local logs/caches safely (dry-run first)
+uv run pivot-clean --dry-run --include-tmp-logs --older-than-days 14
+uv run pivot-clean --include-tmp-logs --older-than-days 14
 ```
 
 ### 7) Analysis apps
@@ -148,7 +155,7 @@ Dashboard URL: `http://127.0.0.1:9999`
 
 ### 8) Daily paper-trading workflow
 
-Run 4 independent paper sessions each trading day: CPR_LEVELS LONG/SHORT, FBR LONG/SHORT.
+Run 2 primary paper sessions each trading day: CPR_LEVELS LONG and CPR_LEVELS SHORT.
 Paper trading IS the validation. See `docs/PAPER_TRADING_RUNBOOK.md` for the full operating guide.
 When you compare a specific paper run to a backtest baseline, use the same explicit strategy flags
 and sizing override. `--risk-based-sizing` must be present on both sides if that baseline used it;
@@ -180,6 +187,26 @@ disk. They do not start a new Kite backfill from a fixed year like 2015.
 On Windows, launch long `pivot-build` and `pivot-paper-trading daily-live` jobs in the
 background and poll their log files under `.tmp_logs/` rather than blocking the interactive
 terminal for the full runtime.
+
+Operational automation:
+
+```bash
+# Read-only EOD readiness report before rerunning ingestion/builds
+doppler run -- uv run pivot-eod-status --date today --trade-date <next_trading_date>
+
+# Canonical replay validation bundle for one historical date
+doppler run -- uv run pivot-paper-validate --trade-date <YYYY-MM-DD>
+
+# Supervised live-paper launch with heartbeat/stdout/stderr files
+doppler run -- uv run pivot-paper-supervisor -- \
+  --multi --strategy CPR_LEVELS --trade-date today
+
+# Dashboard HTTP smoke test once pivot-dashboard is running
+uv run pivot-dashboard-smoke --base-url http://127.0.0.1:9999
+
+# Validate the active 8-run CPR baseline registry
+uv run pivot-baseline-registry --check-db
+```
 
 ```bash
 # One-time or occasional instrument refresh

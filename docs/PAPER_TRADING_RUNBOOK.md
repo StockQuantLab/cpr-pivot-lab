@@ -64,11 +64,13 @@ The commands below are paper/dry-run only; real Zerodha order placement remains 
 
 **Pre-market gate:**
 ```bash
+doppler run -- uv run pivot-eod-status --date <previous_trading_date> --trade-date today
 doppler run -- uv run pivot-paper-trading daily-prepare --trade-date today --all-symbols
 doppler run -- uv run pivot-data-quality --date today
 doppler run -- uv run python scripts/test_kite_websocket.py
 doppler run -- uv run pivot-paper-trading status
 doppler run -- uv run pivot-paper-trading universes
+uv run pivot-lock-status
 ```
 
 Required result:
@@ -77,6 +79,15 @@ Required result:
 - Kite REST and WebSocket both print `OK`.
 - `status` shows no unexpected active sessions before launch.
 - `universes` includes today's `full_YYYY_MM_DD` snapshot.
+- `pivot-lock-status` shows no live writer PID before startup.
+
+**Historical replay validation bundle:**
+```bash
+doppler run -- uv run pivot-paper-validate --trade-date <YYYY-MM-DD>
+```
+
+This runs paper cleanup, daily-prepare, canonical CPR LONG+SHORT `daily-replay --no-alerts`,
+feed audit, and writes `.tmp_logs/paper_validate_<date>.json`.
 
 **Pre-market broker dry-run checks:**
 ```bash

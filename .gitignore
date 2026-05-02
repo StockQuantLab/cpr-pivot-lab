@@ -61,6 +61,7 @@ RESULTS.md
 STATUS.md
 code-review.md
 docs/UI_REDESIGN_PROPOSAL.md
+docs/REVIEW_*.md
 docs/superpowers/
 .tmp_pytest/
 pytest-cache-files-*/
