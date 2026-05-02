@@ -7,6 +7,114 @@ Supersedes: `docs/PARITY_INCIDENT_LOG.md` (contents migrated below).
 
 ---
 
+## 2026-05-01 — OPEN: CPR risk baseline reference is not reproducible after runtime rebuild
+
+**Status:** OPEN — baseline promotion guard required before accepting new CPR baseline family
+**Severity:** High — baseline comparisons can be misleading if the runtime setup surface changed
+
+### Symptom
+
+Rerunning the daily-reset CPR risk baselines with the same saved universe and same visible
+strategy parameters did not reproduce the previous LONG reference run:
+
+- Old LONG reference `82b6b8c1e3fa` (`full_2026_04_27`, 2025-01-01→2026-04-28):
+  3,284 trades, ₹1,047,927 PnL.
+- Repro LONG run `8ebdb3c25632` with the same universe/window/sizing:
+  2,851 trades, ₹907,099 PnL.
+- Old SHORT reference `f7f1a698788f` reproduced closely against `12c5b346efa4`, so the
+  large drift is concentrated in the LONG path.
+
+### Evidence
+
+- Old and repro runs both used `full_2026_04_27` (2,029 symbols).
+- Visible sizing/strategy parameters matched: `capital=100000`, `max_positions=10`,
+  `max_position_pct=0.1`, `risk_based_sizing=True`, `compound_equity=False`,
+  `direction_filter=LONG/SHORT`, `or_minutes=5`, `entry_window_end=10:15`.
+- Quality sort was already present before the old reference run; `select_entries_for_bar()`
+  quality ordering dates to 2026-04-25 and the old reference was created on 2026-04-28.
+- The current runtime state marks 363 of the 602 old-only LONG trades as
+  `strategy_day_state.direction_5 = 'NONE'`; those rows cannot pass the current setup query.
+- Sample contradictions include old archived LONG trades where the current 09:15 close is still
+  inside the CPR band, e.g. `BAJAJHLDNG` 2025-01-02 and `HATSUN` 2025-01-02.
+- `strategy_day_state.direction_5` builder logic was not recently changed; it still uses
+  `or_close_5 > GREATEST(tc, bc)` for LONG and `< LEAST(tc, bc)` for SHORT.
+
+### Root Cause
+
+The old baseline was generated against a different runtime setup surface than the one now in
+`market.duckdb`. The archived baseline rows do not persist enough setup/candidate diagnostics
+to reconstruct which `strategy_day_state` values, candidate ranks, and selected/skipped
+same-bar contenders existed at run time.
+
+This is a baseline reproducibility gap, not proof that quality sort reduced profits. The
+current comparison is mixing an old archived result with a rebuilt runtime state.
+
+### Fix Needed
+
+1. Persist a baseline data fingerprint with every promoted run:
+   - saved universe name and symbol hash,
+   - market/runtime table build timestamp or manifest hash,
+   - `market_day_state` / `strategy_day_state` row counts and max dates,
+   - relevant source parquet manifest hash.
+2. Persist CPR candidate diagnostics for promoted baselines:
+   - setup direction, CPR bounds, OR close, OR/ATR, effective RR, quality score,
+   - candidate rank, selected/skipped status, skip reason, slot count/open slots.
+3. Add a baseline promotion gate:
+   - rerun the same params against the same universe/window before promotion,
+   - fail if trade count/PnL drift exceeds tolerance,
+   - print whether drift is due to universe, setup-state, candidate-selection, or execution.
+4. DONE 2026-05-01: accepted the current rebuilt runtime surface as the new baseline family,
+   promoted the `full_2026_04_30` 8-run set, and deleted the old 2026-04-28 reference rows.
+   The fingerprint/candidate-diagnostics guard is still required before future promotions.
+
+---
+
+## 2026-05-01 — FIXED IN CODE: Compound-risk CPR batch path used raw risk quantity before overlay
+
+**Status:** FIXED IN CODE — targeted tests pass; fixed compound-risk reruns completed
+**Severity:** High for compound-risk baselines; low for daily-reset live paper
+
+### Symptom
+
+The 2026-04-30 current-runtime baseline rerun showed daily-reset and compound-standard improving
+with the new 5-position / ₹2L slot configuration, but compound-risk regressed sharply:
+
+- `RISK_LONG_CMP`: old ₹23.53L → new ₹15.05L, trades 3,282 → 1,109.
+- `RISK_SHORT_CMP`: old ₹29.99L → new ₹17.86L, trades 4,853 → 1,651.
+
+That was inconsistent with the standard compound result and indicated an implementation issue,
+not a valid strategy conclusion.
+
+### Root Cause
+
+In the CPR batch path, `compound_equity=True` plus `risk_based_sizing=True` used the raw
+risk-sized quantity from `scan_cpr_levels_entry()` before the final portfolio overlay. The
+tracker recorded that raw notional during candidate simulation, so cash/slot availability for
+later same-day candidates was distorted before the final overlay later capped allocation.
+
+Daily-reset CPR was not affected because it does not use the compound overlay path.
+
+### Fix
+
+`engine/cpr_atr_strategy.py` now uses `SessionPositionTracker.compute_position_qty()` for
+compound-risk as well as standard/risk daily-reset paths, passing `capital_base` so compound
+slot sizing can grow with equity while still capping notional before the tracker records the
+open position.
+
+Regression coverage was updated in `tests/test_strategy.py` so compound-risk batch sizing is
+capped before tracking instead of preserving raw risk quantity.
+
+### Follow-up
+
+Fixed reruns on `full_2026_04_30`:
+
+- `CPR_LEVELS_RISK_LONG` compound: `08104818d54d`, 2,381 trades, ₹1,707,747 PnL.
+- `CPR_LEVELS_RISK_SHORT` compound: `14beb06cadca`, 3,130 trades, ₹1,669,177 PnL.
+
+The earlier post-fix candidate runs `18c9f0587fd7` and `46b91b4c2842` should not be promoted.
+
+---
+
 ## 2026-04-30 — FIXED: `pivot-data-quality` Windows encoding failure on readiness checkmark
 
 **Status:** FIXED — non-data bug; final readiness passed when rerun with UTF-8 output
@@ -3148,28 +3256,28 @@ Engine changes made in this session:
 
 **Verdict: ACCEPT.** Both directions show clear Calmar improvement with higher PnL and lower MaxDD. The trade-off (lower WR) is expected and acceptable — MOMENTUM_FAIL exits are small losses that prevent deeper SL hits.
 
-### 2026-04-28 follow-up: Apr-28 `u2029` CPR baseline promotion
+### 2026-05-01 follow-up: `full_2026_04_30` CPR baseline promotion
 
-The 2026-04-28 `u2029` runs below supersede the 2026-04-27 `u2029` rows as the active CPR
-comparison set. Daily-reset variants matched the overlapping window through 2026-04-27 exactly;
-compound variants are accepted as current reference rows but should be compared only inside the
-same `u2029` universe family.
+The 2026-05-01 `full_2026_04_30` runs below supersede the 2026-04-28 `u2029` rows as the active
+CPR comparison set. The old 2026-04-28 rows were deleted after the runtime rebuild made their setup
+surface non-reproducible. This promotion also adopts canonical 5-position / ₹2L sizing:
+`max_positions=5`, `capital=200000`, `max_position_pct=0.2`.
 
 New canonical CPR baseline set:
 
 | Mode | Preset | Run ID | Window | P/L | Calmar |
 |------|--------|--------|--------|-----|--------|
-| Daily Reset | `CPR_LEVELS_STANDARD_LONG` | `920f14ee4ea7` | 2025-01-01 → 2026-04-28 | ₹1,055,848 | 201 |
-| Daily Reset | `CPR_LEVELS_STANDARD_SHORT` | `026505f8d6c1` | 2025-01-01 → 2026-04-28 | ₹1,149,596 | 101 |
-| Daily Reset | `CPR_LEVELS_RISK_LONG` | `82b6b8c1e3fa` | 2025-01-01 → 2026-04-28 | ₹1,047,927 | 202 |
-| Daily Reset | `CPR_LEVELS_RISK_SHORT` | `f7f1a698788f` | 2025-01-01 → 2026-04-28 | ₹1,144,828 | 104 |
-| Compound | `CPR_LEVELS_STANDARD_LONG` | `fa35b2a13877` | 2025-01-01 → 2026-04-28 | ₹2,344,200 | 333 |
-| Compound | `CPR_LEVELS_STANDARD_SHORT` | `b7dfa94cec97` | 2025-01-01 → 2026-04-28 | ₹2,978,877 | 177 |
-| Compound | `CPR_LEVELS_RISK_LONG` | `cd842bcbb076` | 2025-01-01 → 2026-04-28 | ₹2,352,553 | 333 |
-| Compound | `CPR_LEVELS_RISK_SHORT` | `8af633d259e1` | 2025-01-01 → 2026-04-28 | ₹2,998,996 | 178 |
+| Daily Reset | `CPR_LEVELS_STANDARD_LONG` | `6a4fca8525c0` | 2025-01-01 → 2026-04-30 | ₹1,710,015 | 207 |
+| Daily Reset | `CPR_LEVELS_STANDARD_SHORT` | `b057ede867a7` | 2025-01-01 → 2026-04-30 | ₹1,626,701 | 91 |
+| Daily Reset | `CPR_LEVELS_RISK_LONG` | `88fe02668a5f` | 2025-01-01 → 2026-04-30 | ₹1,703,478 | 209 |
+| Daily Reset | `CPR_LEVELS_RISK_SHORT` | `a4faf0e2ba5f` | 2025-01-01 → 2026-04-30 | ₹1,647,622 | 97 |
+| Compound | `CPR_LEVELS_STANDARD_LONG` | `9ad2c9922bea` | 2025-01-01 → 2026-04-30 | ₹5,387,307 | 397 |
+| Compound | `CPR_LEVELS_STANDARD_SHORT` | `64d05abd46e2` | 2025-01-01 → 2026-04-30 | ₹5,049,227 | 179 |
+| Compound | `CPR_LEVELS_RISK_LONG` | `08104818d54d` | 2025-01-01 → 2026-04-30 | ₹1,707,747 | 207 |
+| Compound | `CPR_LEVELS_RISK_SHORT` | `14beb06cadca` | 2025-01-01 → 2026-04-30 | ₹1,669,177 | 88 |
 
-Future ~2105-symbol baselines are a universe migration and must be labelled separately. Do not
-compare `u2105` totals against this `u2029` family as a daily extension.
+Future universe changes are migrations and must be labelled separately. Do not compare future
+universe totals against this `full_2026_04_30` family as a daily extension.
 
 ---
 

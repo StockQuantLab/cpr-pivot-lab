@@ -1414,7 +1414,7 @@ class TestPortfolioExecutionOverlay:
         assert high_cap["position_size"] == pytest.approx(3333.0, abs=1.0)
         assert high_cap["position_size"] > low_cap["position_size"]
 
-    def test_cpr_levels_batch_compound_risk_keeps_raw_qty_for_overlay(
+    def test_cpr_levels_batch_compound_risk_caps_qty_before_tracking(
         self, monkeypatch: pytest.MonkeyPatch
     ):
         params = BacktestParams(
@@ -1523,7 +1523,7 @@ class TestPortfolioExecutionOverlay:
         )
 
         assert out["SBIN"]
-        assert captured["position_size"] == pytest.approx(3000.0)
+        assert captured["position_size"] == pytest.approx(1000.0)
 
     def test_scan_cpr_levels_entry_skips_early_failed_candidate(self):
         params = BacktestParams(

@@ -318,6 +318,33 @@ Acceptance:
 - IPO first-day gaps do not block live readiness.
 - Systemic missing source/runtime gaps still block baseline promotion.
 
+### P2 — Baseline Runtime Fingerprints
+
+Goal: make promoted baseline comparisons reproducible without storing a full DuckDB/parquet
+snapshot for every run.
+
+Actions:
+
+1. Store lightweight fingerprints on every saved run:
+   - git commit and strategy preset/config hash
+   - saved universe name, symbol count, and symbol-list hash
+   - source parquet manifest hash or source file fingerprint
+   - runtime table row counts, min/max trade dates, and last build timestamp/hash
+2. Store compact CPR audit rows only for promoted baselines:
+   - setup direction, CPR bounds, OR close, OR/ATR, effective RR, quality score
+   - candidate rank, selected/skipped status, skip reason, slot count/open slots
+3. Do not create full data snapshots for every experiment.
+4. Allow an explicit frozen runtime DB copy only for rare major baseline promotions or release
+   checkpoints, not routine strategy sweeps.
+5. Baseline promotion must rerun the same params/universe/window and fail if drift cannot be
+   explained as universe, runtime-state, candidate-selection, or execution drift.
+
+Acceptance:
+
+- A promoted run can explain future drift without needing the old mutable `market.duckdb`.
+- Storage growth is bounded to hashes plus compact candidate/setup audit rows.
+- Full DB snapshots are manual, named release artifacts only.
+
 ### P3 — EOD Manifest Only If Consumed
 
 Goal: avoid stale artifact bloat.
@@ -490,4 +517,3 @@ The plan is complete when:
 5. Operator can see readiness and exact fix from dashboard.
 6. Agents have one safe decision tree and do not recommend broad repairs first.
 7. Regression tests cover the Apr30 incident class.
-

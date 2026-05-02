@@ -387,8 +387,7 @@ The live engine uses `paper_feed_audit` data to build its bars. The backtest use
 | Live vs exact-feed backtest | **~47-61%** | Orchestration ordering only |
 | Replay vs exact-feed backtest | **~100%** | Same engine, same data |
 
-The ~50% live vs exact-feed gap is irreducible without making the live engine deterministic.
-Live fills `max_positions=10` in WebSocket arrival order (non-deterministic); the backtest
-fills alphabetically. Both start from the same pool of qualified symbols, but the 10-slot
-selection differs. This is expected and acceptable — PnL comparison at the session level
-(not trade level) remains valid.
+The live vs exact-feed gap is reduced by the shared quality selector, but can still appear when
+feed timing differs. Canonical CPR now uses `max_positions=5`; live/replay/backtest all rank
+same-bar candidates through the shared quality selector before filling slots. PnL comparison at
+the session level remains more reliable than exact trade matching for Kite live data.

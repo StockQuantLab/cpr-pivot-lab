@@ -1938,19 +1938,12 @@ class CPRATRBacktest:
                 for selected in selected_entries:
                     symbol = str(selected.get("symbol") or "")
                     setup_row, day_pack = rows_by_symbol[symbol]
-                    if self.params.compound_equity and self.params.risk_based_sizing:
-                        # Keep the raw risk-sized quantity for the overlay pass.
-                        # Compound risk needs the later portfolio pass to apply the
-                        # growing equity/slot cap; pre-clamping here would freeze
-                        # the quantity at the daily-reset slot size.
-                        actual_qty = max(1, int(selected["position_size"]))
-                    else:
-                        actual_qty = tracker.compute_position_qty(
-                            entry_price=float(selected["entry_price"]),
-                            risk_based_sizing=self.params.risk_based_sizing,
-                            candidate_size=int(selected["position_size"]),
-                            capital_base=capital_base,
-                        )
+                    actual_qty = tracker.compute_position_qty(
+                        entry_price=float(selected["entry_price"]),
+                        risk_based_sizing=self.params.risk_based_sizing,
+                        candidate_size=int(selected["position_size"]),
+                        capital_base=capital_base,
+                    )
                     if actual_qty < 1:
                         continue
                     trade = self._simulate_trade(

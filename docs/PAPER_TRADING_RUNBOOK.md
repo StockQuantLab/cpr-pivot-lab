@@ -293,32 +293,32 @@ Reference sets (Apr 2026):
 | Daily Reset Std SHORT | `1d6e5e93618e` | 2025-01-01 → 2026-04-09 | ₹1,041,450 |
 | Daily Reset Std LONG | `84a85d954f99` | 2025-01-01 → 2026-04-09 | ₹827,381 |
 
-**Current CPR baselines (2026-04-28 `u2029` quality-sort refresh on all four CPR presets — use these for current comparisons):**
+**Current CPR baselines (2026-05-01 `full_2026_04_30` / 2038-symbol current-runtime refresh — use these for current comparisons):**
 
 SHORT presets now use `short_trail_atr_multiplier = 1.25`. LONG keeps `trail_atr_multiplier = 1.0`.
+Canonical sizing is now `max_positions=5`, `capital=200000`, `max_position_pct=0.2`.
+Daily-reset risk is the live-paper sizing reference.
 
 | Mode | Preset | Run ID | Start → End | P/L | Calmar |
 |------|--------|--------|-------------|-----|--------|
-| Daily Reset | `CPR_LEVELS_STANDARD_LONG` | `920f14ee4ea7` | 2025-01-01 → 2026-04-28 | ₹1,055,848 | 201 |
-| Daily Reset | `CPR_LEVELS_STANDARD_SHORT` | `026505f8d6c1` | 2025-01-01 → 2026-04-28 | ₹1,149,596 | 101 |
-| Daily Reset | `CPR_LEVELS_RISK_LONG` | `82b6b8c1e3fa` | 2025-01-01 → 2026-04-28 | ₹1,047,927 | 202 |
-| Daily Reset | `CPR_LEVELS_RISK_SHORT` | `f7f1a698788f` | 2025-01-01 → 2026-04-28 | ₹1,144,828 | 104 |
-| Compound | `CPR_LEVELS_STANDARD_LONG` | `fa35b2a13877` | 2025-01-01 → 2026-04-28 | ₹2,344,200 | 333 |
-| Compound | `CPR_LEVELS_STANDARD_SHORT` | `b7dfa94cec97` | 2025-01-01 → 2026-04-28 | ₹2,978,877 | 177 |
-| Compound | `CPR_LEVELS_RISK_LONG` | `cd842bcbb076` | 2025-01-01 → 2026-04-28 | ₹2,352,553 | 333 |
-| Compound | `CPR_LEVELS_RISK_SHORT` | `8af633d259e1` | 2025-01-01 → 2026-04-28 | ₹2,998,996 | 178 |
+| Daily Reset | `CPR_LEVELS_STANDARD_LONG` | `6a4fca8525c0` | 2025-01-01 → 2026-04-30 | ₹1,710,015 | 207 |
+| Daily Reset | `CPR_LEVELS_STANDARD_SHORT` | `b057ede867a7` | 2025-01-01 → 2026-04-30 | ₹1,626,701 | 91 |
+| Daily Reset | `CPR_LEVELS_RISK_LONG` | `88fe02668a5f` | 2025-01-01 → 2026-04-30 | ₹1,703,478 | 209 |
+| Daily Reset | `CPR_LEVELS_RISK_SHORT` | `a4faf0e2ba5f` | 2025-01-01 → 2026-04-30 | ₹1,647,622 | 97 |
+| Compound | `CPR_LEVELS_STANDARD_LONG` | `9ad2c9922bea` | 2025-01-01 → 2026-04-30 | ₹5,387,307 | 397 |
+| Compound | `CPR_LEVELS_STANDARD_SHORT` | `64d05abd46e2` | 2025-01-01 → 2026-04-30 | ₹5,049,227 | 179 |
+| Compound | `CPR_LEVELS_RISK_LONG` | `08104818d54d` | 2025-01-01 → 2026-04-30 | ₹1,707,747 | 207 |
+| Compound | `CPR_LEVELS_RISK_SHORT` | `14beb06cadca` | 2025-01-01 → 2026-04-30 | ₹1,669,177 | 88 |
 
-The 2026-04-28 `u2029` rerun extended the canonical baseline set by one trading day from the
-2026-04-27 `u2029` reference set. Daily-reset variants matched the overlapping window exactly
-through 2026-04-27; Apr 28 was the only source of P/L delta for those four runs. Compound variants
-are accepted as the current comparison set, but their compounding path has small prior-window drift.
-
-Future ~2105-symbol baselines are a deliberate universe migration, not a daily extension of this
-`u2029` family. Keep them labelled separately and compare only within the same universe family.
+The 2026-05-01 refresh supersedes the deleted 2026-04-28 `u2029` baseline rows. The old rows were
+run against a non-reproducible runtime setup surface and should not be used as comparison targets.
+Use `full_2026_04_30` explicitly for reproducible reruns; it matched `canonical_full` at promotion
+time but the dated name is the durable reference.
 
 When extending the v2 set to a later end date, rerun these same eight presets and
 compare the overlapping window only. The incremental window should be the only source
-of P/L delta. Do not infer the reference set from label prefixes alone.
+of P/L delta unless the operator explicitly accepts a universe/runtime-surface migration. Do not
+infer the reference set from label prefixes alone.
 
 Dashboard note:
 - Home page `Recent Backtest Runs` now has a one-click copy icon for `run_id`.

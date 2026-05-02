@@ -500,10 +500,10 @@ Current interpretation:
 
 | Run | Calmar | WR | PF | P/L |
 |---|---:|---:|---:|---:|
-| STD_LONG | 136.2 | 34.6% | 2.42 | ~₹830K |
-| RISK_LONG | 134.5 | 34.6% | 2.44 | ~₹821K |
-| STD_SHORT | 67.6 | 33.7% | 2.07 | ~₹1.04M |
-| RISK_SHORT | 65.9 | 33.7% | 2.09 | ~₹1.03M |
+| STD_LONG `6a4fca8525c0` | 206.9 | 33.5% | 3.39 | ~₹1.71M |
+| RISK_LONG `88fe02668a5f` | 209.1 | 33.4% | 3.44 | ~₹1.70M |
+| STD_SHORT `b057ede867a7` | 90.8 | 29.6% | 2.59 | ~₹1.63M |
+| RISK_SHORT `a4faf0e2ba5f` | 96.7 | 29.8% | 2.65 | ~₹1.65M |
 
 #### What this means
 
@@ -521,8 +521,8 @@ Current interpretation:
 
 #### Pending validation
 
-- Keep the Apr 14 reference baseline fixed unless a future change is explicitly intended to alter
-  the reference behavior.
+- Keep the 2026-05-01 `full_2026_04_30` reference baseline fixed unless a future change is
+  explicitly intended to alter the reference behavior.
 - Use the current reference baseline set for any future regression checks.
 
 #### Measured follow-up hypotheses
@@ -548,12 +548,12 @@ Current interpretation:
      identically to backtest, paper replay, and live.
    - Baselines must be rerun after any such change.
 
-5. **Compound-risk validation COMPLETE (2026-04-13)**
-   - Row-level diff confirmed compounding works:
-     - LONG: 3071/3102 changed (mostly size-only), 6 timing/price changes, 14 removed keys
-     - SHORT: 4526/4579 size-only changes, 3 timing, 5 price, 0 exit-reason changes
-   - New compound-risk baselines: LONG `2039b1e1b52b`, SHORT `c612d451721f`
-   - Historical April 11 baselines were reviewed and retired; the Apr 14 baseline set is now the active reference.
+5. **Compound-risk validation COMPLETE (2026-05-01)**
+   - Backtest compound-risk now uses the same shared `SessionPositionTracker.compute_position_qty()`
+     sizing helper as paper/live.
+   - Active compound-risk baselines: LONG `08104818d54d`, SHORT `14beb06cadca`.
+   - Earlier compound-risk runs created before the sizing-path fix were deleted and must not be
+     used as references.
 
 6. **Compound risk sizing now has explicit semantics**
    - Compound risk mode uses the current session capital base.
