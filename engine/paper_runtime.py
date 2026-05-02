@@ -3,24 +3,20 @@
 from __future__ import annotations
 
 import asyncio
-import html
 import inspect
 import json
 import logging
-import re
 import threading
-from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from collections.abc import Callable
 from datetime import datetime, timedelta
 from datetime import time as dt_time
 from typing import Any, cast
 from zoneinfo import ZoneInfo
 
 from db.duckdb import get_dashboard_db
-from db.paper_db import FeedState, PaperPosition, PaperSession, get_paper_db
+from db.paper_db import FeedState, PaperPosition, PaperSession
 from engine.alert_dispatcher import AlertDispatcher, AlertType, get_alert_config
 from engine.bar_orchestrator import SessionPositionTracker
-from engine.constants import normalize_symbol
 from engine.cpr_atr_shared import (
     CompletedCandleDecision,
     normalize_stop_loss,
@@ -29,39 +25,68 @@ from engine.cpr_atr_shared import (
     scan_cpr_levels_entry,
     split_scale_out_quantity,
 )
-from engine.cpr_atr_strategy import DayPack, StrategyConfig
+from engine.cpr_atr_strategy import DayPack
 from engine.cpr_atr_utils import (
-    TrailingStop,
     calculate_gap_pct,
     calculate_or_atr_ratio,
     calculate_position_size,
     normalize_cpr_bounds,
     resolve_cpr_direction,
 )
-from engine.execution_safety import build_order_idempotency_key, get_default_order_governor
-from engine.strategy_presets import (
-    build_strategy_config_from_overrides as shared_build_strategy_config_from_overrides,
+from engine.execution_safety import build_order_idempotency_key
+from engine.paper_admin import write_admin_command
+from engine.paper_alerts import (
+    _format_close_alert,
+    _format_event_time,
+    _format_open_alert,
+    _format_risk_alert,
+    _parse_session_label,
+)
+from engine.paper_params import (
+    BacktestParams,
+    PaperRuntimeState,
+    SymbolRuntimeState,
+    apply_paper_strategy_defaults,
+    build_backtest_params,
+    build_backtest_params_from_overrides,
+)
+from engine.paper_risk import _risk_limit_reasons
+from engine.paper_store import (
+    _db,
+    append_order_event,
+    get_feed_state,
+    get_session,
+    get_session_positions,
+    open_position,
+    update_session_state,
+)
+from engine.paper_store import (
+    accumulate_session_pnl as _store_accumulate_session_pnl,
+)
+from engine.paper_store import (
+    force_paper_db_sync as _store_force_paper_db_sync,
+)
+from engine.paper_store import (
+    update_position as _store_update_position,
+)
+from engine.paper_summary import (
+    _exit_value_for_position,
+    _float_or_none,
+    build_summary_feed_state,
+    mark_price_for_position,
+    summarize_paper_positions,
+)
+from engine.paper_trailing import (
+    _get_trailing_stop,
+    _updated_trail_state,
+    clear_trailing_stop_cache,
 )
 
 logger = logging.getLogger(__name__)
+build_strategy_config_from_overrides = build_backtest_params_from_overrides
+build_strategy_config = build_backtest_params
 
 _IST = ZoneInfo("Asia/Kolkata")
-_SESSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9_\-:.]+$")
-_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
-_ADMIN_ACTIONS = {
-    "close_positions",
-    "close_all",
-    "set_risk_budget",
-    "pause_entries",
-    "resume_entries",
-    "cancel_pending_intents",
-}
-_ADMIN_TEXT_MAX_LEN = 80
-_ADMIN_MAX_PORTFOLIO_VALUE = 10_000_000.0
-_ADMIN_MAX_POSITIONS = 50
-_ADMIN_MAX_POSITION_PCT = 1.0
-
-BacktestParams = StrategyConfig
 
 # ---------------------------------------------------------------------------
 # Alert dispatcher (lazy singleton — best-effort, never blocks trading)
@@ -79,12 +104,6 @@ _flatten_eod_sent: set[str] = set()
 # In-memory dedup guard for session-start notifications. A retry/restart inside the same
 # process should not spam duplicate "session started" alerts for the same session_id.
 _session_started_sent: set[str] = set()
-_TRAILING_STOP_CACHE: dict[str, TrailingStop] = {}
-_TRAILING_STOP_CACHE_KEYS: dict[str, tuple[Any, ...]] = {}
-
-
-def _html_text(value: object) -> str:
-    return html.escape(_CONTROL_CHARS.sub("", str(value)), quote=True)
 
 
 def _has_flatten_eod_in_alert_log(session_id: str, *, trade_date: str | None = None) -> bool:
@@ -209,76 +228,21 @@ async def shutdown_alert_dispatcher() -> None:
         _background_tasks.clear()
 
 
-_PAPER_DB_IO_LOCK = threading.RLock()
 _MARKET_DB_READ_LOCK = (
     threading.RLock()
 )  # serializes market.duckdb reads across threads (reentrant)
 
 
-def _db():
-    return get_paper_db()
-
-
-async def get_session(session_id: str) -> PaperSession | None:
-    with _PAPER_DB_IO_LOCK:
-        return _db().get_session(session_id)
-
-
-async def get_session_positions(
-    session_id: str, symbol: str | None = None, statuses: list[str] | None = None
-) -> list[PaperPosition]:
-    with _PAPER_DB_IO_LOCK:
-        return _db().get_session_positions(session_id, symbol=symbol, statuses=statuses)
-
-
-async def get_feed_state(session_id: str) -> FeedState | None:
-    with _PAPER_DB_IO_LOCK:
-        return _db().get_feed_state(session_id)
-
-
-async def update_session_state(session_id: str, **kwargs: Any) -> PaperSession | None:
-    with _PAPER_DB_IO_LOCK:
-        return _db().update_session(session_id, **kwargs)
-
-
 async def _accumulate_session_pnl(session_id: str, pnl_delta: float) -> None:
-    """Add a position's realized PnL to the session's running total_pnl.
-
-    Called after each position close so the dashboard can show live PnL
-    during an active trading session without waiting for archive.
-    """
-    with _PAPER_DB_IO_LOCK:
-        session = _db().get_session(session_id)
-        if session is None:
-            return
-        new_total = round(float(session.total_pnl or 0.0) + pnl_delta, 2)
-        _db().update_session(session_id, total_pnl=new_total)
+    await _store_accumulate_session_pnl(session_id, pnl_delta)
 
 
-async def open_position(**kwargs: Any) -> PaperPosition:
-    with _PAPER_DB_IO_LOCK:
-        return _db().open_position(**kwargs)
-
-
-async def append_order_event(**kwargs: Any) -> Any:
-    throttle = bool(kwargs.pop("throttle", True))
-    if throttle:
-        waited = await get_default_order_governor().acquire()
-        if waited > 0:
-            logger.info(
-                "Paper order governor delayed order %.3fs session_id=%s symbol=%s side=%s",
-                waited,
-                kwargs.get("session_id"),
-                kwargs.get("symbol"),
-                kwargs.get("side"),
-            )
-    with _PAPER_DB_IO_LOCK:
-        return _db().append_order_event(**kwargs)
+def force_paper_db_sync(paper_db: Any | None = None) -> None:
+    _store_force_paper_db_sync(paper_db)
 
 
 async def update_position(position_id: str, **kwargs: Any) -> PaperPosition | None:
-    with _PAPER_DB_IO_LOCK:
-        position = _db().update_position(position_id, **kwargs)
+    position = await _store_update_position(position_id, **kwargs)
     status = str(kwargs.get("status") or "").upper()
     if status in {"CLOSED", "FLATTENED"}:
         _clear_trailing_stop_cache(position_id)
@@ -286,149 +250,7 @@ async def update_position(position_id: str, **kwargs: Any) -> PaperPosition | No
 
 
 def _clear_trailing_stop_cache(position_id: str) -> None:
-    key = str(position_id)
-    _TRAILING_STOP_CACHE.pop(key, None)
-    _TRAILING_STOP_CACHE_KEYS.pop(key, None)
-
-
-def force_paper_db_sync(paper_db: Any | None = None) -> None:
-    """Force a replica sync while serializing access to the shared writer DB."""
-    with _PAPER_DB_IO_LOCK:
-        pdb = paper_db or _db()
-        sync = getattr(pdb, "_sync", None)
-        if sync is not None:
-            sync.force_sync(source_conn=getattr(pdb, "con", None))
-
-
-def _format_event_time(event_time: datetime | None) -> str:
-    """Format trade event time as 'HH:MM DD-Mon' for alerts."""
-    if event_time is None:
-        return ""
-    return event_time.strftime("%H:%M %d-%b")
-
-
-def _format_open_alert(
-    *,
-    symbol: str,
-    direction: str,
-    entry_price: float,
-    sl_price: float,
-    target_price: float,
-    sl_distance: float,
-    position_size: int,
-    rr_ratio: float,
-    strategy: str,
-    session_id: str,
-    event_time: datetime | None = None,
-) -> tuple[str, str]:
-    """Format TRADE_OPENED alert subject and body (HTML for Telegram)."""
-    icon = "🟢" if direction == "LONG" else "🔴"
-    clean_symbol = _CONTROL_CHARS.sub("", str(symbol))
-    clean_direction = _CONTROL_CHARS.sub("", str(direction))
-    safe_strategy = _html_text(strategy)
-    safe_session_id = _html_text(str(session_id)[:16])
-    chart_symbol = re.sub(r"[^A-Za-z0-9_.-]", "", str(symbol).upper())
-    subject = f"{icon} {clean_direction} OPENED: {clean_symbol}"
-    time_str = _format_event_time(event_time)
-    risk_rupees = sl_distance * position_size
-    chart_link = (
-        f"📊 <a href='https://www.tradingview.com/chart/?symbol=NSE:{chart_symbol}'>Chart</a>"
-    )
-    body = (
-        f"📥 Entry: <code>₹{entry_price:.2f}</code> | 🛡️ SL: <code>₹{sl_price:.2f}</code>\n"
-        f"🎯 Target: <code>₹{target_price:.2f}</code> | 📏 Qty: <code>{position_size}</code>\n"
-        f"💰 Risk: ₹{risk_rupees:,.0f} ({rr_ratio:.1f}R)"
-        + (f" | 🕒 {time_str}" if time_str else "")
-        + f"\n{chart_link}"
-        + f"\n<i>{safe_strategy} · {safe_session_id}</i>"
-    )
-    return subject, body
-
-
-def _format_close_alert(
-    *,
-    symbol: str,
-    direction: str,
-    entry_price: float,
-    close_price: float,
-    reason: str,
-    realized_pnl: float,
-    duration_bars: int | None = None,
-    strategy: str = "",
-    session_id: str = "",
-    event_time: datetime | None = None,
-) -> tuple[str, str]:
-    """Format TRADE_CLOSED alert subject and body (HTML for Telegram)."""
-    safe_reason = _html_text(reason)
-    safe_strategy = _html_text(strategy)
-    safe_session_id = _html_text(str(session_id)[:16])
-    pnl_pct = (
-        ((close_price - entry_price) / entry_price * 100)
-        if direction == "LONG"
-        else ((entry_price - close_price) / entry_price * 100)
-    )
-    is_win = realized_pnl >= 0
-    result_tag = "WIN" if is_win else "LOSS"
-    icon = "✅" if is_win else "❌"
-    trend_icon = "📈" if is_win else "📉"
-    subject = (
-        f"{icon} [{result_tag}] "
-        f"{_CONTROL_CHARS.sub('', str(symbol))} "
-        f"{_CONTROL_CHARS.sub('', str(direction))} "
-        f"{_CONTROL_CHARS.sub('', str(reason))}"
-    )
-    time_str = _format_event_time(event_time)
-    pnl_display = f"{'+' if is_win else '-'}₹{abs(realized_pnl):,.0f}"
-    chart_symbol = re.sub(r"[^A-Za-z0-9_.-]", "", str(symbol).upper())
-    chart_link = (
-        f"📊 <a href='https://www.tradingview.com/chart/?symbol=NSE:{chart_symbol}'>Chart</a>"
-    )
-    body = (
-        f"💰 P&L: <code>{pnl_display}</code> ({pnl_pct:+.2f}%)\n"
-        f"🏁 Reason: {safe_reason}\n"
-        f"{trend_icon} Exit: <code>{entry_price:.2f}</code> → <code>{close_price:.2f}</code>"
-        + (f"\n🕒 {time_str}" if time_str else "")
-        + (f"\n{chart_link}" if chart_link else "")
-        + (f"\n<i>{safe_strategy} · {safe_session_id}</i>" if strategy else "")
-    )
-    return subject, body
-
-
-def _format_risk_alert(
-    *,
-    reason: str,
-    net_pnl: float,
-    session_id: str,
-    positions_closed: int = 0,
-    total_trades: int | None = None,
-    trade_date: str | None = None,
-) -> tuple[str, str]:
-    """Format risk limit alert (HTML for Telegram — daily summary card style).
-
-    Args:
-        positions_closed: Positions force-closed by this risk event (flatten/loss limit).
-        total_trades: Total trades closed in the session (including earlier SL/target exits).
-            When provided, both lines are shown.
-        trade_date: Trade date string for the summary header.
-    """
-    safe_session_id = _html_text(session_id)
-    pnl_emoji = "📈" if net_pnl >= 0 else "📉"
-    date_str = trade_date if trade_date else ""
-    if date_str and len(date_str) == 10:
-        # Format "2026-04-01" → "01-Apr-2026"
-        from datetime import datetime as _dt
-
-        date_str = _dt.strptime(date_str, "%Y-%m-%d").strftime("%d-%b-%Y")
-    if date_str:
-        subject = f"📊 EOD Summary — {date_str}"
-    else:
-        subject = "📊 EOD Summary"
-    body = (
-        f"Session: <code>{safe_session_id}</code>\n"
-        f"Net P&L: <code>{net_pnl:+,.2f}</code> {pnl_emoji}\n"
-        f"Trades closed: {total_trades if total_trades is not None else positions_closed}"
-    )
-    return subject, body
+    clear_trailing_stop_cache(position_id)
 
 
 def _dispatch_alert(alert_type: AlertType, subject: str, body: str) -> None:
@@ -499,39 +321,6 @@ def dispatch_session_state_alert(
     if details:
         body_lines.append(f"Details: {details}")
     _dispatch_alert(alert_type, subject, "\n".join(body_lines))
-
-
-def _parse_session_label(session_id: str) -> tuple[str, str]:
-    """Extract (short_label, date_label) from session_id for alert subjects.
-
-    'CPR_LEVELS_LONG-2026-04-23-live-kite' → ('CPR LONG', '23 Apr')
-    """
-    parts = str(session_id or "").split("-")
-    label_parts: list[str] = []
-    date_label = ""
-    i = 0
-    while i < len(parts):
-        if len(parts[i]) == 4 and parts[i].isdigit() and i + 2 < len(parts):
-            try:
-                from datetime import date as _date
-
-                d = _date(int(parts[i]), int(parts[i + 1]), int(parts[i + 2]))
-                date_label = d.strftime("%d %b").lstrip("0")
-                break
-            except ValueError, IndexError:
-                pass
-        label_parts.append(parts[i])
-        i += 1
-    raw = "_".join(label_parts)
-    short = (
-        raw.replace("CPR_LEVELS_LONG", "CPR LONG")
-        .replace("CPR_LEVELS_SHORT", "CPR SHORT")
-        .replace("FBR_LONG", "FBR LONG")
-        .replace("FBR_SHORT", "FBR SHORT")
-        .replace("_", " ")
-        .strip()
-    )
-    return short or raw, date_label
 
 
 def dispatch_feed_stale_alert(
@@ -659,221 +448,6 @@ def _hhmm(value: datetime | None) -> str | None:
     if value is None:
         return None
     return value.strftime("%H:%M")
-
-
-def _exit_value_for_position(position: PaperPosition, qty: float, close_price: float) -> float:
-    """Compute exit_value matching backtest's portfolio constraint model.
-
-    Backtest: exit_value = position_value + gross_pnl
-    For SHORT: gross_pnl = qty * (entry - exit) → exit_value = qty * (2*entry - exit)
-    For LONG:  gross_pnl = qty * (exit - entry) → exit_value = qty * exit  (= qty * close)
-    Using the unified formula ensures SHORT exits credit the correct cash amount.
-    """
-    entry = float(position.entry_price or 0.0)
-    direction = str(getattr(position, "direction", "")).upper()
-    if direction == "SHORT":
-        return round(float(qty) * (2.0 * entry - float(close_price)), 2)
-    return round(float(qty) * float(close_price), 2)
-
-
-def _float_or_none(value: Any) -> float | None:
-    if value is None:
-        return None
-    try:
-        return float(value)
-    except TypeError, ValueError:
-        return None
-
-
-def _symbol_price_from_raw_state(raw_state: Any, symbol: str) -> float | None:
-    if isinstance(raw_state, str):
-        try:
-            raw_state = json.loads(raw_state)
-        except json.JSONDecodeError:
-            return None
-    if not isinstance(raw_state, dict):
-        return None
-    symbol_prices = raw_state.get("symbol_last_prices")
-    if isinstance(symbol_prices, dict) and symbol in symbol_prices:
-        return _float_or_none(symbol_prices[symbol])
-    legacy_prices = raw_state.get("prices")
-    if isinstance(legacy_prices, dict) and symbol in legacy_prices:
-        return _float_or_none(legacy_prices[symbol])
-    if raw_state.get("symbol") == symbol:
-        return _float_or_none(raw_state.get("last_price"))
-    return None
-
-
-def mark_price_for_position(position: PaperPosition, feed_state: FeedState | None) -> float | None:
-    direct = _float_or_none(getattr(position, "last_price", None))
-    if direct is not None:
-        return direct
-    if feed_state is None:
-        return None
-    raw_state = getattr(feed_state, "raw_state", None)
-    symbol = str(getattr(position, "symbol", "") or "")
-    symbol_price = _symbol_price_from_raw_state(raw_state, symbol)
-    if symbol_price is not None:
-        return symbol_price
-    return _float_or_none(getattr(feed_state, "last_price", None))
-
-
-def summarize_paper_positions(
-    session: PaperSession, positions: list[PaperPosition], feed_state: FeedState | None
-) -> dict[str, object]:
-    open_positions = [p for p in positions if str(getattr(p, "status", "")).upper() == "OPEN"]
-    closed_positions = [p for p in positions if str(getattr(p, "status", "")).upper() == "CLOSED"]
-
-    def _mtm(position: PaperPosition) -> float:
-        qty = float(
-            getattr(position, "current_qty", None) or getattr(position, "quantity", 0.0) or 0.0
-        )
-        entry = float(getattr(position, "entry_price", 0.0) or 0.0)
-        mark = mark_price_for_position(position, feed_state)
-        if mark is None:
-            mark = entry
-        direction = str(getattr(position, "direction", "")).upper()
-        return (entry - mark) * qty if direction == "SHORT" else (mark - entry) * qty
-
-    realized = sum(
-        float(getattr(position, "realized_pnl", 0.0) or 0.0) for position in closed_positions
-    )
-    unrealized = sum(_mtm(position) for position in open_positions)
-    return {
-        "session_id": getattr(session, "session_id", ""),
-        "name": getattr(session, "name", None),
-        "strategy": getattr(session, "strategy", ""),
-        "status": getattr(session, "status", ""),
-        "feed_status": getattr(feed_state, "status", None),
-        "feed_reason": getattr(feed_state, "stale_reason", None),
-        "open_positions": len(open_positions),
-        "closed_positions": len(closed_positions),
-        "orders": 0,
-        "realized_pnl": round(realized, 2),
-        "unrealized_pnl": round(unrealized, 2),
-        "net_pnl": round(realized + unrealized, 2),
-        "gross_exposure": round(
-            sum(
-                float(getattr(position, "entry_price", 0.0) or 0.0)
-                * float(
-                    getattr(position, "current_qty", None)
-                    or getattr(position, "quantity", 0.0)
-                    or 0.0
-                )
-                for position in open_positions
-            ),
-            2,
-        ),
-        "last_price": getattr(feed_state, "last_price", None) if feed_state else None,
-        "latest_candle_ts": getattr(session, "latest_candle_ts", None),
-        "stale_feed_at": getattr(session, "stale_feed_at", None),
-    }
-
-
-def build_summary_feed_state(
-    *,
-    session_id: str,
-    symbol_last_prices: dict[str, float],
-    last_price: float | None,
-) -> FeedState:
-    """Create a lightweight feed-state object for risk control checks.
-
-    Used by both replay and live runners to pass current price state
-    into enforce_session_risk_controls without a real PostgreSQL feed row.
-    """
-    return FeedState(
-        session_id=session_id,
-        status="OK",
-        last_event_ts=None,
-        last_bar_ts=None,
-        last_price=last_price,
-        stale_reason=None,
-        raw_state={"symbol_last_prices": dict(symbol_last_prices)},
-    )
-
-
-@dataclass(slots=True)
-class SymbolRuntimeState:
-    trade_date: str | None = None
-    candles: list[dict[str, Any]] = field(default_factory=list)
-    time_str: list[str] = field(default_factory=list)
-    opens: list[float] = field(default_factory=list)
-    highs: list[float] = field(default_factory=list)
-    lows: list[float] = field(default_factory=list)
-    closes: list[float] = field(default_factory=list)
-    volumes: list[float] = field(default_factory=list)
-    setup_row: dict[str, Any] | None = None
-    setup_refresh_bar_end: datetime | None = None
-    position_closed_today: bool = False
-    entry_window_closed_without_trade: bool = False
-
-
-@dataclass(slots=True)
-class PaperRuntimeState:
-    symbols: dict[str, SymbolRuntimeState] = field(default_factory=dict)
-    session_params_key: str | None = None
-    session_params: BacktestParams | None = None
-    allow_live_setup_fallback: bool = True
-    bar_end_offset: timedelta | None = None
-    skipped_setup_rows: int = 0
-    invalid_setup_rows: int = 0
-
-    def for_symbol(self, symbol: str) -> SymbolRuntimeState:
-        state = self.symbols.get(symbol)
-        if state is None:
-            state = SymbolRuntimeState()
-            self.symbols[symbol] = state
-        return state
-
-    def get_session_params(self, session: PaperSession) -> BacktestParams:
-        raw_key = json.dumps(
-            {
-                "strategy": getattr(session, "strategy", None),
-                "strategy_params": getattr(session, "strategy_params", {}) or {},
-            },
-            sort_keys=True,
-            default=str,
-            separators=(",", ":"),
-        )
-        if self.session_params is None or self.session_params_key != raw_key:
-            self.session_params = build_backtest_params(session)
-            self.session_params_key = raw_key
-        return self.session_params
-
-
-def build_backtest_params_from_overrides(
-    strategy: str,
-    overrides: Mapping[str, Any] | None = None,
-) -> BacktestParams:
-    return shared_build_strategy_config_from_overrides(strategy, overrides)
-
-
-def apply_paper_strategy_defaults(
-    strategy: str,
-    overrides: Mapping[str, Any] | None = None,
-) -> dict[str, Any]:
-    """Normalize explicit paper overrides without injecting paper-only defaults.
-
-    Paper replay/live/sim should resolve to the same strategy parameters as
-    backtest. This helper only preserves caller-provided overrides and keeps the
-    direction filter canonical for session naming and downstream routing.
-    """
-    _ = str(strategy or "CPR_LEVELS").upper()
-    resolved = dict(overrides or {})
-    resolved["direction_filter"] = str(resolved.get("direction_filter", "BOTH") or "BOTH").upper()
-    return resolved
-
-
-def build_backtest_params(session: PaperSession) -> BacktestParams:
-    strategy = getattr(session, "strategy", None)
-    strategy_params = session.strategy_params or {}
-    if not strategy and isinstance(strategy_params, Mapping):
-        strategy = strategy_params.get("strategy")
-    return build_backtest_params_from_overrides(str(strategy or "CPR_LEVELS"), strategy_params)
-
-
-build_strategy_config_from_overrides = build_backtest_params_from_overrides
-build_strategy_config = build_backtest_params
 
 
 def _build_intraday_summary(
@@ -1818,123 +1392,6 @@ async def flatten_positions_subset(
     return {"session_id": session_id, "closed_positions": len(closed), "positions": closed}
 
 
-def write_admin_command(
-    session_id: str,
-    action: str,
-    *,
-    symbols: list[str] | None = None,
-    portfolio_value: float | None = None,
-    max_positions: int | None = None,
-    max_position_pct: float | None = None,
-    reason: str = "manual",
-    requester: str = "unknown",
-) -> str:
-    """Write a command to the session's admin queue for the live loop to process.
-
-    Actions: 'close_positions' (symbols required), 'close_all',
-    'set_risk_budget', 'pause_entries', 'resume_entries', and
-    'cancel_pending_intents'.
-    Returns the path of the command file written.
-    """
-    import json as _json
-    from pathlib import Path as _Path
-
-    if not _SESSION_ID_PATTERN.fullmatch(str(session_id)):
-        raise ValueError(
-            "session_id contains unsupported characters; allowed: letters, numbers, _, -, :, ."
-        )
-    action = str(action or "").strip()
-    if action not in _ADMIN_ACTIONS:
-        raise ValueError(f"action must be one of: {', '.join(sorted(_ADMIN_ACTIONS))}")
-    clean_symbols = [normalize_symbol(str(s)) for s in (symbols or []) if str(s).strip()]
-    if action == "close_positions" and not clean_symbols:
-        raise ValueError("close_positions requires at least one symbol")
-    if action != "close_positions" and clean_symbols:
-        raise ValueError("symbols are only valid for close_positions")
-    if portfolio_value is not None:
-        portfolio_value = float(portfolio_value)
-        if not 0 < portfolio_value <= _ADMIN_MAX_PORTFOLIO_VALUE:
-            raise ValueError(f"portfolio_value must be > 0 and <= {_ADMIN_MAX_PORTFOLIO_VALUE:g}")
-    if max_positions is not None:
-        max_positions = int(max_positions)
-        if not 1 <= max_positions <= _ADMIN_MAX_POSITIONS:
-            raise ValueError(f"max_positions must be between 1 and {_ADMIN_MAX_POSITIONS}")
-    if max_position_pct is not None:
-        max_position_pct = float(max_position_pct)
-        if not 0 < max_position_pct <= _ADMIN_MAX_POSITION_PCT:
-            raise ValueError(f"max_position_pct must be > 0 and <= {_ADMIN_MAX_POSITION_PCT:g}")
-    if action == "set_risk_budget" and all(
-        value is None for value in (portfolio_value, max_positions, max_position_pct)
-    ):
-        raise ValueError("set_risk_budget requires at least one budget field")
-
-    cmd_dir = _Path(".tmp_logs") / f"cmd_{session_id}"
-    cmd_dir.mkdir(parents=True, exist_ok=True)
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    cmd_file = cmd_dir / f"{ts}_{action}.json"
-    cmd: dict[str, Any] = {
-        "action": action,
-        "reason": _clean_admin_text(reason),
-        "requester": _clean_admin_text(requester),
-    }
-    if clean_symbols:
-        cmd["symbols"] = clean_symbols
-    if portfolio_value is not None:
-        cmd["portfolio_value"] = float(portfolio_value)
-    if max_positions is not None:
-        cmd["max_positions"] = int(max_positions)
-    if max_position_pct is not None:
-        cmd["max_position_pct"] = float(max_position_pct)
-    cmd_file.write_text(_json.dumps(cmd))
-    return str(cmd_file)
-
-
-def _clean_admin_text(value: object) -> str:
-    text = _CONTROL_CHARS.sub("", str(value or "")).strip()
-    return text[:_ADMIN_TEXT_MAX_LEN] or "unknown"
-
-
-def _current_session_time(as_of: datetime) -> dt_time:
-    return dt_time(as_of.hour, as_of.minute, as_of.second)
-
-
-def _risk_limit_reasons(
-    session: PaperSession,
-    as_of: datetime,
-    net_pnl: float,
-) -> list[str]:
-    reasons: list[str] = []
-    flatten_time = getattr(session, "flatten_time", None)
-    if flatten_time is not None:
-        if isinstance(flatten_time, str):
-            from datetime import time as _time
-
-            parts = flatten_time.split(":")
-            if len(parts) < 2:
-                return reasons
-            h, m = int(parts[0]), int(parts[1])
-            s = int(parts[2]) if len(parts) > 2 else 0
-            flatten_time = _time(h, m, s)
-        if _current_session_time(as_of) >= flatten_time:
-            reasons.append(f"flatten_time:{flatten_time.isoformat()}")
-
-    portfolio_value = float(build_backtest_params(session).portfolio_value)
-
-    max_daily_loss_pct = float(getattr(session, "max_daily_loss_pct", 0.0) or 0.0)
-    if max_daily_loss_pct > 0:
-        loss_limit_amount = portfolio_value * max_daily_loss_pct
-        if net_pnl <= (-loss_limit_amount):
-            reasons.append(f"daily_loss_limit:{loss_limit_amount:.2f}")
-
-    max_drawdown_pct = float(getattr(session, "max_drawdown_pct", 0.0) or 0.0)
-    if max_drawdown_pct > 0:
-        drawdown_limit_amount = portfolio_value * max_drawdown_pct
-        if net_pnl <= (-drawdown_limit_amount):
-            reasons.append(f"max_drawdown:{drawdown_limit_amount:.2f}")
-
-    return reasons
-
-
 async def enforce_session_risk_controls(
     *,
     session: Any,
@@ -2027,100 +1484,6 @@ def _entry_candidate(
         "position_size": int(position_size),
         "rr_ratio": float(rr_ratio),
     }
-
-
-def _updated_trail_state(
-    ts: TrailingStop, trail_state: dict[str, Any], candle: dict[str, Any]
-) -> dict[str, Any]:
-    return {
-        **trail_state,
-        "current_sl": float(ts.current_sl),
-        "phase": ts.phase,
-        "highest_since_entry": float(ts.highest_since_entry),
-        "lowest_since_entry": float(ts.lowest_since_entry),
-        "last_candle_ts": _hhmm(candle["bar_end"]),
-    }
-
-
-def _trailing_stop_cache_key(
-    *,
-    position: PaperPosition,
-    trail_state: dict[str, Any],
-    params: BacktestParams,
-) -> tuple[Any, ...]:
-    entry_price = float(trail_state.get("entry_price") or position.entry_price)
-    direction = str(trail_state.get("direction") or position.direction).upper()
-    initial_sl = trail_state.get("initial_sl")
-    if initial_sl is None:
-        initial_sl = position.stop_loss if position.stop_loss is not None else entry_price
-    return (
-        position.position_id,
-        direction,
-        float(entry_price),
-        float(initial_sl),
-        float(trail_state.get("atr") or 0.0),
-        float(trail_state.get("trail_atr_multiplier") or 1.0),
-        float(trail_state.get("rr_ratio") or params.rr_ratio),
-        float(trail_state.get("breakeven_r") or params.breakeven_r),
-    )
-
-
-def _build_trailing_stop(
-    *,
-    position: PaperPosition,
-    trail_state: dict[str, Any],
-    params: BacktestParams,
-) -> TrailingStop:
-    entry_price = float(trail_state.get("entry_price") or position.entry_price)
-    direction = str(trail_state.get("direction") or position.direction).upper()
-    initial_sl = trail_state.get("initial_sl")
-    if initial_sl is None:
-        initial_sl = position.stop_loss if position.stop_loss is not None else entry_price
-    return TrailingStop(
-        entry_price=entry_price,
-        direction=direction,
-        # Preserve lifecycle geometry from the original risk leg. Using current_sl
-        # here collapses sl_distance after breakeven and causes premature
-        # TRAIL transitions.
-        sl_price=float(initial_sl),
-        atr=float(trail_state.get("atr") or 0.0),
-        trail_atr_multiplier=float(trail_state.get("trail_atr_multiplier") or 1.0),
-        rr_ratio=float(trail_state.get("rr_ratio") or params.rr_ratio),
-        breakeven_r=float(trail_state.get("breakeven_r") or params.breakeven_r),
-    )
-
-
-def _get_trailing_stop(
-    position: PaperPosition,
-    params: BacktestParams,
-    trail_state: dict[str, Any],
-) -> TrailingStop:
-    key = str(position.position_id)
-    cache_key = _trailing_stop_cache_key(
-        position=position,
-        trail_state=trail_state,
-        params=params,
-    )
-    cached = _TRAILING_STOP_CACHE.get(key)
-    if cached is None or _TRAILING_STOP_CACHE_KEYS.get(key) != cache_key:
-        cached = _build_trailing_stop(
-            position=position,
-            trail_state=trail_state,
-            params=params,
-        )
-        _TRAILING_STOP_CACHE[key] = cached
-        _TRAILING_STOP_CACHE_KEYS[key] = cache_key
-
-    # Re-sync mutable runtime-derived fields from the persisted trail_state.
-    cached.current_sl = float(trail_state.get("current_sl") or cached.current_sl)
-    cached.phase = str(trail_state.get("phase") or cached.phase)
-    cached.highest_since_entry = float(
-        trail_state.get("highest_since_entry") or cached.highest_since_entry
-    )
-    cached.lowest_since_entry = float(
-        trail_state.get("lowest_since_entry") or cached.lowest_since_entry
-    )
-    return cached
 
 
 async def _open_position_from_candidate(
