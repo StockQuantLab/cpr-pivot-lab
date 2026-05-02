@@ -1072,15 +1072,53 @@ doppler run -- uv run pivot-paper-trading real-dry-run-order \
 
 This prints and records the Zerodha payload with `broker_mode=REAL_DRY_RUN`.
 It is safe for payload validation because the adapter does not call Kite `place_order`.
-Real order placement remains disabled in this phase.
 
-**Real-order safety model (future broker mode):**
+**Manual real-order pilot path:**
 
-Current production code cannot place real Zerodha orders. The only broker-facing path is
-`REAL_DRY_RUN`, which builds and records the payload but never calls Kite `place_order`.
+Real Zerodha order placement is available only through the manual `real-order` CLI command. It is
+off by default and requires both a CLI confirmation flag and Doppler environment gates:
 
-When real placement is implemented later, the accepted exit/flatten shape is protected LIMIT,
-not raw MARKET:
+```bash
+CPR_ZERODHA_REAL_ORDERS_ENABLED=true
+CPR_ZERODHA_REAL_ORDER_ACK=I_UNDERSTAND_REAL_MONEY_ORDERS
+CPR_ZERODHA_REAL_MAX_QTY=1
+CPR_ZERODHA_REAL_MAX_NOTIONAL=10000
+CPR_ZERODHA_REAL_ALLOWED_PRODUCTS=MIS
+CPR_ZERODHA_REAL_ALLOWED_ORDER_TYPES=LIMIT,SL,SL-M
+```
+
+Default real-order safety posture:
+
+- real orders are disabled unless `CPR_ZERODHA_REAL_ORDERS_ENABLED=true`
+- the acknowledgement string must exactly match `I_UNDERSTAND_REAL_MONEY_ORDERS`
+- default pilot scope is max quantity `1`, max notional `₹10,000`, `MIS`, and `LIMIT/SL/SL-M`
+- `MARKET` is not allowed unless explicitly added to `CPR_ZERODHA_REAL_ALLOWED_ORDER_TYPES`
+- every real order requires fresh `--reference-price` and `--reference-price-age-sec`
+- real placement also requires `--confirm-real-order`
+
+Example manual real LIMIT buy:
+
+```bash
+doppler run -- uv run pivot-paper-trading real-order \
+  --session-id manual-pilot-2026-05-04 \
+  --symbol SBIN \
+  --side BUY \
+  --quantity 1 \
+  --role manual \
+  --order-type LIMIT \
+  --price 700 \
+  --reference-price 700 \
+  --reference-price-age-sec 1 \
+  --confirm-real-order
+```
+
+This calls Kite `place_order` only after all gates pass and records the broker payload/order id in
+`paper_orders` with `broker_mode=LIVE`. Automated CPR live sessions still run through the paper
+runtime; strategy-to-real automatic order routing is not enabled here.
+
+**Real-order safety model:**
+
+The accepted exit/flatten shape is protected LIMIT, not raw MARKET:
 
 ```text
 LONG position emergency exit:
@@ -1103,7 +1141,7 @@ Default safety assumptions in code:
 - MARKET/SL-M require Zerodha `market_protection`
 - exit/close/flatten/emergency roles must use protected LIMIT with a fresh reference price
 - stale reference prices are rejected
-- real order placement remains blocked even if `allow_real_orders=True`
+- real order placement remains blocked if either the code gate or Doppler gate is off
 
 Example protected dry-run flatten payload:
 

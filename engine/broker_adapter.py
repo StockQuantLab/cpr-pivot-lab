@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from typing import Any, Protocol
@@ -28,6 +29,15 @@ DEFAULT_EXIT_MAX_SLIPPAGE_PCT = 2.0
 DEFAULT_MAX_QUOTE_AGE_SEC = 5.0
 DEFAULT_MARKET_PROTECTION_PCT = 2.0
 DEFAULT_TICK_SIZE = 0.01
+REAL_ORDER_ENABLE_ENV = "CPR_ZERODHA_REAL_ORDERS_ENABLED"
+REAL_ORDER_ACK_ENV = "CPR_ZERODHA_REAL_ORDER_ACK"
+REAL_ORDER_ACK_VALUE = "I_UNDERSTAND_REAL_MONEY_ORDERS"
+REAL_ORDER_MAX_QTY_ENV = "CPR_ZERODHA_REAL_MAX_QTY"
+REAL_ORDER_MAX_NOTIONAL_ENV = "CPR_ZERODHA_REAL_MAX_NOTIONAL"
+REAL_ORDER_ALLOWED_PRODUCTS_ENV = "CPR_ZERODHA_REAL_ALLOWED_PRODUCTS"
+REAL_ORDER_ALLOWED_ORDER_TYPES_ENV = "CPR_ZERODHA_REAL_ALLOWED_ORDER_TYPES"
+REAL_ORDER_DEFAULT_ALLOWED_PRODUCTS = frozenset({"MIS"})
+REAL_ORDER_DEFAULT_ALLOWED_ORDER_TYPES = frozenset({"LIMIT", "SL", "SL-M"})
 _PROTECTED_EXIT_ROLES = (
     "exit",
     "close",
@@ -37,6 +47,33 @@ _PROTECTED_EXIT_ROLES = (
     "kill",
     "stop",
 )
+
+
+@dataclass(frozen=True, slots=True)
+class RealOrderGuardConfig:
+    enabled: bool = False
+    acknowledgement: str = ""
+    max_quantity: int = 1
+    max_notional: float = 10_000.0
+    allowed_products: frozenset[str] = REAL_ORDER_DEFAULT_ALLOWED_PRODUCTS
+    allowed_order_types: frozenset[str] = REAL_ORDER_DEFAULT_ALLOWED_ORDER_TYPES
+
+    @classmethod
+    def from_env(cls) -> RealOrderGuardConfig:
+        return cls(
+            enabled=_env_flag(REAL_ORDER_ENABLE_ENV),
+            acknowledgement=str(os.getenv(REAL_ORDER_ACK_ENV, "")).strip(),
+            max_quantity=_env_int(REAL_ORDER_MAX_QTY_ENV, default=1),
+            max_notional=_env_float(REAL_ORDER_MAX_NOTIONAL_ENV, default=10_000.0),
+            allowed_products=_env_set(
+                REAL_ORDER_ALLOWED_PRODUCTS_ENV,
+                default=REAL_ORDER_DEFAULT_ALLOWED_PRODUCTS,
+            ),
+            allowed_order_types=_env_set(
+                REAL_ORDER_ALLOWED_ORDER_TYPES_ENV,
+                default=REAL_ORDER_DEFAULT_ALLOWED_ORDER_TYPES,
+            ),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -252,8 +289,7 @@ class ZerodhaBrokerAdapter:
     """Zerodha payload builder.
 
     `REAL_DRY_RUN` intentionally records payloads but never calls Kite `place_order`.
-    Real placement is blocked until a future feature explicitly adds the required
-    environment and CLI guards.
+    Real placement requires explicit code and environment gates.
     """
 
     def __init__(
@@ -263,11 +299,13 @@ class ZerodhaBrokerAdapter:
         governor: OrderRateGovernor | None = None,
         allow_real_orders: bool = False,
         kite_client: Any | None = None,
+        guard_config: RealOrderGuardConfig | None = None,
     ) -> None:
         self.mode = mode.upper()
         self._governor = governor or get_default_order_governor()
         self._allow_real_orders = bool(allow_real_orders)
         self._kite_client = kite_client
+        self._guard_config = guard_config
 
     async def place_order(self, intent: BrokerOrderIntent) -> BrokerExecutionResult:
         await self._governor.acquire()
@@ -288,8 +326,21 @@ class ZerodhaBrokerAdapter:
             raise RealOrderPlacementDisabledError(
                 "Real Zerodha order placement is disabled. Use REAL_DRY_RUN."
             )
-        raise RealOrderPlacementDisabledError(
-            "Real Zerodha order placement is not implemented in this safety phase."
+        guard = self._guard_config or RealOrderGuardConfig.from_env()
+        _validate_real_order_gate(
+            intent=safe_intent,
+            payload=payload,
+            guard=guard,
+            kite_client=self._kite_client,
+        )
+        order_id = _call_kite_place_order(self._kite_client, payload)
+        return BrokerExecutionResult(
+            broker="zerodha",
+            mode=self.mode,
+            status="PLACED",
+            payload=payload,
+            idempotency_key=idempotency_key,
+            exchange_order_id=str(order_id),
         )
 
     async def fetch_order_snapshots(self) -> list[BrokerOrderSnapshot]:
@@ -354,6 +405,45 @@ async def record_real_dry_run_order(
     }
 
 
+async def record_real_order(
+    *,
+    paper_db: Any,
+    intent: BrokerOrderIntent,
+    adapter: ZerodhaBrokerAdapter,
+) -> dict[str, Any]:
+    result = await adapter.place_order(intent)
+    payload_json = json.dumps(result.payload, sort_keys=True, separators=(",", ":"))
+    normalized = intent.normalized()
+    order_id = paper_db.append_order_event(
+        session_id=normalized.session_id,
+        position_id=normalized.position_id,
+        signal_id=normalized.signal_id,
+        symbol=normalized.symbol,
+        side=normalized.side,
+        order_type=normalized.order_type,
+        requested_qty=normalized.quantity,
+        request_price=normalized.price,
+        fill_price=None,
+        fill_qty=0,
+        status="PENDING",
+        requested_at=datetime.now(UTC),
+        exchange_order_id=result.exchange_order_id,
+        idempotency_key=result.idempotency_key,
+        notes="LIVE",
+        broker_mode=result.mode,
+        broker_payload=payload_json,
+    )
+    return {
+        "order_id": order_id,
+        "broker": result.broker,
+        "mode": result.mode,
+        "status": result.status,
+        "idempotency_key": result.idempotency_key,
+        "exchange_order_id": result.exchange_order_id,
+        "payload": result.payload,
+    }
+
+
 def _default_zerodha_tag(session_id: str, role: str) -> str:
     raw = f"cpr-{role}-{session_id}".replace("_", "-")
     safe = "".join(ch for ch in raw.lower() if ch.isalnum() or ch == "-")
@@ -399,6 +489,115 @@ def _validate_protected_exit(intent: BrokerOrderIntent) -> None:
             raise OrderSafetyError(
                 f"BUY exit limit price {price:.4f} is above protected cap {max_price:.4f}"
             )
+
+
+def _validate_real_order_gate(
+    *,
+    intent: BrokerOrderIntent,
+    payload: dict[str, Any],
+    guard: RealOrderGuardConfig,
+    kite_client: Any | None,
+) -> None:
+    if not guard.enabled:
+        raise RealOrderPlacementDisabledError(
+            f"Real Zerodha order placement is disabled by {REAL_ORDER_ENABLE_ENV}."
+        )
+    if guard.acknowledgement != REAL_ORDER_ACK_VALUE:
+        raise RealOrderPlacementDisabledError(
+            f"Set {REAL_ORDER_ACK_ENV}={REAL_ORDER_ACK_VALUE} to acknowledge real-money orders."
+        )
+    if kite_client is None or not callable(getattr(kite_client, "place_order", None)):
+        raise RealOrderPlacementDisabledError("A Kite client with place_order is required.")
+    if intent.product not in guard.allowed_products:
+        raise OrderSafetyError(
+            f"product {intent.product} is not allowed for real orders "
+            f"(allowed={sorted(guard.allowed_products)})"
+        )
+    if intent.order_type not in guard.allowed_order_types:
+        raise OrderSafetyError(
+            f"order_type {intent.order_type} is not allowed for real orders "
+            f"(allowed={sorted(guard.allowed_order_types)})"
+        )
+    if intent.quantity > guard.max_quantity:
+        raise OrderSafetyError(
+            f"quantity {intent.quantity} exceeds real-order max {guard.max_quantity}"
+        )
+    if intent.reference_price is None:
+        raise OrderSafetyError("real orders require a fresh reference_price")
+    if intent.reference_price_age_sec is None:
+        raise OrderSafetyError("real orders require reference_price_age_sec")
+    if intent.reference_price_age_sec > DEFAULT_MAX_QUOTE_AGE_SEC:
+        raise OrderSafetyError(
+            f"reference price is stale: {intent.reference_price_age_sec:.2f}s > "
+            f"{DEFAULT_MAX_QUOTE_AGE_SEC:.2f}s"
+        )
+
+    estimated_notional = _estimated_order_price(intent) * intent.quantity
+    if estimated_notional > guard.max_notional:
+        raise OrderSafetyError(
+            f"estimated notional {estimated_notional:.2f} exceeds real-order max "
+            f"{guard.max_notional:.2f}"
+        )
+    if payload.get("tradingsymbol") != intent.symbol:
+        raise OrderSafetyError("payload symbol mismatch")
+    if payload.get("transaction_type") != intent.side:
+        raise OrderSafetyError("payload side mismatch")
+
+
+def _estimated_order_price(intent: BrokerOrderIntent) -> float:
+    prices = [
+        float(value)
+        for value in (intent.price, intent.trigger_price, intent.reference_price)
+        if value is not None
+    ]
+    if not prices:
+        raise OrderSafetyError("real orders require a price, trigger_price, or reference_price")
+    return max(prices)
+
+
+def _call_kite_place_order(kite_client: Any, payload: dict[str, Any]) -> str:
+    # pykiteconnect v4 place_order has explicit keyword parameters and does not
+    # accept market_protection in the documented signature.
+    kwargs = {key: value for key, value in payload.items() if key != "market_protection"}
+    return kite_client.place_order(**kwargs)
+
+
+def _env_flag(name: str) -> bool:
+    return str(os.getenv(name, "")).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str, *, default: int) -> int:
+    raw = str(os.getenv(name, "")).strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise OrderSafetyError(f"{name} must be an integer") from exc
+    if value <= 0:
+        raise OrderSafetyError(f"{name} must be positive")
+    return value
+
+
+def _env_float(name: str, *, default: float) -> float:
+    raw = str(os.getenv(name, "")).strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise OrderSafetyError(f"{name} must be numeric") from exc
+    if not math.isfinite(value) or value <= 0:
+        raise OrderSafetyError(f"{name} must be a positive finite number")
+    return value
+
+
+def _env_set(name: str, *, default: frozenset[str]) -> frozenset[str]:
+    raw = str(os.getenv(name, "")).strip()
+    if not raw:
+        return default
+    values = frozenset(part.strip().upper() for part in raw.split(",") if part.strip())
+    return values or default
 
 
 def _require_positive_finite(value: float | None, field: str, *, allow_none: bool) -> None:

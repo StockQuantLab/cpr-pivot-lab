@@ -47,6 +47,7 @@ from scripts.paper_broker_cli import (
     _cmd_order,
     _cmd_pilot_check,
     _cmd_real_dry_run_order,
+    _cmd_real_order,
     _load_json_list_arg,
 )
 from scripts.paper_coverage import (
@@ -2562,6 +2563,68 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional event timestamp included in the idempotency key",
     )
     dry_run_order.set_defaults(handler=_cmd_real_dry_run_order)
+
+    real_order = sub.add_parser(
+        "real-order",
+        help="Place a real Zerodha order after Doppler and CLI confirmation gates",
+    )
+    real_order.add_argument("--session-id", required=True, help="Session for the order intent")
+    real_order.add_argument("--symbol", required=True, help="NSE tradingsymbol")
+    real_order.add_argument("--side", required=True, choices=["BUY", "SELL"], help="Order side")
+    real_order.add_argument("--quantity", required=True, type=int, help="Order quantity")
+    real_order.add_argument("--role", default="manual", help="Intent role for idempotency")
+    real_order.add_argument("--position-id", default=None, help="Optional linked position id")
+    real_order.add_argument("--signal-id", type=int, default=None, help="Optional signal id")
+    real_order.add_argument(
+        "--order-type",
+        default="LIMIT",
+        choices=["MARKET", "LIMIT", "SL", "SL-M"],
+        help="Zerodha order type; real-order env default allows LIMIT/SL/SL-M",
+    )
+    real_order.add_argument("--price", type=float, default=None, help="Required for LIMIT/SL")
+    real_order.add_argument(
+        "--trigger-price", type=float, default=None, help="Required for SL/SL-M"
+    )
+    real_order.add_argument(
+        "--reference-price",
+        type=float,
+        required=True,
+        help="Fresh LTP/mark used for real-order guardrails",
+    )
+    real_order.add_argument(
+        "--reference-price-age-sec",
+        type=float,
+        required=True,
+        help="Age in seconds of --reference-price; must be fresh",
+    )
+    real_order.add_argument(
+        "--max-slippage-pct",
+        type=float,
+        default=2.0,
+        help="Max exit/flatten slippage from reference price (default: 2.0)",
+    )
+    real_order.add_argument(
+        "--market-protection",
+        type=float,
+        default=2.0,
+        help="Zerodha market_protection for MARKET/SL-M payloads (default: 2.0)",
+    )
+    real_order.add_argument("--product", default="MIS", help="Zerodha product, default MIS")
+    real_order.add_argument("--exchange", default="NSE", help="Zerodha exchange, default NSE")
+    real_order.add_argument("--variety", default="regular", help="Zerodha variety")
+    real_order.add_argument("--validity", default="DAY", help="Order validity")
+    real_order.add_argument("--tag", default=None, help="Optional Zerodha order tag")
+    real_order.add_argument(
+        "--event-time",
+        default=None,
+        help="Optional event timestamp included in the idempotency key",
+    )
+    real_order.add_argument(
+        "--confirm-real-order",
+        action="store_true",
+        help="Required extra CLI confirmation for real-money order placement",
+    )
+    real_order.set_defaults(handler=_cmd_real_order)
 
     close = sub.add_parser("close-position", help="Close a paper position row")
     close.add_argument("--position-id", required=True, type=int, help="Position to close")

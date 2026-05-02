@@ -120,6 +120,38 @@ def test_paper_trading_parser_supports_feed_audit() -> None:
     assert feed_audit_args.feed_source == "kite"
 
 
+def test_paper_trading_parser_supports_real_order_confirmation() -> None:
+    parser = build_parser()
+
+    args = parser.parse_args(
+        [
+            "real-order",
+            "--session-id",
+            "pilot-1",
+            "--symbol",
+            "SBIN",
+            "--side",
+            "BUY",
+            "--quantity",
+            "1",
+            "--order-type",
+            "LIMIT",
+            "--price",
+            "700",
+            "--reference-price",
+            "700",
+            "--reference-price-age-sec",
+            "1",
+            "--confirm-real-order",
+        ]
+    )
+
+    assert args.command == "real-order"
+    assert args.confirm_real_order is True
+    assert args.order_type == "LIMIT"
+    assert args.reference_price == 700.0
+
+
 def test_paper_trading_parser_supports_replay() -> None:
     parser = build_parser()
 

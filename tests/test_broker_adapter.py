@@ -10,10 +10,12 @@ from engine.broker_adapter import (
     BrokerOrderIntent,
     OrderSafetyError,
     PaperBrokerAdapter,
+    RealOrderGuardConfig,
     RealOrderPlacementDisabledError,
     ZerodhaBrokerAdapter,
     build_protected_flatten_intent,
     record_real_dry_run_order,
+    record_real_order,
 )
 from engine.execution_safety import OrderRateGovernor
 
@@ -316,7 +318,7 @@ def test_protected_flatten_intent_rejects_invalid_side() -> None:
 
 
 @pytest.mark.asyncio
-async def test_real_order_mode_is_blocked_even_with_client() -> None:
+async def test_real_order_mode_is_blocked_without_code_gate() -> None:
     adapter = ZerodhaBrokerAdapter(mode="LIVE", kite_client=object())
 
     with pytest.raises(RealOrderPlacementDisabledError):
@@ -331,16 +333,146 @@ async def test_real_order_mode_is_blocked_even_with_client() -> None:
 
 
 @pytest.mark.asyncio
-async def test_real_order_mode_still_blocked_even_when_allow_flag_true() -> None:
-    adapter = ZerodhaBrokerAdapter(mode="LIVE", allow_real_orders=True, kite_client=object())
+async def test_real_order_mode_is_blocked_without_env_gate() -> None:
+    class FakeKiteClient:
+        def place_order(self, **kwargs):  # pragma: no cover - should never be reached
+            raise AssertionError(f"place_order must not be called: {kwargs}")
 
-    with pytest.raises(RealOrderPlacementDisabledError, match="not implemented"):
+    adapter = ZerodhaBrokerAdapter(
+        mode="LIVE",
+        allow_real_orders=True,
+        kite_client=FakeKiteClient(),
+        guard_config=RealOrderGuardConfig(enabled=False),
+    )
+
+    with pytest.raises(RealOrderPlacementDisabledError, match="disabled"):
         await adapter.place_order(
             BrokerOrderIntent(
                 session_id="paper-live-1",
                 symbol="SBIN",
                 side="BUY",
                 quantity=1,
+                order_type="LIMIT",
+                price=700.0,
+                reference_price=700.0,
+                reference_price_age_sec=1.0,
+            )
+        )
+
+
+@pytest.mark.asyncio
+async def test_real_order_mode_requires_acknowledgement() -> None:
+    class FakeKiteClient:
+        def place_order(self, **kwargs):  # pragma: no cover - should never be reached
+            raise AssertionError(f"place_order must not be called: {kwargs}")
+
+    adapter = ZerodhaBrokerAdapter(
+        mode="LIVE",
+        allow_real_orders=True,
+        kite_client=FakeKiteClient(),
+        guard_config=RealOrderGuardConfig(enabled=True, acknowledgement=""),
+    )
+
+    with pytest.raises(RealOrderPlacementDisabledError, match="acknowledge"):
+        await adapter.place_order(
+            BrokerOrderIntent(
+                session_id="paper-live-1",
+                symbol="SBIN",
+                side="BUY",
+                quantity=1,
+                order_type="LIMIT",
+                price=700.0,
+                reference_price=700.0,
+                reference_price_age_sec=1.0,
+            )
+        )
+
+
+@pytest.mark.asyncio
+async def test_real_order_mode_places_kite_order_when_all_gates_pass() -> None:
+    class FakeKiteClient:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def place_order(self, **kwargs):
+            self.calls.append(kwargs)
+            return "kite-real-1"
+
+    kite = FakeKiteClient()
+    adapter = ZerodhaBrokerAdapter(
+        mode="LIVE",
+        allow_real_orders=True,
+        kite_client=kite,
+        governor=_NoSleepGovernor(),
+        guard_config=RealOrderGuardConfig(
+            enabled=True,
+            acknowledgement="I_UNDERSTAND_REAL_MONEY_ORDERS",
+            max_quantity=1,
+            max_notional=1_000.0,
+            allowed_products=frozenset({"MIS"}),
+            allowed_order_types=frozenset({"LIMIT"}),
+        ),
+    )
+
+    result = await adapter.place_order(
+        BrokerOrderIntent(
+            session_id="paper-live-1",
+            symbol="SBIN",
+            side="BUY",
+            quantity=1,
+            order_type="LIMIT",
+            price=700.0,
+            reference_price=700.0,
+            reference_price_age_sec=1.0,
+            market_protection=2.0,
+        )
+    )
+
+    assert result.status == "PLACED"
+    assert result.exchange_order_id == "kite-real-1"
+    assert kite.calls == [
+        {
+            "variety": "regular",
+            "exchange": "NSE",
+            "tradingsymbol": "SBIN",
+            "transaction_type": "BUY",
+            "quantity": 1,
+            "product": "MIS",
+            "order_type": "LIMIT",
+            "validity": "DAY",
+            "tag": "cpr-manual-paper-liv",
+            "price": 700.0,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_real_order_mode_rejects_disallowed_market_order() -> None:
+    class FakeKiteClient:
+        def place_order(self, **kwargs):  # pragma: no cover - should never be reached
+            raise AssertionError(f"place_order must not be called: {kwargs}")
+
+    adapter = ZerodhaBrokerAdapter(
+        mode="LIVE",
+        allow_real_orders=True,
+        kite_client=FakeKiteClient(),
+        guard_config=RealOrderGuardConfig(
+            enabled=True,
+            acknowledgement="I_UNDERSTAND_REAL_MONEY_ORDERS",
+            allowed_order_types=frozenset({"LIMIT"}),
+        ),
+    )
+
+    with pytest.raises(OrderSafetyError, match="order_type MARKET is not allowed"):
+        await adapter.place_order(
+            BrokerOrderIntent(
+                session_id="paper-live-1",
+                symbol="SBIN",
+                side="BUY",
+                quantity=1,
+                order_type="MARKET",
+                reference_price=700.0,
+                reference_price_age_sec=1.0,
             )
         )
 
@@ -466,5 +598,55 @@ async def test_record_real_dry_run_order_writes_payload_and_dedupes(tmp_path) ->
         payload = json.loads(str(orders[0].broker_payload))
         assert payload["tradingsymbol"] == "TCS"
         assert payload["quantity"] == 3
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_record_real_order_writes_submitted_broker_order(tmp_path) -> None:
+    class FakeKiteClient:
+        def place_order(self, **kwargs):
+            return "kite-real-2"
+
+    db = PaperDB(db_path=tmp_path / "paper.duckdb")
+    try:
+        intent = BrokerOrderIntent(
+            session_id="paper-live-1",
+            symbol="TCS",
+            side="BUY",
+            quantity=1,
+            role="manual",
+            order_type="LIMIT",
+            price=3500.0,
+            reference_price=3500.0,
+            reference_price_age_sec=1.0,
+            event_time="2026-04-28T09:20:00+05:30",
+        )
+        adapter = ZerodhaBrokerAdapter(
+            mode="LIVE",
+            allow_real_orders=True,
+            kite_client=FakeKiteClient(),
+            governor=_NoSleepGovernor(),
+            guard_config=RealOrderGuardConfig(
+                enabled=True,
+                acknowledgement="I_UNDERSTAND_REAL_MONEY_ORDERS",
+                max_quantity=1,
+                max_notional=4_000.0,
+                allowed_order_types=frozenset({"LIMIT"}),
+            ),
+        )
+
+        payload = await record_real_order(paper_db=db, intent=intent, adapter=adapter)
+
+        orders = db.get_session_orders("paper-live-1")
+        assert payload["exchange_order_id"] == "kite-real-2"
+        assert len(orders) == 1
+        assert orders[0].status == "PENDING"
+        assert orders[0].broker_mode == "LIVE"
+        assert orders[0].notes == "LIVE"
+        assert orders[0].exchange_order_id == "kite-real-2"
+        broker_payload = json.loads(str(orders[0].broker_payload))
+        assert broker_payload["tradingsymbol"] == "TCS"
+        assert broker_payload["quantity"] == 1
     finally:
         db.close()

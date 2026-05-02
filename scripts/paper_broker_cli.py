@@ -8,7 +8,12 @@ from pathlib import Path
 from typing import Any
 
 from db.paper_db import get_paper_db
-from engine.broker_adapter import BrokerOrderIntent, ZerodhaBrokerAdapter, record_real_dry_run_order
+from engine.broker_adapter import (
+    BrokerOrderIntent,
+    ZerodhaBrokerAdapter,
+    record_real_dry_run_order,
+    record_real_order,
+)
 from engine.broker_reconciliation import (
     BrokerOrderSnapshot,
     BrokerPositionSnapshot,
@@ -84,7 +89,33 @@ async def _cmd_order(args: argparse.Namespace) -> None:
 
 
 async def _cmd_real_dry_run_order(args: argparse.Namespace) -> None:
-    intent = BrokerOrderIntent(
+    intent = _build_broker_order_intent(args)
+    payload = await record_real_dry_run_order(
+        paper_db=_pdb(),
+        intent=intent,
+        adapter=ZerodhaBrokerAdapter(mode="REAL_DRY_RUN"),
+    )
+    print(json.dumps(payload, default=str, indent=2))
+
+
+async def _cmd_real_order(args: argparse.Namespace) -> None:
+    if not bool(getattr(args, "confirm_real_order", False)):
+        raise SystemExit("--confirm-real-order is required for real Zerodha placement")
+    intent = _build_broker_order_intent(args)
+    payload = await record_real_order(
+        paper_db=_pdb(),
+        intent=intent,
+        adapter=ZerodhaBrokerAdapter(
+            mode="LIVE",
+            allow_real_orders=True,
+            kite_client=_get_kite_client(),
+        ),
+    )
+    print(json.dumps(payload, default=str, indent=2))
+
+
+def _build_broker_order_intent(args: argparse.Namespace) -> BrokerOrderIntent:
+    return BrokerOrderIntent(
         session_id=args.session_id,
         symbol=args.symbol,
         side=args.side,
@@ -106,12 +137,12 @@ async def _cmd_real_dry_run_order(args: argparse.Namespace) -> None:
         tag=args.tag,
         event_time=args.event_time,
     )
-    payload = await record_real_dry_run_order(
-        paper_db=_pdb(),
-        intent=intent,
-        adapter=ZerodhaBrokerAdapter(mode="REAL_DRY_RUN"),
-    )
-    print(json.dumps(payload, default=str, indent=2))
+
+
+def _get_kite_client():
+    from engine.kite_ingestion import get_kite_client
+
+    return get_kite_client()
 
 
 async def _cmd_close_position(args: argparse.Namespace) -> None:
