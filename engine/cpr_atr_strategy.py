@@ -27,9 +27,8 @@ import json
 import logging
 import time
 import uuid
-from bisect import bisect_left, bisect_right
 from collections.abc import Callable, Mapping
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import asdict, replace
 from datetime import date
 from types import SimpleNamespace
 from typing import Any
@@ -49,7 +48,25 @@ from engine.bar_orchestrator import (
     slot_capital_for,
 )
 from engine.constants import preview_list
-from engine.cost_model import CostModel, cost_model_from_name
+from engine.cpr_atr_models import (
+    STRATEGY_VERSION,
+    BacktestParams,
+    DayPack,
+    FunnelCounts,
+    TradeResult,
+)
+from engine.cpr_atr_models import (
+    CPRLevelsParams as CPRLevelsParams,
+)
+from engine.cpr_atr_models import (
+    FBRParams as FBRParams,
+)
+from engine.cpr_atr_models import (
+    StrategyConfig as StrategyConfig,
+)
+from engine.cpr_atr_models import (
+    VirginCPRParams as VirginCPRParams,
+)
 from engine.cpr_atr_shared import (
     TradeLifecycleOutcome,
     get_cpr_entry_scan_start,
@@ -75,18 +92,9 @@ from engine.day_pack_sources import (
     is_feed_audit_pack_source,
     load_feed_audit_day_pack_records,
 )
-from engine.execution_defaults import (
-    DEFAULT_MAX_POSITION_PCT,
-    DEFAULT_MAX_POSITIONS,
-    DEFAULT_PORTFOLIO_VALUE,
-    DEFAULT_POSITION_CAPITAL,
-    DEFAULT_RISK_PCT,
-)
 from engine.progress import BacktestProgress
 
 logger = logging.getLogger(__name__)
-
-STRATEGY_VERSION = "cpr-atr-v3"
 
 
 def get_db() -> BacktestDB:
@@ -124,361 +132,6 @@ def _int_from_mapping(
         return int(str(value))
     except TypeError, ValueError:
         return default
-
-
-# ---------------------------------------------------------------------------
-# Parameters
-# ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class CPRLevelsParams:
-    """Strategy-specific parameters for CPR_LEVELS."""
-
-    cpr_shift_filter: str
-    min_effective_rr: float
-    use_narrowing_filter: bool
-    cpr_entry_start: str
-    cpr_confirm_entry: bool
-    cpr_hold_confirm: bool
-    cpr_min_close_atr: float
-    scale_out_pct: float = 0.0
-    time_stop_bars: int = 0  # exit at close of bar N if MFE < 0.5R (0 = disabled)
-    momentum_confirm: bool = False  # exit at bar 2 open if bar 1 closes adverse
-
-
-@dataclass(frozen=True)
-class FBRParams:
-    """Strategy-specific parameters for failed-breakout reversals."""
-
-    failure_window: int
-    reversal_buffer_pct: float
-    fbr_min_or_atr: float
-    fbr_failure_depth: float
-    fbr_entry_window_end: str
-    use_narrowing_filter: bool
-
-
-@dataclass(frozen=True)
-class VirginCPRParams:
-    """Strategy-specific parameters for VIRGIN_CPR breakout entries."""
-
-    vcpr_confirm_candles: int
-    vcpr_body_pct: float
-    vcpr_sl_mode: str
-    candle_exit: int
-    vcpr_scan_start: str
-    vcpr_scan_end: str
-    vcpr_min_open_dist_atr: float
-
-
-@dataclass
-class StrategyConfig:
-    """CPR-ATR strategy parameters. Change here to test different configs."""
-
-    # CPR filter
-    cpr_percentile: float = 33.0  # Dynamic threshold: P33 of historical widths (bottom third only)
-    cpr_max_width_pct: float = 2.0  # Hard cap — skip days wider than this
-
-    # ATR
-    atr_periods: int = 12  # Last 12 five-min candles of prev day = 1 hour
-
-    # Entry
-    buffer_pct: float = 0.0005  # 0.05% breakout buffer above/below OR
-    rvol_threshold: float = (
-        1.0  # Minimum relative volume on entry candle (average-or-better required)
-    )
-    entry_window_end: str = "10:15"  # Stop looking for entry after this time
-    short_open_to_cpr_atr_min: float = 0.0  # Short-only min distance from open to CPR band
-
-    # Risk management
-    min_sl_atr_ratio: float = 0.5
-    max_sl_atr_ratio: float = (
-        2.0  # Max SL as ATR multiple (was 3.0 — wide SL defeats tight-CPR thesis)
-    )
-    rr_ratio: float = 2.0  # 1:2 risk-reward
-    breakeven_r: float = 1.0  # Move SL to entry at this R-multiple (0.3 = early breakeven)
-    atr_sl_buffer: float = 0.0  # ATR multiplier added as noise buffer beyond OR extreme
-    trail_atr_multiplier: float = 1.0  # LONG trailing SL ATR multiplier once TRAIL begins
-    short_trail_atr_multiplier: float = 1.0  # SHORT trailing SL ATR multiplier
-
-    # Position sizing
-    capital: float = DEFAULT_POSITION_CAPITAL  # Risk-based sizing base for candidate trades
-    risk_pct: float = (
-        DEFAULT_RISK_PCT  # Risk sizing; portfolio overlay is the default execution path
-    )
-    portfolio_value: float = (
-        DEFAULT_PORTFOLIO_VALUE  # Shared portfolio base for execution/reporting
-    )
-    max_positions: int = DEFAULT_MAX_POSITIONS  # Max concurrent intraday positions
-    max_position_pct: float = DEFAULT_MAX_POSITION_PCT  # Max capital allocated to one position
-    risk_based_sizing: bool = False  # Use per-trade risk-based sizing before portfolio overlay
-    compound_equity: bool = False  # Carry forward equity across days (True = old behavior)
-
-    # Time exit
-    time_exit: str = "15:15"  # Close all positions by this time
-
-    # Volume profile lookback
-    rvol_lookback_days: int = 10
-    skip_rvol_check: bool = False  # Set True for faster testing
-    runtime_batch_size: int = 512  # Day-pack fetch batch size; setup always fetched in one shot
-
-    # Trade direction filter: "BOTH" | "LONG" | "SHORT"
-    # For CPR_LEVELS/VIRGIN_CPR: filters setup direction directly (LONG = buy, SHORT = sell).
-    # For FBR: the CLI maps --direction to the *trade* direction; run_backtest.py inverts this
-    # internally so direction_filter here stores the *breakout* direction being scanned
-    # (LONG breakout setup → SHORT reversal trade; SHORT breakdown setup → LONG reversal trade).
-    direction_filter: str = "BOTH"
-
-    # FBR-only: human-readable label for the breakout setup type targeted.
-    # "BREAKOUT"  = scanning for failed LONG breakouts  → produces SHORT reversal trades.
-    # "BREAKDOWN" = scanning for failed SHORT breakdowns → produces LONG reversal trades.
-    # "BOTH" = both setup types. Ignored for CPR_LEVELS/VIRGIN_CPR.
-    fbr_setup_filter: str = "BOTH"
-
-    # Opening Range duration: how many minutes to observe before entry is allowed
-    or_minutes: int = 5  # 5 | 10 | 15 | 30 — wider OR reduces false breakouts
-
-    # OR/ATR ratio filter — skip days where OR is tiny (noise) or huge (exhausted move)
-    or_atr_min: float = 0.3  # Min OR/ATR ratio — skip tiny ORs with no momentum (was 0.0)
-    or_atr_max: float = (
-        2.5  # Max OR/ATR ratio — skip exhausted ORs with no follow-through (was 99.0)
-    )
-
-    # Gap filter — skip days with a large opening gap (tends to fill, fighting the breakout)
-    max_gap_pct: float = 1.5  # Max |gap from prev close| % (was 99.0 — large gaps tend to fill)
-    long_max_gap_pct: float | None = (
-        None  # Optional tighter long-side cap while leaving shorts unchanged
-    )
-
-    # Price filter — skip symbols with prev_close below this threshold (eliminates penny stocks)
-    min_price: float = 0.0  # 0 = no filter; 50 = skip stocks trading below Rs.50
-
-    # Optional market-regime gate:
-    # When enabled, use a broad index snapshot to skip LONG trades on weak days and
-    # SHORT trades on strong days. Leave disabled by default until a regime hypothesis is proven.
-    regime_index_symbol: str = ""
-    regime_min_move_pct: float = 0.0
-    regime_snapshot_minutes: int = 30
-
-    # Optional intraday source override:
-    # Default backtest/replay path uses intraday_day_pack. For exact live-feed parity
-    # analysis, callers can opt into paper_feed_audit for one archived session.
-    pack_source: str = "intraday_day_pack"
-    pack_source_session_id: str = ""
-
-    # Strategy selection: "CPR_LEVELS" | "FBR" | "VIRGIN_CPR"
-    strategy: str = "CPR_LEVELS"
-
-    # Strategy-specific grouped configs
-    cpr_levels_config: CPRLevelsParams = field(
-        default_factory=lambda: CPRLevelsParams(
-            cpr_shift_filter="ALL",
-            min_effective_rr=2.0,
-            use_narrowing_filter=False,
-            cpr_entry_start="",
-            cpr_confirm_entry=False,
-            cpr_hold_confirm=False,
-            cpr_min_close_atr=0.0,
-            scale_out_pct=0.0,
-        )
-    )
-    fbr_config: FBRParams = field(
-        default_factory=lambda: FBRParams(
-            failure_window=8,
-            reversal_buffer_pct=0.001,
-            fbr_min_or_atr=0.5,
-            fbr_failure_depth=0.3,
-            fbr_entry_window_end="10:30",
-            use_narrowing_filter=False,
-        )
-    )
-    virgin_cpr_config: VirginCPRParams = field(
-        default_factory=lambda: VirginCPRParams(
-            vcpr_confirm_candles=1,
-            vcpr_body_pct=0.0,
-            vcpr_sl_mode="ZONE",
-            candle_exit=0,
-            vcpr_scan_start="09:20",
-            vcpr_scan_end="12:30",
-            vcpr_min_open_dist_atr=0.3,
-        )
-    )
-
-    # Transaction costs — default to realistic Zerodha model
-    commission_model: str = "zerodha"  # "zerodha" | "zero"
-    slippage_bps: float = 0.0  # Slippage in basis points per side
-
-    @property
-    def cpr_levels(self) -> CPRLevelsParams:
-        """Expose CPR_LEVELS-specific config as a structured object."""
-        return self.cpr_levels_config
-
-    @property
-    def fbr(self) -> FBRParams:
-        """Expose FBR-specific config as a structured object."""
-        return self.fbr_config
-
-    @property
-    def virgin_cpr(self) -> VirginCPRParams:
-        """Expose VIRGIN_CPR-specific config as a structured object."""
-        return self.virgin_cpr_config
-
-    def get_cost_model(self) -> CostModel:
-        """Create a CostModel from the commission_model and slippage_bps params."""
-        return cost_model_from_name(self.commission_model, slippage_bps=self.slippage_bps)
-
-    def max_gap_for_direction(self, direction: str) -> float:
-        """Return the applicable gap cap for the requested direction."""
-        if direction == "LONG" and self.long_max_gap_pct is not None:
-            return float(self.long_max_gap_pct)
-        return float(self.max_gap_pct)
-
-    def apply_strategy_configs(
-        self,
-        *,
-        cpr_levels: CPRLevelsParams | None = None,
-        fbr: FBRParams | None = None,
-        virgin_cpr: VirginCPRParams | None = None,
-    ) -> StrategyConfig:
-        """
-        Return a copy with updated grouped strategy config objects.
-        """
-        updates: dict[str, object] = {}
-        if cpr_levels is not None:
-            updates["cpr_levels_config"] = cpr_levels
-        if fbr is not None:
-            updates["fbr_config"] = fbr
-        if virgin_cpr is not None:
-            updates["virgin_cpr_config"] = virgin_cpr
-        if not updates:
-            return self
-        return replace(self, **updates)
-
-
-BacktestParams = StrategyConfig
-
-
-# ---------------------------------------------------------------------------
-# Trade result
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class TradeResult:
-    run_id: str
-    symbol: str
-    trade_date: str
-    direction: str
-    entry_time: str | None = None
-    exit_time: str | None = None
-    entry_price: float = 0.0
-    exit_price: float = 0.0
-    sl_price: float = 0.0
-    target_price: float = 0.0
-    profit_loss: float = 0.0
-    profit_loss_pct: float = 0.0
-    exit_reason: str = ""  # "SL" | "TARGET" | "TIME" | "NO_ENTRY"
-    sl_phase: str = ""  # Phase when trade ended
-    atr: float = 0.0
-    cpr_width_pct: float = 0.0
-    cpr_threshold: float = 0.0
-    rvol: float = 0.0
-    position_size: int = 0
-    position_value: float = 0.0
-    strategy_version: str = STRATEGY_VERSION
-    mfe_r: float = 0.0  # Max favorable excursion in R-multiples
-    mae_r: float = 0.0  # Max adverse excursion in R-multiples (negative by convention)
-    or_atr_ratio: float = 0.0  # OR range / ATR (diagnostic: 0.3–1.5 is the sweet spot)
-    gap_pct: float = 0.0  # Gap from previous close % (large gaps tend to fill)
-    # Cost fields (§0.1)
-    gross_pnl: float = 0.0  # PnL before transaction costs
-    total_costs: float = 0.0  # Brokerage + STT + exchange + slippage
-    # Exit diagnostics (§0.3)
-    reached_1r: bool = False  # MFE reached >= 1R during trade
-    reached_2r: bool = False  # MFE reached >= 2R during trade
-    max_r: float = 0.0  # Maximum favorable excursion in R-multiples
-
-
-@dataclass
-class FunnelCounts:
-    """Per-run setup selection funnel counts."""
-
-    run_id: str = ""
-    strategy: str = ""
-    universe_count: int = 0  # Total symbol-days in the universe
-    after_cpr_width: int = 0  # Passed CPR width filter
-    after_direction: int = 0  # Had valid direction (LONG/SHORT, not NONE)
-    after_dir_filter: int = 0  # Passed direction filter (BOTH/LONG/SHORT)
-    after_min_price: int = 0  # Passed min-price filter
-    after_gap: int = 0  # Passed gap filter
-    after_or_atr: int = 0  # Passed OR/ATR filter
-    after_narrowing: int = 0  # Passed narrowing filter (if enabled)
-    after_shift: int = 0  # Passed CPR shift filter (if enabled)
-    entry_triggered: int = 0  # Entry rules met -> trade taken
-
-
-@dataclass
-class DayPack:
-    """Compact per-day intraday payload used by runtime simulation."""
-
-    time_str: list[str]
-    opens: list[float]
-    highs: list[float]
-    lows: list[float]
-    closes: list[float]
-    volumes: list[float]
-    rvol_baseline: list[float | None] | None = None
-    _idx_by_time: dict[str, int] = field(init=False, repr=False)
-
-    def __post_init__(self) -> None:
-        self._idx_by_time = {t: i for i, t in enumerate(self.time_str)}
-
-    def to_frame(self) -> pl.DataFrame:
-        """Materialize a DataFrame view on demand for current strategy logic."""
-        return pl.DataFrame(
-            {
-                "time_str": self.time_str,
-                "open": self.opens,
-                "high": self.highs,
-                "low": self.lows,
-                "close": self.closes,
-                "volume": self.volumes,
-            }
-        )
-
-    def baseline_for_time(self, time_str: str) -> float:
-        """Return RVOL baseline volume for the given candle time, or 0 when unavailable."""
-        idx = self._idx_by_time.get(time_str, -1)
-        if idx < 0:
-            return 0.0
-        return self.baseline_for_index(idx)
-
-    def baseline_for_index(self, idx: int) -> float:
-        """Return RVOL baseline volume for a candle index, or 0 when unavailable."""
-        if not self.rvol_baseline:
-            return 0.0
-        if idx < 0 or idx >= len(self.rvol_baseline):
-            return 0.0
-        val = self.rvol_baseline[idx]
-        if val is None:
-            return 0.0
-        avg = float(val)
-        return avg if avg > 0 else 0.0
-
-    def index_of(self, time_str: str) -> int:
-        """Return exact candle index for a time string, or -1 when absent."""
-        return self._idx_by_time.get(time_str, -1)
-
-    def range_indices(self, start_time: str, end_time: str) -> tuple[int, int]:
-        """Return inclusive index range for [start_time, end_time], or (-1, -1) if empty."""
-        if not self.time_str:
-            return -1, -1
-        lo = bisect_left(self.time_str, start_time)
-        hi = bisect_right(self.time_str, end_time) - 1
-        if lo >= len(self.time_str) or hi < lo:
-            return -1, -1
-        return lo, hi
 
 
 # ---------------------------------------------------------------------------
