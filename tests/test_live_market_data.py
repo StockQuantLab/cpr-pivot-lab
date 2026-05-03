@@ -698,7 +698,6 @@ async def test_run_live_session_uses_websocket_path_when_ticker_adapter_is_provi
 async def test_run_live_session_survives_all_pending_startup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import engine.paper_runtime as paper_runtime
     import scripts.paper_live as paper_live
 
     session = SimpleNamespace(
@@ -760,7 +759,7 @@ async def test_run_live_session_survives_all_pending_startup(
     fake_db = SimpleNamespace(con=FakeCon())
 
     monkeypatch.setattr(paper_live, "get_dashboard_db", lambda: fake_db)
-    monkeypatch.setattr(paper_runtime, "get_dashboard_db", lambda: fake_db)
+    monkeypatch.setattr("engine.paper_setup_loader.get_dashboard_db", lambda: fake_db)
     monkeypatch.setattr(
         paper_live, "pre_filter_symbols_for_strategy", lambda *args, **kwargs: ["SBIN", "RELIANCE"]
     )

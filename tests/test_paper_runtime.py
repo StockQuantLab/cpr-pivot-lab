@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 import engine.paper_runtime as paper_runtime
+import engine.paper_setup_loader as paper_setup_loader
 from engine.bar_orchestrator import SessionPositionTracker
 from engine.cpr_atr_strategy import BacktestParams, CPRLevelsParams, DayPack
 from engine.paper_runtime import (
@@ -339,7 +340,7 @@ def test_load_setup_row_falls_back_to_live_intraday_context(
     class _FakeDB:
         con = _FakeCon()
 
-    monkeypatch.setattr(paper_runtime, "get_dashboard_db", lambda: _FakeDB())
+    monkeypatch.setattr(paper_setup_loader, "get_dashboard_db", lambda: _FakeDB())
 
     row = paper_runtime.load_setup_row(
         "SBIN",
@@ -395,7 +396,7 @@ def test_load_setup_row_waits_for_full_opening_range_window(
     class _FakeDB:
         con = _FakeCon()
 
-    monkeypatch.setattr(paper_runtime, "get_dashboard_db", lambda: _FakeDB())
+    monkeypatch.setattr(paper_setup_loader, "get_dashboard_db", lambda: _FakeDB())
 
     incomplete = paper_runtime.load_setup_row(
         "SBIN",
@@ -624,7 +625,7 @@ async def test_pending_setup_rows_refresh_once_per_bar(
             return FakeResult([row])
 
     monkeypatch.setattr(
-        "engine.paper_runtime.get_dashboard_db",
+        "engine.paper_setup_loader.get_dashboard_db",
         lambda: SimpleNamespace(con=FakeCon()),
     )
     monkeypatch.setattr(
