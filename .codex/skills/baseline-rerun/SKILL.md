@@ -14,20 +14,19 @@ Rerun and verify canonical CPR/FBR baselines for regression control.
 
 ## Current Canonical Set
 
-Use the 2026-05-03 15:00 daily-reset risk rows as the active live-trading comparison target.
-The remaining six rows in the 2026-05-02 `full_2026_04_30` / 2038-symbol CPR baseline family
-are still the historical 15:15 matrix until all eight are intentionally rerun.
+Use the 2026-05-03 15:00 all-8 CPR rerun as the active comparison target. The
+previous 15:15 rows were retired after promotion.
 
 | Variant | Run ID |
 |---|---|
-| STD_LONG | `e811f5bb01e5` |
-| STD_SHORT | `9a2ccbd93c5b` |
-| RISK_LONG | `6d360a20b46c` |
-| RISK_SHORT | `5ebee33228ed` |
-| STD_LONG_CMP | `8bbabe422f9c` |
-| STD_SHORT_CMP | `a700bb027f24` |
-| RISK_LONG_CMP | `480a14f8aa26` |
-| RISK_SHORT_CMP | `f377d33a9157` |
+| STD_LONG | `9a317c93b934` |
+| STD_SHORT | `fc5bca650a39` |
+| RISK_LONG | `c352c2c9e238` |
+| RISK_SHORT | `b4007289822e` |
+| STD_LONG_CMP | `91bfdcbcd776` |
+| STD_SHORT_CMP | `ca7fa0c63e4b` |
+| RISK_LONG_CMP | `b6ac11d6998f` |
+| RISK_SHORT_CMP | `121b2b0c6461` |
 
 Canonical sizing is `max_positions=5`, `capital=200000`, `max_position_pct=0.2`.
 Daily-reset risk (`RISK_LONG` / `RISK_SHORT`) is the live-paper sizing reference.

@@ -310,34 +310,26 @@ Reference sets (Apr 2026):
 | Daily Reset Std SHORT | `1d6e5e93618e` | 2025-01-01 → 2026-04-09 | ₹1,041,450 |
 | Daily Reset Std LONG | `84a85d954f99` | 2025-01-01 → 2026-04-09 | ₹827,381 |
 
-**Current CPR baselines (2026-05-02 `full_2026_04_30` / 2038-symbol review-batch rerun):**
+**Current CPR baselines (2026-05-03 `full_2026_04_30` / 2038-symbol 15:00 all-8 rerun):**
 
 SHORT presets now use `short_trail_atr_multiplier = 1.25`. LONG keeps `trail_atr_multiplier = 1.0`.
 Canonical sizing is now `max_positions=5`, `capital=200000`, `max_position_pct=0.2`.
 Daily-reset risk is the live-paper sizing reference.
-
-15:00 MIS safety reruns supersede the 15:15 daily-reset risk rows for live-trading comparisons:
-
-| Mode | Preset | Run ID | Start → End | P/L | Calmar |
-|------|--------|--------|-------------|-----|--------|
-| Daily Reset | `CPR_LEVELS_RISK_LONG` | `6d360a20b46c` | 2025-01-01 → 2026-04-30 | ₹1,709,319 | 210 |
-| Daily Reset | `CPR_LEVELS_RISK_SHORT` | `5ebee33228ed` | 2025-01-01 → 2026-04-30 | ₹1,620,145 | 95 |
-
-Historical 15:15 matrix retained for context and non-live comparisons:
+The 15:00 MIS safety rerun is now the canonical comparison target for all eight CPR baselines:
 
 | Mode | Preset | Run ID | Start → End | P/L | Calmar |
 |------|--------|--------|-------------|-----|--------|
-| Daily Reset | `CPR_LEVELS_STANDARD_LONG` | `e811f5bb01e5` | 2025-01-01 → 2026-04-30 | ₹1,710,015 | 207 |
-| Daily Reset | `CPR_LEVELS_STANDARD_SHORT` | `9a2ccbd93c5b` | 2025-01-01 → 2026-04-30 | ₹1,626,569 | 91 |
-| Daily Reset | `CPR_LEVELS_RISK_LONG` | `638b343959ad` | 2025-01-01 → 2026-04-30 | ₹1,706,953 | 210 |
-| Daily Reset | `CPR_LEVELS_RISK_SHORT` | `307c3e175a16` | 2025-01-01 → 2026-04-30 | ₹1,643,730 | 96 |
-| Compound | `CPR_LEVELS_STANDARD_LONG` | `8bbabe422f9c` | 2025-01-01 → 2026-04-30 | ₹5,459,694 | 401 |
-| Compound | `CPR_LEVELS_STANDARD_SHORT` | `a700bb027f24` | 2025-01-01 → 2026-04-30 | ₹5,028,099 | 178 |
-| Compound | `CPR_LEVELS_RISK_LONG` | `480a14f8aa26` | 2025-01-01 → 2026-04-30 | ₹1,710,760 | 207 |
-| Compound | `CPR_LEVELS_RISK_SHORT` | `f377d33a9157` | 2025-01-01 → 2026-04-30 | ₹1,652,271 | 87 |
+| Daily Reset | `CPR_LEVELS_STANDARD_LONG` | `9a317c93b934` | 2025-01-01 → 2026-04-30 | ₹1,715,879 | 208 |
+| Daily Reset | `CPR_LEVELS_STANDARD_SHORT` | `fc5bca650a39` | 2025-01-01 → 2026-04-30 | ₹1,602,868 | 89 |
+| Daily Reset | `CPR_LEVELS_RISK_LONG` | `c352c2c9e238` | 2025-01-01 → 2026-04-30 | ₹1,709,319 | 210 |
+| Daily Reset | `CPR_LEVELS_RISK_SHORT` | `b4007289822e` | 2025-01-01 → 2026-04-30 | ₹1,620,145 | 95 |
+| Compound | `CPR_LEVELS_STANDARD_LONG` | `91bfdcbcd776` | 2025-01-01 → 2026-04-30 | ₹5,485,604 | 402 |
+| Compound | `CPR_LEVELS_STANDARD_SHORT` | `ca7fa0c63e4b` | 2025-01-01 → 2026-04-30 | ₹4,928,531 | 175 |
+| Compound | `CPR_LEVELS_RISK_LONG` | `b6ac11d6998f` | 2025-01-01 → 2026-04-30 | ₹1,716,664 | 208 |
+| Compound | `CPR_LEVELS_RISK_SHORT` | `121b2b0c6461` | 2025-01-01 → 2026-04-30 | ₹1,633,514 | 86 |
 
-The 2026-05-01 refresh supersedes the deleted 2026-04-28 `u2029` baseline rows. The old rows were
-run against a non-reproducible runtime setup surface and should not be used as comparison targets.
+The 2026-05-03 promotion supersedes the 2026-05-02 15:15 comparison set and the older deleted
+2026-04-28 `u2029` baseline rows. The retired rows should not be used as comparison targets.
 Use `full_2026_04_30` explicitly for reproducible reruns; it matched `canonical_full` at promotion
 time but the dated name is the durable reference.
 
