@@ -22,8 +22,6 @@ Usage:
 
 from __future__ import annotations
 
-import hashlib
-import json
 import logging
 import time
 import uuid
@@ -45,7 +43,6 @@ from engine.bar_orchestrator import (
     should_process_symbol,
     slot_capital_for,
 )
-from engine.constants import preview_list
 from engine.cpr_atr_models import (
     STRATEGY_VERSION,
     BacktestParams,
@@ -85,6 +82,13 @@ from engine.cpr_atr_utils import (
     calculate_or_atr_ratio,
     calculate_position_size,
     normalize_cpr_bounds,
+)
+from engine.cpr_backtest_helpers import (
+    count_setup_funnel,
+    format_runtime_coverage_error,
+    iter_symbol_batches,
+    make_param_signature,
+    strategy_columns_for_minutes,
 )
 from engine.day_pack_sources import (
     apply_opening_range_from_day_pack,
@@ -729,72 +733,7 @@ class CPRATRBacktest:
         Same params + symbols + date range always produce the same signature.
         Used for grouping and comparison, NOT as the storage identity.
         """
-        p = self.params
-        cpr_cfg = p.cpr_levels
-        fbr_cfg = p.fbr
-        vcpr_cfg = p.virgin_cpr
-        key = {
-            "symbols": sorted(symbols),
-            "start": start,
-            "end": end,
-            "version": STRATEGY_VERSION,
-            "cpr_percentile": p.cpr_percentile,
-            "cpr_max_width_pct": p.cpr_max_width_pct,
-            "atr_periods": p.atr_periods,
-            "buffer_pct": p.buffer_pct,
-            "rvol_threshold": p.rvol_threshold,
-            "min_sl_atr_ratio": p.min_sl_atr_ratio,
-            "max_sl_atr_ratio": p.max_sl_atr_ratio,
-            "rr_ratio": p.rr_ratio,
-            "breakeven_r": p.breakeven_r,
-            "capital": p.capital,
-            "risk_pct": p.risk_pct,
-            "portfolio_value": p.portfolio_value,
-            "max_positions": p.max_positions,
-            "max_position_pct": p.max_position_pct,
-            "risk_based_sizing": p.risk_based_sizing,
-            "entry_window_end": p.entry_window_end,
-            "time_exit": p.time_exit,
-            "short_open_to_cpr_atr_min": p.short_open_to_cpr_atr_min,
-            "skip_rvol": p.skip_rvol_check,
-            "runtime_batch_size": p.runtime_batch_size,
-            "atr_sl_buffer": p.atr_sl_buffer,
-            "direction_filter": p.direction_filter,
-            "fbr_setup_filter": p.fbr_setup_filter,
-            "or_atr_min": p.or_atr_min,
-            "or_atr_max": p.or_atr_max,
-            "max_gap_pct": p.max_gap_pct,
-            "long_max_gap_pct": p.long_max_gap_pct,
-            "min_price": p.min_price,
-            "or_minutes": p.or_minutes,
-            "strategy": p.strategy,
-            "failure_window": fbr_cfg.failure_window,
-            "reversal_buffer_pct": fbr_cfg.reversal_buffer_pct,
-            "fbr_min_or_atr": fbr_cfg.fbr_min_or_atr,
-            "fbr_failure_depth": fbr_cfg.fbr_failure_depth,
-            "fbr_entry_window_end": fbr_cfg.fbr_entry_window_end,
-            "cpr_shift_filter": cpr_cfg.cpr_shift_filter,
-            "min_effective_rr": cpr_cfg.min_effective_rr,
-            "cpr_use_narrowing_filter": cpr_cfg.use_narrowing_filter,
-            "fbr_use_narrowing_filter": fbr_cfg.use_narrowing_filter,
-            "vcpr_confirm_candles": vcpr_cfg.vcpr_confirm_candles,
-            "vcpr_body_pct": vcpr_cfg.vcpr_body_pct,
-            "vcpr_sl_mode": vcpr_cfg.vcpr_sl_mode,
-            "candle_exit": vcpr_cfg.candle_exit,
-            "vcpr_scan_end": vcpr_cfg.vcpr_scan_end,
-            "vcpr_min_open_dist_atr": vcpr_cfg.vcpr_min_open_dist_atr,
-            "vcpr_scan_start": vcpr_cfg.vcpr_scan_start,
-            "cpr_entry_start": cpr_cfg.cpr_entry_start,
-            "cpr_confirm_entry": cpr_cfg.cpr_confirm_entry,
-            "cpr_hold_confirm": cpr_cfg.cpr_hold_confirm,
-            "cpr_min_close_atr": cpr_cfg.cpr_min_close_atr,
-            "scale_out_pct": cpr_cfg.scale_out_pct,
-            "commission_model": p.commission_model,
-            "slippage_bps": p.slippage_bps,
-            "compound_equity": p.compound_equity,
-        }
-        digest = hashlib.sha256(json.dumps(key, sort_keys=True).encode()).hexdigest()[:12]
-        return digest
+        return make_param_signature(self.params, symbols, start, end)
 
     # ------------------------------------------------------------------
     # Batch data fetch — ONE DuckDB query for ALL symbols
@@ -803,10 +742,7 @@ class CPRATRBacktest:
     @staticmethod
     def _iter_symbol_batches(symbols: list[str], batch_size: int) -> list[list[str]]:
         """Split symbols into fixed-size batches, preserving order."""
-        size = max(1, int(batch_size))
-        if not symbols:
-            return []
-        return [symbols[i : i + size] for i in range(0, len(symbols), size)]
+        return iter_symbol_batches(symbols, batch_size)
 
     def _format_runtime_coverage_error(
         self,
@@ -817,35 +753,12 @@ class CPRATRBacktest:
         missing_pack: list[str],
     ) -> str:
         """Build a strict and actionable runtime coverage validation error message."""
-        lines = [
-            (
-                "Runtime table coverage is incomplete for "
-                f"{len(requested_symbols)} requested symbol(s)."
-            )
-        ]
-        if missing_state:
-            lines.append(
-                "- market_day_state missing "
-                f"{len(missing_state)} symbol(s): "
-                f"{preview_list(missing_state)}"
-            )
-        if missing_pack:
-            lines.append(
-                "- intraday_day_pack missing "
-                f"{len(missing_pack)} symbol(s): "
-                f"{preview_list(missing_pack)}"
-            )
-        if missing_strategy:
-            lines.append(
-                "- strategy_day_state missing "
-                f"{len(missing_strategy)} symbol(s): "
-                f"{preview_list(missing_strategy)}"
-            )
-        lines.append(
-            "Run full runtime materialization before backtesting: "
-            "`uv run pivot-build --force --batch-size 128`"
+        return format_runtime_coverage_error(
+            requested_symbols=requested_symbols,
+            missing_state=missing_state,
+            missing_strategy=missing_strategy,
+            missing_pack=missing_pack,
         )
-        return "\n".join(lines)
 
     def _or_columns_for_minutes(self, or_minutes: int) -> tuple[str, str, str]:
         """Return precomputed OR high/low/close columns for the selected OR window."""
@@ -862,16 +775,7 @@ class CPRATRBacktest:
 
     def _strategy_columns_for_minutes(self, or_minutes: int) -> tuple[str, str]:
         """Return strategy_day_state direction/or_atr columns for selected OR window."""
-        mapping = {
-            5: ("direction_5", "or_atr_5"),
-            10: ("direction_10", "or_atr_10"),
-            15: ("direction_15", "or_atr_15"),
-            30: ("direction_30", "or_atr_30"),
-        }
-        cols = mapping.get(or_minutes)
-        if cols is None:
-            raise ValueError(f"Unsupported or_minutes={or_minutes}. Supported: 5, 10, 15, 30")
-        return cols
+        return strategy_columns_for_minutes(or_minutes)
 
     def _count_setup_funnel(self, symbols: list[str], start: str, end: str) -> FunnelCounts:
         """Run staged COUNT queries to measure how many symbol-days pass each filter.
@@ -879,175 +783,13 @@ class CPRATRBacktest:
         Uses conditional aggregation in a single SQL query for CPR_LEVELS and FBR.
         VIRGIN_CPR is not supported yet (returns a minimal FunnelCounts).
         """
-        p = self.params
-        strategy = p.strategy
-        funnel = FunnelCounts(strategy=strategy)
-
-        if not symbols:
-            return funnel
-
-        if is_feed_audit_pack_source(getattr(p, "pack_source", None)):
-            return funnel
-
-        if strategy == "VIRGIN_CPR":
-            # VIRGIN_CPR has a different filter pipeline; skip for now.
-            return funnel
-
-        sym_param = list(symbols)
-        direction_col, or_atr_col = self._strategy_columns_for_minutes(p.or_minutes)
-        cpr_cfg = p.cpr_levels
-        fbr_cfg = p.fbr
-
-        use_narrowing = (
-            cpr_cfg.use_narrowing_filter
-            if strategy == "CPR_LEVELS"
-            else fbr_cfg.use_narrowing_filter
+        return count_setup_funnel(
+            db=self.db,
+            params=self.params,
+            symbols=symbols,
+            start=start,
+            end=end,
         )
-        or_atr_min = (
-            max(p.or_atr_min, fbr_cfg.fbr_min_or_atr) if strategy == "FBR" else p.or_atr_min
-        )
-        regime_close_col = regime_snapshot_close_col(p.regime_snapshot_minutes)
-
-        # Build the CPR shift clause — only applies to CPR_LEVELS
-        shift_clause = "1"  # always true for FBR
-        if strategy == "CPR_LEVELS":
-            shift_clause = "($cpr_shift_filter = 'ALL' OR m.cpr_shift = $cpr_shift_filter)"
-
-        regime_move_expr = (
-            f"CASE WHEN reg.open_915 > 0 AND reg.{regime_close_col} IS NOT NULL "
-            f"THEN ((reg.{regime_close_col} - reg.open_915) / reg.open_915) * 100.0 END"
-        )
-        regime_gate_sql = f"""
-                     AND (
-                         $regime_index_symbol = ''
-                         OR $regime_min_move_pct <= 0
-                         OR (
-                             {regime_move_expr} IS NOT NULL
-                             AND NOT (
-                                 (s.{direction_col} = 'SHORT' AND {regime_move_expr} >= $regime_min_move_pct)
-                                 OR (s.{direction_col} = 'LONG' AND {regime_move_expr} <= -$regime_min_move_pct)
-                             )
-                         )
-                     )
-        """
-
-        query = f"""
-            SELECT
-                COUNT(*) AS universe_count,
-                SUM(CASE
-                    WHEN m.cpr_width_pct < LEAST(m.cpr_threshold_pct, $max_width)
-                    THEN 1 ELSE 0
-                END) AS after_cpr_width,
-                SUM(CASE
-                    WHEN m.cpr_width_pct < LEAST(m.cpr_threshold_pct, $max_width)
-                     AND s.{direction_col} IN ('LONG', 'SHORT')
-                    THEN 1 ELSE 0
-                END) AS after_direction,
-                SUM(CASE
-                    WHEN m.cpr_width_pct < LEAST(m.cpr_threshold_pct, $max_width)
-                     AND s.{direction_col} IN ('LONG', 'SHORT')
-                     AND ($direction_filter = 'BOTH' OR s.{direction_col} = $direction_filter)
-                    THEN 1 ELSE 0
-                END) AS after_dir_filter,
-                SUM(CASE
-                    WHEN m.cpr_width_pct < LEAST(m.cpr_threshold_pct, $max_width)
-                     AND s.{direction_col} IN ('LONG', 'SHORT')
-                     AND ($direction_filter = 'BOTH' OR s.{direction_col} = $direction_filter)
-                     AND ($min_price <= 0 OR m.prev_close >= $min_price)
-{regime_gate_sql}
-                    THEN 1 ELSE 0
-                END) AS after_min_price,
-                SUM(CASE
-                    WHEN m.cpr_width_pct < LEAST(m.cpr_threshold_pct, $max_width)
-                     AND s.{direction_col} IN ('LONG', 'SHORT')
-                     AND ($direction_filter = 'BOTH' OR s.{direction_col} = $direction_filter)
-                     AND ($min_price <= 0 OR m.prev_close >= $min_price)
-                     AND s.gap_abs_pct <= $max_gap
-{regime_gate_sql}
-                    THEN 1 ELSE 0
-                END) AS after_gap,
-                SUM(CASE
-                    WHEN m.cpr_width_pct < LEAST(m.cpr_threshold_pct, $max_width)
-                     AND s.{direction_col} IN ('LONG', 'SHORT')
-                     AND ($direction_filter = 'BOTH' OR s.{direction_col} = $direction_filter)
-                     AND ($min_price <= 0 OR m.prev_close >= $min_price)
-                     AND s.gap_abs_pct <= $max_gap
-                     AND s.{or_atr_col} >= $or_atr_min
-                     AND s.{or_atr_col} <= $or_atr_max
-{regime_gate_sql}
-                    THEN 1 ELSE 0
-                END) AS after_or_atr,
-                SUM(CASE
-                    WHEN m.cpr_width_pct < LEAST(m.cpr_threshold_pct, $max_width)
-                     AND s.{direction_col} IN ('LONG', 'SHORT')
-                     AND ($direction_filter = 'BOTH' OR s.{direction_col} = $direction_filter)
-                     AND ($min_price <= 0 OR m.prev_close >= $min_price)
-                     AND s.gap_abs_pct <= $max_gap
-                     AND s.{or_atr_col} >= $or_atr_min
-                     AND s.{or_atr_col} <= $or_atr_max
-                     AND (NOT $use_narrowing OR CAST(m.is_narrowing AS INTEGER) = 1)
-{regime_gate_sql}
-                    THEN 1 ELSE 0
-                END) AS after_narrowing,
-                SUM(CASE
-                    WHEN m.cpr_width_pct < LEAST(m.cpr_threshold_pct, $max_width)
-                     AND s.{direction_col} IN ('LONG', 'SHORT')
-                     AND ($direction_filter = 'BOTH' OR s.{direction_col} = $direction_filter)
-                     AND ($min_price <= 0 OR m.prev_close >= $min_price)
-                     AND s.gap_abs_pct <= $max_gap
-                     AND s.{or_atr_col} >= $or_atr_min
-                     AND s.{or_atr_col} <= $or_atr_max
-                     AND (NOT $use_narrowing OR CAST(m.is_narrowing AS INTEGER) = 1)
-                     AND ({shift_clause})
-{regime_gate_sql}
-                    THEN 1 ELSE 0
-                END) AS after_shift
-            FROM market_day_state m
-            JOIN strategy_day_state s
-              ON s.symbol = m.symbol AND s.trade_date = m.trade_date
-            LEFT JOIN market_day_state reg
-              ON reg.symbol = $regime_index_symbol
-             AND reg.trade_date = m.trade_date
-            WHERE list_contains($symbols, m.symbol)
-              AND m.trade_date >= $start::DATE
-              AND m.trade_date <= $end::DATE
-        """
-
-        params_dict: dict[str, object] = {
-            "start": start,
-            "end": end,
-            "max_width": p.cpr_max_width_pct,
-            "direction_filter": p.direction_filter,
-            "min_price": p.min_price,
-            "max_gap": p.max_gap_pct,
-            "or_atr_min": or_atr_min,
-            "or_atr_max": p.or_atr_max,
-            "use_narrowing": use_narrowing,
-            "symbols": sym_param,
-            "regime_index_symbol": str(p.regime_index_symbol or "").upper(),
-            "regime_min_move_pct": float(p.regime_min_move_pct or 0.0),
-        }
-        if strategy == "CPR_LEVELS":
-            params_dict["cpr_shift_filter"] = cpr_cfg.cpr_shift_filter
-
-        try:
-            row = self.db.con.execute(query, params_dict).fetchone()
-        except Exception as e:
-            logger.warning("Setup funnel query failed: %s", e)
-            return funnel
-
-        if row:
-            funnel.universe_count = int(row[0] or 0)
-            funnel.after_cpr_width = int(row[1] or 0)
-            funnel.after_direction = int(row[2] or 0)
-            funnel.after_dir_filter = int(row[3] or 0)
-            funnel.after_min_price = int(row[4] or 0)
-            funnel.after_gap = int(row[5] or 0)
-            funnel.after_or_atr = int(row[6] or 0)
-            funnel.after_narrowing = int(row[7] or 0)
-            funnel.after_shift = int(row[8] or 0)
-
-        return funnel
 
     def _get_all_setups_batch(self, symbols: list[str], start: str, end: str) -> pl.DataFrame:
         """Load all setup rows from market_day_state (no raw-candle fallback path)."""
