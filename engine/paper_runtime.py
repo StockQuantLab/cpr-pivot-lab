@@ -900,11 +900,12 @@ async def enforce_session_risk_controls(
     positions = await get_session_positions(session.session_id)
     summary = summarize_paper_positions(session, positions, feed_state)
     realized_pnl = float(summary.get("realized_pnl", 0.0) or 0.0)
-    await update_session_state(session.session_id, daily_pnl_used=realized_pnl)
+    risk_pnl = float(summary.get("net_pnl", realized_pnl) or 0.0)
+    await update_session_state(session.session_id, daily_pnl_used=risk_pnl)
 
-    reasons = _risk_limit_reasons(session, as_of, realized_pnl)
+    reasons = _risk_limit_reasons(session, as_of, risk_pnl)
     if not reasons:
-        return {"triggered": False, "daily_pnl_used": realized_pnl, "reasons": []}
+        return {"triggered": False, "daily_pnl_used": risk_pnl, "reasons": []}
 
     flatten_kwargs: dict[str, Any] = {
         "notes": f"{notes_prefix}: {', '.join(reasons)}",
@@ -917,7 +918,7 @@ async def enforce_session_risk_controls(
     # No need to send a second DAILY_LOSS_LIMIT alert here.
     return {
         "triggered": True,
-        "daily_pnl_used": realized_pnl,
+        "daily_pnl_used": risk_pnl,
         "reasons": reasons,
         "flatten": flatten_result,
     }
@@ -1278,7 +1279,12 @@ async def _advance_open_position(
             "symbol": position.symbol,
             "partial_qty": float(decision.fills[0][0]),
             "partial_exit_price": float(decision.fills[0][1]),
-            "exit_value": float(decision.fills[0][0]) * float(decision.fills[0][1]),
+            "exit_value": _exit_value_for_position(
+                position,
+                float(decision.fills[0][0]),
+                float(decision.fills[0][1]),
+            ),
+            "remaining_qty": remaining_qty,
             "next_trail_state": next_trail_state,
         }
 
@@ -1600,7 +1606,11 @@ async def process_closed_candle(
                 float(advance.get("exit_value") or 0.0),
             )
         elif advance.get("action") == "PARTIAL":
-            position_tracker.credit_cash(float(advance.get("exit_value") or 0.0))
+            position_tracker.record_partial(
+                str(candle.symbol),
+                float(advance.get("exit_value") or 0.0),
+                float(advance.get("remaining_qty") or 0.0),
+            )
         return {
             "symbol": candle.symbol,
             "opened": 0,

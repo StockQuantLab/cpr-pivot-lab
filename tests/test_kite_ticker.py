@@ -210,6 +210,32 @@ def test_kite_ticker_adapter_updates_subscriptions(monkeypatch) -> None:
     assert ticker.closed is True
 
 
+def test_kite_ticker_adapter_does_not_mark_failed_subscribe_as_active(monkeypatch) -> None:
+    _install_fake_kite(monkeypatch)
+    adapter = KiteTickerAdapter()
+    builder = FiveMinuteCandleBuilder(interval_minutes=5)
+    adapter.register_session("A", ["SBIN"], builder)
+    ticker = adapter._ticker
+    assert ticker is not None
+
+    original_subscribe = ticker.subscribe
+    subscribe_attempts: list[list[int]] = []
+
+    def fail_subscribe(tokens: list[int]) -> None:
+        subscribe_attempts.append(list(tokens))
+        if tokens == [2]:
+            raise RuntimeError("subscribe failed")
+        original_subscribe(tokens)
+
+    ticker.subscribe = fail_subscribe
+    adapter.update_symbols("A", ["SBIN", "TCS"])
+
+    assert 2 not in adapter._subscribed_tokens
+    adapter._reconcile_subscriptions()
+    assert subscribe_attempts[-2:] == [[2], [2]]
+    adapter.close()
+
+
 def test_kite_ticker_adapter_batches_snapshots_per_builder(monkeypatch) -> None:
     _install_fake_kite(monkeypatch)
     adapter = KiteTickerAdapter()

@@ -263,7 +263,7 @@ async def test_cmd_flatten_both_queues_long_and_short(tmp_path, monkeypatch, cap
             return SimpleNamespace(
                 fetchall=lambda: [
                     ("CPR_LEVELS_LONG-2026-04-24-live-kite", "LONG", "ACTIVE"),
-                    ("CPR_LEVELS_SHORT-2026-04-24-live-kite", "SHORT", "ACTIVE"),
+                    ("CPR_LEVELS_SHORT-2026-04-24-live-kite", "SHORT", "FAILED"),
                 ]
             )
 

@@ -1119,7 +1119,7 @@ async def test_process_closed_candle_rejects_non_cpr_strategy(
 
 
 @pytest.mark.asyncio
-async def test_enforce_session_risk_controls_ignores_unrealized_daily_loss(
+async def test_enforce_session_risk_controls_flattens_on_unrealized_daily_loss(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     session = SimpleNamespace(
@@ -1173,11 +1173,11 @@ async def test_enforce_session_risk_controls_ignores_unrealized_daily_loss(
         ),
     )
 
-    assert result["triggered"] is False
-    assert result["daily_pnl_used"] == pytest.approx(0.0)
-    assert result["reasons"] == []
-    assert session_updates[0]["daily_pnl_used"] == pytest.approx(0.0)
-    assert flatten_calls == []
+    assert result["triggered"] is True
+    assert result["daily_pnl_used"] == pytest.approx(-2000.0)
+    assert result["reasons"] == ["daily_loss_limit:1000.00"]
+    assert session_updates[0]["daily_pnl_used"] == pytest.approx(-2000.0)
+    assert "daily_loss_limit:1000.00" in str(flatten_calls[0]["notes"])
 
 
 @pytest.mark.asyncio
@@ -1237,6 +1237,124 @@ async def test_enforce_session_risk_controls_flattens_on_realized_daily_loss(
     assert result["daily_pnl_used"] == pytest.approx(-2000.0)
     assert result["reasons"] == ["daily_loss_limit:1000.00"]
     assert session_updates[0]["daily_pnl_used"] == pytest.approx(-2000.0)
+    assert "daily_loss_limit:1000.00" in str(flatten_calls[0]["notes"])
+
+
+@pytest.mark.asyncio
+async def test_enforce_session_risk_controls_includes_open_unrealized_loss(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = SimpleNamespace(
+        session_id="paper-risk-open-loss",
+        flatten_time=None,
+        max_daily_loss_pct=0.01,
+        strategy_params={"portfolio_value": 100_000},
+    )
+    positions = [
+        SimpleNamespace(
+            symbol="SBIN",
+            status="OPEN",
+            current_qty=100.0,
+            quantity=100.0,
+            entry_price=100.0,
+            direction="LONG",
+            realized_pnl=0.0,
+            last_price=80.0,
+        )
+    ]
+    session_updates: list[dict[str, object]] = []
+    flatten_calls: list[dict[str, object]] = []
+
+    async def fake_get_session_positions(session_id: str, symbol: str | None = None, statuses=None):
+        await asyncio.sleep(0)
+        return positions
+
+    async def fake_update_session_state(session_id: str, **kwargs):
+        await asyncio.sleep(0)
+        session_updates.append(kwargs)
+        return session
+
+    async def fake_flatten_session_positions(
+        session_id: str, *, notes: str | None = None, feed_state=None
+    ):
+        await asyncio.sleep(0)
+        flatten_calls.append({"notes": notes, "feed_state": feed_state})
+        return {"session_id": session_id, "closed_positions": 1}
+
+    monkeypatch.setattr("engine.paper_runtime.get_session_positions", fake_get_session_positions)
+    monkeypatch.setattr("engine.paper_runtime.update_session_state", fake_update_session_state)
+    monkeypatch.setattr(
+        "engine.paper_runtime.flatten_session_positions", fake_flatten_session_positions
+    )
+
+    result = await enforce_session_risk_controls(
+        session=session,
+        as_of=datetime(2024, 1, 1, 10, 0),
+        feed_state=SimpleNamespace(
+            raw_state={"symbol_last_prices": {"SBIN": 80.0}}, last_price=80.0
+        ),
+    )
+
+    assert result["triggered"] is True
+    assert result["daily_pnl_used"] == pytest.approx(-2000.0)
+    assert result["reasons"] == ["daily_loss_limit:1000.00"]
+    assert session_updates[0]["daily_pnl_used"] == pytest.approx(-2000.0)
+    assert "daily_loss_limit:1000.00" in str(flatten_calls[0]["notes"])
+
+
+@pytest.mark.asyncio
+async def test_enforce_session_risk_controls_malformed_flatten_time_keeps_loss_checks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = SimpleNamespace(
+        session_id="paper-risk-bad-time",
+        flatten_time="bad",
+        max_daily_loss_pct=0.01,
+        strategy_params={"portfolio_value": 100_000},
+    )
+    positions = [
+        SimpleNamespace(
+            symbol="SBIN",
+            status="CLOSED",
+            current_qty=0.0,
+            quantity=100.0,
+            entry_price=100.0,
+            direction="LONG",
+            realized_pnl=-2_000.0,
+            last_price=80.0,
+        )
+    ]
+    flatten_calls: list[dict[str, object]] = []
+
+    async def fake_get_session_positions(session_id: str, symbol: str | None = None, statuses=None):
+        await asyncio.sleep(0)
+        return positions
+
+    async def fake_update_session_state(session_id: str, **kwargs):
+        await asyncio.sleep(0)
+        return session
+
+    async def fake_flatten_session_positions(
+        session_id: str, *, notes: str | None = None, feed_state=None
+    ):
+        await asyncio.sleep(0)
+        flatten_calls.append({"notes": notes})
+        return {"session_id": session_id, "closed_positions": 0}
+
+    monkeypatch.setattr("engine.paper_runtime.get_session_positions", fake_get_session_positions)
+    monkeypatch.setattr("engine.paper_runtime.update_session_state", fake_update_session_state)
+    monkeypatch.setattr(
+        "engine.paper_runtime.flatten_session_positions", fake_flatten_session_positions
+    )
+
+    result = await enforce_session_risk_controls(
+        session=session,
+        as_of=datetime(2024, 1, 1, 10, 0),
+        feed_state=SimpleNamespace(raw_state={"symbol_last_prices": {}}, last_price=None),
+    )
+
+    assert result["triggered"] is True
+    assert result["reasons"] == ["daily_loss_limit:1000.00"]
     assert "daily_loss_limit:1000.00" in str(flatten_calls[0]["notes"])
 
 

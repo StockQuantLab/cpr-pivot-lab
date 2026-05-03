@@ -127,6 +127,110 @@ def test_fetch_live_readiness_uses_dashboard_replica(monkeypatch: pytest.MonkeyP
     assert result["blocking_missing_counts"] == {"market_day_state": 2}
 
 
+def test_fetch_live_readiness_defaults_to_prepared_runtime_date(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from scripts import data_quality
+
+    class FakeDB:
+        def get_table_max_trade_dates(self, tables):
+            return {
+                "intraday_day_pack": "2026-04-30",
+                "cpr_daily": "2026-05-04",
+                "cpr_thresholds": "2026-05-04",
+                "market_day_state": "2026-05-04",
+                "strategy_day_state": "2026-05-04",
+            }
+
+    fake_db = FakeDB()
+    monkeypatch.setattr(web_state, "get_dashboard_db", lambda: fake_db)
+
+    def fake_report(trade_date: str, *, db=None):
+        assert trade_date == "2026-05-04"
+        assert db is fake_db
+        return {
+            "trade_date": trade_date,
+            "ready": True,
+            "requested_symbols": ["SBIN"],
+            "coverage_status": {},
+            "missing_counts": {},
+        }
+
+    monkeypatch.setattr(data_quality, "build_trade_date_readiness_report", fake_report)
+
+    result = web_state._fetch_live_readiness_sync(None)
+
+    assert result["trade_date"] == "2026-05-04"
+    assert result["date_source"] == "prepared_runtime"
+    assert result["requested_count"] == 1
+
+
+def test_fetch_live_readiness_adds_operator_status_rows(monkeypatch: pytest.MonkeyPatch) -> None:
+    from scripts import data_quality
+
+    class FakeResult:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def fetchone(self):
+            return self._rows[0] if self._rows else None
+
+    class FakeCon:
+        def execute(self, sql, params=None):
+            if "FROM cpr_daily" in sql:
+                return FakeResult([(2018,)])
+            if "FROM cpr_thresholds" in sql:
+                return FakeResult([(2018,)])
+            if "FROM market_day_state" in sql:
+                return FakeResult([(1993,)])
+            if "FROM strategy_day_state" in sql:
+                return FakeResult([(1993,)])
+            return FakeResult([(0,)])
+
+    class FakeDB:
+        con = FakeCon()
+
+    fake_db = FakeDB()
+    monkeypatch.setattr(web_state, "get_dashboard_db", lambda: fake_db)
+
+    def fake_report(trade_date: str, *, db=None):
+        assert trade_date == "2026-05-04"
+        assert db is fake_db
+        return {
+            "trade_date": trade_date,
+            "ready": True,
+            "requested_symbols": ["SBIN", "TCS"],
+            "freshness_rows": [
+                {
+                    "table": "market_day_state",
+                    "max_trade_date": "2026-05-04",
+                    "status": "OK next-day (2026-05-04)",
+                },
+                {
+                    "table": "intraday_day_pack",
+                    "max_trade_date": "2026-04-30",
+                    "status": "OK",
+                },
+            ],
+            "coverage_status": {"v_daily": "ok", "v_5min": "warning"},
+            "missing_counts": {"v_daily": 0, "v_5min": 1},
+        }
+
+    monkeypatch.setattr(data_quality, "build_trade_date_readiness_report", fake_report)
+
+    result = web_state._fetch_live_readiness_sync("2026-05-04")
+
+    assert {row["status"] for row in result["setup_table_status_rows"]} == {"OK"}
+    assert result["freshness_status_rows"][0]["status"] == "OK"
+    coverage_rows = {row["table"]: row for row in result["coverage_status_rows"]}
+    assert coverage_rows["v_5min"] == {
+        "table": "v_5min",
+        "value": "1 missing",
+        "status": "OK",
+        "detail": "WARNING",
+    }
+
+
 @pytest.mark.asyncio
 async def test_aqueue_paper_admin_command_writes_command_file(
     tmp_path: Path,

@@ -383,19 +383,22 @@ class KiteTickerAdapter:
             to_sub = sorted(needed_tokens - current_tokens)
             to_unsub = sorted(current_tokens - needed_tokens)
 
+        next_tokens = set(current_tokens)
         if to_unsub:
             try:
                 ticker.unsubscribe(to_unsub)
+                next_tokens.difference_update(to_unsub)
             except Exception:
                 logger.exception("KiteTicker unsubscribe failed for %s", to_unsub[:10])
         if to_sub:
             try:
                 ticker.subscribe(to_sub)
                 ticker.set_mode(ticker.MODE_QUOTE, to_sub)
+                next_tokens.update(to_sub)
             except Exception:
                 logger.exception("KiteTicker subscribe failed for %s", to_sub[:10])
         with self._lock:
-            self._subscribed_tokens = needed_tokens
+            self._subscribed_tokens = next_tokens
 
     def _on_connect(self, ws: Any, _response: Any) -> None:
         self._connected.set()

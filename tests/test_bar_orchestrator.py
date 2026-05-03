@@ -38,6 +38,48 @@ def test_session_position_tracker_records_open_and_close_cash_flow() -> None:
     assert tracker.cash_available == pytest.approx(102_000.0)
 
 
+def test_session_position_tracker_rejects_duplicate_open_for_symbol() -> None:
+    tracker = SessionPositionTracker(max_positions=2, portfolio_value=100_000.0)
+    position = SimpleNamespace(
+        position_id="p1",
+        symbol="SBIN",
+        direction="LONG",
+        entry_price=500.0,
+        stop_loss=490.0,
+        target_price=530.0,
+        trail_state={},
+        quantity=100.0,
+        current_qty=100.0,
+    )
+
+    tracker.record_open(position, position_value=50_000.0)
+    with pytest.raises(RuntimeError, match="Position already open"):
+        tracker.record_open(position, position_value=50_000.0)
+    assert tracker.cash_available == pytest.approx(50_000.0)
+
+
+def test_session_position_tracker_partial_reduces_qty_and_credits_cash() -> None:
+    tracker = SessionPositionTracker(max_positions=2, portfolio_value=100_000.0)
+    position = SimpleNamespace(
+        position_id="p1",
+        symbol="SBIN",
+        direction="LONG",
+        entry_price=500.0,
+        stop_loss=490.0,
+        target_price=530.0,
+        trail_state={},
+        quantity=100.0,
+        current_qty=100.0,
+    )
+
+    tracker.record_open(position, position_value=50_000.0)
+    tracker.record_partial("SBIN", exit_value=26_000.0, remaining_qty=50.0)
+
+    assert tracker.cash_available == pytest.approx(76_000.0)
+    assert tracker.current_open_notional() == pytest.approx(25_000.0)
+    assert position.current_qty == pytest.approx(50.0)
+
+
 def test_should_process_symbol_respects_window_status_and_open_positions() -> None:
     tracker = SessionPositionTracker(max_positions=2, portfolio_value=100_000.0)
 

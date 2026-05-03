@@ -530,7 +530,11 @@ def pre_filter_symbols_for_strategy(
                 )
             return list(symbols)
         if require_trade_date_rows and prefilter_date != trade_date:
-            return list(symbols)
+            raise RuntimeError(
+                "Live pre-filter prerequisites stale: latest cpr_daily row is "
+                f"{prefilter_date}, expected {trade_date}. Run pivot-refresh + daily-prepare "
+                "before daily-live."
+            )
 
         stage_a_sql = f"""
             SELECT c.symbol

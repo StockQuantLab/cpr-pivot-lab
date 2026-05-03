@@ -7,6 +7,68 @@ Supersedes: `docs/PARITY_INCIDENT_LOG.md` (contents migrated below).
 
 ---
 
+## 2026-05-03 — FIXED: UI: live readiness hid OK/NOT OK prerequisite details
+
+**Status:** FIXED
+**Severity:** Medium
+
+### Symptom
+
+Operators had to remember why exact trade-date setup rows such as `cpr_daily`,
+`cpr_thresholds`, `market_day_state`, and `strategy_day_state` were valid for next-day live
+startup. The Paper Sessions readiness panel showed aggregate counts and only displayed
+non-OK freshness rows, so a green result did not explain which prerequisites were satisfied.
+
+### Root Cause
+
+`web/pages/ops_pages.py` filtered the readiness freshness table down to failures only and
+did not render exact trade-date setup table statuses. `web/state.py` returned the raw
+readiness report without dashboard-friendly OK/NOT OK rows.
+
+### Fix
+
+`web/state.py` now adds `setup_table_status_rows`, `freshness_status_rows`, and
+`coverage_status_rows` to the readiness payload. `web/pages/ops_pages.py` renders those rows
+with explicit `OK` / `NOT OK` status labels in the Live Readiness tab.
+
+### Related
+
+Focused verification: `uv run pytest tests/test_web_state.py -q`.
+
+---
+
+## 2026-05-03 — FIXED: UI: paper readiness checked Sunday calendar date by default
+
+**Status:** FIXED
+**Severity:** Medium
+
+### Symptom
+
+On Sunday 2026-05-03, the Paper Sessions dashboard showed `Live Readiness` for
+`2026-05-03` and refreshed it every 3 seconds inside the Active Sessions tab. Operators
+expected the readiness check to show the prepared next live date, `2026-05-04`, and to run
+only when explicitly refreshed.
+
+### Root Cause
+
+`web/pages/ops_pages.py` initialized the readiness trade-date input with
+`datetime.now().date()`, and `_load_active()` fetched readiness together with active sessions
+on the near-real-time refresh loop. `web/state.py` also treated an empty readiness date as
+literal `today` instead of preferring the prepared next-day runtime setup date.
+
+### Fix
+
+Moved readiness to its own `Live Readiness` tab with manual refresh. The Active Sessions
+3-second timer now refreshes only active-session state and only while that tab is selected.
+`web/state.py` now defaults empty readiness requests to the prepared runtime setup date when
+next-day setup tables are ahead of `intraday_day_pack`.
+
+### Related
+
+Focused verification: `uv run pytest tests/test_web_state.py -q`.
+
+---
+
 ## 2026-05-03 — FIXED: LIVE: daily-live could bypass the stronger data-quality readiness gate
 
 **Status:** FIXED
@@ -5706,3 +5768,968 @@ Investigate whether the remaining derived-table gaps are expected sparse symbol-
 (suspended/no daily candle/no ATR lookback) or repairable runtime gaps. Do this before final
 baseline promotion, but do not rerun broad Kite ingestion unless raw parquet coverage is proven
 missing.
+
+---
+
+## 2026-05-03 — FIXED: RISK: enforce_session_risk_controls uses only realized PnL, ignoring open losses
+
+**Status:** FIXED
+**Severity:** High
+
+### Symptom
+
+A live session with large open unrealized losses never triggers the daily-loss or max-drawdown flatten, because `enforce_session_risk_controls` evaluates only closed-position PnL.
+
+### Root Cause
+
+`engine/paper_runtime.py:892-907` — `enforce_session_risk_controls()` calls `_risk_limit_reasons(session, as_of, realized_pnl)` where `realized_pnl` is taken from `summary["realized_pnl"]` only. Open/unrealized position PnL from `summary["open_pnl"]` or mark-to-market is never included. `engine/paper_risk.py:38-46` then compares that realized-only value against the daily-loss and drawdown thresholds.
+
+### Impact
+
+A session that has ₹0 realized PnL but ₹50K open losses will not trigger the `max_daily_loss_pct` flatten even if the threshold is 2%. The risk gate is effectively blind to open positions.
+
+### Location
+
+`engine/paper_runtime.py:900-907`, `engine/paper_risk.py:37-47`
+
+### Fix
+
+`enforce_session_risk_controls()` now gates on `summary["net_pnl"]`, which includes open
+unrealized P&L, and stores that risk P&L in `daily_pnl_used`. Regression coverage:
+`tests/test_paper_runtime.py::test_enforce_session_risk_controls_includes_open_unrealized_loss`.
+
+---
+
+## 2026-05-03 — FIXED: RISK: malformed flatten_time string silently skips all risk checks
+
+**Status:** FIXED
+**Severity:** High
+
+### Symptom
+
+If `flatten_time` stored on a session is an empty string or any value without a `:` separator, `_risk_limit_reasons()` returns an empty list immediately, bypassing daily-loss limit and max-drawdown checks entirely.
+
+### Root Cause
+
+`engine/paper_risk.py:25-28`:
+```python
+if isinstance(flatten_time, str):
+    parts = flatten_time.split(":")
+    if len(parts) < 2:
+        return reasons   # early return skips all remaining checks
+```
+The `len(parts) < 2` guard is placed before the daily-loss and drawdown blocks, so a blank or malformed string short-circuits the entire function.
+
+### Impact
+
+All session-level risk limits are silently inactive if `flatten_time` is blank, null-string, or malformed in the DB.
+
+### Location
+
+`engine/paper_risk.py:25-28`
+
+### Fix
+
+Malformed `flatten_time` is ignored only for the time-exit check; daily loss and drawdown
+checks still run. Regression coverage:
+`tests/test_paper_runtime.py::test_enforce_session_risk_controls_malformed_flatten_time_keeps_loss_checks`.
+
+---
+
+## 2026-05-03 — OPEN: STRATEGY: min_effective_rr gate evaluated against runner target (R2/S2), not first target (R1/S1)
+
+**Status:** OPEN
+**Severity:** High
+
+### Symptom
+
+When `scale_out_pct > 0`, trades that would fail the `min_effective_rr` check against R1/S1 are admitted because the check uses the farther R2/S2 as the target price.
+
+### Root Cause
+
+`engine/cpr_atr_shared.py:277`:
+```python
+target_price = runner_target_price if use_scale_out else first_target_price
+```
+This line sets `target_price` to the runner target (R2/S2) before the `min_effective_rr` gate on line 306-310. The RR is therefore computed as `|runner_target - fill| / sl_distance`, which is always larger than the first-target RR. Trades with insufficient reward at R1/S1 pass the gate when R2 is used.
+
+### Impact
+
+Trade quality is overstated when scale-out is active. Trades that do not meet the RR threshold at the first take-profit level are admitted.
+
+### Location
+
+`engine/cpr_atr_shared.py:277`, `306-310`
+
+---
+
+## 2026-05-03 — FIXED: RUNTIME: partial exit leaves in-memory position tracker with stale qty and exposure
+
+**Status:** FIXED
+**Severity:** High
+
+### Symptom
+
+After a scale-out (PARTIAL) exit, `SessionPositionTracker` still holds the full position quantity and exposure. Subsequent `can_open_new()` and equity calculations treat the partial exit as if no size was reduced.
+
+### Root Cause
+
+`engine/paper_runtime.py:1602-1603` — when `advance.get("action") == "PARTIAL"`, only cash is credited:
+```python
+position_tracker.credit_cash(float(advance.get("exit_value") or 0.0))
+```
+The tracker's `_open[symbol].current_qty` is never reduced. `record_close()` is not called (position remains open), and there is no `update_trail_state()` call that would reduce the in-memory qty. The DB is correctly updated at line 1260, but the in-memory mirror diverges.
+
+### Impact
+
+`current_equity()` overstates equity (cash credited without reducing open exposure). Downstream position sizing for the same bar uses stale equity.
+
+### Location
+
+`engine/paper_runtime.py:1245-1263`, `1602-1603`, `engine/bar_orchestrator.py:177-194`
+
+### Fix
+
+`SessionPositionTracker.record_partial()` now credits partial-exit cash and reduces cached
+`current_qty`; the paper runtime calls it after PARTIAL exits. Regression coverage:
+`tests/test_bar_orchestrator.py::test_session_position_tracker_partial_reduces_qty_and_credits_cash`.
+
+---
+
+## 2026-05-03 — OPEN: RUNTIME: partial exit with real-order routing raises RuntimeError, crashing candle loop
+
+**Status:** OPEN
+**Severity:** High
+
+### Symptom
+
+If `real_order_router` is enabled and a PARTIAL scale-out decision occurs, the candle evaluation raises a `RuntimeError` that is not caught, terminating the entire session's candle processing loop.
+
+### Root Cause
+
+`engine/paper_runtime.py:1211-1212`:
+```python
+if decision.action == "PARTIAL" and real_order_router is not None and real_order_router.enabled:
+    raise RuntimeError("automated real-order routing does not support partial scale-out exits")
+```
+This is placed inside the candle evaluation coroutine with no local error handler. The exception propagates up and the session exits abnormally.
+
+### Impact
+
+Any live session with `real_order_router` enabled and `scale_out_pct > 0` will crash as soon as the first partial exit is triggered.
+
+### Location
+
+`engine/paper_runtime.py:1211-1212`
+
+---
+
+## 2026-05-03 — FIXED: ARCHIVE: FLATTENED positions excluded from paper session archive
+
+**Status:** FIXED
+**Severity:** High
+
+### Symptom
+
+When a session is manually flattened using `flatten --session-id` or `flatten-all`, positions are marked with `status=FLATTENED`. The subsequent archive writes zero trades to `backtest_results` even though trades exist.
+
+### Root Cause
+
+`scripts/paper_archive.py:107`:
+```python
+closed_positions = paper_db.get_session_positions(session_id, statuses=["CLOSED"])
+```
+`FLATTENED` is a distinct status used for manually closed positions. It is not included in the status filter. The archive therefore sees zero positions for sessions that ended via manual flatten.
+
+### Impact
+
+Archived trade count, PnL, and win rate are understated or zero for all manually-flattened sessions. Dashboard archived view shows no trades.
+
+### Location
+
+`scripts/paper_archive.py:107`
+
+### Fix
+
+`archive_completed_session()` now reads both `CLOSED` and `FLATTENED` positions. Regression
+coverage: `tests/test_paper_archive.py::test_archive_completed_session_includes_flattened_positions`.
+
+---
+
+## 2026-05-03 — FIXED: ARCHIVE: metadata and results written without a transaction boundary
+
+**Status:** FIXED
+**Severity:** High
+
+### Symptom
+
+If `store_backtest_results()` fails after `store_run_metadata()` succeeds, `backtest.duckdb` contains orphaned metadata rows with no corresponding trade rows.
+
+### Root Cause
+
+`scripts/paper_archive.py:156-169` — the two writes are independent calls with no wrapping transaction:
+```python
+backtest_db.store_run_metadata(...)   # call 1
+if rows:
+    backtest_db.store_backtest_results(pl.DataFrame(rows))  # call 2 — independent
+```
+A crash or DuckDB error between calls leaves the DB in a partial state. Re-running the archive appends a second metadata row rather than cleaning up.
+
+### Impact
+
+`run_metrics` and `backtest_results` are out of sync. Dashboard compare page shows phantom sessions with no trades.
+
+### Location
+
+`scripts/paper_archive.py:156-170`
+
+### Fix
+
+Archive failures now clean up partial PAPER rows via `delete_runs([session_id])` before
+re-raising, preventing orphaned archive metadata from surviving a failed result write.
+
+---
+
+## 2026-05-03 — FIXED: ARCHIVE: zero PnL treated as missing, recomputed from prices
+
+**Status:** FIXED
+**Severity:** Medium
+
+### Symptom
+
+A break-even trade (entry == exit) stored with `pnl=0.0` is recomputed during archiving instead of using the stored value. If `exit_price` is `None` or inaccurate, the recomputed PnL will be wrong.
+
+### Root Cause
+
+`scripts/paper_archive.py:25`:
+```python
+if not pnl:   # catches 0.0 as falsy
+    pnl = (exit_price - entry_price) * qty ...
+```
+`if not pnl` is true for `None`, `0`, `0.0`, and `False`. A scratch trade stored with `pnl=0.0` is overwritten. Should be `if pnl is None:`.
+
+### Impact
+
+Break-even trades can have their PnL silently recalculated. If `exit_price` defaulted to `entry_price` (line 22), the result is the same, but if the stored exit_price differs, the archived value is wrong.
+
+### Location
+
+`scripts/paper_archive.py:25-30`
+
+---
+
+## 2026-05-03 — OPEN: DB: ConstraintException in open_position masks all schema/integrity errors
+
+**Status:** OPEN
+**Severity:** High
+
+### Symptom
+
+When `open_position()` raises any `duckdb.ConstraintException` — not just the expected duplicate-open violation — the handler silently swallows the error, queries for an existing OPEN row, and either returns stale data or re-raises with no context.
+
+### Root Cause
+
+`db/paper_db.py:775-792` — the exception handler catches the broad `duckdb.ConstraintException` class. DuckDB can raise this for primary key, foreign key, check constraint, and uniqueness violations. The handler only knows how to recover from the uniqueness case (duplicate OPEN row). All other constraint failures follow the same code path and produce misleading log output.
+
+### Impact
+
+Unrelated data integrity errors (bad position_id, check constraint violation) are misattributed as "duplicate open" and can return wrong position data to the caller.
+
+### Location
+
+`db/paper_db.py:775-792`
+
+---
+
+## 2026-05-03 — OPEN: DB: update_position has no state-transition guard
+
+**Status:** OPEN
+**Severity:** High
+
+### Symptom
+
+Any caller can set `status=OPEN` on an already-CLOSED position, or set `status=CLOSED` on a position that was never OPEN. There is no enforcement of the intended OPEN → CLOSED/FLATTENED lifecycle.
+
+### Root Cause
+
+`db/paper_db.py:840-902` — `update_position()` builds an UPDATE from whatever kwargs are passed and executes it unconditionally. There is no check of the current status before applying the new status.
+
+### Impact
+
+Bugs in calling code (double-close, stale reference, async reordering) can leave positions in invalid states without any error. The UNIQUE INDEX on `(session_id, symbol, status)` provides partial protection for duplicate OPEN rows, but does not prevent status regressions.
+
+### Location
+
+`db/paper_db.py:840-902`
+
+---
+
+## 2026-05-03 — OPEN: DB: UNIQUE index on (session_id, symbol, status) blocks re-entries and multiple manual closes
+
+**Status:** OPEN
+**Severity:** High
+
+### Symptom
+
+If a symbol is re-entered in the same session (which `position_closed_today` prevents in normal flow but can happen in error recovery), `open_position()` raises a ConstraintException and returns the stale prior OPEN row. Additionally, two manual `FLATTENED` closes for the same symbol in the same session (e.g., after a bug leaves a ghost position) are blocked by the unique constraint.
+
+### Root Cause
+
+`db/paper_db.py:353-355`:
+```sql
+CREATE UNIQUE INDEX IF NOT EXISTS idx_pp_session_symbol_status
+ON paper_positions(session_id, symbol, status)
+```
+This prevents multiple rows with the same (session, symbol, status) triple. While intentional for OPEN rows, it also prevents two CLOSED or two FLATTENED rows for the same session/symbol, making error recovery writes fail.
+
+### Impact
+
+Error recovery paths that try to close or flatten an already-closed position (e.g., a delayed duplicate flatten command) raise ConstraintExceptions instead of idempotently succeeding.
+
+### Location
+
+`db/paper_db.py:353-355`
+
+---
+
+## 2026-05-03 — FIXED: KITE: subscription state updated even when subscribe/unsubscribe raises exception
+
+**Status:** FIXED
+**Severity:** High
+
+### Symptom
+
+After a Kite WebSocket subscribe or unsubscribe call fails, `self._subscribed_tokens` is still updated to the intended set. On the next reconciliation, the adapter believes those symbols are already subscribed and does not retry, silently missing market data for those symbols.
+
+### Root Cause
+
+`engine/kite_ticker_adapter.py:386-398` — the `_subscribed_tokens` assignment happens unconditionally after the try/except blocks:
+```python
+if to_sub:
+    try:
+        ticker.subscribe(to_sub)
+        ticker.set_mode(...)
+    except Exception:
+        logger.exception(...)
+with self._lock:
+    self._subscribed_tokens = needed_tokens   # runs even if subscribe raised
+```
+
+### Impact
+
+Symbols that failed to subscribe are silently dropped from price feeds. Live sessions lose data for affected symbols without any ongoing alert or retry.
+
+### Location
+
+`engine/kite_ticker_adapter.py:386-398`
+
+### Fix
+
+`_subscribed_tokens` now updates only for subscribe/unsubscribe calls that succeed, so failed
+subscriptions remain pending and are retried on the next reconciliation. Regression coverage:
+`tests/test_kite_ticker.py::test_kite_ticker_adapter_does_not_mark_failed_subscribe_as_active`.
+
+---
+
+## 2026-05-03 — OPEN: ALERT: alert dispatcher can double-dispatch alerts during shutdown drain
+
+**Status:** OPEN
+**Severity:** High
+
+### Symptom
+
+Alerts sent near session end can be delivered twice — once by the still-running consumer task, and again by the shutdown drain loop.
+
+### Root Cause
+
+`engine/alert_dispatcher.py:183-210` — the shutdown path sets `self._running = False`, waits for the consumer task to finish, then drains remaining queue items. However, the consumer task may still be processing the last item when the drain runs. The same alert is dispatched by both code paths.
+
+### Impact
+
+Duplicate Telegram/email alerts for TRADE_CLOSED or FLATTEN_EOD near session end.
+
+### Location
+
+`engine/alert_dispatcher.py:183-210`
+
+---
+
+## 2026-05-03 — FIXED: ORCHESTRATOR: record_open silently overwrites existing position and double-deducts cash
+
+**Status:** FIXED
+**Severity:** High
+
+### Symptom
+
+If `record_open()` is called twice for the same symbol (e.g., due to a duplicate open event or bug), the second call overwrites the first tracked position and deducts cash twice, understating available capital.
+
+### Root Cause
+
+`engine/bar_orchestrator.py:177-194`:
+```python
+self._open[symbol] = tracked        # overwrites without checking
+self.cash_available -= max(0.0, float(position_value or 0.0))  # always deducts
+```
+There is no guard against `symbol` already being present in `self._open`.
+
+### Impact
+
+Double cash deduction can prevent legitimate new entries (`can_open_new()` fails early). The overwritten position tracker loses the original entry price, SL, and trail state.
+
+### Location
+
+`engine/bar_orchestrator.py:177-194`
+
+### Fix
+
+`record_open()` now rejects duplicate opens for the same symbol instead of overwriting the
+tracked position and deducting cash twice. Regression coverage:
+`tests/test_bar_orchestrator.py::test_session_position_tracker_rejects_duplicate_open_for_symbol`.
+
+---
+
+## 2026-05-03 — FIXED: SUPERVISOR: global variables not declared in main(), breaking signal handling
+
+**Status:** FIXED
+**Severity:** High
+
+### Symptom
+
+`paper_supervisor.py` signal handlers reference `_child_heartbeat_path` and `_run_loop_active` module globals. These are assigned in `main()` without `global` declarations, creating local variables that shadow the module-level names. The signal handlers always see the original module-level values (None / False).
+
+### Root Cause
+
+`scripts/paper_supervisor.py:400-405` — assignments like:
+```python
+_child_heartbeat_path = heartbeat_path
+_run_loop_active = True
+```
+are missing `global _child_heartbeat_path` and `global _run_loop_active` declarations. Python treats these as local variable assignments rather than mutations of the module globals.
+
+### Impact
+
+SIGINT/SIGTERM handlers cannot write to the heartbeat log or stop the watch-relaunch loop reliably.
+
+### Location
+
+`scripts/paper_supervisor.py:400-405`
+
+### Fix
+
+`main()` now declares both `_child_heartbeat_path` and `_run_loop_active` as global before
+assigning them, so signal handlers see the active heartbeat path and watch-loop flag.
+
+---
+
+## 2026-05-03 — OPEN: LIVE: session startup force-sets status to ACTIVE, clobbering PAUSED/STOPPING
+
+**Status:** OPEN
+**Severity:** High
+
+### Symptom
+
+If an operator sets a session to PAUSED or STOPPING, and then the live runner restarts (resume path), the session status is unconditionally overwritten to ACTIVE on startup.
+
+### Root Cause
+
+`scripts/paper_live.py:699-701`:
+```python
+if session.status != "ACTIVE":
+    session = await _update_session(session_id, deps, status="ACTIVE", notes=notes)
+```
+Any non-ACTIVE status is forced to ACTIVE without checking whether that transition is valid. A session intentionally paused or being stopped by an operator is silently promoted back to ACTIVE.
+
+### Impact
+
+Operator-initiated pause/stop commands are overridden on runner restart. Combined with the sentinel-file or admin-command flat logic, this can produce unexpected re-activation.
+
+### Location
+
+`scripts/paper_live.py:699-701`
+
+---
+
+## 2026-05-03 — OPEN: LIVE: deferred sync window leaves replica stale on crash
+
+**Status:** OPEN
+**Severity:** High
+
+### Symptom
+
+If the live process crashes between `defer_sync()` and `flush_deferred_sync()` — e.g., due to an exception in `process_closed_bar_group()` — DB writes completed within that window are never synced to the paper replica. The dashboard shows stale data until the next manual sync or restart.
+
+### Root Cause
+
+`scripts/paper_live.py:1111-1143`:
+```python
+get_paper_db().defer_sync()
+try:
+    driver_result = await paper_session_driver.process_closed_bar_group(...)
+finally:
+    get_paper_db().flush_deferred_sync()
+```
+`flush_deferred_sync()` is in a `finally` block, so it runs on normal exceptions. However, a hard process exit (SIGKILL, OOM, Windows force-close) bypasses Python's finally handlers entirely.
+
+### Impact
+
+Dashboard shows old position data after an abnormal exit. Operators may not see newly opened/closed positions until the next DB access flushes the pending sync.
+
+### Location
+
+`scripts/paper_live.py:1111-1143`
+
+---
+
+## 2026-05-03 — FIXED: LIVE: flatten-all includes CANCELLED sessions; flatten-both misses STOPPING/FAILED
+
+**Status:** FIXED
+**Severity:** High
+
+### Symptom
+
+`flatten-all` tries to flatten `CANCELLED` sessions (no-op or unintended). `flatten-both` misses `STOPPING` and `FAILED` sessions that still have open positions.
+
+### Root Cause
+
+Two separate filter bugs:
+
+1. `scripts/paper_trading.py:1746` — `flatten-all` query includes `'CANCELLED'` in the status filter. Cancelled sessions have no open positions to close and should be excluded.
+
+2. `scripts/paper_trading.py:1832` — `flatten-both` (sentinel/admin-command path) only targets `ACTIVE` and `PAUSED`. A session in `STOPPING` or `FAILED` state can still have OPEN positions that need flattening.
+
+### Impact
+
+`flatten-all` generates spurious "closed 0 position(s)" entries for cancelled sessions. `flatten-both` silently skips sessions stuck in STOPPING/FAILED with open positions, leaving them unflattened.
+
+### Location
+
+`scripts/paper_trading.py:1746`, `1832`
+
+### Fix
+
+`flatten-all` no longer includes `CANCELLED`; `flatten-both` now includes `STOPPING` and
+`FAILED` sessions so stuck sessions with open positions can still receive `close_all`.
+Regression coverage in `tests/test_paper_trading_workflow.py` and
+`tests/test_paper_admin_commands.py`.
+
+---
+
+## 2026-05-03 — FIXED: PRE-FILTER: date mismatch returns unfiltered full universe instead of empty/failing
+
+**Status:** FIXED
+**Severity:** High
+
+### Symptom
+
+When the live pre-filter cannot find CPR rows for the requested `trade_date` and falls back to an older date, and `require_trade_date_rows=True`, it returns the **full unrestricted universe** instead of an empty list or an error.
+
+### Root Cause
+
+`scripts/paper_prepare.py:532-533` (and mirrored in `engine/paper_setup_loader.py:532-533`):
+```python
+if require_trade_date_rows and prefilter_date != trade_date:
+    return list(symbols)   # returns all symbols unfiltered
+```
+The intent appears to be a passthrough when the date is unavailable, but instead of returning an empty list or raising, the code returns the full input symbol list. This can cause the live session to attempt to trade all ~2100 symbols with no CPR filter applied.
+
+### Impact
+
+A live session started when `cpr_daily` rows are not yet available for the trade date runs with no CPR pre-filtering, wasting Kite API quota and potentially opening positions without valid CPR levels.
+
+### Location
+
+`scripts/paper_prepare.py:532-533`, `engine/paper_setup_loader.py:532-533`
+
+### Fix
+
+Live pre-filter now fails closed when `require_trade_date_rows=True` and the latest
+`cpr_daily` row does not match the requested trade date. Regression coverage:
+`tests/test_paper_prepare.py::test_pre_filter_symbols_fails_when_exact_cpr_date_missing_for_live`.
+
+---
+
+## 2026-05-03 — OPEN: REPLAY: date filters ignored when preloaded_days pack is supplied
+
+**Status:** OPEN
+**Severity:** Medium
+
+### Symptom
+
+When `paper_replay.py` is invoked with a `preloaded_days` pack, the replay processes all dates in the pack regardless of `start_date` / `end_date` parameters. Sessions can include out-of-range dates, producing incorrect PnL attribution.
+
+### Root Cause
+
+`scripts/paper_replay.py:638-640`:
+```python
+if preloaded_days is not None:
+    replay_symbols_set = set(replay_symbols)
+    replay_days = [d for d in preloaded_days if d.symbol in replay_symbols_set]
+```
+The filter is symbol-only. No date range check is applied when using the preloaded pack.
+
+### Impact
+
+Multi-date replay with date-range constraints silently includes extra dates when a preloaded pack is provided. Callers (e.g., parity comparison tools) can see inflated trade counts.
+
+### Location
+
+`scripts/paper_replay.py:638-640`
+
+---
+
+## 2026-05-03 — OPEN: LIVE: admin command file deleted even when processing fails
+
+**Status:** OPEN
+**Severity:** Medium
+
+### Symptom
+
+If an admin command JSON file is malformed or causes a processing error, the file is still deleted in the `finally` block, making the command unrecoverable.
+
+### Root Cause
+
+`scripts/paper_live.py:1271-1291` — command file is deleted in the `finally` after a try/except that catches parsing and processing errors. A partially-written or corrupted file is silently discarded rather than moved to a `.failed` location for inspection.
+
+### Impact
+
+Lost admin commands during error conditions. Operators cannot tell whether a command was processed or silently dropped.
+
+### Location
+
+`scripts/paper_live.py:1271-1291`
+
+---
+
+## 2026-05-03 — OPEN: LIVE: stage-B direction filter applied as one-way latch, can freeze universe too early
+
+**Status:** OPEN
+**Severity:** Medium
+
+### Symptom
+
+Once stage-B direction filtering runs for a CPR_LEVELS session, `stage_b_applied = True` is set and the filter never runs again, even if the setup universe changes (e.g., symbols are added by a late-registering variant or the direction signal changes).
+
+### Root Cause
+
+`engine/paper_session_driver.py:265-289`:
+```python
+if not stage_b_applied and normalized_strategy == "CPR_LEVELS":
+    active_symbols = apply_stage_b_direction_filter(...)
+    stage_b_applied = True
+```
+The latch is set on the first successful run. It is not re-evaluated if `active_symbols` is empty (no direction signal yet) or if the 9:15 bar arrives while the driver has only a partial symbol set.
+
+### Impact
+
+A session that applies stage-B before the full symbol universe is loaded may trade with a truncated universe for the rest of the day.
+
+### Location
+
+`engine/paper_session_driver.py:265-289`
+
+---
+
+## 2026-05-03 — OPEN: LIVE: resume_entries admin command restores original universe, ignoring post-open pruning
+
+**Status:** OPEN
+**Severity:** Medium
+
+### Symptom
+
+When an operator sends a `resume_entries` admin command to re-enable entries mid-session, the symbol universe is restored to the original pre-filter list, ignoring stage-B filtering, symbols already traded, and symbols excluded after open-position limits were hit.
+
+### Root Cause
+
+`scripts/paper_live.py:1470-1473`:
+```python
+elif _action == "resume_entries":
+    entries_disabled = False
+    active_symbols = list(entry_universe_symbols)
+```
+`entry_universe_symbols` is the full pre-filter output from session start. Any runtime pruning (stage-B, `max_positions` cap, `position_closed_today`) accumulated since then is discarded.
+
+### Impact
+
+Re-activating entries can attempt to open positions in symbols that were already excluded for valid strategic or risk reasons during the current session.
+
+### Location
+
+`scripts/paper_live.py:1470-1473`
+
+---
+
+## 2026-05-03 — FIXED: SUPERVISOR: watch-mode relaunch cutoff uses host local timezone instead of IST
+
+**Status:** FIXED
+**Severity:** Medium
+
+### Symptom
+
+On a server in a non-IST timezone (e.g., UTC), the `_is_within_trading_hours()` cutoff used by the supervisor watch-mode relaunch logic fires at the wrong wall-clock time, potentially relaunching the session outside NSE trading hours.
+
+### Root Cause
+
+`scripts/paper_supervisor.py:45-47`:
+```python
+current = now or datetime.now().astimezone()
+return current.timetz().replace(tzinfo=None) < WATCH_RELAUNCH_CUTOFF
+```
+`datetime.now().astimezone()` uses the host's local timezone. If the host is not in IST (UTC+5:30), `timetz()` returns a local time, not an IST time, producing an incorrect comparison against the IST-based `WATCH_RELAUNCH_CUTOFF`.
+
+### Impact
+
+On UTC servers, the supervisor will try to relaunch paper sessions up to 5.5 hours outside the intended IST cutoff window.
+
+### Location
+
+`scripts/paper_supervisor.py:45-47`
+
+### Fix
+
+`_watch_relaunch_allowed()` now evaluates the 15:00 IST relaunch cutoff in `Asia/Kolkata`,
+including when passed an aware timestamp from another timezone. Regression coverage:
+`tests/test_paper_supervisor.py::test_supervisor_watch_relaunch_cutoff_uses_ist_for_aware_time`.
+
+---
+
+## 2026-05-03 — OPEN: ALERT: FLATTEN_EOD and SESSION_STARTED dedup guards are not thread-safe
+
+**Status:** OPEN
+**Severity:** Medium
+
+### Symptom
+
+Rare duplicate FLATTEN_EOD or SESSION_STARTED alerts can be dispatched when two coroutines reach the dedup check simultaneously before either updates the in-memory set.
+
+### Root Cause
+
+`engine/paper_runtime.py:414-428` and `733-756` — both use a pattern of `if session_id in _set: return` followed by `_set.add(session_id)` then `_dispatch_alert(...)`. In async code running in a single-threaded event loop these are non-atomic: `await _dispatch_alert(...)` yields control between the check and the add, allowing a second caller to pass the guard.
+
+### Impact
+
+Occasional duplicate Telegram alerts for session start and EOD summary. Not harmful but noisy and confusing.
+
+### Location
+
+`engine/paper_runtime.py:414-428`, `733-756`
+
+---
+
+## 2026-05-03 — OPEN: ALERT: close alert formatting crashes on zero entry_price or invalid date string
+
+**Status:** OPEN
+**Severity:** Medium
+
+### Symptom
+
+Two separate crash paths in alert body formatting:
+1. Division by zero when `entry_price == 0.0` in `pnl_pct` calculation.
+2. Unhandled `ValueError` when parsing a malformed 10-character `trade_date` string.
+
+### Root Cause
+
+`engine/paper_alerts.py:78-82`:
+```python
+pnl_pct = (
+    ((close_price - entry_price) / entry_price * 100)  # ZeroDivisionError if entry_price==0
+    ...
+)
+```
+
+`engine/paper_alerts.py:123-125`:
+```python
+if date_str and len(date_str) == 10:
+    date_str = datetime.strptime(date_str, "%Y-%m-%d").strftime("%d-%b-%Y")
+    # no exception handler — ValueError if date_str is 10 chars but not a valid date
+```
+
+### Impact
+
+Any position with a corrupt or zero entry price causes the close alert to fail entirely, suppressing the Telegram/email notification.
+
+### Location
+
+`engine/paper_alerts.py:78-82`, `123-125`
+
+---
+
+## 2026-05-03 — OPEN: STRATEGY: CPR entry boundary allows equality (close == trigger) when exclusive crossing intended
+
+**Status:** OPEN
+**Severity:** Medium
+
+### Symptom
+
+A candle whose close price exactly equals the CPR trigger (TC with buffer for LONG, BC minus buffer for SHORT) is accepted as an entry, even though the intended rule is "close **beyond** the trigger."
+
+### Root Cause
+
+`engine/cpr_atr_shared.py:239-261`:
+```python
+# LONG
+if current_close < trigger:   # reject if below; accept if at or above
+    return None
+# SHORT
+if current_close > trigger:   # reject if above; accept if at or below
+    return None
+```
+Exact equality is not rejected. For the LONG case, `close == trigger` means the candle closed exactly at the TC+buffer level, which is ambiguous — it could be a rejection wick rather than a confirmed breakout.
+
+### Impact
+
+Marginal entries at the exact trigger boundary may have lower follow-through probability. Impact is small in practice since exact equality at two decimal places is rare, but it is a parity divergence from a strict "close beyond" rule.
+
+### Location
+
+`engine/cpr_atr_shared.py:239`, `258`
+
+---
+
+## 2026-05-03 — OPEN: KITE: tick timestamp source silently discarded, receive-time fallbacks mixed with exchange time
+
+**Status:** OPEN
+**Severity:** Medium
+
+### Symptom
+
+Bar timing accuracy cannot be audited after the fact. Bars built under high-latency or reconnect conditions may have receive-time timestamps silently substituted for exchange timestamps without any indicator in stored data.
+
+### Root Cause
+
+`engine/kite_ticker_adapter.py:439-447` — when a tick's `exchange_timestamp` is unavailable, the adapter falls back to `timestamp` (SDK time) or receive time (`datetime.now(IST)`). All three cases produce a `source="websocket"` label with no distinction. The `fallback_count` metric is accumulated but never stored with the bar or surfaced in session diagnostics.
+
+### Impact
+
+Parity comparisons and latency audits cannot distinguish bars built from exchange time vs. estimated receive time. On reconnect bursts where many fallback ticks arrive simultaneously, bar open/close attribution can shift by 200ms–2s.
+
+### Location
+
+`engine/kite_ticker_adapter.py:439-447`
+
+---
+
+## 2026-05-03 — OPEN: DB: cleanup_feed_audit uses created_at instead of trade/feed date for retention
+
+**Status:** OPEN
+**Severity:** Medium
+
+### Symptom
+
+Feed audit record cleanup based on `created_at` can delete freshly ingested historical records that have a recent `created_at` but old feed dates, or retain old audit records that were created recently via a late backfill.
+
+### Root Cause
+
+`db/paper_db.py:1299-1315`:
+```python
+DELETE FROM paper_feed_audit WHERE created_at < ?
+```
+The cutoff should be based on the feed/trade date (`bar_time` or `trade_date`), not the DB insertion timestamp. Late-inserted historical bars (e.g., from a replay) share a recent `created_at` and survive the cleanup unnecessarily.
+
+### Impact
+
+`paper_feed_audit` table grows unbounded for replay-heavy usage. Targeted purge by trade date is not possible with this schema approach.
+
+### Location
+
+`db/paper_db.py:1299-1315`
+
+---
+
+## 2026-05-03 — OPEN: ALERT: email channel never configured or tested; both channels are parallel not sequential
+
+**Status:** OPEN
+**Severity:** Low
+
+### Symptom
+
+Email alerts have never been delivered. Despite the comment "Email (backup)", email is not a fallback triggered only when Telegram fails — both channels are attempted **simultaneously on every retry attempt**. However since the three required Doppler secrets have never been set, `email.enabled` is always `False` and email is completely inactive.
+
+### Root Cause
+
+`engine/notifiers/email.py:36-37` — `email.enabled` is `True` only when all three Doppler secrets are present: `SMTP_USER` (sender address + SMTP login), `SMTP_PASSWORD`, and `ALERT_TO_EMAIL` (recipient address). None of these have been configured.
+
+`engine/alert_dispatcher.py:262-271` — the `_send_with_retry` loop tries Telegram and email independently on every attempt:
+```python
+if self.telegram.enabled and not telegram_ok:
+    await self.telegram.send(...)    # attempted every iteration until success
+if self.email.enabled and not email_ok:
+    await self.email.send(...)       # also attempted every iteration — parallel, NOT fallback
+```
+If both are enabled, every alert goes to both channels. The "backup" label in the old comment was misleading.
+
+### Impact
+
+No email alerts are ever delivered. If Telegram is down, there is no secondary alert channel. The email path is untested end-to-end.
+
+### To Activate
+
+Set Doppler secrets `SMTP_USER`, `SMTP_PASSWORD`, and `ALERT_TO_EMAIL`. Use a Gmail app password. The SMTP defaults are `smtp.gmail.com:587` (STARTTLS).
+
+### Location
+
+`engine/notifiers/email.py:36-37`, `engine/alert_dispatcher.py:262-271`
+
+---
+
+## 2026-05-03 — OPEN: LOCAL-FEED/REPLAY: missing bars silently skipped; diverges from Kite live flat-candle behavior
+
+**Status:** OPEN
+**Severity:** Medium
+
+### Symptom
+
+In Kite live trading, an illiquid symbol that has no new trade ticks for a 5-minute slot still emits a candle with OHLC = last known close and volume = 0 (a "flat candle"). In local-feed (`daily-live --feed-source local`) and paper replay, the same symbol simply **does not appear** in that bar's candle list. The bar is silently skipped entirely for that symbol.
+
+This means open positions on illiquid symbols are not evaluated for trailing stop, time-exit, or risk checks during quiet bars in local-feed and replay, while live would evaluate them with the flat candle.
+
+### Root Cause
+
+All three non-live modes skip consistently:
+
+- **Local-feed** (`engine/local_ticker_adapter.py:263-265`): iterates the global union of bar timestamps and emits only symbols that have data at that slot. Missing → `continue`.
+- **Paper replay** (`engine/local_ticker_adapter.py:263-265`): same code path — preloaded packs carry only recorded candles, no fill for quiet bars.
+- **Backtest** (`engine/cpr_atr_strategy.py`): vectorized engine also skips missing candle indices.
+
+The root cause is that `intraday_day_pack` only stores bars with actual recorded data. There is no fill step that injects flat candles for symbols that traded in a prior bar but were quiet in the current one.
+
+### Impact
+
+**Trailing stop evaluation** — a position open on a quiet symbol is not evaluated for `TRAIL_STOP`, `TIME_EXIT`, or `DAILY_LOSS_LIMIT` during the silent bars. In live, the trailing stop would advance (or hold) using the flat-candle close. This difference is small in practice (quiet symbol → no meaningful price move) but it is a correctness gap.
+
+**Time exit** — if all bars for a position's symbol are quiet from 14:00–15:15, the TIME_EXIT at 15:15 is not triggered in replay/local-feed. In live, the flat-candle at 15:15 triggers it.
+
+**Parity** — local-feed is used for "closest-to-live" simulation. Any divergence from live behavior undermines its validation purpose.
+
+### Fix Direction
+
+In `local_ticker_adapter.py`, after building the candle list for a bar, inject flat candles for any symbol that has an open position in the session tracker but was not present in the current bar. Use `last known close = self._last_ltp[symbol]` as the flat OHLC with volume=0. This matches Kite live behavior and ensures all three evaluation paths (stop, time-exit, risk) are run for open positions every bar.
+
+Backtest already doesn't need this fix — its vectorized engine handles missing bars by design and results are the reference. The fix is specifically for `local_ticker_adapter.py` (covers both local-feed and replay paths since they share the same adapter).
+
+### Location
+
+`engine/local_ticker_adapter.py:250-289`, `engine/bar_orchestrator.py` (where flat-candle injection should occur after `get_closed_bars()`)
+
+---
+
+## 2026-05-03 — FIXED: ALERTS: paper_alerts.py used ambiguous Python 2-style comma except syntax
+
+**Status:** FIXED
+**Severity:** Low
+
+### Symptom
+
+`engine/paper_alerts.py:148` uses `except ValueError, IndexError:` — Python 2 syntax where the second name was the binding variable for the exception, not a second exception type. In Python 3.14 this compiles to a tuple catch (correct behavior), but this is non-obvious, not PEP 8 compliant, and would have incorrect semantics in Python 2 where `IndexError` would be the variable holding the caught ValueError.
+
+### Root Cause
+
+Legacy Python 2 style code not updated during the Python 3 migration. Should be `except (ValueError, IndexError):`.
+
+### Impact
+
+No runtime breakage on Python 3.14, but a code clarity/maintenance hazard. Future readers may misinterpret the intent.
+
+### Location
+
+`engine/paper_alerts.py:148`
+

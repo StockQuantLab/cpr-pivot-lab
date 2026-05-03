@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 
 import pytest
 
@@ -94,8 +94,15 @@ def test_supervisor_accepts_optional_daily_live_prefix() -> None:
 
 
 def test_supervisor_watch_relaunch_cutoff() -> None:
-    assert _watch_relaunch_allowed(datetime(2026, 5, 2, 15, 29, 59))
-    assert not _watch_relaunch_allowed(datetime(2026, 5, 2, 15, 30, 0))
+    assert _watch_relaunch_allowed(datetime(2026, 5, 2, 14, 59, 59))
+    assert not _watch_relaunch_allowed(datetime(2026, 5, 2, 15, 0, 0))
+
+
+def test_supervisor_watch_relaunch_cutoff_uses_ist_for_aware_time() -> None:
+    # 09:29:59 UTC is 14:59:59 IST, still allowed.
+    assert _watch_relaunch_allowed(datetime(2026, 5, 2, 9, 29, 59, tzinfo=UTC))
+    # 09:30:00 UTC is 15:00:00 IST, cutoff reached.
+    assert not _watch_relaunch_allowed(datetime(2026, 5, 2, 9, 30, 0, tzinfo=UTC))
 
 
 def test_supervisor_clock_drift_warning(monkeypatch, capsys) -> None:

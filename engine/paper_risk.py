@@ -24,12 +24,16 @@ def _risk_limit_reasons(
     if flatten_time is not None:
         if isinstance(flatten_time, str):
             parts = flatten_time.split(":")
-            if len(parts) < 2:
-                return reasons
-            h, m = int(parts[0]), int(parts[1])
-            s = int(parts[2]) if len(parts) > 2 else 0
-            flatten_time = dt_time(h, m, s)
-        if _current_session_time(as_of) >= flatten_time:
+            if len(parts) >= 2:
+                try:
+                    h, m = int(parts[0]), int(parts[1])
+                    s = int(parts[2]) if len(parts) > 2 else 0
+                    flatten_time = dt_time(h, m, s)
+                except TypeError, ValueError:
+                    flatten_time = None
+            else:
+                flatten_time = None
+        if flatten_time is not None and _current_session_time(as_of) >= flatten_time:
             reasons.append(f"flatten_time:{flatten_time.isoformat()}")
 
     portfolio_value = float(build_backtest_params(session).portfolio_value)

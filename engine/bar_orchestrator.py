@@ -176,6 +176,8 @@ class SessionPositionTracker:
 
     def record_open(self, position: Any, position_value: float) -> None:
         symbol = str(getattr(position, "symbol", ""))
+        if symbol in self._open:
+            raise RuntimeError(f"Position already open for {symbol}")
         tracked = TrackedPosition(
             position_id=str(getattr(position, "position_id", "")),
             symbol=symbol,
@@ -192,6 +194,16 @@ class SessionPositionTracker:
         )
         self._open[symbol] = tracked
         self.cash_available -= max(0.0, float(position_value or 0.0))
+
+    def record_partial(self, symbol: str, exit_value: float, remaining_qty: float) -> None:
+        normalized = str(symbol)
+        tracked = self._open.get(normalized)
+        if tracked is None:
+            return
+        tracked.current_qty = max(0.0, float(remaining_qty or 0.0))
+        if tracked.raw_position is not None:
+            tracked.raw_position.current_qty = tracked.current_qty
+        self.cash_available += max(0.0, float(exit_value or 0.0))
 
     def update_trail_state(self, symbol: str, trail_state: dict[str, Any]) -> None:
         """Refresh the cached trail_state so subsequent candles see accumulated state."""

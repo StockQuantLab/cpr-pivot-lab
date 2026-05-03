@@ -1361,16 +1361,23 @@ def _fetch_live_readiness_sync(trade_date: str | None = None) -> dict:
     from scripts.data_quality import build_trade_date_readiness_report
     from scripts.paper_prepare import resolve_trade_date
 
-    resolved_trade_date = resolve_trade_date(trade_date or "today")
+    db = get_dashboard_db()
+    date_source = "operator"
+    if trade_date and str(trade_date).strip():
+        resolved_trade_date = resolve_trade_date(trade_date)
+    else:
+        resolved_trade_date = _resolve_default_live_readiness_date(db)
+        date_source = "prepared_runtime"
     try:
         report = build_trade_date_readiness_report(
             resolved_trade_date,
-            db=get_dashboard_db(),
+            db=db,
         )
     except Exception as exc:
         logger.exception("Live readiness failed for %s", resolved_trade_date)
         return {
             "trade_date": resolved_trade_date,
+            "date_source": date_source,
             "ready": False,
             "error": str(exc),
             "requested_count": 0,
@@ -1385,7 +1392,118 @@ def _fetch_live_readiness_sync(trade_date: str | None = None) -> dict:
         for table, status in coverage_status.items()
         if str(status).lower() == "blocking"
     }
+    report["date_source"] = date_source
+    _add_live_readiness_dashboard_rows(report, db, resolved_trade_date)
     return report
+
+
+_LIVE_SETUP_TABLES = (
+    "cpr_daily",
+    "cpr_thresholds",
+    "market_day_state",
+    "strategy_day_state",
+)
+
+
+def _add_live_readiness_dashboard_rows(report: dict, db: MarketDB, trade_date: str) -> None:
+    """Attach dashboard-friendly OK/NOT OK rows to the readiness report."""
+    setup_counts = _fetch_exact_setup_table_counts(db, trade_date)
+    if "cpr_daily" not in setup_counts and "next_day_cpr_count" in report:
+        setup_counts["cpr_daily"] = int(report.get("next_day_cpr_count") or 0)
+    if "market_day_state" not in setup_counts and "next_day_mds_count" in report:
+        setup_counts["market_day_state"] = int(report.get("next_day_mds_count") or 0)
+
+    report["setup_table_status_rows"] = [
+        {
+            "table": table,
+            "value": f"{int(setup_counts.get(table) or 0):,}",
+            "status": "OK" if int(setup_counts.get(table) or 0) > 0 else "NOT OK",
+            "detail": f"exact {trade_date} rows",
+        }
+        for table in _LIVE_SETUP_TABLES
+    ]
+
+    report["freshness_status_rows"] = [
+        {
+            "table": str(row.get("table") or ""),
+            "value": str(row.get("max_trade_date") or "missing"),
+            "status": "OK" if _readiness_detail_is_ok(row.get("status")) else "NOT OK",
+            "detail": str(row.get("status") or ""),
+        }
+        for row in (report.get("freshness_rows") or [])
+    ]
+
+    coverage_status = report.get("coverage_status") or {}
+    missing_counts = report.get("missing_counts") or {}
+    coverage_tables = sorted(set(coverage_status) | set(missing_counts))
+    report["coverage_status_rows"] = [
+        {
+            "table": table,
+            "value": f"{int(missing_counts.get(table) or 0):,} missing",
+            "status": "NOT OK"
+            if str(coverage_status.get(table) or "ok").lower() == "blocking"
+            else "OK",
+            "detail": str(coverage_status.get(table) or "ok").upper(),
+        }
+        for table in coverage_tables
+    ]
+
+
+def _fetch_exact_setup_table_counts(db: MarketDB, trade_date: str) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    con = getattr(db, "con", None)
+    if con is None:
+        return counts
+    for table in _LIVE_SETUP_TABLES:
+        try:
+            row = con.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE trade_date = ?::DATE",
+                [trade_date],
+            ).fetchone()
+            counts[table] = int((row or [0])[0] or 0)
+        except Exception:
+            logger.debug("Failed to count setup rows for %s on %s", table, trade_date)
+    return counts
+
+
+def _readiness_detail_is_ok(status: object) -> bool:
+    return str(status or "").upper().startswith("OK")
+
+
+def _resolve_default_live_readiness_date(db: MarketDB) -> str:
+    """Prefer the prepared next live date over literal calendar today."""
+    from scripts.paper_prepare import resolve_trade_date
+
+    try:
+        table_dates = db.get_table_max_trade_dates(
+            [
+                "cpr_daily",
+                "cpr_thresholds",
+                "market_day_state",
+                "strategy_day_state",
+                "intraday_day_pack",
+            ]
+        )
+    except Exception:
+        return resolve_trade_date("today")
+
+    pack_date = table_dates.get("intraday_day_pack")
+    setup_dates: list[str] = []
+    for table in (
+        "cpr_daily",
+        "cpr_thresholds",
+        "market_day_state",
+        "strategy_day_state",
+    ):
+        table_date = table_dates.get(table)
+        if table_date:
+            setup_dates.append(str(table_date))
+    prepared_dates = sorted(
+        {date for date in setup_dates if pack_date is None or str(date) > str(pack_date)}
+    )
+    if prepared_dates:
+        return str(prepared_dates[-1])
+    return resolve_trade_date("today")
 
 
 async def aget_live_readiness(trade_date: str | None = None) -> dict:

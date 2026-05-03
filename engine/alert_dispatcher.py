@@ -258,11 +258,12 @@ class AlertDispatcher:
 
         for attempt in range(self.MAX_RETRIES):
             try:
-                # Telegram (primary)
+                # Telegram (primary channel)
                 if self.telegram.enabled and not telegram_ok:
                     await self.telegram.send(event.subject, event.body)
                     telegram_ok = True
-                # Email (backup)
+                # Email (parallel channel — sent on every attempt alongside Telegram,
+                # not a fallback triggered only on Telegram failure)
                 if self.email.enabled and not email_ok:
                     await asyncio.wait_for(
                         self.email.send(event.subject, event.body),

@@ -1743,7 +1743,7 @@ async def _cmd_flatten_all(args: argparse.Namespace) -> None:
     db = _pdb()
     rows = db.con.execute(
         "SELECT session_id, status FROM paper_sessions "
-        "WHERE trade_date = ? AND status IN ('ACTIVE','PAUSED','STOPPING','FAILED','CANCELLED') "
+        "WHERE trade_date = ? AND status IN ('ACTIVE','PAUSED','STOPPING','FAILED') "
         "ORDER BY created_at",
         [trade_date],
     ).fetchall()
@@ -1829,7 +1829,7 @@ async def _cmd_flatten_both(args: argparse.Namespace) -> None:
         SELECT session_id, direction, status
         FROM paper_sessions
         WHERE trade_date = ?
-          AND status IN ('ACTIVE','PAUSED')
+          AND status IN ('ACTIVE','PAUSED','STOPPING','FAILED')
           AND UPPER(direction) IN ('LONG','SHORT')
         ORDER BY direction, created_at
         """,

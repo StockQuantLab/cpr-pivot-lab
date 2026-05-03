@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import datetime
 from types import SimpleNamespace
 
+import pytest
+
 import scripts.paper_prepare as paper_prepare
 from scripts.paper_prepare import pre_filter_symbols_for_strategy
 
@@ -483,7 +485,7 @@ def test_pre_filter_symbols_for_strategy_can_return_empty(monkeypatch):
     assert filtered == []
 
 
-def test_pre_filter_symbols_keeps_universe_when_exact_cpr_date_missing_for_live(monkeypatch):
+def test_pre_filter_symbols_fails_when_exact_cpr_date_missing_for_live(monkeypatch):
     class _FakeCon:
         def execute(self, query: str, params: list[object]):
             if "MAX(trade_date)::VARCHAR FROM cpr_daily" in query:
@@ -495,12 +497,11 @@ def test_pre_filter_symbols_keeps_universe_when_exact_cpr_date_missing_for_live(
 
     monkeypatch.setattr(paper_prepare, "get_db", lambda: _FakeDB())
 
-    filtered = pre_filter_symbols_for_strategy(
-        trade_date="2024-03-11",
-        symbols=["SBIN"],
-        strategy="CPR_LEVELS",
-        strategy_params={},
-        require_trade_date_rows=True,
-    )
-
-    assert filtered == ["SBIN"]
+    with pytest.raises(RuntimeError, match="latest cpr_daily row is 2024-03-08"):
+        pre_filter_symbols_for_strategy(
+            trade_date="2024-03-11",
+            symbols=["SBIN"],
+            strategy="CPR_LEVELS",
+            strategy_params={},
+            require_trade_date_rows=True,
+        )

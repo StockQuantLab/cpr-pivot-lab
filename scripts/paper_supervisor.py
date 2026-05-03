@@ -20,14 +20,16 @@ from datetime import datetime
 from datetime import time as dt_time
 from pathlib import Path
 from typing import Any, ClassVar
+from zoneinfo import ZoneInfo
 
 from db.paper_db import get_paper_db
 from scripts.paper_prepare import resolve_trade_date
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_LOG_DIR = PROJECT_ROOT / ".tmp_logs" / "supervisor"
-WATCH_RELAUNCH_CUTOFF = dt_time(15, 30)
+WATCH_RELAUNCH_CUTOFF = dt_time(15, 0)
 NTP_DELTA = 2_208_988_800
+IST = ZoneInfo("Asia/Kolkata")
 _ACTIVE_SESSION_STATUSES = ("ACTIVE", "PAUSED", "STOPPING")
 _active_child: subprocess.Popen[str] | None = None
 _child_heartbeat_path: Path | None = None
@@ -43,7 +45,7 @@ def _stamp() -> str:
 
 
 def _watch_relaunch_allowed(now: datetime | None = None) -> bool:
-    current = now or datetime.now().astimezone()
+    current = now.astimezone(IST) if now is not None else datetime.now(IST)
     return current.timetz().replace(tzinfo=None) < WATCH_RELAUNCH_CUTOFF
 
 
@@ -380,7 +382,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
-    global _run_loop_active
+    global _child_heartbeat_path, _run_loop_active
     args = _build_parser().parse_args()
     live_args = _normalize_live_args(args.live_args)
     log_dir = Path(args.log_dir)

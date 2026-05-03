@@ -34,6 +34,8 @@ class EmailNotifier:
 
     @property
     def enabled(self) -> bool:
+        # Requires three Doppler secrets: SMTP_USER (sender address + SMTP login),
+        # SMTP_PASSWORD, and ALERT_TO_EMAIL (recipient address).
         return bool(self._user and self._password and self._to_addr)
 
     async def send(self, subject: str, body: str) -> None:

@@ -976,8 +976,12 @@ async def test_cmd_flatten_all_archives_each_completed_session(
         def fetchall(self):
             return [("paper-long", "ACTIVE"), ("paper-short", "FAILED")]
 
+    def fake_execute(sql: str, *args, **kwargs):
+        assert "CANCELLED" not in sql
+        return _Rows()
+
     fake_db = SimpleNamespace(
-        con=SimpleNamespace(execute=lambda *args, **kwargs: _Rows()),
+        con=SimpleNamespace(execute=fake_execute),
         force_sync=lambda: calls.append(("force_sync", None)),
     )
 

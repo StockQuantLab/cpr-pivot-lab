@@ -666,6 +666,56 @@ def _render_live_readiness(readiness: dict, colors: dict) -> None:
         reason_text = "; ".join(reasons) if reasons else "readiness gate returned NO"
         info_box(f"{trade_date} is not live-ready: {reason_text}.", color="red")
 
+    setup_rows = list(readiness.get("setup_table_status_rows") or [])
+    if setup_rows:
+        ui.label("Exact Trade-Date Setup Tables").classes("text-sm font-semibold mt-3 mb-1")
+        paginated_table(
+            columns=[
+                {"name": "table", "label": "Table", "field": "table", "align": "left"},
+                {"name": "value", "label": "Rows", "field": "value", "align": "right"},
+                {"name": "status", "label": "Status", "field": "status", "align": "left"},
+                {"name": "detail", "label": "Detail", "field": "detail", "align": "left"},
+            ],
+            rows=setup_rows,
+            row_key="table",
+            page_size=8,
+        )
+
+    freshness_status_rows = list(readiness.get("freshness_status_rows") or [])
+    if freshness_status_rows:
+        ui.label("Runtime Freshness").classes("text-sm font-semibold mt-3 mb-1")
+        paginated_table(
+            columns=[
+                {"name": "table", "label": "Table", "field": "table", "align": "left"},
+                {
+                    "name": "value",
+                    "label": "Max Trade Date",
+                    "field": "value",
+                    "align": "left",
+                },
+                {"name": "status", "label": "Status", "field": "status", "align": "left"},
+                {"name": "detail", "label": "Detail", "field": "detail", "align": "left"},
+            ],
+            rows=freshness_status_rows,
+            row_key="table",
+            page_size=8,
+        )
+
+    coverage_status_rows = list(readiness.get("coverage_status_rows") or [])
+    if coverage_status_rows:
+        ui.label("Symbol Coverage").classes("text-sm font-semibold mt-3 mb-1")
+        paginated_table(
+            columns=[
+                {"name": "table", "label": "Check", "field": "table", "align": "left"},
+                {"name": "value", "label": "Missing", "field": "value", "align": "right"},
+                {"name": "status", "label": "Status", "field": "status", "align": "left"},
+                {"name": "detail", "label": "Detail", "field": "detail", "align": "left"},
+            ],
+            rows=coverage_status_rows,
+            row_key="table",
+            page_size=8,
+        )
+
     if blocking_counts:
         rows = [
             {"table": str(table), "missing": int(count)}
@@ -691,28 +741,6 @@ def _render_live_readiness(readiness: dict, colors: dict) -> None:
             f"Sparse symbol/day warnings exist ({sparse_total:,} table-symbol gaps), "
             "but they are below the blocking threshold.",
             color="yellow",
-        )
-
-    freshness_rows = [
-        row
-        for row in (readiness.get("freshness_rows") or [])
-        if not str(row.get("status") or "").upper().startswith("OK")
-    ]
-    if freshness_rows:
-        paginated_table(
-            columns=[
-                {"name": "table", "label": "Table", "field": "table", "align": "left"},
-                {
-                    "name": "max_trade_date",
-                    "label": "Max Trade Date",
-                    "field": "max_trade_date",
-                    "align": "left",
-                },
-                {"name": "status", "label": "Status", "field": "status", "align": "left"},
-            ],
-            rows=freshness_rows,
-            row_key="table",
-            page_size=8,
         )
 
 
@@ -922,7 +950,7 @@ async def paper_ledger_page() -> None:
         )
         page_state: dict[str, object] = {
             "auto_refresh": True,
-            "loading": False,
+            "selected_tab": "readiness",
             "timer": None,
             "selected_active_session_id": "",
         }
@@ -934,18 +962,32 @@ async def paper_ledger_page() -> None:
 
         tabs = ui.tabs().classes("w-full")
         with tabs:
+            ui.tab("readiness", label="Live Readiness", icon="verified")
             ui.tab("active", label="Active Sessions", icon="sensors")
             ui.tab("archived", label="Archived Sessions", icon="archive")
             ui.tab("daily", label="Daily Summary", icon="calendar_view_day")
 
-        with ui.tab_panels(tabs, value="active", keep_alive=True).classes("w-full"):
+        with ui.tab_panels(tabs, value="readiness", keep_alive=True).classes("w-full"):
+            with ui.tab_panel("readiness"):
+                with ui.row().classes("mb-4 items-center gap-3 flex-wrap"):
+                    readiness_date_input = (
+                        ui.input("Readiness Date", value="")
+                        .props("outlined dense placeholder='auto prepared date'")
+                        .classes("w-44")
+                    )
+                    ui.button(
+                        "Refresh Readiness",
+                        icon="refresh",
+                        on_click=lambda: safe_timer(0.01, _load_readiness),
+                    ).props("outline aria-label='Refresh live readiness now'")
+                readiness_content = ui.column().classes("w-full")
             with ui.tab_panel("active"):
                 # Active-session controls — only visible on this tab
                 with ui.row().classes("mb-4 items-center gap-3 flex-wrap"):
                     ui.button(
                         "Refresh Now",
                         icon="refresh",
-                        on_click=lambda: safe_timer(0.01, _load),
+                        on_click=lambda: safe_timer(0.01, _load_active),
                     ).props("outline aria-label='Refresh paper sessions now'")
                     ui.checkbox(
                         "Near-real-time refresh 3s",
@@ -990,7 +1032,6 @@ async def paper_ledger_page() -> None:
                         "color=negative"
                     )
 
-                readiness_content = ui.column().classes("w-full mb-4")
                 active_content = ui.column().classes("w-full")
             with ui.tab_panel("archived"):
                 archived_content = ui.column().classes("w-full")
@@ -1004,25 +1045,39 @@ async def paper_ledger_page() -> None:
                     ui.spinner("dots").props('role="status" aria-live="polite"')
                     ui.label(label).classes("text-sm").style(f"color:{THEME['text_muted']};")
 
-        async def _load_active() -> None:
-            if page_state.get("loading_active"):
+        async def _load_readiness() -> None:
+            if page_state.get("loading_readiness"):
                 return
-            page_state["loading_active"] = True
-            trade_date = str(trade_date_input.value or "").strip() or None
+            page_state["loading_readiness"] = True
+            _loading(readiness_content, "Checking live readiness...")
+            trade_date = str(readiness_date_input.value or "").strip() or None
             try:
-                readiness, active_sessions = await asyncio.gather(
-                    aget_live_readiness(trade_date),
-                    aget_paper_active_sessions(),
-                )
-                active_count = len(active_sessions)
+                readiness = await aget_live_readiness(trade_date)
+                resolved_date = str(readiness.get("trade_date") or "")
+                if not trade_date and resolved_date:
+                    readiness_date_input.value = resolved_date
                 status_line.text = (
-                    f"Active refreshed {datetime.now().strftime('%H:%M:%S')} | "
-                    f"active={active_count} | "
+                    f"Readiness refreshed {datetime.now().strftime('%H:%M:%S')} | "
+                    f"trade_date={resolved_date or '-'} | "
                     f"readiness={'YES' if readiness.get('ready') else 'NO'}"
                 )
                 readiness_content.clear()
                 with readiness_content:
                     _render_live_readiness(readiness, colors)
+            finally:
+                page_state["loading_readiness"] = False
+
+        async def _load_active() -> None:
+            if page_state.get("loading_active"):
+                return
+            page_state["loading_active"] = True
+            try:
+                active_sessions = await aget_paper_active_sessions()
+                active_count = len(active_sessions)
+                status_line.text = (
+                    f"Active refreshed {datetime.now().strftime('%H:%M:%S')} | "
+                    f"active={active_count}"
+                )
                 active_content.clear()
                 with active_content:
                     _render_live_paper_sessions(active_sessions, colors, page_state)
@@ -1121,7 +1176,11 @@ async def paper_ledger_page() -> None:
                 page_state["loading_daily"] = False
 
         async def _load() -> None:
-            await _load_active()
+            selected = str(page_state.get("selected_tab") or "readiness")
+            if selected == "readiness":
+                await _load_readiness()
+            elif selected == "active":
+                await _load_active()
             if page_state.get("archived_loaded"):
                 await _load_archived()
             if page_state.get("daily_loaded"):
@@ -1129,7 +1188,14 @@ async def paper_ledger_page() -> None:
 
         def _on_tab_change(e) -> None:
             selected = _extract_tab_value(e)
-            if selected == "archived" and not page_state.get("archived_loaded"):
+            page_state["selected_tab"] = selected
+            if selected == "readiness" and not page_state.get("readiness_loaded"):
+                page_state["readiness_loaded"] = True
+                safe_timer(0.01, _load_readiness)
+            elif selected == "active" and not page_state.get("active_loaded"):
+                page_state["active_loaded"] = True
+                safe_timer(0.01, _load_active)
+            elif selected == "archived" and not page_state.get("archived_loaded"):
                 page_state["archived_loaded"] = True
                 safe_timer(0.01, _load_archived)
             elif selected == "daily" and not page_state.get("daily_loaded"):
@@ -1137,11 +1203,16 @@ async def paper_ledger_page() -> None:
                 safe_timer(0.01, _load_daily)
 
         tabs.on("update:model-value", _on_tab_change)
-        _loading(active_content, "Loading active sessions...")
-        safe_timer(0.1, _load_active)
+        _loading(readiness_content, "Checking live readiness...")
+        page_state["readiness_loaded"] = True
+        safe_timer(0.1, _load_readiness)
         safe_timer(
             3.0,
-            lambda: safe_timer(0.01, _load_active) if page_state.get("auto_refresh") else None,
+            lambda: (
+                safe_timer(0.01, _load_active)
+                if page_state.get("auto_refresh") and page_state.get("selected_tab") == "active"
+                else None
+            ),
             once=False,
         )
 

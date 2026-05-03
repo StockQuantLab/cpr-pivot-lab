@@ -88,9 +88,13 @@ def test_archive_completed_session_stamps_paper_metadata_and_coexists_with_backt
         )
         session_updates: list[dict[str, object]] = []
 
+        def fake_get_session_positions(sid, statuses=None):
+            assert statuses == ["CLOSED", "FLATTENED"]
+            return [position] if sid == "paper-1" else []
+
         fake_paper_db = SimpleNamespace(
             get_session=lambda sid: session if sid == "paper-1" else None,
-            get_session_positions=lambda sid, statuses=None: [position] if sid == "paper-1" else [],
+            get_session_positions=fake_get_session_positions,
             update_session=lambda sid, **kwargs: session_updates.append(
                 {"session_id": sid, **kwargs}
             ),
@@ -184,6 +188,64 @@ def test_archive_completed_session_normalizes_manual_close_exit_reason(
             "SELECT exit_reason FROM backtest_results WHERE run_id = 'paper-manual'"
         ).fetchone()
         assert row == ("TIME",)
+    finally:
+        db.close()
+
+
+def test_archive_completed_session_includes_flattened_positions(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    db = BacktestDB(db_path=tmp_path / "flattened-archive.duckdb")
+    try:
+        session = SimpleNamespace(
+            session_id="paper-flattened",
+            strategy="CPR_LEVELS",
+            status="COMPLETED",
+            symbols=["SBIN"],
+            strategy_params={},
+            max_daily_loss_pct=0.03,
+            max_positions=10,
+            max_position_pct=0.10,
+            mode="LIVE",
+            trade_date="2026-04-28",
+            portfolio_value=1_000_000,
+        )
+        position = SimpleNamespace(
+            position_id="pos-flat",
+            session_id="paper-flattened",
+            symbol="SBIN",
+            direction="LONG",
+            status="FLATTENED",
+            qty=10,
+            entry_price=100.0,
+            stop_loss=98.0,
+            target_price=106.0,
+            trail_state={"close_reason": "MANUAL_FLATTEN"},
+            entry_time=datetime(2026, 4, 28, 10, 30),
+            exit_time=datetime(2026, 4, 28, 10, 55),
+            exit_price=101.0,
+            exit_reason="MANUAL_FLATTEN",
+            pnl=10.0,
+        )
+        fake_paper_db = SimpleNamespace(
+            get_session=lambda sid: session if sid == "paper-flattened" else None,
+            get_session_positions=lambda sid, statuses=None: (
+                [position] if sid == "paper-flattened" else []
+            ),
+            update_session=lambda sid, **kwargs: None,
+        )
+
+        monkeypatch.setattr(paper_archive, "get_backtest_db", lambda: db)
+        monkeypatch.setattr(paper_archive, "get_paper_db", lambda: fake_paper_db)
+
+        payload = paper_archive.archive_completed_session("paper-flattened")
+
+        assert payload["trade_count"] == 1
+        row = db.con.execute(
+            "SELECT COUNT(*), SUM(profit_loss) FROM backtest_results WHERE run_id = 'paper-flattened'"
+        ).fetchone()
+        assert row == (1, 10.0)
     finally:
         db.close()
 

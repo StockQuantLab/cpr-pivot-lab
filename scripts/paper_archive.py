@@ -22,7 +22,7 @@ def _position_to_trade_row(session: PaperSession, position: PaperPosition) -> di
     exit_price = float(position.exit_price or entry_price)
     direction = position.direction.upper()
     pnl = position.pnl
-    if not pnl:
+    if pnl is None:
         pnl = (
             (exit_price - entry_price) * quantity
             if direction == "LONG"
@@ -104,7 +104,7 @@ def archive_completed_session(
         session.strategy,
         session.status,
     )
-    closed_positions = paper_db.get_session_positions(session_id, statuses=["CLOSED"])
+    closed_positions = paper_db.get_session_positions(session_id, statuses=["CLOSED", "FLATTENED"])
     total_pnl = round(
         sum(
             float(
@@ -153,20 +153,28 @@ def archive_completed_session(
             "max_position_pct": session.max_position_pct,
         }
     )
-    backtest_db.store_run_metadata(
-        run_id=session.session_id,
-        strategy=session.strategy,
-        label=session.strategy,
-        symbols=session.symbols,
-        start_date=start_date,
-        end_date=end_date,
-        params=params,
-        execution_mode="PAPER",
-        session_id=session.session_id,
-        source_session_id=session.session_id,
-    )
-    if rows:
-        backtest_db.store_backtest_results(pl.DataFrame(rows))
+    try:
+        backtest_db.store_run_metadata(
+            run_id=session.session_id,
+            strategy=session.strategy,
+            label=session.strategy,
+            symbols=session.symbols,
+            start_date=start_date,
+            end_date=end_date,
+            params=params,
+            execution_mode="PAPER",
+            session_id=session.session_id,
+            source_session_id=session.session_id,
+        )
+        if rows:
+            backtest_db.store_backtest_results(pl.DataFrame(rows))
+    except Exception:
+        logger.exception("Archive failed; removing partial PAPER archive for %s", session_id)
+        try:
+            backtest_db.delete_runs([session.session_id])
+        except Exception:
+            logger.warning("Failed to clean partial archive for %s", session_id, exc_info=True)
+        raise
 
     # Ensure the archive reaches the backtest replica promptly. The writer's
     # replica sync has a 30 s debounce — sequential archive calls (e.g. LONG

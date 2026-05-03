@@ -353,7 +353,8 @@ class MarketDB(
     def get_universe_symbols(self, name: str) -> list[str]:
         """Load symbol list for a saved universe name."""
         universe_name = _validate_universe_name((name or "").strip())
-        self.ensure_universe_table()
+        if not self.read_only:
+            self.ensure_universe_table()
         row = self.con.execute(
             "SELECT symbols_json FROM backtest_universe WHERE universe_name = ?",
             [universe_name],
@@ -372,7 +373,8 @@ class MarketDB(
 
     def list_universes(self) -> list[dict[str, object]]:
         """List saved universe metadata rows."""
-        self.ensure_universe_table()
+        if not self.read_only:
+            self.ensure_universe_table()
         rows = self.con.execute(
             """
             SELECT
