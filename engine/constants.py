@@ -13,7 +13,7 @@ from typing import Literal, TypeVar, cast
 # Time constants
 # ---------------------------------------------------------------------------
 MARKET_OPEN = "09:15"
-TIME_EXIT_DEFAULT = "15:15"
+TIME_EXIT_DEFAULT = "15:00"
 VCPR_SCAN_END_DEFAULT = "12:30"
 ENTRY_WINDOW_END_DEFAULT = "10:15"
 

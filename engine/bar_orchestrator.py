@@ -335,14 +335,18 @@ async def check_bar_risk_controls(
     last_price: float | None,
     enforce_risk_controls: Callable[..., Any],
     build_feed_state: Callable[..., Any],
+    real_order_router: Any = None,
 ) -> bool:
-    risk_result = await enforce_risk_controls(
-        session=session,
-        as_of=as_of,
-        feed_state=build_feed_state(
+    risk_kwargs: dict[str, Any] = {
+        "session": session,
+        "as_of": as_of,
+        "feed_state": build_feed_state(
             session_id=session_id,
             symbol_last_prices=symbol_last_prices,
             last_price=last_price,
         ),
-    )
+    }
+    if real_order_router is not None:
+        risk_kwargs["real_order_router"] = real_order_router
+    risk_result = await enforce_risk_controls(**risk_kwargs)
     return bool((risk_result or {}).get("triggered"))

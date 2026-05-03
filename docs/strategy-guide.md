@@ -121,7 +121,7 @@ the operator-level version.
   quickly.  When that happened, we tuned SHORT separately with `short_trail_atr_multiplier = 1.25`.
 - LONG keeps the default `trail_atr_multiplier = 1.0` because the high-aware trigger was the
   profit-improving change we wanted to preserve for the morning baseline set.
-- TIME\_EXIT at 15:15 takes priority — any open position is force-closed regardless of phase.
+- TIME\_EXIT at 15:00 takes priority — any open position is force-closed regardless of phase.
 
 For candle-by-candle worked examples (including the April 2026 intraday-high bug and its fix)
 see `docs/trailing-stop-explained.md`.
@@ -323,9 +323,10 @@ for the full quantification.
 would better match what live actually sees (since live's effective threshold ≈ 2.5 on
 tick data ≈ 4.0-5.0 on REST data).
 
-**Time Exit** · default `15:15`
+**Time Exit** · default `15:00`
 *What:* All open positions are force-closed at this time regardless of phase.
-*Why 15:15 not 15:30:* Leaves 15 minutes before NSE close to avoid last-minute spread
+*Why 15:00 not later:* Keeps MIS positions away from Zerodha's intraday auto-square-off window
+and leaves time for operator intervention if an exit order is rejected.
 widening and to allow Zerodha's execution engine to process MOC orders normally.
 
 ---

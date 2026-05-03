@@ -25,6 +25,7 @@ from engine.paper_runtime import (
     refresh_pending_setup_rows_for_bar,
     runtime_setup_status,
 )
+from engine.real_order_runtime import RealOrderRouter
 
 logger = logging.getLogger(__name__)
 
@@ -126,6 +127,7 @@ async def process_closed_bar_group(
     enforce_risk_controls: Callable[..., Any] = enforce_session_risk_controls,
     build_feed_state: Callable[..., Any] = build_summary_feed_state,
     update_symbols_cb: Callable[[list[str]], Any] | None = None,
+    real_order_router: RealOrderRouter | None = None,
 ) -> dict[str, Any]:
     if not bar_candles:
         return {
@@ -188,6 +190,7 @@ async def process_closed_bar_group(
             now=candle.bar_end,
             position_tracker=tracker,
             allow_entry_evaluation=False,
+            real_order_router=real_order_router,
         )
         advance = dict(evaluation.get("advance_result") or {})
         if advance.get("action") == "CLOSE":
@@ -227,6 +230,7 @@ async def process_closed_bar_group(
             now=candle.bar_end,
             position_tracker=tracker,
             allow_entry_evaluation=True,
+            real_order_router=real_order_router,
         )
         if evaluation.get("action") == "ENTRY_CANDIDATE":
             entry_candidates.append(evaluation)
@@ -243,6 +247,7 @@ async def process_closed_bar_group(
             params=params,
             now=bar_candles_sorted[0].bar_end,
             position_tracker=tracker,
+            real_order_router=real_order_router,
         )
         if execute_result.get("action") == "OPEN":
             candidate = dict(selected.get("candidate") or {})
@@ -310,6 +315,7 @@ async def process_closed_bar_group(
             last_price=current_bar_close,
             enforce_risk_controls=enforce_risk_controls,
             build_feed_state=build_feed_state,
+            real_order_router=real_order_router,
         ):
             triggered = True
 

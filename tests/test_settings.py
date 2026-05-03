@@ -67,7 +67,7 @@ def test_paper_trading_settings_defaults_are_present() -> None:
     assert settings.paper_max_positions == 5
     assert settings.paper_max_position_pct == 0.20
     assert settings.paper_stale_feed_timeout_sec == 120
-    assert settings.paper_flatten_time == "15:15:00"
+    assert settings.paper_flatten_time == "15:00:00"
     assert settings.paper_live_poll_interval_sec == 1.0
     assert settings.paper_candle_interval_minutes == 5
     assert settings.paper_live_quote_batch_size == 500

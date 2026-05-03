@@ -7,6 +7,44 @@ Supersedes: `docs/PARITY_INCIDENT_LOG.md` (contents migrated below).
 
 ---
 
+## 2026-05-03 — FIXED: LIVE: CPR time exit too close to Zerodha MIS auto square-off
+
+**Status:** FIXED
+**Severity:** Critical
+
+### Symptom
+
+CPR live/paper/backtest defaults exited open intraday positions at 15:15 IST. For real MIS
+trading this left too little room before broker RMS auto square-off, extra charges, and failure
+cases such as circuit-limit or connectivity issues.
+
+### Root Cause
+
+The strategy default was optimized against NSE close, not broker intraday square-off operations.
+`StrategyConfig.time_exit`, paper session `flatten_time`, settings, and the backtest CLI all
+defaulted to 15:15.
+
+### Fix
+
+Changed the production default EOD/time exit to 15:00 across `engine/constants.py`,
+`engine/cpr_atr_models.py`, `engine/run_backtest.py`, `config/settings.py`, and `db/paper_db.py`.
+Updated tests and current operator docs so backtest, replay, live paper, and real-routed live
+sessions share the earlier exit.
+
+Follow-up in the same safety batch: automated real-order routing now enforces a cash-only budget.
+`daily-live --real-orders` rejects startup when `--real-order-cash-budget` exceeds Kite-reported
+available equity cash, and each entry is blocked if cumulative open real-order notional would
+exceed that cash budget.
+
+### Related
+
+Focused verification: `uv run pytest tests/test_settings.py tests/test_strategy.py
+tests/test_live_market_data.py tests/test_paper_replay.py tests/test_paper_runtime.py
+tests/test_paper_trading_cli.py -q`. LONG/SHORT CPR risk baselines must be rerun because this
+changes strategy behaviour.
+
+---
+
 ## 2026-05-02 — FIXED: LIVE: Broker order intents lacked hard price-safety guards
 
 **Status:** FIXED

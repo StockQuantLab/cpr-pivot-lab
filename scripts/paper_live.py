@@ -56,6 +56,7 @@ from engine.paper_runtime import (
     register_session_start,
     runtime_setup_status,
 )
+from engine.real_order_runtime import build_real_order_router
 from scripts import paper_live_helpers as _live_helpers
 from scripts.paper_archive import archive_completed_session
 from scripts.paper_feed_audit import record_closed_candles
@@ -628,6 +629,7 @@ async def run_live_session(
     auto_flatten_on_abnormal_exit: bool = True,
     allow_late_start_fallback: bool = False,
     allow_live_setup_fallback: bool = True,
+    real_order_config: dict[str, Any] | None = None,
     notes: str | None = None,
     deps: LiveSessionDeps | None = None,
 ) -> dict[str, Any]:
@@ -706,6 +708,14 @@ async def run_live_session(
         )
     params = build_backtest_params(params_session)
     direction_filter = str(getattr(params, "direction_filter", "BOTH") or "BOTH").upper()
+    real_order_router = build_real_order_router(real_order_config)
+    if real_order_router is not None:
+        logger.warning(
+            "[%s] ZERODHA_LIVE real-order routing enabled: fixed_qty=%d entry_order_type=%s",
+            session_id,
+            real_order_router.config.fixed_quantity,
+            real_order_router.config.entry_order_type,
+        )
 
     runtime_state = PaperRuntimeState(
         allow_live_setup_fallback=allow_live_setup_fallback,
@@ -906,6 +916,7 @@ async def run_live_session(
                     notes="global_flatten_signal",
                     feed_state=live_feed_state,
                     emit_summary=False,
+                    real_order_router=real_order_router,
                 )
                 if _reconcile_live_session(
                     session_id=session_id,
@@ -1152,6 +1163,7 @@ async def run_live_session(
                                 execute_entry_fn=execute_entry,
                                 enforce_risk_controls=enforce_session_risk_controls,
                                 build_feed_state=build_summary_feed_state,
+                                real_order_router=real_order_router,
                                 update_symbols_cb=(
                                     (
                                         lambda symbols: ticker_adapter.update_symbols(
@@ -1271,6 +1283,7 @@ async def run_live_session(
                     notes="manual_flatten_signal",
                     feed_state=live_feed_state,
                     emit_summary=False,
+                    real_order_router=real_order_router,
                 )
                 if _reconcile_live_session(
                     session_id=session_id,
@@ -1333,6 +1346,7 @@ async def run_live_session(
                                 notes=f"admin_{_reason}_{_requester}",
                                 feed_state=live_feed_state,
                                 emit_summary=False,
+                                real_order_router=real_order_router,
                             )
                             if _reconcile_live_session(
                                 session_id=session_id,
@@ -1362,6 +1376,7 @@ async def run_live_session(
                                     _syms,
                                     notes=f"admin_{_reason}_{_requester}",
                                     feed_state=live_feed_state,
+                                    real_order_router=real_order_router,
                                 )
                                 for _pos in _close_result.get("positions", []):
                                     _sym = str(_pos.get("symbol", ""))
@@ -1725,6 +1740,7 @@ async def run_live_session(
                         execute_entry_fn=execute_entry,
                         enforce_risk_controls=enforce_session_risk_controls,
                         build_feed_state=build_summary_feed_state,
+                        real_order_router=real_order_router,
                     )
                     active_symbols = list(driver_result["active_symbols"])
                     last_price = driver_result["last_price"]
@@ -1761,6 +1777,7 @@ async def run_live_session(
                         ticker_adapter=ticker_adapter if use_websocket else None,
                         symbols=list(tracker._open.keys()) or active_symbols,
                     ),
+                    real_order_router=real_order_router,
                 )
             except Exception:
                 logger.warning("Final EOD flatten/summary failed (best-effort)", exc_info=True)
@@ -1783,6 +1800,7 @@ async def run_live_session(
                             ticker_adapter=ticker_adapter if use_websocket else None,
                             symbols=list(tracker._open.keys()) or active_symbols,
                         ),
+                        real_order_router=real_order_router,
                     )
                 except Exception:
                     # Fix 2: alert operator when auto-flatten itself fails — orphaned positions.
@@ -1936,6 +1954,17 @@ async def run_live_session(
         "last_snapshot_ts": last_snapshot_ts.isoformat() if last_snapshot_ts else None,
         "last_bar_ts": last_bar_ts.isoformat() if last_bar_ts else None,
         "terminal_reason": terminal_reason,
+        "broker_execution": "ZERODHA_LIVE" if real_order_router is not None else "PAPER_LIVE",
+        "real_orders_enabled": real_order_router is not None,
+        "real_order_fixed_qty": (
+            real_order_router.config.fixed_quantity if real_order_router is not None else None
+        ),
+        "real_order_max_positions": (
+            real_order_router.config.max_positions if real_order_router is not None else None
+        ),
+        "real_order_cash_budget": (
+            real_order_router.config.cash_budget if real_order_router is not None else None
+        ),
         "final_status": final_status
         if final_status != "ACTIVE"
         else getattr(final_session, "status", "ACTIVE"),

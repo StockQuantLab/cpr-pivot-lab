@@ -1,0 +1,360 @@
+"""Guarded real-order routing for live CPR paper sessions."""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Any
+
+from db.paper_db import get_paper_db
+from engine.broker_adapter import (
+    DEFAULT_EXIT_MAX_SLIPPAGE_PCT,
+    DEFAULT_MARKET_PROTECTION_PCT,
+    DEFAULT_TICK_SIZE,
+    BrokerOrderIntent,
+    OrderSafetyError,
+    ZerodhaBrokerAdapter,
+    build_protected_flatten_intent,
+    record_real_order,
+)
+
+
+@dataclass(frozen=True, slots=True)
+class RealOrderRuntimeConfig:
+    enabled: bool = False
+    fixed_quantity: int = 1
+    max_positions: int = 1
+    cash_budget: float = 10_000.0
+    require_account_cash_check: bool = True
+    entry_order_type: str = "LIMIT"
+    entry_max_slippage_pct: float = 0.5
+    exit_max_slippage_pct: float = DEFAULT_EXIT_MAX_SLIPPAGE_PCT
+    product: str = "MIS"
+    exchange: str = "NSE"
+
+    @classmethod
+    def from_mapping(cls, raw: dict[str, Any] | None) -> RealOrderRuntimeConfig:
+        data = dict(raw or {})
+        return cls(
+            enabled=bool(data.get("enabled", False)),
+            fixed_quantity=int(data.get("fixed_quantity") or 1),
+            max_positions=int(data.get("max_positions") or 1),
+            cash_budget=float(data.get("cash_budget") or 10_000.0),
+            require_account_cash_check=bool(data.get("require_account_cash_check", True)),
+            entry_order_type=str(data.get("entry_order_type") or "LIMIT").upper(),
+            entry_max_slippage_pct=float(data.get("entry_max_slippage_pct") or 0.5),
+            exit_max_slippage_pct=float(
+                data.get("exit_max_slippage_pct") or DEFAULT_EXIT_MAX_SLIPPAGE_PCT
+            ),
+            product=str(data.get("product") or "MIS").upper(),
+            exchange=str(data.get("exchange") or "NSE").upper(),
+        ).validate()
+
+    def validate(self) -> RealOrderRuntimeConfig:
+        if self.fixed_quantity <= 0:
+            raise OrderSafetyError("real-order fixed quantity must be positive")
+        if self.max_positions <= 0:
+            raise OrderSafetyError("real-order max positions must be positive")
+        if not math.isfinite(self.cash_budget) or self.cash_budget <= 0:
+            raise OrderSafetyError("real-order cash budget must be positive")
+        if self.entry_order_type not in {"MARKET", "LIMIT"}:
+            raise OrderSafetyError("automated real entries support only MARKET or LIMIT")
+        if not math.isfinite(self.entry_max_slippage_pct) or self.entry_max_slippage_pct <= 0:
+            raise OrderSafetyError("entry max slippage must be positive")
+        if not math.isfinite(self.exit_max_slippage_pct) or self.exit_max_slippage_pct <= 0:
+            raise OrderSafetyError("exit max slippage must be positive")
+        if self.product != "MIS":
+            raise OrderSafetyError("automated CPR real-order pilot supports MIS only")
+        if self.exchange != "NSE":
+            raise OrderSafetyError("automated CPR real-order pilot supports NSE only")
+        return self
+
+
+class RealOrderRouter:
+    """Places guarded real broker orders for live-session paper events.
+
+    The router uses a fixed real quantity independent of paper sizing. This lets
+    paper strategy math continue unchanged while the real-money pilot starts at
+    one share and scales only after the Doppler caps and CLI quantity are raised.
+    """
+
+    def __init__(
+        self,
+        config: RealOrderRuntimeConfig,
+        *,
+        adapter: ZerodhaBrokerAdapter | None = None,
+        account_available_cash: float | None = None,
+    ) -> None:
+        self.config = config
+        self.adapter = adapter or _default_live_adapter()
+        self._open_real_positions = 0
+        self._used_cash_notional = 0.0
+        self._open_notional_by_symbol: dict[str, float] = {}
+        if (
+            config.enabled
+            and config.require_account_cash_check
+            and account_available_cash is not None
+            and config.cash_budget > float(account_available_cash)
+        ):
+            raise OrderSafetyError(
+                f"real-order cash budget {config.cash_budget:.2f} exceeds available cash "
+                f"{float(account_available_cash):.2f}"
+            )
+
+    @property
+    def enabled(self) -> bool:
+        return self.config.enabled
+
+    async def place_entry(
+        self,
+        *,
+        session_id: str,
+        symbol: str,
+        direction: str,
+        reference_price: float,
+        event_time: datetime | str | None,
+    ) -> dict[str, Any]:
+        if not self.enabled:
+            return {}
+        if self._open_real_positions >= self.config.max_positions:
+            raise OrderSafetyError(
+                f"real-order max open positions reached ({self.config.max_positions})"
+            )
+        side = "BUY" if direction.upper() == "LONG" else "SELL"
+        intent = self._entry_intent(
+            session_id=session_id,
+            symbol=symbol,
+            side=side,
+            reference_price=reference_price,
+            event_time=_event_time_value(event_time),
+        )
+        entry_notional = _intent_notional(intent)
+        if self._used_cash_notional + entry_notional > self.config.cash_budget:
+            raise OrderSafetyError(
+                f"real-order cash budget exceeded: requested cumulative notional "
+                f"{self._used_cash_notional + entry_notional:.2f} > "
+                f"{self.config.cash_budget:.2f}"
+            )
+        result = await record_real_order(
+            paper_db=get_paper_db(),
+            intent=intent,
+            adapter=self.adapter,
+        )
+        self._open_real_positions += 1
+        self._used_cash_notional += entry_notional
+        self._open_notional_by_symbol[symbol.upper()] = (
+            self._open_notional_by_symbol.get(symbol.upper(), 0.0) + entry_notional
+        )
+        return {
+            "real_order_qty": self.config.fixed_quantity,
+            "real_entry_order_id": result.get("exchange_order_id"),
+            "real_entry_order_type": intent.order_type,
+            "real_entry_side": side,
+            "real_entry_payload": result.get("payload"),
+            "real_remaining_qty": self.config.fixed_quantity,
+        }
+
+    async def place_exit(
+        self,
+        *,
+        session_id: str,
+        symbol: str,
+        direction: str,
+        position_id: str | None,
+        quantity: int,
+        reference_price: float,
+        role: str,
+        event_time: datetime | str | None,
+        quote_age_sec: float = 0.0,
+    ) -> dict[str, Any]:
+        if not self.enabled or quantity <= 0:
+            return {}
+        side = "SELL" if direction.upper() == "LONG" else "BUY"
+        intent = build_protected_flatten_intent(
+            session_id=session_id,
+            symbol=symbol,
+            side=side,
+            quantity=int(quantity),
+            latest_price=float(reference_price),
+            quote_age_sec=float(quote_age_sec),
+            role=role,
+            position_id=position_id,
+            product=self.config.product,
+            exchange=self.config.exchange,
+            max_slippage_pct=self.config.exit_max_slippage_pct,
+            event_time=_event_time_value(event_time),
+        )
+        result = await record_real_order(
+            paper_db=get_paper_db(),
+            intent=intent,
+            adapter=self.adapter,
+        )
+        self._open_real_positions = max(0, self._open_real_positions - 1)
+        released = self._open_notional_by_symbol.pop(symbol.upper(), 0.0)
+        self._used_cash_notional = max(0.0, self._used_cash_notional - released)
+        return {
+            "real_exit_order_id": result.get("exchange_order_id"),
+            "real_exit_order_type": intent.order_type,
+            "real_exit_side": side,
+            "real_exit_payload": result.get("payload"),
+        }
+
+    def exit_quantity_for_position(self, position: Any) -> int:
+        if not self.enabled:
+            return 0
+        trail_state = dict(getattr(position, "trail_state", None) or {})
+        remaining = trail_state.get("real_remaining_qty")
+        if remaining is None:
+            remaining = trail_state.get("real_order_qty")
+        if remaining is None:
+            remaining = self.config.fixed_quantity
+        return max(0, int(remaining))
+
+    def _entry_intent(
+        self,
+        *,
+        session_id: str,
+        symbol: str,
+        side: str,
+        reference_price: float,
+        event_time: str | None,
+    ) -> BrokerOrderIntent:
+        order_type = self.config.entry_order_type
+        price = None
+        if order_type == "LIMIT":
+            price = _marketable_limit_price(
+                side=side,
+                reference_price=reference_price,
+                max_slippage_pct=self.config.entry_max_slippage_pct,
+            )
+        return BrokerOrderIntent(
+            session_id=session_id,
+            symbol=symbol,
+            side=side,
+            quantity=self.config.fixed_quantity,
+            role="entry",
+            order_type=order_type,
+            price=price,
+            reference_price=float(reference_price),
+            reference_price_age_sec=0.0,
+            max_slippage_pct=self.config.entry_max_slippage_pct,
+            market_protection=DEFAULT_MARKET_PROTECTION_PCT if order_type == "MARKET" else None,
+            product=self.config.product,
+            exchange=self.config.exchange,
+            event_time=event_time,
+        )
+
+
+def build_real_order_router(
+    config: RealOrderRuntimeConfig | dict[str, Any] | None,
+) -> RealOrderRouter | None:
+    runtime_config = (
+        config
+        if isinstance(config, RealOrderRuntimeConfig)
+        else RealOrderRuntimeConfig.from_mapping(config)
+    )
+    if not runtime_config.enabled:
+        return None
+    if runtime_config.require_account_cash_check:
+        kite_client = _get_kite_client()
+        return RealOrderRouter(
+            runtime_config,
+            adapter=ZerodhaBrokerAdapter(
+                mode="LIVE",
+                allow_real_orders=True,
+                kite_client=kite_client,
+            ),
+            account_available_cash=_fetch_available_cash(kite_client),
+        )
+    return RealOrderRouter(runtime_config)
+
+
+def _default_live_adapter() -> ZerodhaBrokerAdapter:
+    return ZerodhaBrokerAdapter(
+        mode="LIVE",
+        allow_real_orders=True,
+        kite_client=_get_kite_client(),
+    )
+
+
+def _get_kite_client() -> Any:
+    from engine.kite_ingestion import get_kite_client
+
+    return get_kite_client()
+
+
+def _marketable_limit_price(
+    *,
+    side: str,
+    reference_price: float,
+    max_slippage_pct: float,
+    tick_size: float = DEFAULT_TICK_SIZE,
+) -> float:
+    if reference_price <= 0 or not math.isfinite(reference_price):
+        raise OrderSafetyError("reference price must be positive for real entry")
+    side_upper = side.upper()
+    if side_upper == "BUY":
+        raw = reference_price * (1.0 + max_slippage_pct / 100.0)
+        return round(math.ceil(raw / tick_size) * tick_size, 4)
+    if side_upper == "SELL":
+        raw = reference_price * (1.0 - max_slippage_pct / 100.0)
+        return round(math.floor(raw / tick_size) * tick_size, 4)
+    raise OrderSafetyError("entry side must be BUY or SELL")
+
+
+def _intent_notional(intent: BrokerOrderIntent) -> float:
+    normalized = intent.normalized()
+    price = normalized.price or normalized.reference_price
+    if price is None:
+        raise OrderSafetyError("real-order cash budget requires price or reference_price")
+    if not math.isfinite(float(price)) or float(price) <= 0:
+        raise OrderSafetyError("real-order cash budget price must be positive")
+    return float(price) * int(normalized.quantity)
+
+
+def _fetch_available_cash(kite_client: Any) -> float | None:
+    margins = getattr(kite_client, "margins", None)
+    if not callable(margins):
+        return None
+    try:
+        payload = margins("equity")
+    except TypeError:
+        payload = margins()
+    return _extract_available_cash(payload)
+
+
+def _extract_available_cash(payload: Any) -> float | None:
+    if not isinstance(payload, dict):
+        return None
+    candidates = [
+        ("equity", "available", "cash"),
+        ("available", "cash"),
+        ("cash",),
+        ("live_balance",),
+        ("opening_balance",),
+    ]
+    for path in candidates:
+        current: Any = payload
+        for key in path:
+            if not isinstance(current, dict) or key not in current:
+                current = None
+                break
+            current = current[key]
+        if current is None:
+            continue
+        try:
+            value = float(current)
+        except TypeError, ValueError:
+            continue
+        if math.isfinite(value):
+            return value
+    return None
+
+
+def _event_time_value(value: datetime | str | None) -> str | None:
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if value is None:
+        return None
+    return str(value)

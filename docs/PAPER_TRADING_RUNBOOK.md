@@ -41,6 +41,9 @@ PYTHONUNBUFFERED=1 doppler run -- uv run pivot-paper-trading daily-live \
   intraday candles or future-dated `market_day_state` rows.
 - Start `daily-live --feed-source kite` at/after 09:16 IST. The CLI now fails fast before
   09:16 unless `--wait-for-open` is explicitly supplied; do not use the wait mode for normal ops.
+- CPR exits open positions at 15:00 IST by default. Zerodha publishes intraday auto square-off
+  timings at/after 15:25 for equity/cash and says timings may change with volatility; exiting at
+  15:00 keeps CPR out of the broker RMS auto-square-off window.
 - Do not run backtests while live is running — `market.duckdb` write lock will block startup.
 - Reproducibility: `daily-prepare --all-symbols` uses the stable `canonical_full` universe and
   saves that same list as `full_YYYY_MM_DD` in `backtest_universe` inside the canonical
@@ -60,7 +63,8 @@ PYTHONUNBUFFERED=1 doppler run -- uv run pivot-paper-trading daily-live \
 ## Today's Live-Paper Dry-Run Checklist
 
 Use this compact checklist on live-paper days when validating real-trading safety behaviour.
-The commands below are paper/dry-run only; real Zerodha order placement remains disabled.
+The commands below are paper/dry-run only; real Zerodha order placement remains disabled unless
+you explicitly launch `daily-live --real-orders` and all Doppler real-order gates are enabled.
 
 **Pre-market gate:**
 ```bash
@@ -306,11 +310,20 @@ Reference sets (Apr 2026):
 | Daily Reset Std SHORT | `1d6e5e93618e` | 2025-01-01 → 2026-04-09 | ₹1,041,450 |
 | Daily Reset Std LONG | `84a85d954f99` | 2025-01-01 → 2026-04-09 | ₹827,381 |
 
-**Current CPR baselines (2026-05-02 `full_2026_04_30` / 2038-symbol review-batch rerun — use these for current comparisons):**
+**Current CPR baselines (2026-05-02 `full_2026_04_30` / 2038-symbol review-batch rerun):**
 
 SHORT presets now use `short_trail_atr_multiplier = 1.25`. LONG keeps `trail_atr_multiplier = 1.0`.
 Canonical sizing is now `max_positions=5`, `capital=200000`, `max_position_pct=0.2`.
 Daily-reset risk is the live-paper sizing reference.
+
+15:00 MIS safety reruns supersede the 15:15 daily-reset risk rows for live-trading comparisons:
+
+| Mode | Preset | Run ID | Start → End | P/L | Calmar |
+|------|--------|--------|-------------|-----|--------|
+| Daily Reset | `CPR_LEVELS_RISK_LONG` | `6d360a20b46c` | 2025-01-01 → 2026-04-30 | ₹1,709,319 | 210 |
+| Daily Reset | `CPR_LEVELS_RISK_SHORT` | `5ebee33228ed` | 2025-01-01 → 2026-04-30 | ₹1,620,145 | 95 |
+
+Historical 15:15 matrix retained for context and non-live comparisons:
 
 | Mode | Preset | Run ID | Start → End | P/L | Calmar |
 |------|--------|--------|-------------|-----|--------|
@@ -834,7 +847,7 @@ commands below; the dashboard does not directly mutate live positions.
 
 ### 3a. Recovery: missed FLATTEN_EOD alert
 
-If the EOD summary was not delivered (network outage at EOD, stale exit before 15:15,
+If the EOD summary was not delivered (network outage at EOD, stale exit before 15:00,
 or process crash), re-send it after the session is COMPLETED:
 
 ```bash
@@ -881,7 +894,7 @@ archive_completed_session(sid)
 
 **Illiquid positions and early session death**: When only 1 illiquid symbol remains open
 after the entry window closes, and it stops ticking for 10+ minutes, the stale watchdog
-terminates the session before the 15:15 TIME exit. This is correct behaviour — the FEED_STALE
+terminates the session before the 15:00 TIME exit. This is correct behaviour — the FEED_STALE
 alert includes the open position details (`entry`, `SL`, `target`, `qty`) so you can act
 manually if needed. Use `flatten` + `resend-eod` as above to close the position cleanly.
 
@@ -1075,8 +1088,8 @@ It is safe for payload validation because the adapter does not call Kite `place_
 
 **Manual real-order pilot path:**
 
-Real Zerodha order placement is available only through the manual `real-order` CLI command. It is
-off by default and requires both a CLI confirmation flag and Doppler environment gates:
+Manual Zerodha order placement is available through the `real-order` CLI command. It is off by
+default and requires both a CLI confirmation flag and Doppler environment gates:
 
 ```bash
 CPR_ZERODHA_REAL_ORDERS_ENABLED=true
@@ -1113,8 +1126,60 @@ doppler run -- uv run pivot-paper-trading real-order \
 ```
 
 This calls Kite `place_order` only after all gates pass and records the broker payload/order id in
-`paper_orders` with `broker_mode=LIVE`. Automated CPR live sessions still run through the paper
-runtime; strategy-to-real automatic order routing is not enabled here.
+`paper_orders` with `broker_mode=LIVE`.
+
+**Automated real-order CPR pilot path:**
+
+Normal `daily-live` remains paper-only. Automated Zerodha routing starts only when the command
+includes `--real-orders` and the same Doppler gates above are enabled. The pilot intentionally
+blocks `--multi --real-orders` and `--resume --real-orders`; run one LONG or one SHORT session
+first.
+
+1-share market connectivity test:
+
+```bash
+# Doppler must also allow MARKET temporarily:
+# CPR_ZERODHA_REAL_ALLOWED_ORDER_TYPES=MARKET,LIMIT,SL,SL-M
+doppler run -- uv run pivot-paper-trading daily-live \
+  --strategy CPR_LEVELS \
+  --preset CPR_LEVELS_RISK_LONG \
+  --trade-date today \
+  --symbols SBIN \
+  --real-orders \
+  --real-order-fixed-qty 1 \
+  --real-order-max-positions 1 \
+  --real-order-cash-budget 10000 \
+  --real-entry-order-type MARKET
+```
+
+Safer first live strategy pilot after market-order connectivity is proven:
+
+```bash
+doppler run -- uv run pivot-paper-trading daily-live \
+  --strategy CPR_LEVELS \
+  --preset CPR_LEVELS_RISK_LONG \
+  --trade-date today \
+  --real-orders \
+  --real-order-fixed-qty 1 \
+  --real-order-max-positions 1 \
+  --real-order-cash-budget 10000 \
+  --real-entry-order-type LIMIT \
+  --real-entry-max-slippage-pct 0.5 \
+  --real-exit-max-slippage-pct 2
+```
+
+Automated pilot behaviour:
+
+- paper-live is unchanged unless `--real-orders` is present
+- real quantity is fixed by `--real-order-fixed-qty`; it does not use paper position size
+- default max real-routed open positions is `1`
+- real entries are cash-budgeted: cumulative open real-order notional must stay within
+  `--real-order-cash-budget`, and startup rejects the session if that budget exceeds Kite
+  reported available equity cash
+- entries can be `LIMIT` or `MARKET`, but `MARKET` requires the Doppler order-type allow-list
+- exits, stop exits, admin close, global flatten, and EOD flatten use protected LIMIT orders
+- partial scale-out is blocked for real routing until it has a dedicated reconciliation path
+- every real order row is recorded in `paper_orders` with `broker_mode=LIVE` and the Kite order id
 
 **Real-order safety model:**
 
@@ -1163,9 +1228,11 @@ doppler run -- uv run pivot-paper-trading real-dry-run-order \
 Dashboard visibility:
 
 - `/paper_ledger` shows active sessions, open/closed positions, orders, feed state, and archived ledgers.
+- Active sessions show `PAPER LIVE` or `ZERODHA LIVE` in the session selector and broker chip.
+- Real-routed order rows show `broker_mode=LIVE` and the Zerodha exchange order id.
 - `/paper_ledger` can queue paper controls: close selected symbols, flatten one session, flatten LONG+SHORT, pause/resume entries, cancel pending intents, set risk budget, and reconcile.
 - `/paper_ledger` does **not** currently show a dedicated real-broker payload preview or broker snapshot comparison panel. Use the CLI dry-run and `broker-reconcile` commands for that.
-- No dashboard control places real Zerodha orders.
+- No dashboard control starts real Zerodha trading; real routing starts only from CLI `daily-live --real-orders`.
 
 **Broker reconciliation check (read-only):**
 ```bash

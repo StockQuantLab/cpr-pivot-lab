@@ -74,7 +74,7 @@ class TestBacktestParams:
         assert p.buffer_pct == 0.0005
         assert p.rr_ratio == 2.0
         assert p.breakeven_r == 1.0
-        assert p.time_exit == "15:15"
+        assert p.time_exit == "15:00"
         assert p.direction_filter == "BOTH"
         assert p.cpr_levels.cpr_hold_confirm is False
         assert p.cpr_levels.cpr_min_close_atr == 0.0
@@ -163,7 +163,7 @@ class TestBacktestParams:
             "runtime_batch_size": 512,
             "commission_model": "zerodha",
             "slippage_bps": 5.0,
-            "time_exit": "15:15",
+            "time_exit": "15:00",
             "entry_window_end": "10:15",
             # Strategy semantics intentionally excluded — no explicit flag was set
         }

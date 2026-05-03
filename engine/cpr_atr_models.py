@@ -7,6 +7,7 @@ from dataclasses import dataclass, field, replace
 
 import polars as pl
 
+from engine.constants import TIME_EXIT_DEFAULT
 from engine.cost_model import CostModel, cost_model_from_name
 from engine.execution_defaults import (
     DEFAULT_MAX_POSITION_PCT,
@@ -85,7 +86,7 @@ class StrategyConfig:
     max_position_pct: float = DEFAULT_MAX_POSITION_PCT
     risk_based_sizing: bool = False
     compound_equity: bool = False
-    time_exit: str = "15:15"
+    time_exit: str = TIME_EXIT_DEFAULT
     rvol_lookback_days: int = 10
     skip_rvol_check: bool = False
     runtime_batch_size: int = 512

@@ -81,6 +81,7 @@ from engine.paper_trailing import (
     _updated_trail_state,
     clear_trailing_stop_cache,
 )
+from engine.real_order_runtime import RealOrderRouter
 
 logger = logging.getLogger(__name__)
 build_strategy_config_from_overrides = build_backtest_params_from_overrides
@@ -1119,6 +1120,18 @@ def _build_symbol_price_map(feed_state: FeedState | None) -> dict[str, float]:
     }
 
 
+def _feed_quote_age_sec(feed_state: FeedState | None, now: datetime) -> float:
+    last_event_ts = getattr(feed_state, "last_event_ts", None)
+    if not isinstance(last_event_ts, datetime):
+        return 0.0
+    if last_event_ts.tzinfo is None and now.tzinfo is not None:
+        last_event_ts = last_event_ts.replace(tzinfo=now.tzinfo)
+    try:
+        return max(0.0, (now - last_event_ts.astimezone(now.tzinfo)).total_seconds())
+    except Exception:
+        return 0.0
+
+
 def _close_price_for_position(position: PaperPosition, price_map: dict[str, float]) -> float:
     return (
         price_map.get(position.symbol)
@@ -1160,6 +1173,7 @@ async def flatten_session_positions(
     notes: str | None = None,
     feed_state: FeedState | None = None,
     emit_summary: bool = True,
+    real_order_router: RealOrderRouter | None = None,
 ) -> dict[str, Any]:
     session = await get_session(session_id)
     if session is None:
@@ -1179,6 +1193,20 @@ async def flatten_session_positions(
         realized = _realized_pnl_for_close(position, close_price, params=params)
         total_realized += realized
         side = "SELL" if str(position.direction).upper() == "LONG" else "BUY"
+        real_exit_meta: dict[str, Any] = {}
+        if real_order_router is not None and real_order_router.enabled:
+            real_qty = real_order_router.exit_quantity_for_position(position)
+            real_exit_meta = await real_order_router.place_exit(
+                session_id=session_id,
+                symbol=position.symbol,
+                direction=str(position.direction),
+                position_id=position.position_id,
+                quantity=real_qty,
+                reference_price=close_price,
+                quote_age_sec=_feed_quote_age_sec(feed_state, now_ist),
+                role=f"manual_flatten:{notes or 'paper flatten'}",
+                event_time=now_ist,
+            )
         await append_order_event(
             session_id=session_id,
             symbol=position.symbol,
@@ -1211,6 +1239,16 @@ async def flatten_session_positions(
             closed_at=now_ist,
             trail_state={**(position.trail_state or {}), "close_reason": "MANUAL_FLATTEN"},
         )
+        if real_exit_meta:
+            await update_position(
+                position.position_id,
+                trail_state={
+                    **(position.trail_state or {}),
+                    **real_exit_meta,
+                    "real_remaining_qty": 0,
+                    "close_reason": "MANUAL_FLATTEN",
+                },
+            )
         # Dispatch individual TRADE_CLOSED alert so the user sees the position close
         # in Telegram immediately — not just in the EOD summary.
         try:
@@ -1301,6 +1339,7 @@ async def flatten_positions_subset(
     *,
     notes: str | None = None,
     feed_state: FeedState | None = None,
+    real_order_router: RealOrderRouter | None = None,
 ) -> dict[str, Any]:
     """Close specific open positions without stopping the session.
 
@@ -1332,6 +1371,20 @@ async def flatten_positions_subset(
         close_price = _close_price_for_position(position, price_map)
         realized = _realized_pnl_for_close(position, close_price, params=params)
         side = "SELL" if str(position.direction).upper() == "LONG" else "BUY"
+        real_exit_meta: dict[str, Any] = {}
+        if real_order_router is not None and real_order_router.enabled:
+            real_qty = real_order_router.exit_quantity_for_position(position)
+            real_exit_meta = await real_order_router.place_exit(
+                session_id=session_id,
+                symbol=position.symbol,
+                direction=str(position.direction),
+                position_id=position.position_id,
+                quantity=real_qty,
+                reference_price=close_price,
+                quote_age_sec=_feed_quote_age_sec(feed_state, now_ist),
+                role=f"close:{notes or 'partial flatten'}",
+                event_time=now_ist,
+            )
         await append_order_event(
             session_id=session_id,
             symbol=position.symbol,
@@ -1364,6 +1417,16 @@ async def flatten_positions_subset(
             closed_at=now_ist,
             trail_state={**(position.trail_state or {}), "close_reason": "MANUAL_CLOSE"},
         )
+        if real_exit_meta:
+            await update_position(
+                position.position_id,
+                trail_state={
+                    **(position.trail_state or {}),
+                    **real_exit_meta,
+                    "real_remaining_qty": 0,
+                    "close_reason": "MANUAL_CLOSE",
+                },
+            )
         try:
             subject, body = _format_close_alert(
                 symbol=position.symbol,
@@ -1398,6 +1461,7 @@ async def enforce_session_risk_controls(
     as_of: datetime,
     feed_state: FeedState | None = None,
     notes_prefix: str = "paper risk",
+    real_order_router: RealOrderRouter | None = None,
 ) -> dict[str, Any]:
     positions = await get_session_positions(session.session_id)
     summary = summarize_paper_positions(session, positions, feed_state)
@@ -1408,11 +1472,13 @@ async def enforce_session_risk_controls(
     if not reasons:
         return {"triggered": False, "daily_pnl_used": realized_pnl, "reasons": []}
 
-    flatten_result = await flatten_session_positions(
-        session.session_id,
-        notes=f"{notes_prefix}: {', '.join(reasons)}",
-        feed_state=feed_state,
-    )
+    flatten_kwargs: dict[str, Any] = {
+        "notes": f"{notes_prefix}: {', '.join(reasons)}",
+        "feed_state": feed_state,
+    }
+    if real_order_router is not None:
+        flatten_kwargs["real_order_router"] = real_order_router
+    flatten_result = await flatten_session_positions(session.session_id, **flatten_kwargs)
     # flatten_session_positions already dispatches the EOD summary alert.
     # No need to send a second DAILY_LOSS_LIMIT alert here.
     return {
@@ -1494,7 +1560,17 @@ async def _open_position_from_candidate(
     setup_row: dict[str, Any],
     params: BacktestParams,
     now: datetime,
+    real_order_router: RealOrderRouter | None = None,
 ) -> dict[str, Any]:
+    real_entry_meta: dict[str, Any] = {}
+    if real_order_router is not None and real_order_router.enabled:
+        real_entry_meta = await real_order_router.place_entry(
+            session_id=session.session_id,
+            symbol=symbol,
+            direction=str(candidate["direction"]),
+            reference_price=float(candidate["entry_price"]),
+            event_time=candidate.get("event_time") or now,
+        )
     position = await open_position(
         session_id=session.session_id,
         symbol=symbol,
@@ -1527,6 +1603,7 @@ async def _open_position_from_candidate(
             "scaled_out": False,
             "initial_qty": float(candidate["position_size"]),
             "candle_count": 0,
+            **real_entry_meta,
         },
         opened_by=str(getattr(session, "strategy", "") or "paper_runtime"),
         opened_at=now,
@@ -1596,6 +1673,7 @@ async def _advance_open_position(
     position: PaperPosition,
     candle: dict[str, Any],
     params: BacktestParams,
+    real_order_router: RealOrderRouter | None = None,
 ) -> dict[str, Any]:
     trail_state = dict(position.trail_state or {})
     current_qty = float(position.current_qty or position.quantity or 0.0)
@@ -1696,6 +1774,24 @@ async def _advance_open_position(
             "next_trail_state": next_trail_state,
         }
 
+    if decision.action == "PARTIAL" and real_order_router is not None and real_order_router.enabled:
+        raise RuntimeError("automated real-order routing does not support partial scale-out exits")
+
+    real_exit_meta: dict[str, Any] = {}
+    if decision.action == "CLOSE" and real_order_router is not None and real_order_router.enabled:
+        real_qty = real_order_router.exit_quantity_for_position(position)
+        exit_price_for_order = float(decision.fills[-1][1] if decision.fills else mark_price)
+        real_exit_meta = await real_order_router.place_exit(
+            session_id=position.session_id,
+            symbol=position.symbol,
+            direction=position.direction,
+            position_id=position.position_id,
+            quantity=real_qty,
+            reference_price=exit_price_for_order,
+            role=f"exit:{decision.exit_reason or 'TIME'}",
+            event_time=candle.get("bar_end"),
+        )
+
     fill_total_qty = 0.0
     fill_total_value = 0.0
     realized = realized_so_far
@@ -1756,7 +1852,14 @@ async def _advance_open_position(
         position.position_id,
         status="CLOSED",
         stop_loss=float(ts.current_sl),
-        trail_state={**pre_update_trail_state, **exit_payload},
+        trail_state={
+            **pre_update_trail_state,
+            **exit_payload,
+            **real_exit_meta,
+            "real_remaining_qty": 0,
+        }
+        if real_exit_meta
+        else {**pre_update_trail_state, **exit_payload},
         current_qty=0.0,
         last_price=close_price,
         close_price=close_price,
@@ -1817,6 +1920,7 @@ async def evaluate_candle(
     now: datetime,
     position_tracker: SessionPositionTracker,
     allow_entry_evaluation: bool = True,
+    real_order_router: RealOrderRouter | None = None,
 ) -> dict[str, Any]:
     state = runtime_state.for_symbol(candle.symbol)
     params = runtime_state.get_session_params(session)
@@ -1860,6 +1964,7 @@ async def evaluate_candle(
             position=tracked_position,
             candle=state.candles[-1],
             params=params,
+            real_order_router=real_order_router,
         )
         if result["action"] == "CLOSE":
             state.position_closed_today = True
@@ -1991,6 +2096,7 @@ async def execute_entry(
     params: BacktestParams,
     now: datetime,
     position_tracker: SessionPositionTracker,
+    real_order_router: RealOrderRouter | None = None,
 ) -> dict[str, Any]:
     symbol = str(candidate.get("symbol") or "")
     if not symbol:
@@ -2023,6 +2129,7 @@ async def execute_entry(
         setup_row=setup_row,
         params=params,
         now=now,
+        real_order_router=real_order_router,
     )
     if result.get("action") == "OPEN":
         position = result.get("position")

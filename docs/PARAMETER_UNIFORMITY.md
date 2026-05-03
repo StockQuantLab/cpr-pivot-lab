@@ -56,7 +56,7 @@ across all three modes. Examples:
 |-----------|----------------------|------------|--------|
 | `min_effective_rr` | 2.0 | No | All modes get 2.0 from `CPRLevelsParams` default |
 | `entry_window_end` | "10:15" | No | All modes get "10:15" from `StrategyConfig` default |
-| `time_exit` | "15:15" | No | All modes get "15:15" from `StrategyConfig` default |
+| `time_exit` | "15:00" | No | All modes get "15:00" from `StrategyConfig` default |
 | `or_atr_min` | 0.3 | No | All modes get 0.3 from `StrategyConfig` default |
 | `compound_equity` | False | No | All modes get False from `StrategyConfig` default |
 
@@ -94,7 +94,7 @@ explicitly include the override. The assertion gate catches accidental omissions
 | `cpr_percentile` | 33.0 | *(default)* | 33.0 | 33.0 | 33.0 | YES |
 | `buffer_pct` | 0.0005 | *(default)* | 0.0005 | 0.0005 | 0.0005 | YES |
 | `entry_window_end` | "10:15" | *(default)* | "10:15" | "10:15" | "10:15" | YES |
-| `time_exit` | "15:15" | *(default)* | "15:15" | "15:15" | "15:15" | YES |
+| `time_exit` | "15:00" | *(default)* | "15:00" | "15:00" | "15:00" | YES |
 | `rr_ratio` | 2.0 | *(default)* | 2.0 | 2.0 | 2.0 | YES |
 | `breakeven_r` | 1.0 | *(default)* | 1.0 | 1.0 | 1.0 | YES |
 

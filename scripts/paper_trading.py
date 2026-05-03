@@ -289,6 +289,54 @@ def _workflow_session_suffix(mode: str, feed_source: str | None = None) -> str:
     return f"-{'-'.join(tokens)}" if tokens else ""
 
 
+def _real_order_notes(notes: str | None) -> str:
+    marker = "ZERODHA_LIVE_REAL_ORDERS"
+    if notes and marker in notes:
+        return notes
+    return f"{marker}: {notes}" if notes else marker
+
+
+def _build_real_order_config(
+    args: argparse.Namespace,
+    *,
+    strategy: str,
+    strategy_params: dict[str, Any],
+    feed_source: str,
+) -> dict[str, Any] | None:
+    if not bool(getattr(args, "real_orders", False)):
+        return None
+    if str(feed_source or "").lower() != "kite":
+        raise SystemExit("--real-orders is supported only with --feed-source kite.")
+    if bool(getattr(args, "multi", False)):
+        raise SystemExit(
+            "--multi --real-orders is intentionally blocked for the pilot. "
+            "Run one LONG or one SHORT session first."
+        )
+    if bool(getattr(args, "resume", False)):
+        raise SystemExit(
+            "--resume --real-orders is intentionally blocked for the pilot. "
+            "Reconcile live Kite state manually before starting another real-routed session."
+        )
+    resolved = build_backtest_params_from_overrides(strategy, strategy_params)
+    scale_out_pct = float(getattr(getattr(resolved, "cpr_levels", None), "scale_out_pct", 0.0) or 0)
+    if scale_out_pct > 0:
+        raise SystemExit("--real-orders does not support CPR partial scale-out yet.")
+    return {
+        "enabled": True,
+        "fixed_quantity": int(getattr(args, "real_order_fixed_qty", 1) or 1),
+        "max_positions": int(getattr(args, "real_order_max_positions", 1) or 1),
+        "cash_budget": float(getattr(args, "real_order_cash_budget", 10_000.0) or 10_000.0),
+        "require_account_cash_check": not bool(
+            getattr(args, "real_order_skip_account_cash_check", False)
+        ),
+        "entry_order_type": str(getattr(args, "real_entry_order_type", "LIMIT") or "LIMIT").upper(),
+        "entry_max_slippage_pct": float(getattr(args, "real_entry_max_slippage_pct", 0.5) or 0.5),
+        "exit_max_slippage_pct": float(getattr(args, "real_exit_max_slippage_pct", 2.0) or 2.0),
+        "product": "MIS",
+        "exchange": "NSE",
+    }
+
+
 def _default_session_id(
     prefix: str,
     trade_date: str,
@@ -491,6 +539,7 @@ async def _run_daily_workflow(
             allow_late_start_fallback=bool(
                 (live_kwargs or {}).get("allow_late_start_fallback", False)
             ),
+            real_order_config=(live_kwargs or {}).get("real_order_config"),
             notes=notes,
             ticker_adapter=(live_kwargs or {}).get("ticker_adapter"),
         )
@@ -701,6 +750,11 @@ async def _cmd_daily_live_resume(args: argparse.Namespace) -> None:
     Loads open positions directly from DB — no pre-filter, no fresh session.
     run_live_session() seeds open + closed positions and updates status to ACTIVE.
     """
+    if bool(getattr(args, "real_orders", False)):
+        raise SystemExit(
+            "--resume --real-orders is intentionally blocked for the pilot. "
+            "Reconcile live Kite state manually before starting another real-routed session."
+        )
     trade_date = resolve_trade_date(getattr(args, "trade_date", None))
     strategy = _assert_cpr_only_strategy(
         getattr(args, "strategy", None) or _paper_default_strategy(get_settings()),
@@ -796,6 +850,13 @@ async def _cmd_daily_live(args: argparse.Namespace) -> None:
 
     feed_source = getattr(args, "feed_source", "kite")
     suppress_alerts = bool(getattr(args, "no_alerts", False))
+    real_order_config = _build_real_order_config(
+        args,
+        strategy=args.strategy,
+        strategy_params=strategy_params,
+        feed_source=feed_source,
+    )
+    session_notes = _real_order_notes(args.notes) if real_order_config else args.notes
 
     if feed_source == "kite":
         _reject_early_kite_live_start(
@@ -834,6 +895,7 @@ async def _cmd_daily_live(args: argparse.Namespace) -> None:
         "max_cycles": args.max_cycles,
         "complete_on_exit": args.complete_on_exit,
         "allow_late_start_fallback": bool(getattr(args, "allow_late_start_fallback", False)),
+        "real_order_config": real_order_config,
     }
 
     if feed_source == "local":
@@ -858,7 +920,7 @@ async def _cmd_daily_live(args: argparse.Namespace) -> None:
             strategy=args.strategy,
             strategy_params=strategy_params,
             session_id=args.session_id,
-            notes=args.notes,
+            notes=session_notes,
             skip_preparation=bool(args.skip_coverage),
             live_kwargs=live_kwargs,
         )
@@ -1197,6 +1259,11 @@ async def _cmd_daily_live_multi(args: argparse.Namespace) -> None:
     with asyncio.gather avoids multi-process file-lock conflicts on
     paper.duckdb while allowing all variants to poll simultaneously.
     """
+    if bool(getattr(args, "real_orders", False)):
+        raise SystemExit(
+            "--multi --real-orders is intentionally blocked for the pilot. "
+            "Run one LONG or one SHORT real-routed session first."
+        )
     trade_date = resolve_trade_date(args.trade_date)
     _apply_default_saved_universe(args, trade_date)
     all_symbols = _resolve_cli_symbols(build_parser(), args, read_only=True)
@@ -2254,6 +2321,61 @@ def build_parser() -> argparse.ArgumentParser:
                 f"Allow daily-live to sleep until {MARKET_READY_HHMM} IST when launched early. "
                 "Default is fail-fast before market-ready time."
             ),
+        )
+        sp.add_argument(
+            "--real-orders",
+            action="store_true",
+            help=(
+                "Route daily-live paper entries/exits to real Zerodha orders. "
+                "Requires Doppler real-order gates; default is paper-only."
+            ),
+        )
+        sp.add_argument(
+            "--real-order-fixed-qty",
+            type=int,
+            default=1,
+            help="Fixed real quantity per automated order (default: 1 share).",
+        )
+        sp.add_argument(
+            "--real-order-max-positions",
+            type=int,
+            default=1,
+            help="Max open real-routed positions for this pilot session (default: 1).",
+        )
+        sp.add_argument(
+            "--real-order-cash-budget",
+            type=float,
+            default=10_000.0,
+            help=(
+                "Cash-only notional budget for real-routed open positions "
+                "(default: 10000). Set to available start-of-day cash you are willing to use."
+            ),
+        )
+        sp.add_argument(
+            "--real-order-skip-account-cash-check",
+            action="store_true",
+            help=(
+                "Skip Kite account cash read before startup. Not recommended; "
+                "the local cash budget still applies."
+            ),
+        )
+        sp.add_argument(
+            "--real-entry-order-type",
+            choices=["LIMIT", "MARKET"],
+            default="LIMIT",
+            help="Real entry order type. LIMIT is default; MARKET requires Doppler allow-list.",
+        )
+        sp.add_argument(
+            "--real-entry-max-slippage-pct",
+            type=float,
+            default=0.5,
+            help="Marketable LIMIT entry protection percent (default: 0.5).",
+        )
+        sp.add_argument(
+            "--real-exit-max-slippage-pct",
+            type=float,
+            default=2.0,
+            help="Protected LIMIT exit/flatten protection percent (default: 2.0).",
         )
 
     # -- Subcommands --

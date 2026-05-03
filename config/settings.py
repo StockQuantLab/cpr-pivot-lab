@@ -43,7 +43,7 @@ class Settings(BaseSettings):
     paper_max_positions: int = Field(default=DEFAULT_MAX_POSITIONS)
     paper_max_position_pct: float = Field(default=DEFAULT_MAX_POSITION_PCT)
     paper_stale_feed_timeout_sec: int = Field(default=120)
-    paper_flatten_time: str = Field(default="15:15:00")
+    paper_flatten_time: str = Field(default="15:00:00")
     paper_live_poll_interval_sec: float = Field(default=1.0)
     paper_candle_interval_minutes: int = Field(default=5)
     paper_live_quote_batch_size: int = Field(default=500)

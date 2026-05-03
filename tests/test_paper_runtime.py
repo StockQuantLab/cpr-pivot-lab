@@ -1245,7 +1245,7 @@ async def test_enforce_session_risk_controls_flattens_at_session_time(
 ) -> None:
     session = SimpleNamespace(
         session_id="paper-risk-2",
-        flatten_time=datetime.strptime("15:15:00", "%H:%M:%S").time(),
+        flatten_time=datetime.strptime("15:00:00", "%H:%M:%S").time(),
         max_daily_loss_pct=0.0,
         strategy_params={"portfolio_value": 100_000},
     )
@@ -1276,14 +1276,14 @@ async def test_enforce_session_risk_controls_flattens_at_session_time(
 
     result = await enforce_session_risk_controls(
         session=session,
-        as_of=datetime(2024, 1, 1, 15, 15),
+        as_of=datetime(2024, 1, 1, 15, 0),
         feed_state=SimpleNamespace(raw_state={"symbol_last_prices": {}}, last_price=None),
     )
 
     assert result["triggered"] is True
-    assert result["reasons"] == ["flatten_time:15:15:00"]
+    assert result["reasons"] == ["flatten_time:15:00:00"]
     assert session_updates[0]["daily_pnl_used"] == pytest.approx(0.0)
-    assert "flatten_time:15:15:00" in str(flatten_calls[0]["notes"])
+    assert "flatten_time:15:00:00" in str(flatten_calls[0]["notes"])
 
 
 @pytest.mark.asyncio

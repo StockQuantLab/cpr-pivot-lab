@@ -29,7 +29,13 @@ from db.backtest_db import get_backtest_db
 from db.duckdb import get_db
 from engine.cli_setup import configure_windows_stdio
 from engine.command_lock import command_lock
-from engine.constants import CPR_SHIFTS, DIRECTIONS, PUBLIC_STRATEGIES, normalize_symbol
+from engine.constants import (
+    CPR_SHIFTS,
+    DIRECTIONS,
+    PUBLIC_STRATEGIES,
+    TIME_EXIT_DEFAULT,
+    normalize_symbol,
+)
 from engine.constants import parse_iso_date as parse_iso_date_str
 from engine.cpr_atr_strategy import (
     BacktestParams,
@@ -403,8 +409,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--time-exit",
-        default="15:15",
-        help="Time to close all positions HH:MM (default 15:15). Use 12:00 for mid-day kill.",
+        default=TIME_EXIT_DEFAULT,
+        help=(
+            f"Time to close all positions HH:MM (default {TIME_EXIT_DEFAULT}). "
+            "Use 12:00 for mid-day kill."
+        ),
     )
     parser.add_argument(
         "--entry-window-end",

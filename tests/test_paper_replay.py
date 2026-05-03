@@ -53,7 +53,7 @@ async def test_close_remaining_open_positions_at_time_exit_uses_last_price(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     session = SimpleNamespace(strategy="CPR_LEVELS", strategy_params={})
-    params = SimpleNamespace(time_exit="15:15")
+    params = SimpleNamespace(time_exit="15:00")
     runtime_state = paper_replay.PaperRuntimeState()
     state = runtime_state.symbols.setdefault("SBIN", paper_replay.SymbolRuntimeState())
     state.trade_date = "2024-01-02"
@@ -102,7 +102,7 @@ async def test_close_remaining_open_positions_at_time_exit_uses_last_price(
     )
 
     assert closed == 1
-    assert terminal_ts == datetime(2024, 1, 2, 15, 15, tzinfo=paper_replay.IST)
+    assert terminal_ts == datetime(2024, 1, 2, 15, 0, tzinfo=paper_replay.IST)
     assert calls == [terminal_ts]
     assert tracker.open_count == 0
 
@@ -299,7 +299,7 @@ async def test_replay_session_stops_later_dates_when_risk_triggers(
         return {
             "triggered": len(risk_calls) == 1,
             "daily_pnl_used": 0.0,
-            "reasons": ["flatten_time:15:15:00"] if len(risk_calls) == 1 else [],
+            "reasons": ["flatten_time:15:00:00"] if len(risk_calls) == 1 else [],
         }
 
     async def fake_get_feed_state(session_id: str):

@@ -14,15 +14,16 @@ Rerun and verify canonical CPR/FBR baselines for regression control.
 
 ## Current Canonical Set
 
-Use the 2026-05-02 `full_2026_04_30` / 2038-symbol CPR baseline family as the active
-comparison target:
+Use the 2026-05-03 15:00 daily-reset risk rows as the active live-trading comparison target.
+The remaining six rows in the 2026-05-02 `full_2026_04_30` / 2038-symbol CPR baseline family
+are still the historical 15:15 matrix until all eight are intentionally rerun.
 
 | Variant | Run ID |
 |---|---|
 | STD_LONG | `e811f5bb01e5` |
 | STD_SHORT | `9a2ccbd93c5b` |
-| RISK_LONG | `638b343959ad` |
-| RISK_SHORT | `307c3e175a16` |
+| RISK_LONG | `6d360a20b46c` |
+| RISK_SHORT | `5ebee33228ed` |
 | STD_LONG_CMP | `8bbabe422f9c` |
 | STD_SHORT_CMP | `a700bb027f24` |
 | RISK_LONG_CMP | `480a14f8aa26` |

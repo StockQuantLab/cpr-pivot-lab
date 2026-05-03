@@ -44,6 +44,65 @@ def test_default_session_id_includes_direction_for_daily_sessions() -> None:
     )
 
 
+def test_real_order_config_defaults_to_disabled() -> None:
+    args = SimpleNamespace(real_orders=False)
+
+    assert (
+        paper_trading._build_real_order_config(
+            args,
+            strategy="CPR_LEVELS",
+            strategy_params={"direction_filter": "LONG"},
+            feed_source="kite",
+        )
+        is None
+    )
+
+
+def test_real_order_config_marks_pilot_session_and_blocks_multi() -> None:
+    args = SimpleNamespace(
+        real_orders=True,
+        multi=False,
+        resume=False,
+        real_order_fixed_qty=1,
+        real_order_max_positions=1,
+        real_order_cash_budget=10_000.0,
+        real_order_skip_account_cash_check=False,
+        real_entry_order_type="MARKET",
+        real_entry_max_slippage_pct=0.5,
+        real_exit_max_slippage_pct=2.0,
+    )
+
+    config = paper_trading._build_real_order_config(
+        args,
+        strategy="CPR_LEVELS",
+        strategy_params={"direction_filter": "LONG"},
+        feed_source="kite",
+    )
+
+    assert config == {
+        "enabled": True,
+        "fixed_quantity": 1,
+        "max_positions": 1,
+        "cash_budget": 10_000.0,
+        "require_account_cash_check": True,
+        "entry_order_type": "MARKET",
+        "entry_max_slippage_pct": 0.5,
+        "exit_max_slippage_pct": 2.0,
+        "product": "MIS",
+        "exchange": "NSE",
+    }
+    assert paper_trading._real_order_notes(None) == "ZERODHA_LIVE_REAL_ORDERS"
+
+    args.multi = True
+    with pytest.raises(SystemExit, match="--multi --real-orders"):
+        paper_trading._build_real_order_config(
+            args,
+            strategy="CPR_LEVELS",
+            strategy_params={"direction_filter": "LONG"},
+            feed_source="kite",
+        )
+
+
 def test_reject_early_kite_live_start_aborts_before_market_open(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -289,7 +348,8 @@ async def test_run_daily_workflow_live_uses_live_session_kwargs(
         complete_on_exit: bool,
         auto_flatten_on_abnormal_exit: bool,
         allow_late_start_fallback: bool,
-        notes: str | None,
+        real_order_config: dict | None = None,
+        notes: str | None = None,
         ticker_adapter: object | None = None,
     ):
         calls["live"] = {
@@ -301,6 +361,7 @@ async def test_run_daily_workflow_live_uses_live_session_kwargs(
             "complete_on_exit": complete_on_exit,
             "auto_flatten_on_abnormal_exit": auto_flatten_on_abnormal_exit,
             "allow_late_start_fallback": allow_late_start_fallback,
+            "real_order_config": real_order_config,
             "notes": notes,
             "ticker_adapter": ticker_adapter,
         }
@@ -350,6 +411,7 @@ async def test_run_daily_workflow_live_uses_live_session_kwargs(
         "complete_on_exit": True,
         "auto_flatten_on_abnormal_exit": True,
         "allow_late_start_fallback": False,
+        "real_order_config": None,
         "notes": None,
         "ticker_adapter": None,
     }

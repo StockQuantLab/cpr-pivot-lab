@@ -302,6 +302,18 @@ def _render_live_paper_sessions(
             feed_source = "HISTORICAL"
         else:
             feed_source = str(strategy_params.get("feed_source") or "kite").upper()
+        orders = payload.get("orders") or []
+        broker_modes = {
+            str(getattr(order, "broker_mode", "") or "").upper()
+            for order in orders
+            if str(getattr(order, "broker_mode", "") or "").strip()
+        }
+        session_notes = str(getattr(session, "notes", "") or "").upper()
+        broker_execution = (
+            "ZERODHA LIVE"
+            if "LIVE" in broker_modes or "ZERODHA_LIVE_REAL_ORDERS" in session_notes
+            else "PAPER LIVE"
+        )
         # Extract direction from session_id for sessions that pre-date the name fix
         # Session IDs follow patterns: CPR_LEVELS_LONG-2026-04-01-xxx, paper-cpr_levels-short-...
         sid_upper = session_id.upper()
@@ -318,6 +330,7 @@ def _render_live_paper_sessions(
             f"{getattr(session, 'strategy', '')} · "
             f"{session_mode} · "
             f"{feed_source} · "
+            f"{broker_execution} · "
             f"{summary.get('status') or getattr(session, 'status', '')}"
         )
         labels.append(label)
@@ -341,6 +354,17 @@ def _render_live_paper_sessions(
                 feed_source = "HISTORICAL"
             else:
                 feed_source = str(strategy_params.get("feed_source") or "kite").upper()
+            broker_modes = {
+                str(getattr(order, "broker_mode", "") or "").upper()
+                for order in orders
+                if str(getattr(order, "broker_mode", "") or "").strip()
+            }
+            session_notes = str(getattr(session, "notes", "") or "").upper()
+            broker_execution = (
+                "ZERODHA LIVE"
+                if "LIVE" in broker_modes or "ZERODHA_LIVE_REAL_ORDERS" in session_notes
+                else "PAPER LIVE"
+            )
 
             # Structured session metadata — replaces markdown block
             with ui.row().classes("w-full gap-3 mb-4 flex-wrap items-center"):
@@ -350,6 +374,11 @@ def _render_live_paper_sessions(
                 _session_meta_chip("Strategy", getattr(session, "strategy", ""), colors["primary"])
                 _session_meta_chip("Mode", session_mode, colors["info"])
                 _session_meta_chip("Feed", feed_source, colors["success"])
+                _session_meta_chip(
+                    "Broker",
+                    broker_execution,
+                    colors["error"] if broker_execution == "ZERODHA LIVE" else colors["info"],
+                )
                 _session_meta_chip(
                     "Latest Candle",
                     str(summary.get("latest_candle_ts") or "—"),
@@ -469,6 +498,8 @@ def _render_live_paper_sessions(
                     "fill_qty": float(getattr(order, "fill_qty", 0.0) or 0.0),
                     "fill_price": float(getattr(order, "fill_price", 0.0) or 0.0),
                     "requested_at": _format_session_ts(getattr(order, "requested_at", None)),
+                    "broker_mode": str(getattr(order, "broker_mode", "") or "PAPER"),
+                    "exchange_order_id": str(getattr(order, "exchange_order_id", "") or ""),
                 }
                 for order in orders
             ]
@@ -511,6 +542,18 @@ def _render_live_paper_sessions(
                             "name": "requested_at",
                             "label": "Requested",
                             "field": "requested_at",
+                            "align": "left",
+                        },
+                        {
+                            "name": "broker_mode",
+                            "label": "Broker",
+                            "field": "broker_mode",
+                            "align": "left",
+                        },
+                        {
+                            "name": "exchange_order_id",
+                            "label": "Exchange ID",
+                            "field": "exchange_order_id",
                             "align": "left",
                         },
                     ],
@@ -1168,11 +1211,11 @@ def _render_ledger_content(
                 parsed = json.loads(symbols_json)
                 if isinstance(parsed, list):
                     return len(parsed)
-            except (TypeError, ValueError):
+            except TypeError, ValueError:
                 pass
         try:
             return int(run_row.get("symbol_count") or 0)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             return 0
 
     if ledger_df.is_empty():

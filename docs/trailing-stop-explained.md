@@ -244,7 +244,7 @@ Every trade ends in exactly one of these ways.
 |---|---|---|---|
 | `INITIAL_SL` | Low ≤ initial SL (PROTECT phase) | CPR edge + ATR buffer | Price never moved in your favour |
 | `BREAKEVEN_SL` | Low ≤ entry (BREAKEVEN phase) | ~Entry (~−₹83 commission) | Price reached 1R then fully reversed; intraday high never crossed R1 |
-| `TIME` (loss) | 15:15, position still open at a loss | 15:15 candle close | Price never reached 1R; SL not hit either |
+| `TIME` (loss) | 15:00, position still open at a loss | 15:00 candle close | Price never reached 1R; SL not hit either |
 
 ### Winning exits
 
@@ -253,7 +253,7 @@ Every trade ends in exactly one of these ways.
 | `TARGET` | Bar HIGH ≥ R1/S1, trail SL not hit first | Exactly R1/S1 | Standard clean win — price hit the CPR pivot target |
 | `TRAILING_SL` (at R1) | Bar HIGH ≥ R1; trail SL set to `HIGH − ATR`; bar LOW ≤ trail SL | `HIGH − ATR` (≤ R1) | Spiked to R1 then reversed sharply within same bar; exits slightly below R1 |
 | `TRAILING_SL` (above R1) | Bar HIGH > R1 + ATR; trail SL = `HIGH − ATR` > R1; bar LOW ≤ trail SL | `HIGH − ATR` (> R1) | Spiked well above R1 then reversed within same bar; exits above R1 — better than TARGET |
-| `TIME` (win) | 15:15, position profitable but R1 never hit | 15:15 candle close | Price moved in favour but stalled below R1 the whole day; breakeven was held |
+| `TIME` (win) | 15:00, position profitable but R1 never hit | 15:00 candle close | Price moved in favour but stalled below R1 the whole day; breakeven was held |
 
 ### Code ordering that determines TARGET vs TRAILING_SL
 

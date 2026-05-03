@@ -88,7 +88,7 @@ class PaperSession:
     max_drawdown_pct: float = 0.10
     max_positions: int = DEFAULT_MAX_POSITIONS
     max_position_pct: float = DEFAULT_MAX_POSITION_PCT
-    flatten_time: str = "15:15"
+    flatten_time: str = "15:00"
     daily_pnl_used: float = 0.0
     total_pnl: float = 0.0
     latest_candle_ts: datetime | None = None
@@ -302,7 +302,7 @@ class PaperDB:
                 max_drawdown_pct DOUBLE DEFAULT 0.10,
                 max_positions  INT DEFAULT 5,
                 max_position_pct DOUBLE DEFAULT 0.20,
-                flatten_time   VARCHAR(10) DEFAULT '15:15',
+                flatten_time   VARCHAR(10) DEFAULT '15:00',
                 daily_pnl_used DOUBLE DEFAULT 0,
                 total_pnl      DOUBLE DEFAULT 0,
                 latest_candle_ts TIMESTAMPTZ,
@@ -525,7 +525,7 @@ class PaperDB:
         max_drawdown_pct: float = 0.10,
         max_positions: int = DEFAULT_MAX_POSITIONS,
         max_position_pct: float = DEFAULT_MAX_POSITION_PCT,
-        flatten_time: str = "15:15",
+        flatten_time: str = "15:00",
         mode: str = "replay",
         notes: str | None = None,
     ) -> PaperSession:
@@ -702,7 +702,7 @@ class PaperDB:
             max_drawdown_pct=d.get("max_drawdown_pct", 0.10),
             max_positions=d.get("max_positions", DEFAULT_MAX_POSITIONS),
             max_position_pct=d.get("max_position_pct", DEFAULT_MAX_POSITION_PCT),
-            flatten_time=d.get("flatten_time", "15:15"),
+            flatten_time=d.get("flatten_time", "15:00"),
             daily_pnl_used=d.get("daily_pnl_used", 0.0),
             total_pnl=d.get("total_pnl", 0.0),
             latest_candle_ts=d.get("latest_candle_ts"),

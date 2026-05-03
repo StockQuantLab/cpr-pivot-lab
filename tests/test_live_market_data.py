@@ -543,7 +543,7 @@ async def test_run_live_session_promotes_flatten_time_stop_to_completed_when_fla
         return None
 
     async def fake_risk_enforcer(**kwargs):
-        return {"triggered": True, "daily_pnl_used": 0.0, "reasons": ["flatten_time:15:15:00"]}
+        return {"triggered": True, "daily_pnl_used": 0.0, "reasons": ["flatten_time:15:00:00"]}
 
     async def fake_evaluate_candle(**kwargs):
         return {

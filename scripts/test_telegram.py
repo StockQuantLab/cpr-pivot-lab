@@ -79,7 +79,7 @@ async def test_telegram() -> None:
             (
                 "<b>📊 Risk Management Update</b>\n\n"
                 "Session: <code>CPR_LEVELS_SHORT</code>\n"
-                "Status: 🕒 flatten_time:15:15:00\n"
+                "Status: 🕒 flatten_time:15:00:00\n"
                 "Net P&L: <code>-708.76</code> 📉\n"
                 "Trades closed: 3",
                 "RISK (flatten EOD)",
