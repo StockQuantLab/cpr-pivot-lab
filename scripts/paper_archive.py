@@ -17,7 +17,8 @@ logger = logging.getLogger(__name__)
 def _position_to_trade_row(session: PaperSession, position: PaperPosition) -> dict[str, Any]:
     opened_at = position.entry_time or datetime.utcnow()
     closed_at = position.exit_time or opened_at
-    quantity = float(position.qty or 0.0)
+    raw_quantity = getattr(position, "quantity", None)
+    quantity = float(raw_quantity if raw_quantity is not None else position.qty or 0.0)
     entry_price = float(position.entry_price or 0.0)
     exit_price = float(position.exit_price or entry_price)
     direction = position.direction.upper()
@@ -47,6 +48,7 @@ def _position_to_trade_row(session: PaperSession, position: PaperPosition) -> di
         "CLOSE_POSITIONS": "TIME",
         "CLOSE_ALL": "TIME",
         "FLATTEN": "TIME",
+        "MOMENTUM_FAIL": "CANDLE_EXIT",
     }
     exit_reason = exit_reason_map.get(raw_exit_reason.strip().upper(), raw_exit_reason)
     sl_phase = str(trail_state.get("sl_phase") or "PROTECT")

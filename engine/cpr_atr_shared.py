@@ -389,7 +389,7 @@ def _regime_move_pct(setup_row: Mapping[str, Any]) -> float | None:
         return None
     try:
         return float(move)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return None
 
 

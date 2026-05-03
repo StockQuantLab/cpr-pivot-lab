@@ -257,25 +257,36 @@ class LocalTickerAdapter:
                 pack = self._symbol_packs.get(symbol)
                 if pack is None:
                     continue
-                # `_idx_by_time.get()` is intentional here: symbols can have
-                # shorter histories than the global union, and missing bars
-                # must be skipped without raising or backfilling.
                 candle_idx = pack._idx_by_time.get(bar_time_str)
                 if candle_idx is None:
-                    continue
-
-                candle = ClosedCandle(
-                    symbol=symbol,
-                    bar_start=bar_start,
-                    bar_end=bar_end,
-                    open=float(pack.opens[candle_idx]),
-                    high=float(pack.highs[candle_idx]),
-                    low=float(pack.lows[candle_idx]),
-                    close=float(pack.closes[candle_idx]),
-                    volume=float(pack.volumes[candle_idx]),
-                    first_snapshot_ts=bar_start,
-                    last_snapshot_ts=bar_end,
-                )
+                    last_ltp = self._last_ltp.get(symbol)
+                    if last_ltp is None:
+                        continue
+                    candle = ClosedCandle(
+                        symbol=symbol,
+                        bar_start=bar_start,
+                        bar_end=bar_end,
+                        open=float(last_ltp),
+                        high=float(last_ltp),
+                        low=float(last_ltp),
+                        close=float(last_ltp),
+                        volume=0.0,
+                        first_snapshot_ts=bar_start,
+                        last_snapshot_ts=bar_end,
+                    )
+                else:
+                    candle = ClosedCandle(
+                        symbol=symbol,
+                        bar_start=bar_start,
+                        bar_end=bar_end,
+                        open=float(pack.opens[candle_idx]),
+                        high=float(pack.highs[candle_idx]),
+                        low=float(pack.lows[candle_idx]),
+                        close=float(pack.closes[candle_idx]),
+                        volume=float(pack.volumes[candle_idx]),
+                        first_snapshot_ts=bar_start,
+                        last_snapshot_ts=bar_end,
+                    )
                 result.append(candle)
                 self._last_ltp[symbol] = candle.close
 

@@ -1886,7 +1886,7 @@ def paginated_table(
             # Prevents "Client has been deleted" errors on navigation/timeout
             try:
                 current_client = ui.context.client
-            except (AttributeError, RuntimeError):
+            except AttributeError, RuntimeError:
                 # No client context or context already gone
                 return
             if not current_client.has_socket_connection:

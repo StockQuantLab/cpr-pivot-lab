@@ -786,6 +786,65 @@ async def test_cmd_daily_live_resume_reuses_same_session_id(
 
 
 @pytest.mark.asyncio
+async def test_cmd_daily_live_resume_reconstructs_local_feed_adapter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import scripts.paper_trading as pt
+
+    session = SimpleNamespace(
+        session_id="paper-live-local",
+        status="FAILED",
+        strategy="CPR_LEVELS",
+        strategy_params={"feed_source": "local"},
+        trade_date="2026-04-30",
+    )
+    calls: dict[str, object] = {}
+
+    class FakeLocalTickerAdapter:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    async def fake_get_session(_session_id: str):
+        return session
+
+    async def fake_get_session_positions(_session_id: str, statuses=None, symbol=None):
+        return [SimpleNamespace(symbol="SBIN")]
+
+    async def fake_run_live_session(**kwargs):
+        calls["run"] = kwargs
+        return {"status": "LIVE"}
+
+    monkeypatch.setattr("engine.local_ticker_adapter.LocalTickerAdapter", FakeLocalTickerAdapter)
+    monkeypatch.setattr(pt, "get_session", fake_get_session)
+    monkeypatch.setattr(pt, "get_session_positions", fake_get_session_positions)
+    monkeypatch.setattr(pt, "run_live_session", fake_run_live_session)
+    monkeypatch.setattr(pt, "dispatch_session_state_alert", lambda **kwargs: None)
+
+    await pt._cmd_daily_live_resume(
+        SimpleNamespace(
+            session_id="paper-live-local",
+            trade_date="2026-04-30",
+            strategy="CPR_LEVELS",
+            preset=None,
+            strategy_params=None,
+            poll_interval_sec=1.0,
+            candle_interval_minutes=5,
+            max_cycles=1,
+            complete_on_exit=False,
+            no_alerts=False,
+        )
+    )
+
+    adapter = calls["run"]["ticker_adapter"]
+    assert isinstance(adapter, FakeLocalTickerAdapter)
+    assert adapter.kwargs == {
+        "trade_date": "2026-04-30",
+        "symbols": ["SBIN"],
+        "candle_interval_minutes": 5,
+    }
+
+
+@pytest.mark.asyncio
 async def test_cmd_daily_live_resume_infers_session_id_from_preset(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

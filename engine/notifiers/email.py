@@ -14,8 +14,8 @@ logger = logging.getLogger(__name__)
 class EmailNotifier:
     """Send plain-text email alerts via STARTTLS.
 
-    Failures are logged but never raised — alerting is best-effort and must not
-    crash the trading loop.
+    Failures are logged and re-raised so AlertDispatcher retry/failure accounting
+    can handle them without crashing the trading loop.
     """
 
     def __init__(
@@ -64,3 +64,4 @@ class EmailNotifier:
                 self._port,
                 exc,
             )
+            raise

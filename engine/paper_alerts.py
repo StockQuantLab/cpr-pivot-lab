@@ -13,11 +13,18 @@ def _html_text(value: object) -> str:
     return html.escape(_CONTROL_CHARS.sub("", str(value)), quote=True)
 
 
-def _format_event_time(event_time: datetime | None) -> str:
+def _format_event_time(event_time: object | None) -> str:
     """Format trade event time as 'HH:MM DD-Mon' for alerts."""
     if event_time is None:
         return ""
-    return event_time.strftime("%H:%M %d-%b")
+    if isinstance(event_time, datetime):
+        return event_time.strftime("%H:%M %d-%b")
+    if isinstance(event_time, str):
+        try:
+            return datetime.fromisoformat(event_time).strftime("%H:%M %d-%b")
+        except ValueError:
+            return ""
+    return ""
 
 
 def _format_open_alert(
@@ -75,11 +82,14 @@ def _format_close_alert(
     safe_reason = _html_text(reason)
     safe_strategy = _html_text(strategy)
     safe_session_id = _html_text(str(session_id)[:16])
-    pnl_pct = (
-        ((close_price - entry_price) / entry_price * 100)
-        if direction == "LONG"
-        else ((entry_price - close_price) / entry_price * 100)
-    )
+    if entry_price:
+        pnl_pct = (
+            ((close_price - entry_price) / entry_price * 100)
+            if direction == "LONG"
+            else ((entry_price - close_price) / entry_price * 100)
+        )
+    else:
+        pnl_pct = 0.0
     is_win = realized_pnl >= 0
     result_tag = "WIN" if is_win else "LOSS"
     icon = "✅" if is_win else "❌"
@@ -121,7 +131,10 @@ def _format_risk_alert(
     pnl_emoji = "📈" if net_pnl >= 0 else "📉"
     date_str = trade_date if trade_date else ""
     if date_str and len(date_str) == 10:
-        date_str = datetime.strptime(date_str, "%Y-%m-%d").strftime("%d-%b-%Y")
+        try:
+            date_str = datetime.strptime(date_str, "%Y-%m-%d").strftime("%d-%b-%Y")
+        except ValueError:
+            date_str = ""
     subject = f"📊 EOD Summary — {date_str}" if date_str else "📊 EOD Summary"
     body = (
         f"Session: <code>{safe_session_id}</code>\n"

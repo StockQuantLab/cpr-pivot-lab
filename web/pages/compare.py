@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 
 import plotly.graph_objects as go
@@ -343,7 +344,16 @@ async def compare_page() -> None:
             divider()
 
             # ── Trade-level breakdown (async DB query) ─────────────────────
-            bd = await aget_compare_breakdown(id1, id2)
+            try:
+                bd = await aget_compare_breakdown(id1, id2)
+            except Exception as exc:
+                logging.getLogger(__name__).exception("Compare breakdown failed: %s", exc)
+                empty_state(
+                    "Failed to load breakdown",
+                    "Could not load trade-level comparison. Please refresh.",
+                    icon="error",
+                )
+                return
 
             # ── Exit Reason Comparison ─────────────────────────────────────
             exit_reasons = bd.get("exit_reasons", {})
@@ -386,8 +396,11 @@ async def compare_page() -> None:
                 # Exit reason detail table
                 wl_a = bd.get("win_loss", {}).get(id1, {})
                 wl_b = bd.get("win_loss", {}).get(id2, {})
-                total_a = wl_a.get("total", 0) or 1
-                total_b = wl_b.get("total", 0) or 1
+                total_a = wl_a.get("total", 0)
+                total_b = wl_b.get("total", 0)
+
+                def _pct(count: int, total: int) -> str:
+                    return f"{count / total * 100:.0f}%" if total else "—"
 
                 er_rows = []
                 for r in present:
@@ -398,9 +411,9 @@ async def compare_page() -> None:
                     er_rows.append(
                         {
                             "reason": reason_labels.get(r, r),
-                            "a_count": f"{ca:,} ({ca / total_a * 100:.0f}%)",
+                            "a_count": f"{ca:,} ({_pct(ca, total_a)})",
                             "a_avg": f"₹{pa:,.0f}",
-                            "b_count": f"{cb:,} ({cb / total_b * 100:.0f}%)",
+                            "b_count": f"{cb:,} ({_pct(cb, total_b)})",
                             "b_avg": f"₹{pb:,.0f}",
                             "delta": f"{cb - ca:+,}",
                         }
@@ -644,7 +657,7 @@ async def compare_page() -> None:
                     if "₹" in a_val:
                         return f"₹{d:+,.0f}"
                     return f"{d:+.2f}"
-                except (ValueError, TypeError):
+                except ValueError, TypeError:
                     return ""
 
             metric_rows = [
@@ -713,11 +726,11 @@ async def compare_page() -> None:
             params2 = {}
             try:
                 params1 = json.loads(str(meta1.get("params_json") or "{}"))
-            except (TypeError, ValueError):
+            except TypeError, ValueError:
                 params1 = {}
             try:
                 params2 = json.loads(str(meta2.get("params_json") or "{}"))
-            except (TypeError, ValueError):
+            except TypeError, ValueError:
                 params2 = {}
             if not isinstance(params1, dict):
                 params1 = {}

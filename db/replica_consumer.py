@@ -64,7 +64,7 @@ class ReplicaConsumer:
             try:
                 content = self.pointer_file.read_text().strip()
                 return int(content.replace("v", ""))
-            except (ValueError, OSError):
+            except ValueError, OSError:
                 pass
         return self._current_version
 
@@ -82,7 +82,7 @@ class ReplicaConsumer:
                     ver = int(ver_str)
                     if ver > max_ver:
                         max_ver = ver
-                except (ValueError, IndexError):
+                except ValueError, IndexError:
                     pass
         except OSError:
             pass

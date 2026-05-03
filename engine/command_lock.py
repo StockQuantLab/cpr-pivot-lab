@@ -24,7 +24,7 @@ def _parse_lock_pid(lock_path: Path) -> int | None:
         for line in lock_path.read_text(encoding="utf-8").splitlines():
             if line.startswith("pid="):
                 return int(line.split("=", 1)[1])
-    except (OSError, ValueError):
+    except OSError, ValueError:
         pass
     return None
 
@@ -60,7 +60,7 @@ def _read_lock_info(lock_path: Path) -> tuple[int | None, str | None, str | None
                 detail = value
             elif key == "started_at" and value:
                 started_at = value
-    except (OSError, ValueError):
+    except OSError, ValueError:
         pass
     return pid, detail, started_at
 

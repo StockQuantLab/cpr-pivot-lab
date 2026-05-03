@@ -94,7 +94,7 @@ def _extract_run_params(meta: dict, run_meta: dict) -> dict:
     if isinstance(params_json, str) and params_json.strip():
         try:
             parsed = json.loads(params_json)
-        except (TypeError, ValueError, json.JSONDecodeError):
+        except TypeError, ValueError, json.JSONDecodeError:
             parsed = {}
         if isinstance(parsed, dict):
             return parsed
@@ -167,7 +167,7 @@ async def backtest_page() -> None:
                 return
 
             # Save to sessionStorage so theme toggle restores it
-            ui.run_javascript(f"sessionStorage.setItem('cpr_run_id', '{exp_id}')")
+            ui.run_javascript(f"sessionStorage.setItem('cpr_run_id', {json.dumps(str(exp_id))})")
 
             # Find run meta
             meta = next((r for r in runs if r.get("run_id") == exp_id), {})
@@ -443,7 +443,7 @@ def _render_content(
 # ---------------------------------------------------------------------------
 def _tab_equity(df: pl.DataFrame, colors: dict) -> None:
     sorted_df = df.sort("trade_date")
-    pnl = sorted_df["profit_loss"].to_numpy()
+    pnl = np.nan_to_num(sorted_df["profit_loss"].to_numpy(), nan=0.0)
     dates = sorted_df["trade_date"].cast(pl.Utf8).to_list()
 
     cumsum = np.cumsum(pnl)
@@ -845,16 +845,21 @@ def _tab_r_multiple(df: pl.DataFrame, colors: dict, theme: dict) -> None:
         )
         return
 
+    risk = (pl.col("entry_price") - pl.col("sl_price")).abs()
     pnl_r_raw = df.with_columns(
-        pl.when(pl.col("direction") == "LONG")
+        pl.when(risk > 1e-9)
         .then(
-            (pl.col("exit_price") - pl.col("entry_price"))
-            / (pl.col("entry_price") - pl.col("sl_price"))
+            pl.when(pl.col("direction") == "LONG")
+            .then(
+                (pl.col("exit_price") - pl.col("entry_price"))
+                / (pl.col("entry_price") - pl.col("sl_price"))
+            )
+            .otherwise(
+                (pl.col("entry_price") - pl.col("exit_price"))
+                / (pl.col("sl_price") - pl.col("entry_price"))
+            )
         )
-        .otherwise(
-            (pl.col("entry_price") - pl.col("exit_price"))
-            / (pl.col("sl_price") - pl.col("entry_price"))
-        )
+        .otherwise(None)
         .alias("pnl_r")
     )["pnl_r"].to_numpy()
 
@@ -1559,7 +1564,7 @@ def _render_trade_inspector(details: dict, strategy: str, colors: dict, theme: d
     try:
         if not ui.context.client.has_socket_connection:
             return
-    except (AttributeError, RuntimeError):
+    except AttributeError, RuntimeError:
         return
 
     trade = details.get("trade", {})
@@ -1783,7 +1788,7 @@ def _fmt_num(value: object, digits: int = 2) -> str:
         return "-"
     try:
         return f"{float(value):.{digits}f}"
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return str(value)
 
 

@@ -15,6 +15,7 @@ from engine.cpr_atr_strategy import BacktestParams, CPRLevelsParams, DayPack
 from engine.paper_runtime import (
     PaperRuntimeState,
     _format_close_alert,
+    _format_risk_alert,
     build_backtest_params,
     build_backtest_params_from_overrides,
     enforce_session_risk_controls,
@@ -105,6 +106,34 @@ def test_format_close_alert_uses_signed_pnl_display() -> None:
     assert subject == "❌ [LOSS] ASTERDM SHORT INITIAL_SL"
     assert "P&L: <code>-₹709</code> (-0.63%)" in body
     assert "09:50 01-Apr" in body
+
+
+def test_format_close_alert_handles_zero_entry_and_invalid_event_time() -> None:
+    subject, body = _format_close_alert(
+        symbol="SBIN",
+        direction="LONG",
+        entry_price=0.0,
+        close_price=100.0,
+        reason="MANUAL_CLOSE",
+        realized_pnl=0.0,
+        event_time="not-a-date",
+    )
+
+    assert subject == "✅ [WIN] SBIN LONG MANUAL_CLOSE"
+    assert "P&L: <code>+₹0</code> (+0.00%)" in body
+    assert "🕒" not in body
+
+
+def test_format_risk_alert_ignores_invalid_trade_date() -> None:
+    subject, body = _format_risk_alert(
+        reason="manual",
+        net_pnl=0.0,
+        session_id="paper-1",
+        trade_date="not-a-date",
+    )
+
+    assert subject == "📊 EOD Summary"
+    assert "paper-1" in body
 
 
 def test_alert_sink_can_capture_dispatch_without_sending(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1714,6 +1743,81 @@ async def test_flatten_session_positions_can_disable_summary_dispatch(
 
 
 @pytest.mark.asyncio
+async def test_flatten_session_positions_uses_remaining_qty_after_partial_exit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from engine.paper_runtime import flatten_session_positions
+
+    session = SimpleNamespace(
+        session_id="test-flatten-runner",
+        strategy="CPR_LEVELS",
+        strategy_params={},
+        max_positions=10,
+        max_daily_loss_pct=0.0,
+        max_position_pct=0.1,
+        portfolio_value=1_000_000.0,
+        trade_date="2026-04-13",
+    )
+    open_position = SimpleNamespace(
+        position_id="pos-runner",
+        session_id="test-flatten-runner",
+        symbol="SBIN",
+        direction="LONG",
+        status="OPEN",
+        entry_price=100.0,
+        current_qty=40.0,
+        quantity=100.0,
+        stop_loss=95.0,
+        target_price=110.0,
+        last_price=105.0,
+        trail_state={},
+        realized_pnl=None,
+        opened_by="CPR_LEVELS",
+    )
+    order_events: list[dict[str, object]] = []
+    updates: list[dict[str, object]] = []
+
+    async def fake_get_session(_session_id: str):
+        return session
+
+    async def fake_get_session_positions(_session_id: str, *, symbol=None, statuses=None):
+        if statuses == ["OPEN"]:
+            return [open_position]
+        if statuses == ["CLOSED"]:
+            return [SimpleNamespace(realized_pnl=updates[0]["realized_pnl"])] if updates else []
+        return []
+
+    async def fake_append_order_event(**kwargs):
+        order_events.append(kwargs)
+        return SimpleNamespace(**kwargs)
+
+    async def fake_update_position(position_id: str, **kwargs):
+        updates.append({"position_id": position_id, **kwargs})
+        return None
+
+    async def fake_update_session_state(_session_id: str, **_kwargs):
+        return session
+
+    monkeypatch.setattr("engine.paper_runtime.get_session", fake_get_session)
+    monkeypatch.setattr("engine.paper_runtime.get_session_positions", fake_get_session_positions)
+    monkeypatch.setattr("engine.paper_runtime.append_order_event", fake_append_order_event)
+    monkeypatch.setattr("engine.paper_runtime.update_position", fake_update_position)
+    monkeypatch.setattr("engine.paper_runtime.update_session_state", fake_update_session_state)
+
+    result = await flatten_session_positions(
+        "test-flatten-runner",
+        notes="runner",
+        feed_state=SimpleNamespace(raw_state={"symbol_last_prices": {"SBIN": 105.0}}),
+        emit_summary=False,
+    )
+
+    assert result["closed_positions"] == 1
+    assert order_events[0]["requested_qty"] == pytest.approx(40.0)
+    assert order_events[0]["fill_qty"] == pytest.approx(40.0)
+    assert updates[0]["realized_pnl"] == pytest.approx(151.29)
+
+
+@pytest.mark.asyncio
 async def test_flatten_session_positions_eod_dedup_in_memory(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1883,6 +1987,42 @@ def test_reset_alert_dedupe_allows_explicit_in_process_restart(
 
     started_alerts = [d for d in dispatched if d[0].value == "SESSION_STARTED"]
     assert len(started_alerts) == 2
+
+
+def test_dispatch_alert_without_running_loop_logs_valid_failed_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import engine.paper_runtime as _pm
+
+    alerts: list[dict[str, object]] = []
+
+    class FakeDB:
+        def log_alert(self, alert_type: str, subject: str, body: str, **kwargs):
+            alerts.append(
+                {
+                    "alert_type": alert_type,
+                    "subject": subject,
+                    "body": body,
+                    **kwargs,
+                }
+            )
+
+    monkeypatch.setattr(_pm, "_db", lambda: FakeDB())
+    _pm.set_alert_sink(None)
+    _pm.set_alerts_suppressed(False)
+
+    _pm._dispatch_alert(_pm.AlertType.SESSION_ERROR, "subject", "body")
+
+    assert alerts == [
+        {
+            "alert_type": "SESSION_ERROR",
+            "subject": "subject",
+            "body": "body",
+            "channel": "LOG",
+            "status": "failed",
+            "error_msg": "no_event_loop",
+        }
+    ]
 
 
 @pytest.mark.asyncio

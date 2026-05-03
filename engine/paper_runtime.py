@@ -272,7 +272,14 @@ def _dispatch_alert(alert_type: AlertType, subject: str, body: str) -> None:
             task.add_done_callback(_background_tasks.discard)
         except RuntimeError:
             # No event loop running -- log to PaperDB directly
-            _db().log_alert(str(alert_type.value), subject, body, status="skipped_no_loop")
+            _db().log_alert(
+                str(alert_type.value),
+                subject,
+                body,
+                channel="LOG",
+                status="failed",
+                error_msg="no_event_loop",
+            )
     except Exception as exc:
         logger.warning("Alert dispatch failed (best-effort, non-blocking): %s", exc)
 
@@ -424,8 +431,8 @@ def dispatch_session_started_alert(
         f"Started: <code>{now_str}</code>\n"
         f"ID: <code>{session_id}</code>"
     )
-    _dispatch_alert(AlertType.SESSION_STARTED, subject, body)
     _session_started_sent.add(session_id)
+    _dispatch_alert(AlertType.SESSION_STARTED, subject, body)
 
 
 def dispatch_session_completed_alert(*, session_id: str) -> None:
@@ -601,6 +608,13 @@ def _realized_pnl_for_close(
     return round(gross_pnl - cost, 2)
 
 
+def _remaining_position_qty(position: PaperPosition) -> float:
+    current_qty = getattr(position, "current_qty", None)
+    if current_qty is not None:
+        return max(0.0, float(current_qty or 0.0))
+    return max(0.0, float(getattr(position, "quantity", 0.0) or 0.0))
+
+
 async def flatten_session_positions(
     session_id: str,
     *,
@@ -623,8 +637,11 @@ async def flatten_session_positions(
     total_realized = 0.0
     now_ist = datetime.now(tz=_IST)
     for position in positions:
+        close_qty = _remaining_position_qty(position)
+        if close_qty <= 0:
+            continue
         close_price = _close_price_for_position(position, price_map)
-        realized = _realized_pnl_for_close(position, close_price, params=params)
+        realized = _realized_pnl_for_close(position, close_price, params=params, qty=close_qty)
         total_realized += realized
         side = "SELL" if str(position.direction).upper() == "LONG" else "BUY"
         real_exit_meta: dict[str, Any] = {}
@@ -645,11 +662,11 @@ async def flatten_session_positions(
             session_id=session_id,
             symbol=position.symbol,
             side=side,
-            requested_qty=float(position.quantity),
+            requested_qty=close_qty,
             position_id=position.position_id,
             order_type="MARKET",
             request_price=close_price,
-            fill_qty=float(position.quantity),
+            fill_qty=close_qty,
             fill_price=close_price,
             status="FILLED",
             idempotency_key=build_order_idempotency_key(
@@ -802,8 +819,11 @@ async def flatten_positions_subset(
     closed: list[dict[str, Any]] = []
     now_ist = datetime.now(tz=_IST)
     for position in positions:
+        close_qty = _remaining_position_qty(position)
+        if close_qty <= 0:
+            continue
         close_price = _close_price_for_position(position, price_map)
-        realized = _realized_pnl_for_close(position, close_price, params=params)
+        realized = _realized_pnl_for_close(position, close_price, params=params, qty=close_qty)
         side = "SELL" if str(position.direction).upper() == "LONG" else "BUY"
         real_exit_meta: dict[str, Any] = {}
         if real_order_router is not None and real_order_router.enabled:
@@ -823,11 +843,11 @@ async def flatten_positions_subset(
             session_id=session_id,
             symbol=position.symbol,
             side=side,
-            requested_qty=float(position.quantity),
+            requested_qty=close_qty,
             position_id=position.position_id,
             order_type="MARKET",
             request_price=close_price,
-            fill_qty=float(position.quantity),
+            fill_qty=close_qty,
             fill_price=close_price,
             status="FILLED",
             idempotency_key=build_order_idempotency_key(

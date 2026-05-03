@@ -157,6 +157,24 @@ def reconcile_paper_session(db: PaperDB, session_id: str) -> dict[str, Any]:
                     position_id=position.position_id,
                 )
             )
+        if (
+            position_status in {"CLOSED", "FLATTENED"}
+            and exit_fills
+            and exit_qty + 1e-9 < expected_qty
+        ):
+            findings.append(
+                ReconciliationFinding(
+                    severity="CRITICAL",
+                    code="EXIT_UNDERFILLED",
+                    message=(
+                        f"Closed position {position.position_id} qty={expected_qty:g} but "
+                        f"exit fills total {exit_qty:g}."
+                    ),
+                    session_id=session_id,
+                    symbol=position.symbol,
+                    position_id=position.position_id,
+                )
+            )
         if position_status == "OPEN" and exit_qty > 0:
             findings.append(
                 ReconciliationFinding(

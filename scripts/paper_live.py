@@ -17,11 +17,7 @@ from config.settings import get_settings
 from db.duckdb import get_dashboard_db
 from db.paper_db import get_dashboard_paper_db, get_paper_db
 from engine import paper_session_driver as paper_session_driver
-from engine.bar_orchestrator import (
-    SessionPositionTracker,
-    select_entries_for_bar,
-    should_process_symbol,
-)
+from engine.bar_orchestrator import SessionPositionTracker
 from engine.cpr_atr_shared import regime_snapshot_close_col
 from engine.kite_ticker_adapter import KiteTickerAdapter
 from engine.live_market_data import (
@@ -52,9 +48,7 @@ from engine.paper_runtime import (
     get_session_positions,
     load_setup_row,
     maybe_shutdown_alert_dispatcher,
-    refresh_pending_setup_rows_for_bar,
     register_session_start,
-    runtime_setup_status,
 )
 from engine.real_order_runtime import build_real_order_router
 from scripts import paper_live_helpers as _live_helpers
@@ -475,115 +469,6 @@ def _prefetch_setup_rows(
     runtime_state.invalid_setup_rows += len(invalid_symbols)
 
 
-async def _process_closed_bar_group(
-    *,
-    session_id: str,
-    session: Any,
-    bar_candles: list[ClosedCandle],
-    runtime_state: PaperRuntimeState,
-    tracker: SessionPositionTracker,
-    params: Any,
-    active_symbols: list[str],
-) -> tuple[list[str], float | None]:
-    if not bar_candles:
-        return active_symbols, None
-    bar_candles_sorted = sorted(bar_candles, key=lambda c: c.symbol)
-    bar_time = bar_candles_sorted[0].bar_end.astimezone(IST).strftime("%H:%M")
-    entry_window_end = str(params.entry_window_end)
-
-    refresh_pending_setup_rows_for_bar(
-        runtime_state=runtime_state,
-        symbols=active_symbols,
-        trade_date=bar_candles_sorted[0].bar_end.date().isoformat(),
-        bar_candles=bar_candles_sorted,
-        or_minutes=int(getattr(params, "or_minutes", 5) or 5),
-        allow_live_fallback=bool(getattr(runtime_state, "allow_live_setup_fallback", True)),
-    )
-
-    # Step 1: exits/position advances first.
-    for candle in bar_candles_sorted:
-        if not tracker.has_open_position(candle.symbol):
-            continue
-        evaluation = await evaluate_candle(
-            session=session,
-            candle=candle,
-            runtime_state=runtime_state,
-            now=candle.bar_end,
-            position_tracker=tracker,
-            allow_entry_evaluation=False,
-        )
-        advance = dict(evaluation.get("advance_result") or {})
-        if advance.get("action") == "CLOSE":
-            tracker.record_close(candle.symbol, float(advance.get("exit_value") or 0.0))
-            logger.info(
-                "[%s] CLOSE %s reason=%s",
-                session_id,
-                candle.symbol,
-                str(advance.get("reason") or "exit"),
-            )
-        elif advance.get("action") == "PARTIAL":
-            tracker.credit_cash(float(advance.get("exit_value") or 0.0))
-
-    # Step 2: evaluate entry candidates for this bar.
-    entry_candidates: list[dict[str, Any]] = []
-    for candle in bar_candles_sorted:
-        if tracker.has_open_position(candle.symbol):
-            continue
-        setup_status = runtime_setup_status(runtime_state, candle.symbol)
-        if not should_process_symbol(
-            bar_time=bar_time,
-            entry_window_end=entry_window_end,
-            tracker=tracker,
-            symbol=candle.symbol,
-            setup_status=setup_status,
-        ):
-            continue
-        evaluation = await evaluate_candle(
-            session=session,
-            candle=candle,
-            runtime_state=runtime_state,
-            now=candle.bar_end,
-            position_tracker=tracker,
-            allow_entry_evaluation=True,
-        )
-        if evaluation.get("action") == "ENTRY_CANDIDATE":
-            entry_candidates.append(evaluation)
-
-    # Step 3: select + execute entries.
-    selected_entries = select_entries_for_bar(entry_candidates, tracker)
-    for selected in selected_entries:
-        execute_result = await execute_entry(
-            session=session,
-            candidate=dict(selected.get("candidate") or {}),
-            setup_row=dict(selected.get("setup_row") or {}),
-            params=params,
-            now=bar_candles_sorted[0].bar_end,
-            position_tracker=tracker,
-        )
-        if execute_result.get("action") == "OPEN":
-            candidate = dict(selected.get("candidate") or {})
-            logger.info(
-                "[%s] OPEN %s @ %.2f",
-                session_id,
-                str(candidate.get("symbol") or ""),
-                float(candidate.get("entry_price") or 0.0),
-            )
-
-    # Step 4: prune symbol universe with shared logic.
-    reduced_symbols = [
-        symbol
-        for symbol in active_symbols
-        if should_process_symbol(
-            bar_time=bar_time,
-            entry_window_end=entry_window_end,
-            tracker=tracker,
-            symbol=symbol,
-            setup_status=runtime_setup_status(runtime_state, symbol),
-        )
-    ]
-    return reduced_symbols, float(bar_candles_sorted[-1].close)
-
-
 async def _finalize_live_session(
     *,
     session_id: str,
@@ -653,7 +538,7 @@ async def run_live_session(
     if session is None:
         return {"session_id": session_id, "error": "session not found"}
     session_status = str(getattr(session, "status", "") or "").upper()
-    if session_status in {"COMPLETED", "CANCELLED"}:
+    if session_status in {"COMPLETED", "CANCELLED", "STOPPING"}:
         logger.info(
             "[%s] Session already terminal at startup status=%s — no live loop started",
             session_id,
@@ -696,7 +581,7 @@ async def run_live_session(
     register_session_start()
     _start_alert_dispatcher()  # start consumer eagerly so first alerts are not delayed
     _was_already_active = session_status not in {"PLANNING", ""}
-    if session.status != "ACTIVE":
+    if session_status not in {"ACTIVE", "PAUSED"}:
         session = await _update_session(session_id, deps, status="ACTIVE", notes=notes)
         force_paper_db_sync(get_paper_db())
 
@@ -880,7 +765,6 @@ async def run_live_session(
                     session_id,
                     notes="global_flatten_signal",
                     feed_state=live_feed_state,
-                    emit_summary=False,
                     real_order_router=real_order_router,
                 )
                 if _reconcile_live_session(
@@ -895,6 +779,15 @@ async def run_live_session(
                     final_status = "COMPLETED"
                     terminal_reason = "global_flatten_signal"
                     complete_on_exit = True
+                try:
+                    _GLOBAL_FLATTEN_SIGNAL.unlink(missing_ok=True)
+                except OSError:
+                    logger.debug(
+                        "[%s] Failed to delete global flatten signal %s",
+                        session_id,
+                        _GLOBAL_FLATTEN_SIGNAL,
+                        exc_info=True,
+                    )
                 stop_requested = True
                 break
             if current_session.status == "PAUSED":
@@ -1247,7 +1140,6 @@ async def run_live_session(
                     session_id,
                     notes="manual_flatten_signal",
                     feed_state=live_feed_state,
-                    emit_summary=False,
                     real_order_router=real_order_router,
                 )
                 if _reconcile_live_session(
@@ -1285,6 +1177,7 @@ async def run_live_session(
                                 exc_info=True,
                             )
                         continue
+                    _command_processed = False
                     try:
                         import json as _json
 
@@ -1310,7 +1203,6 @@ async def run_live_session(
                                 session_id,
                                 notes=f"admin_{_reason}_{_requester}",
                                 feed_state=live_feed_state,
-                                emit_summary=False,
                                 real_order_router=real_order_router,
                             )
                             if _reconcile_live_session(
@@ -1511,15 +1403,17 @@ async def run_live_session(
                                     session_id,
                                     exc_info=True,
                                 )
+                        _command_processed = True
                     except Exception:
                         logger.exception(
                             "[%s] Admin command failed: %s", session_id, _cmd_file.name
                         )
                     finally:
-                        try:
-                            _cmd_file.unlink()
-                        except OSError:
-                            pass
+                        if _command_processed:
+                            try:
+                                _cmd_file.unlink()
+                            except OSError:
+                                pass
                 if stop_requested:
                     break
 
@@ -1665,6 +1559,14 @@ async def run_live_session(
         # Fix 1: guard the flush so a candle-processing error cannot skip the mandatory
         # cleanup steps (adapter teardown, position flatten, alert dispatcher shutdown).
         try:
+            flush_session = session
+            try:
+                latest_session = await _load_session(session_id, deps)
+                if latest_session is not None:
+                    flush_session = latest_session
+            except Exception:
+                logger.debug("[%s] Failed to refresh session before final flush", session_id)
+            flush_params = build_backtest_params(flush_session)
             flush_candles: list[ClosedCandle] = []
             if use_websocket and ticker_adapter is not None:
                 ticker_adapter.synthesize_quiet_symbols(
@@ -1687,11 +1589,11 @@ async def run_live_session(
                         _log_parity_trace(session_id=session_id, candle=candle, setup_row=setup_row)
                     driver_result = await paper_session_driver.process_closed_bar_group(
                         session_id=session_id,
-                        session=session,
+                        session=flush_session,
                         bar_candles=bar_candles,
                         runtime_state=runtime_state,
                         tracker=tracker,
-                        params=params,
+                        params=flush_params,
                         active_symbols=active_symbols,
                         strategy=strategy,
                         direction_filter=direction_filter,

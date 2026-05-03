@@ -202,7 +202,11 @@ async def process_closed_bar_group(
                 str(advance.get("reason") or "exit"),
             )
         elif advance.get("action") == "PARTIAL":
-            tracker.credit_cash(float(advance.get("exit_value") or 0.0))
+            tracker.record_partial(
+                candle.symbol,
+                float(advance.get("exit_value") or 0.0),
+                float(advance.get("remaining_qty") or 0.0),
+            )
         if _i % 64 == 63:
             await asyncio.sleep(0)
 

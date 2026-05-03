@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 import plotly.graph_objects as go
 import polars as pl
 from nicegui import ui
@@ -67,7 +69,18 @@ async def trade_analytics_page() -> None:
             selected_rids = {options[lbl] for lbl in selected_labels if lbl in options}
             filtered = [r for r in bt_runs if str(r.get("run_id") or "") in selected_rids]
             n_selected = len(filtered)
-            df = await aget_cross_run_trades(filtered)
+            try:
+                df = await aget_cross_run_trades(filtered)
+            except Exception as exc:
+                logging.getLogger(__name__).exception("Failed to load cross-run trades: %s", exc)
+                container.clear()
+                with container:
+                    empty_state(
+                        "Failed to load trades",
+                        "Could not aggregate trade data. Please refresh the page.",
+                        icon="error",
+                    )
+                return
             container.clear()
             with container:
                 ui.label(
@@ -98,16 +111,21 @@ def _render_analytics_content(df: pl.DataFrame, colors: dict, theme: dict) -> No
     # Avg R
     avg_r = 0.0
     if "entry_price" in df.columns and "sl_price" in df.columns:
+        risk = (pl.col("entry_price") - pl.col("sl_price")).abs()
         r_df = df.with_columns(
-            pl.when(pl.col("direction") == "LONG")
+            pl.when(risk > 1e-9)
             .then(
-                (pl.col("exit_price") - pl.col("entry_price"))
-                / (pl.col("entry_price") - pl.col("sl_price"))
+                pl.when(pl.col("direction") == "LONG")
+                .then(
+                    (pl.col("exit_price") - pl.col("entry_price"))
+                    / (pl.col("entry_price") - pl.col("sl_price"))
+                )
+                .otherwise(
+                    (pl.col("entry_price") - pl.col("exit_price"))
+                    / (pl.col("sl_price") - pl.col("entry_price"))
+                )
             )
-            .otherwise(
-                (pl.col("entry_price") - pl.col("exit_price"))
-                / (pl.col("sl_price") - pl.col("entry_price"))
-            )
+            .otherwise(None)
             .alias("r_val")
         ).filter(pl.col("r_val").is_finite())
         if not r_df.is_empty():

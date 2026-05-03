@@ -6,6 +6,7 @@ import httpx
 import pytest
 
 from engine.alert_dispatcher import AlertConfig, AlertDispatcher, AlertEvent, AlertType
+from engine.notifiers.email import EmailNotifier
 
 
 class FakePaperDB:
@@ -104,6 +105,25 @@ async def test_alert_dispatcher_discards_stale_network_retry(monkeypatch) -> Non
 
     assert paper_db.alerts[-1]["status"] == "failed"
     assert "network down" in str(paper_db.alerts[-1]["error_msg"])
+
+
+@pytest.mark.asyncio
+async def test_email_notifier_reraises_send_failure(monkeypatch) -> None:
+    notifier = EmailNotifier(
+        "smtp.example.com",
+        587,
+        "sender@example.com",
+        "password",
+        "ops@example.com",
+    )
+
+    async def fake_send(*_args, **_kwargs) -> None:
+        raise OSError("smtp down")
+
+    monkeypatch.setattr("engine.notifiers.email.aiosmtplib.send", fake_send)
+
+    with pytest.raises(OSError, match="smtp down"):
+        await notifier.send("subject", "body")
 
 
 @pytest.mark.asyncio

@@ -662,15 +662,30 @@ async def _cmd_daily_live_resume(args: argparse.Namespace) -> None:
     if suppress_alerts:
         set_alerts_suppressed(True)
 
+    stored_params = dict(getattr(session, "strategy_params", {}) or {})
+    resume_feed_source = str(
+        stored_params.get("feed_source") or getattr(args, "feed_source", "kite")
+    )
+    resume_ticker_adapter: Any | None = None
+    if resume_feed_source.strip().lower() == "local":
+        from engine.local_ticker_adapter import LocalTickerAdapter
+
+        resume_ticker_adapter = LocalTickerAdapter(
+            trade_date=str(getattr(session, "trade_date", None) or trade_date),
+            symbols=symbols,
+            candle_interval_minutes=getattr(args, "candle_interval_minutes", None) or 5,
+        )
+
     try:
         dispatch_session_state_alert(
             session_id=session_id,
             state="RESUMED",
-            details=f"open_positions={len(symbols)}",
+            details=f"open_positions={len(symbols)} feed_source={resume_feed_source}",
         )
         payload = await run_live_session(
             session_id=session_id,
             symbols=symbols,
+            ticker_adapter=resume_ticker_adapter,
             poll_interval_sec=getattr(args, "poll_interval_sec", None),
             candle_interval_minutes=getattr(args, "candle_interval_minutes", None),
             max_cycles=getattr(args, "max_cycles", None),

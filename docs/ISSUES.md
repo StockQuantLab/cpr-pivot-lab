@@ -6018,9 +6018,9 @@ Break-even trades can have their PnL silently recalculated. If `exit_price` defa
 
 ---
 
-## 2026-05-03 — OPEN: DB: ConstraintException in open_position masks all schema/integrity errors
+## 2026-05-03 — FIXED: DB: ConstraintException in open_position masks all schema/integrity errors
 
-**Status:** OPEN
+**Status:** FIXED
 **Severity:** High
 
 ### Symptom
@@ -6039,11 +6039,17 @@ Unrelated data integrity errors (bad position_id, check constraint violation) ar
 
 `db/paper_db.py:775-792`
 
+### Fix
+
+`open_position()` now performs the duplicate-OPEN lookup before insertion and re-raises
+unrelated DuckDB constraint failures with session/symbol context instead of treating every
+constraint as duplicate-open recovery.
+
 ---
 
-## 2026-05-03 — OPEN: DB: update_position has no state-transition guard
+## 2026-05-03 — FIXED: DB: update_position has no state-transition guard
 
-**Status:** OPEN
+**Status:** FIXED
 **Severity:** High
 
 ### Symptom
@@ -6062,11 +6068,17 @@ Bugs in calling code (double-close, stale reference, async reordering) can leave
 
 `db/paper_db.py:840-902`
 
+### Fix
+
+`update_position()` now rejects status regressions from terminal states back to `OPEN` and
+rejects invalid terminal transitions. Regression coverage:
+`tests/test_paper_db.py::test_update_position_rejects_reopening_closed_position`.
+
 ---
 
-## 2026-05-03 — OPEN: DB: UNIQUE index on (session_id, symbol, status) blocks re-entries and multiple manual closes
+## 2026-05-03 — FIXED: DB: UNIQUE index on (session_id, symbol, status) blocks re-entries and multiple manual closes
 
-**Status:** OPEN
+**Status:** FIXED
 **Severity:** High
 
 ### Symptom
@@ -6089,6 +6101,14 @@ Error recovery paths that try to close or flatten an already-closed position (e.
 ### Location
 
 `db/paper_db.py:353-355`
+
+### Fix
+
+The old unique index is dropped during table initialization and replaced with a non-unique
+lookup index. Duplicate OPEN protection is enforced explicitly in `open_position()`, while
+multiple historical CLOSED/FLATTENED rows for the same session/symbol are allowed. Regression
+coverage:
+`tests/test_paper_db.py::test_open_position_allows_multiple_closed_rows_for_same_symbol`.
 
 ---
 
@@ -6131,9 +6151,9 @@ subscriptions remain pending and are retried on the next reconciliation. Regress
 
 ---
 
-## 2026-05-03 — OPEN: ALERT: alert dispatcher can double-dispatch alerts during shutdown drain
+## 2026-05-03 — WON'T FIX: ALERT: alert dispatcher can double-dispatch alerts during shutdown drain
 
-**Status:** OPEN
+**Status:** WON'T FIX — reviewed as false positive
 **Severity:** High
 
 ### Symptom
@@ -6151,6 +6171,13 @@ Duplicate Telegram/email alerts for TRADE_CLOSED or FLATTEN_EOD near session end
 ### Location
 
 `engine/alert_dispatcher.py:183-210`
+
+### Triage
+
+Reviewed 2026-05-04. This is not a real duplicate-dispatch path as written: the consumer
+removes an event from the queue with `get()` before sending it, and shutdown drains only
+items still remaining in the queue after waiting for the consumer. An in-flight event is not
+present in the queue to be drained a second time.
 
 ---
 
@@ -6221,9 +6248,9 @@ assigning them, so signal handlers see the active heartbeat path and watch-loop 
 
 ---
 
-## 2026-05-03 — OPEN: LIVE: session startup force-sets status to ACTIVE, clobbering PAUSED/STOPPING
+## 2026-05-03 — FIXED: LIVE: session startup force-sets status to ACTIVE, clobbering PAUSED/STOPPING
 
-**Status:** OPEN
+**Status:** FIXED
 **Severity:** High
 
 ### Symptom
@@ -6246,6 +6273,12 @@ Operator-initiated pause/stop commands are overridden on runner restart. Combine
 ### Location
 
 `scripts/paper_live.py:699-701`
+
+### Fix
+
+`run_live_session()` now treats startup `STOPPING` as terminal and preserves startup
+`PAUSED` instead of force-promoting it to ACTIVE. PLANNING/FAILED resume paths can still
+activate normally.
 
 ---
 
@@ -6348,9 +6381,9 @@ Live pre-filter now fails closed when `require_trade_date_rows=True` and the lat
 
 ---
 
-## 2026-05-03 — OPEN: REPLAY: date filters ignored when preloaded_days pack is supplied
+## 2026-05-03 — FIXED: REPLAY: date filters ignored when preloaded_days pack is supplied
 
-**Status:** OPEN
+**Status:** FIXED
 **Severity:** Medium
 
 ### Symptom
@@ -6375,11 +6408,17 @@ Multi-date replay with date-range constraints silently includes extra dates when
 
 `scripts/paper_replay.py:638-640`
 
+### Fix
+
+`replay_session()` now applies `start_date` / `end_date` filters even when a caller supplies
+`preloaded_days`. Regression coverage:
+`tests/test_paper_replay.py::test_replay_session_streams_candles_and_archives_completed_session`.
+
 ---
 
-## 2026-05-03 — OPEN: LIVE: admin command file deleted even when processing fails
+## 2026-05-03 — FIXED: LIVE: admin command file deleted even when processing fails
 
-**Status:** OPEN
+**Status:** FIXED
 **Severity:** Medium
 
 ### Symptom
@@ -6397,6 +6436,12 @@ Lost admin commands during error conditions. Operators cannot tell whether a com
 ### Location
 
 `scripts/paper_live.py:1271-1291`
+
+### Fix
+
+Admin command files are now deleted only after parsing and processing complete successfully.
+Malformed or failed command files remain in `.tmp_logs/cmd_<session_id>/` for retry or
+operator inspection.
 
 ---
 
@@ -6492,9 +6537,9 @@ including when passed an aware timestamp from another timezone. Regression cover
 
 ---
 
-## 2026-05-03 — OPEN: ALERT: FLATTEN_EOD and SESSION_STARTED dedup guards are not thread-safe
+## 2026-05-03 — FIXED: ALERT: FLATTEN_EOD and SESSION_STARTED dedup guards are not thread-safe
 
-**Status:** OPEN
+**Status:** FIXED
 **Severity:** Medium
 
 ### Symptom
@@ -6513,11 +6558,16 @@ Occasional duplicate Telegram alerts for session start and EOD summary. Not harm
 
 `engine/paper_runtime.py:414-428`, `733-756`
 
+### Fix
+
+FLATTEN_EOD already adds to `_flatten_eod_sent` before dispatch. `SESSION_STARTED` now also
+adds the session id before dispatch, closing the re-entrant duplicate window.
+
 ---
 
-## 2026-05-03 — OPEN: ALERT: close alert formatting crashes on zero entry_price or invalid date string
+## 2026-05-03 — FIXED: ALERT: close alert formatting crashes on zero entry_price or invalid date string
 
-**Status:** OPEN
+**Status:** FIXED
 **Severity:** Medium
 
 ### Symptom
@@ -6550,6 +6600,13 @@ Any position with a corrupt or zero entry price causes the close alert to fail e
 ### Location
 
 `engine/paper_alerts.py:78-82`, `123-125`
+
+### Fix
+
+Close-alert formatting now reports `0.00%` when entry price is zero. Risk/EOD summary
+formatting now ignores invalid trade-date strings instead of raising. Regression coverage:
+`tests/test_paper_runtime.py::test_format_close_alert_handles_zero_entry_and_invalid_event_time`
+and `tests/test_paper_runtime.py::test_format_risk_alert_ignores_invalid_trade_date`.
 
 ---
 
@@ -6608,9 +6665,9 @@ Parity comparisons and latency audits cannot distinguish bars built from exchang
 
 ---
 
-## 2026-05-03 — OPEN: DB: cleanup_feed_audit uses created_at instead of trade/feed date for retention
+## 2026-05-03 — FIXED: DB: cleanup_feed_audit uses created_at instead of trade/feed date for retention
 
-**Status:** OPEN
+**Status:** FIXED
 **Severity:** Medium
 
 ### Symptom
@@ -6632,6 +6689,13 @@ The cutoff should be based on the feed/trade date (`bar_time` or `trade_date`), 
 ### Location
 
 `db/paper_db.py:1299-1315`
+
+### Fix
+
+Feed-audit cleanup now evaluates retention against feed/bar timestamps first
+(`bar_end`, `last_snapshot_ts`, `first_snapshot_ts`, `trade_date`) and only falls back to
+`created_at` when no feed timestamp exists. Regression coverage:
+`tests/test_paper_db.py::test_cleanup_feed_audit_uses_bar_date_not_insert_date`.
 
 ---
 
@@ -6671,9 +6735,9 @@ Set Doppler secrets `SMTP_USER`, `SMTP_PASSWORD`, and `ALERT_TO_EMAIL`. Use a Gm
 
 ---
 
-## 2026-05-03 — OPEN: LOCAL-FEED/REPLAY: missing bars silently skipped; diverges from Kite live flat-candle behavior
+## 2026-05-03 — FIXED: LOCAL-FEED/REPLAY: missing bars silently skipped; diverges from Kite live flat-candle behavior
 
-**Status:** OPEN
+**Status:** FIXED
 **Severity:** Medium
 
 ### Symptom
@@ -6710,7 +6774,508 @@ Backtest already doesn't need this fix — its vectorized engine handles missing
 
 `engine/local_ticker_adapter.py:250-289`, `engine/bar_orchestrator.py` (where flat-candle injection should occur after `get_closed_bars()`)
 
+### Fix
+
+`LocalTickerAdapter.drain_closed()` now emits a flat carry-forward candle with volume `0`
+when a session symbol is missing for the current bar but has a prior last traded price. This
+matches the live quiet-symbol behavior used by the WebSocket path. Regression coverage:
+`tests/test_local_ticker.py::TestLocalTickerAdapterPartialData::test_symbols_with_different_bar_counts`.
+
 ---
+
+## 2026-05-03 — FIXED: LIVE: flatten_session_positions uses original qty instead of remaining qty for partial positions
+
+**Status:** FIXED
+**Severity:** High
+
+### Symptom
+
+After a partial exit (scale-out at first target), the remaining runner is force-flattened via `flatten-all`, admin command, or EOD flatten. The realized P&L is computed for the **original full quantity** instead of the **remaining runner quantity**, producing an inflated or wrong-sign P&L. The order event also records the wrong fill quantity.
+
+### Root Cause
+
+`engine/paper_runtime.py:627` — `_realized_pnl_for_close(position, close_price, params=params)` is called without passing `qty`. The function defaults to `position.quantity` (the original full qty from entry). After a partial exit, `position.current_qty` holds the reduced runner quantity but this field is never passed.
+
+Similarly, lines 648 and 652 record `float(position.quantity)` in the order event instead of `float(position.current_qty or position.quantity)`.
+
+`flatten_positions_subset` (line 806+) has the same issue.
+
+### Impact
+
+- P&L overstated by the ratio `original_qty / runner_qty` for every force-flattened runner
+- Order events record wrong fill quantities
+- Dashboard and EOD summary show incorrect session totals
+
+### Fix Direction
+
+Pass `qty=float(position.current_qty or position.quantity)` to `_realized_pnl_for_close`, and use `current_qty` in order event `requested_qty`/`fill_qty` fields.
+
+### Location
+
+`engine/paper_runtime.py:627-652`, `engine/paper_runtime.py:806-830`
+
+### Fix
+
+`flatten_session_positions()` and `flatten_positions_subset()` now close
+`position.current_qty` when present, and write the same remaining quantity to order-event
+`requested_qty` / `fill_qty`. Regression coverage:
+`tests/test_paper_runtime.py::test_flatten_session_positions_uses_remaining_qty_after_partial_exit`.
+
+---
+
+## 2026-05-03 — FIXED: SIM: paper_session_driver uses credit_cash instead of record_partial for PARTIAL exits
+
+**Status:** FIXED
+**Severity:** High
+
+### Symptom
+
+In `daily-sim` mode, after a partial exit (scale-out), the `SessionPositionTracker`'s `current_qty` is never updated. Subsequent entries use inflated equity because the partially-exited position's full original notional is still counted.
+
+### Root Cause
+
+`engine/paper_session_driver.py:205` — for `PARTIAL` action, calls `tracker.credit_cash(exit_value)` which adds cash but does NOT update `TrackedPosition.current_qty`. The canonical path in `paper_runtime.py:1609` correctly calls `tracker.record_partial(symbol, exit_value, remaining_qty)`.
+
+### Impact
+
+- `current_open_notional()` returns stale value (original qty, not reduced qty)
+- `current_equity()` returns stale value
+- Incorrect compound-equity sizing for subsequent entries when `--compound-equity` is used
+- Does not affect `slots_available()` (counts positions, not qty)
+
+### Fix Direction
+
+Replace `tracker.credit_cash(...)` with `tracker.record_partial(candle.symbol, exit_value, remaining_qty)` at line 205.
+
+### Location
+
+`engine/paper_session_driver.py:204-205`
+
+### Fix
+
+`engine.paper_session_driver.process_closed_bar_group()` now calls
+`tracker.record_partial(symbol, exit_value, remaining_qty)` for PARTIAL exits. Regression
+coverage:
+`tests/test_paper_session_driver.py::test_process_closed_bar_group_updates_tracker_on_partial_exit`.
+
+---
+
+## 2026-05-03 — FIXED: ALERT: log_alert passes invalid status="skipped_no_loop" violating CHECK constraint
+
+**Status:** FIXED
+**Severity:** High
+
+### Symptom
+
+In `daily-sim` or any paper mode where `asyncio.get_running_loop()` raises `RuntimeError` (no event loop running), every alert dispatch attempt throws a `ConstraintException` at the DB level. The outer try/except catches it silently, so the alert is lost and the caller gets no useful feedback.
+
+### Root Cause
+
+`engine/paper_runtime.py:275` — calls `_db().log_alert(..., status="skipped_no_loop")`. The `alert_log` table has `CHECK (status IN ('sent','failed','queued'))` at `db/paper_db.py:453`. The value `"skipped_no_loop"` is not in the allowed set.
+
+### Impact
+
+- Every alert in sim mode silently fails with a DB constraint violation
+- Alert log has no record of the attempt
+- Masks whatever the original alert was trying to communicate
+
+### Fix Direction
+
+Change `status="skipped_no_loop"` to `status="failed"` with `error_msg="no_event_loop"`.
+
+### Location
+
+`engine/paper_runtime.py:275`, `db/paper_db.py:453`
+
+### Fix
+
+No-loop alert fallback now writes `channel="LOG"`, `status="failed"`, and
+`error_msg="no_event_loop"`, which satisfies the alert-log CHECK constraint. Regression
+coverage:
+`tests/test_paper_runtime.py::test_dispatch_alert_without_running_loop_logs_valid_failed_status`.
+
+---
+
+## 2026-05-03 — FIXED: LIVE: global flatten signal file never deleted after detection
+
+**Status:** FIXED
+**Severity:** High
+
+### Symptom
+
+After triggering a global flatten via `.tmp_logs/flatten_all.signal`, all subsequent `run_live_session` invocations immediately flatten and exit. This includes watch-mode restarts, resume attempts, and concurrent sibling sessions in `--multi`.
+
+### Root Cause
+
+`scripts/paper_live.py:868-899` — detects the signal file and flattens all positions, but never deletes the file afterward. The per-session sentinel file at line 1237 correctly calls `_signal_file.unlink()`, but the global signal has no equivalent cleanup.
+
+### Impact
+
+- Supervisor's watch-mode retry loop is useless after a single global flatten
+- All restart attempts exit within one cycle
+- Operator must remember to manually delete `.tmp_logs/flatten_all.signal`
+
+### Fix Direction
+
+Add `Path(_GLOBAL_FLATTEN_SIGNAL).unlink(missing_ok=True)` before the `break` at line 899.
+
+### Location
+
+`scripts/paper_live.py:868-899`
+
+### Fix
+
+After a global flatten signal is handled, `run_live_session()` now best-effort deletes
+`.tmp_logs/flatten_all.signal` so future watch-mode restarts and resumes do not immediately
+flatten again.
+
+---
+
+## 2026-05-03 — FIXED: ALERT: EmailNotifier.send swallows all exceptions — retry logic bypassed
+
+**Status:** FIXED
+**Severity:** High
+
+### Symptom
+
+When email delivery fails (wrong credentials, SMTP server down, network partition), `_send_with_retry` never sees the exception. The dispatcher records `email_ok=True` in the alert log even though the email never reached the recipient.
+
+### Root Cause
+
+`engine/notifiers/email.py:50-66` — the `send` method catches **all** exceptions and only logs them, never re-raising. The retry loop in `alert_dispatcher.py:275` expects exceptions to trigger retries, but `send()` always returns normally.
+
+### Impact
+
+- Email retry logic (30s + 120s) is completely bypassed
+- Alert log shows email as "sent" on failure
+- Not currently triggered (email secrets not configured), but will manifest when activated
+
+### Fix Direction
+
+Remove the blanket try/except from `send()`. Let network exceptions propagate to `_send_with_retry` which is designed to handle them. Alternatively, catch only non-transient exceptions (e.g., `SMTPAuthenticationError`) and re-raise network errors.
+
+### Location
+
+`engine/notifiers/email.py:50-66`, `engine/alert_dispatcher.py:262-275`
+
+### Fix
+
+`EmailNotifier.send()` now logs and re-raises send failures so `AlertDispatcher._send_with_retry()`
+can retry and record accurate alert status. Regression coverage:
+`tests/test_alert_dispatcher.py::test_email_notifier_reraises_send_failure`.
+
+---
+
+## 2026-05-03 — FIXED: ARCHIVE: uses position.qty (INT) instead of position.quantity (float)
+
+**Status:** FIXED
+**Severity:** High
+
+### Symptom
+
+Archived paper session rows have slightly wrong `position_size`, `position_value`, and `pnl_pct` values for positions where risk-based sizing produced a non-integer quantity.
+
+### Root Cause
+
+`scripts/paper_archive.py:20` — `quantity = float(position.qty or 0.0)` reads `PaperPosition.qty` which is the `INT` DB column (`qty INT DEFAULT 0`). The engine's `PaperPosition.quantity` field carries the precise `float`. `paper_db.py:963` stores `qty=int(quantity)` (truncated) while `quantity=float(quantity)` preserves the float. The archive reads the truncated INT field.
+
+### Impact
+
+- `position_size`, `position_value`, `pnl_pct` in archived `backtest_results` use truncated integer
+- Dashboard analytics and run comparisons are slightly inaccurate for risk-sized positions
+- The `realized_pnl` column is unaffected (uses separate calculation path)
+
+### Fix Direction
+
+Change line 20 to `quantity = float(position.quantity or position.qty or 0.0)`.
+
+### Location
+
+`scripts/paper_archive.py:20`
+
+### Fix
+
+Archive conversion now prefers `position.quantity` over the truncated `qty` field when
+calculating `position_value`, P&L, and P&L percent. Note: `backtest_results.position_size`
+is still an INTEGER schema field, and production NSE share quantities are integer; changing
+that analytics schema is separate cleanup, not a Monday live blocker. Regression coverage:
+`tests/test_paper_archive.py::test_position_to_trade_row_uses_float_quantity_and_maps_momentum_fail`.
+
+---
+
+## 2026-05-03 — OPEN: STRATEGY: SHORT trailing stop skips SL tightening on BREAKEVEN-to-TRAIL transition
+
+**Status:** OPEN
+**Severity:** Medium
+
+### Symptom
+
+When a SHORT position's price reaches the target (S1), the trailing stop phase transitions from BREAKEVEN to TRAIL but the SL is NOT tightened on that bar. For LONG, the SL is tightened immediately on the transition bar. The SHORT SL is one bar late.
+
+### Root Cause
+
+`engine/cpr_atr_utils.py:118-123` (LONG) tightens the SL on BREAKEVEN→TRAIL transition:
+```python
+self.current_sl = max(self.current_sl, self.highest_since_entry - (self.atr * self.trail_atr_multiplier))
+self.phase = "TRAIL"
+```
+
+`engine/cpr_atr_utils.py:144-146` (SHORT) only changes the phase:
+```python
+self.phase = "TRAIL"
+```
+
+The comment says "Same deferred-SL logic as LONG" but the SL update is missing entirely.
+
+### Impact
+
+If price reverses sharply on the target-reaching bar, the SHORT position is not protected by the trailing stop for one bar. The SL remains at breakeven (entry price) instead of tightening to `lowest_since_entry + ATR`.
+
+### Fix Direction
+
+Add SL tightening to the SHORT transition, mirroring LONG:
+```python
+self.current_sl = min(self.current_sl, self.lowest_since_entry + (self.atr * self.trail_atr_multiplier))
+self.phase = "TRAIL"
+```
+
+### Location
+
+`engine/cpr_atr_utils.py:144-146`
+
+---
+
+## 2026-05-03 — FIXED: ARCHIVE: exit_reason normalization incomplete — MOMENTUM_FAIL not mapped
+
+**Status:** FIXED
+**Severity:** Medium
+
+### Symptom
+
+A paper session where a position exits with `exit_reason="MOMENTUM_FAIL"` may crash during archiving with a CHECK constraint violation on `backtest_results`.
+
+### Root Cause
+
+`scripts/paper_archive.py:41-51` — the `exit_reason_map` covers known paper-specific values but `MOMENTUM_FAIL` (used in `paper_runtime.py:1140`) is not mapped to a backtest-compatible value. The DuckDB backtest results path may have a narrower CHECK constraint than `backtest_db.py`'s allow-list, causing the insert to fail.
+
+### Impact
+
+Archive crash for sessions with momentum-failure exits. The session remains unarchived and the operator must manually fix or retry.
+
+### Fix Direction
+
+Add `"MOMENTUM_FAIL": "REVERSAL"` (or `"CANDLE_EXIT"`) to the `exit_reason_map` in `paper_archive.py`. Also align CHECK constraints between `duckdb_backtest_results.py` and `backtest_db.py`.
+
+### Location
+
+`scripts/paper_archive.py:41-51`, `paper_runtime.py:1140`
+
+### Fix
+
+Paper archive normalization now maps `MOMENTUM_FAIL` to `CANDLE_EXIT`, which is accepted by
+the DuckDB `backtest_results` CHECK constraint. Regression coverage:
+`tests/test_paper_archive.py::test_position_to_trade_row_uses_float_quantity_and_maps_momentum_fail`.
+
+---
+
+## 2026-05-03 — FIXED: LIVE: EOD summary suppressed on admin and sentinel flatten paths
+
+**Status:** FIXED
+**Severity:** Medium
+
+### Symptom
+
+Operators do not receive FLATTEN_EOD Telegram alerts when using admin `close_all` command or per-session sentinel files to terminate a session with open positions. The CLAUDE.md documentation states this alert should fire even when all positions are already closed.
+
+### Root Cause
+
+`scripts/paper_live.py:883,1250,1313` — the three mid-loop flatten calls (global signal, per-session sentinel, admin `close_all`) all pass `emit_summary=False`. Only the finally-block flatten at line 1736 defaults to `emit_summary=True`, but that path may not reach the FLATTEN_EOD dispatch if the session status was changed by `complete_session`.
+
+### Impact
+
+Operators relying on EOD summary alerts for admin-initiated flattens miss the session's final P&L notification.
+
+### Fix Direction
+
+Pass `emit_summary=True` on the admin `close_all`, sentinel flatten, and global flatten paths.
+
+### Location
+
+`scripts/paper_live.py:883,1250,1313`
+
+### Fix
+
+The mid-loop global signal, per-session sentinel, and admin `close_all` flatten paths now use
+the default `emit_summary=True`. Existing in-memory/persisted FLATTEN_EOD dedupe prevents
+duplicate summaries if final cleanup calls `flatten_session_positions()` again.
+
+---
+
+## 2026-05-03 — FIXED: LIVE: resume does not reconstruct original feed_source — always defaults to WebSocket
+
+**Status:** FIXED
+**Severity:** Medium
+
+### Symptom
+
+Resuming a session that was originally started with `--feed-source local` always creates a fresh `KiteTickerAdapter` (WebSocket), ignoring the original feed source.
+
+### Root Cause
+
+`scripts/paper_trading.py:671-679` — `_cmd_daily_live_resume` passes `poll_interval_sec`, `candle_interval_minutes`, etc. but does not construct a `ticker_adapter` or pass `feed_source`. The default in `run_live_session` creates a `KiteTickerAdapter` when no adapter is provided.
+
+### Impact
+
+Cannot resume local-feed sessions after stale exit. The resumed session tries to connect to Kite WebSocket instead of reading from historical DuckDB data.
+
+### Fix Direction
+
+Read `feed_source` from the session's `strategy_params` (stored in the DB) and reconstruct the appropriate adapter before calling `run_live_session`.
+
+### Location
+
+`scripts/paper_trading.py:671-679`
+
+### Fix
+
+`_cmd_daily_live_resume()` now reads the stored session `strategy_params["feed_source"]` and
+reconstructs `LocalTickerAdapter` for local-feed sessions before calling `run_live_session()`.
+Regression coverage:
+`tests/test_paper_trading_workflow.py::test_cmd_daily_live_resume_reconstructs_local_feed_adapter`.
+
+---
+
+## 2026-05-03 — FIXED: LIVE: final flush uses stale session object loaded at startup
+
+**Status:** FIXED
+**Severity:** Medium
+
+### Symptom
+
+If an admin command changed session params mid-run (e.g., `set_risk_budget`), the final flush in the finally block evaluates remaining candles against the original params, not the current ones.
+
+### Root Cause
+
+`scripts/paper_live.py:1690` — the finally block passes `session` (loaded at line 652) to `process_closed_bar_group`. The main loop uses `current_session` (reloaded every cycle at line 863) for the same purpose. The stale `session` object may have outdated `strategy_params`.
+
+### Impact
+
+Final-bar evaluations use wrong risk parameters if an admin budget change occurred during the session. In practice this is a narrow window (session must have remaining bars when the finally block runs).
+
+### Fix Direction
+
+Use `current_session` instead of `session` in the final flush, or reload the session from DB before flushing.
+
+### Location
+
+`scripts/paper_live.py:1690`
+
+### Fix
+
+The final flush now reloads the latest session before draining remaining candles and rebuilds
+the flush-time `BacktestParams` from that fresh session object.
+
+---
+
+## 2026-05-03 — FIXED: LIVE: dead code _process_closed_bar_group diverges from canonical driver
+
+**Status:** FIXED
+**Severity:** Low
+
+### Symptom
+
+`scripts/paper_live.py:478-584` defines a 107-line `_process_closed_bar_group` function that is never called in production. The actual call goes to `paper_session_driver.process_closed_bar_group`. The dead copy is missing several features: duplicate candle dedup, 64-symbol yield-to-event-loop, risk control checks, stage-B direction filtering, and `should_complete` detection.
+
+### Root Cause
+
+The driver was extracted to `engine/paper_session_driver.py` but the old function was not deleted. Tests that patch `paper_live._process_closed_bar_group` may be testing dead code.
+
+### Impact
+
+Maintenance hazard — a developer reading top-to-bottom edits the dead copy thinking it's the active path, introducing subtle regressions.
+
+### Fix Direction
+
+Delete lines 478-584. Update any test mocks that reference it to patch `engine.paper_session_driver.process_closed_bar_group` instead.
+
+### Location
+
+`scripts/paper_live.py:478-584`
+
+### Fix
+
+Deleted the unused `_process_closed_bar_group()` copy from `scripts/paper_live.py`; live
+processing now has a single implementation in `engine.paper_session_driver`.
+
+---
+
+## 2026-05-03 — WON'T FIX: LIVE: _cmd_daily_live_multi does not pass real_order_config to run_live_session
+
+**Status:** WON'T FIX for current pilot; keep as latent cleanup if the pilot block is removed
+**Severity:** Low
+
+### Symptom
+
+Multi-live sessions cannot route real orders even when `--real-orders` is requested. The `_execute_variant` closure does not pass `real_order_config` to `run_live_session`, while the single-variant `_cmd_daily_live` does.
+
+### Root Cause
+
+`scripts/paper_trading.py:1258-1269` — the closure passes several kwargs but omits `real_order_config`. A pilot block at line 1126 prevents `--multi --real-orders` today, masking the bug.
+
+### Impact
+
+Latent — removing the pilot block without fixing the pass-through will cause multi-live sessions to silently run in paper mode even when `--real-orders` is requested.
+
+### Fix Direction
+
+Add `real_order_config=real_order_config` to the `_execute_variant` closure's `run_live_session` call.
+
+### Location
+
+`scripts/paper_trading.py:1258-1269`
+
+### Triage
+
+Not a current runtime bug: `_cmd_daily_live_multi()` exits immediately when `--real-orders`
+is supplied, so no multi-live real-order session reaches `_execute_variant`. Keep this as a
+cleanup note for the future commit that deliberately removes the pilot block.
+
+---
+
+## 2026-05-03 — FIXED: RECONCILE: missing EXIT_UNDERFILLED check for closed positions
+
+**Status:** FIXED
+**Severity:** Low
+
+### Symptom
+
+A closed position whose exit order fills total less than the position's original quantity passes reconciliation without any finding.
+
+### Root Cause
+
+`engine/paper_reconciliation.py:129-159` — checks for `ENTRY_UNDERFILLED` and `EXIT_OVERFILLED` but has no corresponding `EXIT_UNDERFILLED` check. A partial exit fill that underfills would go undetected.
+
+### Impact
+
+Real execution gaps (e.g., partial fill on illiquid stock at exit) are not flagged by the reconciliation layer.
+
+### Fix Direction
+
+Add an exit underfill check after the `EXIT_OVERFILLED` check:
+```python
+if exit_fills and exit_qty + 1e-9 < expected_qty:
+    findings.append({"type": "EXIT_UNDERFILLED", ...})
+```
+
+### Location
+
+`engine/paper_reconciliation.py:146-159`
+
+### Fix
+
+Closed/flattened positions now emit a CRITICAL `EXIT_UNDERFILLED` finding when filled exit
+quantity is below the expected position quantity. Regression coverage:
+`tests/test_paper_reconciliation.py::test_reconcile_closed_position_underfilled_exit_order`.
 
 ## 2026-05-03 — FIXED: ALERTS: paper_alerts.py used ambiguous Python 2-style comma except syntax
 
@@ -6732,4 +7297,3 @@ No runtime breakage on Python 3.14, but a code clarity/maintenance hazard. Futur
 ### Location
 
 `engine/paper_alerts.py:148`
-

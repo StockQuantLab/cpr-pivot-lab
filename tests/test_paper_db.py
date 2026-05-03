@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
+
 from db.paper_db import PaperDB
 
 
@@ -91,6 +93,56 @@ def test_delete_all_rows_clears_every_paper_table(tmp_path: Path) -> None:
             "alert_log": 0,
         }
         assert position.session_id == session.session_id
+    finally:
+        db.close()
+
+
+def test_open_position_allows_multiple_closed_rows_for_same_symbol(tmp_path: Path) -> None:
+    db = PaperDB(db_path=tmp_path / "paper.duckdb")
+    try:
+        session = db.create_session(session_id="paper-reentry", status="ACTIVE")
+        first = db.open_position(
+            session_id=session.session_id,
+            symbol="SBIN",
+            direction="LONG",
+            qty=10,
+            entry_price=100.0,
+        )
+        db.update_position(first.position_id, status="CLOSED", exit_price=101.0, pnl=10.0)
+        second = db.open_position(
+            session_id=session.session_id,
+            symbol="SBIN",
+            direction="LONG",
+            qty=5,
+            entry_price=102.0,
+        )
+        db.update_position(second.position_id, status="CLOSED", exit_price=103.0, pnl=5.0)
+
+        closed = db.get_session_positions(session.session_id, statuses=["CLOSED"])
+
+        assert [position.position_id for position in closed] == [
+            first.position_id,
+            second.position_id,
+        ]
+    finally:
+        db.close()
+
+
+def test_update_position_rejects_reopening_closed_position(tmp_path: Path) -> None:
+    db = PaperDB(db_path=tmp_path / "paper.duckdb")
+    try:
+        session = db.create_session(session_id="paper-transition", status="ACTIVE")
+        position = db.open_position(
+            session_id=session.session_id,
+            symbol="SBIN",
+            direction="LONG",
+            qty=10,
+            entry_price=100.0,
+        )
+        db.update_position(position.position_id, status="CLOSED", exit_price=101.0, pnl=10.0)
+
+        with pytest.raises(RuntimeError, match="Invalid paper position status transition"):
+            db.update_position(position.position_id, status="OPEN")
     finally:
         db.close()
 
@@ -203,5 +255,47 @@ def test_cleanup_feed_audit_older_than_removes_only_expired_rows(tmp_path: Path)
         rows = db.get_feed_audit_rows()
         assert len(rows) == 1
         assert rows[0].session_id == "sess-new"
+    finally:
+        db.close()
+
+
+def test_cleanup_feed_audit_uses_bar_date_not_insert_date(tmp_path: Path) -> None:
+    db = PaperDB(db_path=tmp_path / "paper.duckdb")
+    try:
+        now = datetime.now(UTC)
+        old_bar_ts = now - timedelta(days=10)
+        db.con.execute(
+            """
+            INSERT INTO paper_feed_audit (
+                session_id, trade_date, feed_source, transport, symbol,
+                bar_start, bar_end, open, high, low, close, volume,
+                first_snapshot_ts, last_snapshot_ts, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                "sess-late",
+                old_bar_ts.date().isoformat(),
+                "local",
+                "replay",
+                "LATESYM",
+                old_bar_ts,
+                old_bar_ts + timedelta(minutes=5),
+                100.0,
+                101.0,
+                99.5,
+                100.5,
+                1234.0,
+                old_bar_ts,
+                old_bar_ts + timedelta(minutes=5),
+                now,
+                now,
+            ],
+        )
+
+        deleted = db.cleanup_feed_audit_older_than(7)
+
+        assert deleted == 1
+        assert db.get_feed_audit_rows() == []
     finally:
         db.close()

@@ -69,6 +69,73 @@ async def test_process_closed_bar_group_skips_duplicate_candle() -> None:
 
 
 @pytest.mark.asyncio
+async def test_process_closed_bar_group_updates_tracker_on_partial_exit() -> None:
+    bar_end = datetime(2026, 4, 9, 9, 20, tzinfo=UTC)
+    runtime_state = PaperRuntimeState()
+    tracker = SessionPositionTracker(
+        max_positions=10, portfolio_value=10_000.0, max_position_pct=1.0
+    )
+    position = SimpleNamespace(
+        position_id="pos-1",
+        symbol="SBIN",
+        direction="LONG",
+        entry_price=100.0,
+        stop_loss=95.0,
+        target_price=110.0,
+        quantity=100.0,
+        current_qty=100.0,
+        trail_state={},
+    )
+    tracker.record_open(position, position_value=10_000.0)
+    candle = SimpleNamespace(
+        symbol="SBIN",
+        bar_end=bar_end,
+        open=110.0,
+        high=111.0,
+        low=109.0,
+        close=110.0,
+        volume=1000.0,
+    )
+
+    async def _evaluate_candle(**_: object) -> dict[str, object]:
+        return {
+            "action": "ADVANCE",
+            "advance_result": {
+                "action": "PARTIAL",
+                "exit_value": 6_600.0,
+                "remaining_qty": 40.0,
+            },
+        }
+
+    async def _enforce_risk_controls(**_: object) -> dict[str, object]:
+        return {"triggered": False}
+
+    result = await process_closed_bar_group(
+        session_id="s1",
+        session=SimpleNamespace(strategy="CPR_LEVELS"),
+        bar_candles=[candle],
+        runtime_state=runtime_state,
+        tracker=tracker,
+        params=SimpleNamespace(entry_window_end="10:15"),
+        active_symbols=["SBIN"],
+        strategy="CPR_LEVELS",
+        direction_filter="BOTH",
+        stage_b_applied=False,
+        symbol_last_prices={},
+        last_price=None,
+        evaluate_candle_fn=_evaluate_candle,
+        execute_entry_fn=lambda **_: {"action": "SKIP"},
+        enforce_risk_controls=_enforce_risk_controls,
+        build_feed_state=lambda **_: SimpleNamespace(),
+    )
+
+    assert position.current_qty == pytest.approx(40.0)
+    assert tracker.current_open_notional() == pytest.approx(4_000.0)
+    assert tracker.cash_available == pytest.approx(6_600.0)
+    assert result["triggered"] is False
+
+
+@pytest.mark.asyncio
 async def test_process_closed_bar_group_keeps_none_symbols_pending_before_entry_window_close(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

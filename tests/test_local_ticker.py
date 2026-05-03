@@ -361,10 +361,13 @@ class TestLocalTickerAdapterPartialData:
         closed = adapter.drain_closed("s")
         assert len(closed) == 2
 
-        # Bar 2: only SBIN (TCS has no data for this time)
+        # Bar 2: SBIN real candle + TCS flat carry-forward candle, matching live quiet-symbol behavior
         closed = adapter.drain_closed("s")
-        assert len(closed) == 1
-        assert closed[0].symbol == "SBIN"
+        assert len(closed) == 2
+        by_symbol = {candle.symbol: candle for candle in closed}
+        assert by_symbol["SBIN"].volume > 0
+        assert by_symbol["TCS"].volume == 0
+        assert by_symbol["TCS"].open == by_symbol["TCS"].close == 102.0
 
         # Exhausted
         assert adapter.drain_closed("s") == []

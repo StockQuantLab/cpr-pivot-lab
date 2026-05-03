@@ -346,11 +346,12 @@ class PaperDB:
         self.con.execute("CREATE INDEX IF NOT EXISTS idx_pp_session ON paper_positions(session_id)")
         self.con.execute(
             """
-            -- DuckDB does not support partial indexes currently.
-            -- Unique(session_id, symbol, status) is a safe approximation:
-            -- prevents duplicate OPEN rows and still preserves a single closed record
-            -- per symbol for the same session.
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_pp_session_symbol_status
+            DROP INDEX IF EXISTS idx_pp_session_symbol_status
+            """
+        )
+        self.con.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_pp_session_symbol_status_lookup
             ON paper_positions(session_id, symbol, status)
             """
         )
@@ -743,6 +744,22 @@ class PaperDB:
         qty_value = round(quantity if quantity is not None else (qty or 0))
         current_qty_value = current_qty if current_qty is not None else float(qty_value)
         entry_ts = opened_at or entry_time or now
+        existing = self.con.execute(
+            """
+            SELECT
+                position_id, session_id, symbol, direction, status,
+                entry_price, stop_loss, target_price, exit_price, exit_reason, pnl,
+                qty, trail_state, entry_time, exit_time, opened_by, current_qty,
+                last_price, signal_id, closed_by, created_at, updated_at
+            FROM paper_positions
+            WHERE session_id = ? AND symbol = ? AND status = 'OPEN'
+            ORDER BY updated_at DESC
+            LIMIT 1
+            """,
+            [session_id, symbol],
+        ).fetchone()
+        if existing:
+            return self._row_to_position(existing)
         try:
             self.con.execute(
                 """
@@ -772,24 +789,10 @@ class PaperDB:
                     now,
                 ],
             )
-        except duckdb.ConstraintException:
-            existing = self.con.execute(
-                """
-                SELECT
-                    position_id, session_id, symbol, direction, status,
-                    entry_price, stop_loss, target_price, exit_price, exit_reason, pnl,
-                    qty, trail_state, entry_time, exit_time, opened_by, current_qty,
-                    last_price, signal_id, closed_by, created_at, updated_at
-                FROM paper_positions
-                WHERE session_id = ? AND symbol = ? AND status = 'OPEN'
-                ORDER BY updated_at DESC
-                LIMIT 1
-                """,
-                [session_id, symbol],
-            ).fetchone()
-            if existing:
-                return self._row_to_position(existing)
-            raise
+        except duckdb.ConstraintException as exc:
+            raise RuntimeError(
+                f"paper position insert failed for session={session_id} symbol={symbol}: {exc}"
+            ) from exc
         self._after_write()
         return PaperPosition(
             position_id=pid,
@@ -860,6 +863,24 @@ class PaperDB:
         sets: list[str] = ["updated_at = ?"]
         params: list[Any] = [_utcnow_iso()]
         if status is not None:
+            current = self.con.execute(
+                "SELECT status FROM paper_positions WHERE position_id = ?",
+                [position_id],
+            ).fetchone()
+            if current:
+                current_status = str(current[0] or "").upper()
+                next_status = str(status or "").upper()
+                terminal_statuses = {"CLOSED", "FLATTENED"}
+                if current_status in terminal_statuses and next_status != current_status:
+                    raise RuntimeError(
+                        f"Invalid paper position status transition "
+                        f"{current_status}->{next_status} for {position_id}"
+                    )
+                if current_status != "OPEN" and next_status in terminal_statuses:
+                    raise RuntimeError(
+                        f"Invalid paper position status transition "
+                        f"{current_status}->{next_status} for {position_id}"
+                    )
             sets.append("status = ?")
             params.append(status)
             if status in ("CLOSED", "FLATTENED"):
@@ -1301,8 +1322,17 @@ class PaperDB:
             return 0
 
         cutoff = datetime.now(UTC) - timedelta(days=retention_days)
+        cutoff_expr = """
+            COALESCE(
+                bar_end,
+                last_snapshot_ts,
+                first_snapshot_ts,
+                CAST(trade_date AS TIMESTAMPTZ),
+                created_at
+            )
+        """
         count_row = self.con.execute(
-            "SELECT COUNT(*) FROM paper_feed_audit WHERE created_at < ?",
+            f"SELECT COUNT(*) FROM paper_feed_audit WHERE {cutoff_expr} < ?",
             [cutoff],
         ).fetchone()
         deleted = int(count_row[0] or 0) if count_row else 0
@@ -1311,7 +1341,7 @@ class PaperDB:
 
         self.con.execute("BEGIN TRANSACTION")
         try:
-            self.con.execute("DELETE FROM paper_feed_audit WHERE created_at < ?", [cutoff])
+            self.con.execute(f"DELETE FROM paper_feed_audit WHERE {cutoff_expr} < ?", [cutoff])
             self.con.execute("COMMIT")
             self._after_write()
         except Exception:

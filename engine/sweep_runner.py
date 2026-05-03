@@ -130,7 +130,7 @@ def _load_manifest_for_resume(path: Path) -> dict | None:
     try:
         with open(path) as f:
             return json.load(f)
-    except (json.JSONDecodeError, OSError):
+    except json.JSONDecodeError, OSError:
         return None
 
 

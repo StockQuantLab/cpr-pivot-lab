@@ -103,7 +103,9 @@ def _render_symbols_content(df: pl.DataFrame, colors: dict, theme: dict) -> None
             colors["primary"],
         )
         _kpi_chip(
-            "Best Symbol", sym_df["symbol"].to_list()[0] if n_total else "—", colors["success"]
+            "Best Symbol",
+            (sym_df["symbol"].to_list() or ["—"])[0] if n_total else "—",
+            colors["success"],
         )
 
     divider()

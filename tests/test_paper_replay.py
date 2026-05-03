@@ -137,6 +137,18 @@ async def test_replay_session_streams_candles_and_archives_completed_session(
             volumes=[1_000.0, 900.0],
         ),
     )
+    out_of_range_day_pack = paper_replay.ReplayDayPack(
+        symbol="SBIN",
+        trade_date="2024-01-01",
+        day_pack=DayPack(
+            time_str=["09:15"],
+            opens=[90.0],
+            highs=[91.0],
+            lows=[89.5],
+            closes=[90.5],
+            volumes=[500.0],
+        ),
+    )
 
     async def fake_get_session(session_id: str):
         return session
@@ -206,7 +218,6 @@ async def test_replay_session_streams_candles_and_archives_completed_session(
     monkeypatch.setattr(paper_replay, "get_session_positions", fake_get_session_positions)
     monkeypatch.setattr(paper_replay, "get_feed_state", fake_get_feed_state)
     monkeypatch.setattr(paper_replay, "archive_completed_session", fake_archive_completed_session)
-    monkeypatch.setattr(paper_replay, "load_replay_day_packs", lambda **kwargs: [day_pack])
 
     result = await paper_replay.replay_session(
         session_id="paper-1",
@@ -214,6 +225,7 @@ async def test_replay_session_streams_candles_and_archives_completed_session(
         start_date="2024-01-02",
         end_date="2024-01-02",
         leave_active=False,
+        preloaded_days=[out_of_range_day_pack, day_pack],
     )
 
     assert processed_candles == [

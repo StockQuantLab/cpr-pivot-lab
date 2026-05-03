@@ -637,7 +637,13 @@ async def replay_session(
 
     if preloaded_days is not None:
         replay_symbols_set = set(replay_symbols)
-        replay_days = [d for d in preloaded_days if d.symbol in replay_symbols_set]
+        replay_days = [
+            d
+            for d in preloaded_days
+            if d.symbol in replay_symbols_set
+            and (normalized_start is None or d.trade_date >= normalized_start)
+            and (normalized_end is None or d.trade_date <= normalized_end)
+        ]
     else:
         replay_days = load_replay_day_packs(
             symbols=replay_symbols,

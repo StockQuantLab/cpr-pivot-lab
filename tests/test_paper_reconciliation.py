@@ -80,6 +80,53 @@ def test_reconcile_closed_position_missing_exit_order(tmp_path) -> None:
         db.close()
 
 
+def test_reconcile_closed_position_underfilled_exit_order(tmp_path) -> None:
+    db = _make_db(tmp_path)
+    try:
+        session = db.create_session(session_id="paper-live-1", status="ACTIVE")
+        position = db.open_position(
+            session_id=session.session_id,
+            symbol="SBIN",
+            direction="LONG",
+            quantity=10,
+            entry_price=100.0,
+        )
+        db.append_order_event(
+            session_id=session.session_id,
+            position_id=position.position_id,
+            symbol="SBIN",
+            side="BUY",
+            requested_qty=10,
+            fill_qty=10,
+            status="FILLED",
+            notes="paper entry",
+        )
+        db.append_order_event(
+            session_id=session.session_id,
+            position_id=position.position_id,
+            symbol="SBIN",
+            side="SELL",
+            requested_qty=10,
+            fill_qty=4,
+            status="FILLED",
+            notes="paper exit underfilled",
+        )
+        db.update_position(
+            position.position_id,
+            status="CLOSED",
+            close_price=101.0,
+            realized_pnl=10.0,
+            exit_reason="MANUAL_CLOSE",
+        )
+
+        payload = reconcile_paper_session(db, session.session_id)
+
+        assert payload["ok"] is False
+        assert any(f["code"] == "EXIT_UNDERFILLED" for f in payload["findings"])
+    finally:
+        db.close()
+
+
 def test_reconcile_terminal_session_with_open_position(tmp_path) -> None:
     db = _make_db(tmp_path)
     try:

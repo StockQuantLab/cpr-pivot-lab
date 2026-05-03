@@ -274,7 +274,7 @@ def _load_progress(path: Path) -> dict | None:
     try:
         with open(path) as f:
             return json.load(f)
-    except (json.JSONDecodeError, OSError):
+    except json.JSONDecodeError, OSError:
         return None
 
 
@@ -299,7 +299,7 @@ def _format_money(value: object) -> str:
         return "n/a"
     try:
         return f"Rs {float(value):,.0f}"
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return "n/a"
 
 
@@ -308,7 +308,7 @@ def _format_delta_money(value: object) -> str:
         return "n/a"
     try:
         return f"Rs {float(value):+,.0f}"
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return "n/a"
 
 
@@ -317,7 +317,7 @@ def _format_percent(value: object) -> str:
         return "n/a"
     try:
         return f"{float(value):.1f}%"
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return "n/a"
 
 
@@ -327,7 +327,7 @@ def _format_int(value: object) -> str:
     try:
         value_any: Any = value
         return f"{int(value_any):d}"
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return "n/a"
 
 
