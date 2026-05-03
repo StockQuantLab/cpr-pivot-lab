@@ -313,12 +313,10 @@ Paper trading is implemented end-to-end for live session state, replay/live vali
 
 ## Documentation
 
-- [STRATEGY.md](STRATEGY.md) — strategy definitions and parameters
-- [docs/strategy-guide.md](docs/strategy-guide.md) — CPR_LEVELS vs FBR high-level reference for operators
-- [docs/DESIGN.md](docs/DESIGN.md) — core architecture notes and paper-trading implementation plan
-- [docs/KITE_INGESTION.md](docs/KITE_INGESTION.md) — local Kite refresh / parquet catch-up runbook
-- [docs/RUNTIME_REBUILD.md](docs/RUNTIME_REBUILD.md) — safe full-history / repair rebuild runbook
-- [docs/PAPER_TRADING_RUNBOOK.md](docs/PAPER_TRADING_RUNBOOK.md) — live-session operator runbook
-- [CODEMAP.md](CODEMAP.md) — project architecture map
-- [docs/SETUP.md](docs/SETUP.md) — clean runbook and command profile
-- [docs/adr/001-baseline-strategy-policy.md](docs/adr/001-baseline-strategy-policy.md) — ADR for production strategy policy
+- [docs/README.md](docs/README.md) - documentation index and ownership map
+- [STRATEGY.md](STRATEGY.md) - strategy definitions and parameters
+- [docs/PAPER_TRADING_RUNBOOK.md](docs/PAPER_TRADING_RUNBOOK.md) - live-session operator runbook
+- [docs/SETUP.md](docs/SETUP.md) - clean setup runbook and command profile
+- [docs/KITE_INGESTION.md](docs/KITE_INGESTION.md) - local Kite refresh and parquet catch-up runbook
+- [docs/RUNTIME_REBUILD.md](docs/RUNTIME_REBUILD.md) - safe full-history and repair rebuild runbook
+- [docs/CODEMAP.md](docs/CODEMAP.md) - project architecture map

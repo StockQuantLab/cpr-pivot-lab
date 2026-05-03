@@ -5,9 +5,9 @@ Written for operators, analysts, and developers.
 
 ## Read This With
 
-- [docs/strategy-guide.md](docs/strategy-guide.md) for the higher-level CPR_LEVELS vs FBR overview
-- [docs/ISSUES.md](docs/ISSUES.md) for the experiment history and rejected alternatives
-- [docs/PAPER_TRADING_RUNBOOK.md](docs/PAPER_TRADING_RUNBOOK.md) for the current canonical presets and live commands
+- [strategy-guide.md](strategy-guide.md) for the higher-level CPR_LEVELS vs FBR overview
+- [ISSUES.md](ISSUES.md) for the experiment history and rejected alternatives
+- [PAPER_TRADING_RUNBOOK.md](PAPER_TRADING_RUNBOOK.md) for the current canonical presets and live commands
 
 ---
 

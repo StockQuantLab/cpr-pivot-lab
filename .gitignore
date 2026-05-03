@@ -39,6 +39,7 @@ sweeps/*.stderr.log
 .env
 *.env
 secrets/
+.doppler.yaml
 
 # Output
 output/
@@ -52,11 +53,13 @@ Thumbs.db
 .idea/
 *.swp
 
-# Session / planning artifacts (not for repo)
+# Local agent/session artifacts (not for repo)
 plan.md
 memory.md
 AGENTS.md
+agents.md
 CLAUDE.md
+claude.md
 RESULTS.md
 STATUS.md
 code-review.md

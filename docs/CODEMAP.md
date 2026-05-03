@@ -1,5 +1,7 @@
 # Code Map — CPR Pivot Lab
 
+Last reviewed: 2026-05-03
+
 ## Architecture
 
 ```text
@@ -45,7 +47,7 @@ raw CSV (NSE) -> pivot-convert -> parquet -> duckdb runtime tables -> backtest e
 
 ```bash
 doppler run -- uv run pivot-convert
-doppler run -- uv run pivot-build --force
+doppler run -- uv run pivot-build --force --full-history --staged-full-rebuild
 doppler run -- uv run pivot-backtest --strategy CPR_LEVELS --universe-name gold_51 --start ... --end ... --save
 doppler run -- uv run pivot-dashboard
 ```

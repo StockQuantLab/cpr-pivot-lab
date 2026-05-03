@@ -7,6 +7,35 @@ Supersedes: `docs/PARITY_INCIDENT_LOG.md` (contents migrated below).
 
 ---
 
+## 2026-05-03 — FIXED: INFRA: Documentation roots and relative links drifted
+
+**Status:** FIXED
+**Severity:** Low
+
+### Symptom
+
+Legacy durable docs (`CODEMAP.md`, `METRICS_POLICY.md`, `OPTIMIZATION_PLAN.md`) still lived at
+the repository root, while several links inside `docs/` used `docs/...` targets that resolve
+incorrectly from GitHub-rendered files under `docs/`.
+
+### Root Cause
+
+Older project docs predated the current documentation layout, and Git ignore rules only prevented
+new local agent files from being added; they did not organize already-tracked docs or validate
+relative Markdown links.
+
+### Fix
+
+Moved the root project docs under `docs/`, added `docs/README.md` as the documentation index,
+refreshed stale status headers, corrected same-directory Markdown links, and tightened local
+agent ignore rules for case-sensitive environments.
+
+### Related
+
+Verified with a local Markdown link scan across tracked and untracked Markdown files.
+
+---
+
 ## 2026-05-03 — FIXED: LIVE: CPR time exit too close to Zerodha MIS auto square-off
 
 **Status:** FIXED

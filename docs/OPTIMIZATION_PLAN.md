@@ -2,11 +2,12 @@
 
 Date: 2026-03-08
 Owner: CPR Pivot Lab
-Status: Planning (pre-implementation)
+Last reviewed: 2026-05-03
+Status: Completed. Retained as implementation history and regression context.
 
 ## 1) Scope
 
-This document captures the full optimization plan before code changes start.
+This document captures the full optimization plan and the implementation log that followed.
 
 In scope:
 - Backtest runtime performance and memory stability

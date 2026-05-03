@@ -92,7 +92,7 @@ Both strategies use the same three-phase `TrailingStop` engine.  After entry a t
 advances through PROTECT → BREAKEVEN → TRAIL as price moves in your favour.
 
 For candle-by-candle examples, same-bar edge cases, and the full exit matrix, see
-[`docs/trailing-stop-explained.md`](docs/trailing-stop-explained.md). The summary below is
+[`trailing-stop-explained.md`](trailing-stop-explained.md). The summary below is
 the operator-level version.
 
 | Phase | SL sits at | Advance condition |
