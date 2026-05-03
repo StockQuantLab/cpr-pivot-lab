@@ -79,6 +79,7 @@ from scripts.paper_coverage import (
     _handle_coverage_gaps,
 )
 from scripts.paper_feed_audit import compare_feed_audit
+from scripts.paper_handler_map import build_paper_trading_handler_map
 from scripts.paper_live import run_live_session
 from scripts.paper_prepare import (
     CANONICAL_FULL_UNIVERSE_NAME,
@@ -117,6 +118,15 @@ __all__ = [
     "_load_json_list_arg",
     "_parse_json",
 ]
+
+_BROKER_HANDLER_EXPORTS = (
+    _cmd_broker_reconcile,
+    _cmd_close_position,
+    _cmd_order,
+    _cmd_pilot_check,
+    _cmd_real_dry_run_order,
+    _cmd_real_order,
+)
 
 
 def _pdb():
@@ -1949,34 +1959,7 @@ async def _cmd_live(args: argparse.Namespace) -> None:
 def build_parser() -> argparse.ArgumentParser:
     return build_paper_trading_parser(
         settings=get_settings(),
-        handlers={
-            "_cmd_start": _cmd_start,
-            "_cmd_status": _cmd_status,
-            "_cmd_universes": _cmd_universes,
-            "_cmd_pause": _cmd_pause,
-            "_cmd_resume": _cmd_resume,
-            "_cmd_stop": _cmd_stop,
-            "_cmd_resend_eod": _cmd_resend_eod,
-            "_cmd_flatten": _cmd_flatten,
-            "_cmd_flatten_all": _cmd_flatten_all,
-            "_cmd_send_command": _cmd_send_command,
-            "_cmd_flatten_both": _cmd_flatten_both,
-            "_cmd_reconcile": _cmd_reconcile,
-            "_cmd_broker_reconcile": _cmd_broker_reconcile,
-            "_cmd_pilot_check": _cmd_pilot_check,
-            "_cmd_order": _cmd_order,
-            "_cmd_real_dry_run_order": _cmd_real_dry_run_order,
-            "_cmd_real_order": _cmd_real_order,
-            "_cmd_close_position": _cmd_close_position,
-            "_cmd_cleanup": _cmd_cleanup,
-            "_cmd_feed_audit": _cmd_feed_audit,
-            "_cmd_replay": _cmd_replay,
-            "_cmd_live": _cmd_live,
-            "_cmd_daily_prepare": _cmd_daily_prepare,
-            "_cmd_daily_replay": _cmd_daily_replay,
-            "_cmd_daily_sim": _cmd_daily_sim,
-            "_cmd_daily_live": _cmd_daily_live,
-        },
+        handlers=build_paper_trading_handler_map(globals()),
         market_ready_hhmm=MARKET_READY_HHMM,
     )
 
