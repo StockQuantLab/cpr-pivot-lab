@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import polars as pl
 import pytest
 
+import scripts.paper_cli_helpers as cli_helpers
 from engine.strategy_presets import ALL_STRATEGY_PRESETS
 from scripts.paper_trading import (
     PAPER_STANDARD_MATRIX,
@@ -68,7 +69,7 @@ def test_default_saved_universe_falls_back_to_canonical(monkeypatch: pytest.Monk
     import scripts.paper_trading as pt
 
     monkeypatch.setattr(
-        pt,
+        cli_helpers,
         "load_universe_symbols",
         lambda name, read_only=True: ["SBIN"] if name == pt.CANONICAL_FULL_UNIVERSE_NAME else [],
     )
@@ -91,7 +92,7 @@ def test_default_saved_universe_refuses_dated_canonical_mismatch(
             return ["RELIANCE", "SBIN"]
         return []
 
-    monkeypatch.setattr(pt, "load_universe_symbols", fake_load)
+    monkeypatch.setattr(cli_helpers, "load_universe_symbols", fake_load)
 
     args = SimpleNamespace(symbols=None, all_symbols=False, universe_name=None)
     with pytest.raises(SystemExit, match="Refusing default universe"):
@@ -719,7 +720,7 @@ async def test_cmd_daily_prepare_runs_readiness_gate(monkeypatch: pytest.MonkeyP
     )
     monkeypatch.setattr(pt, "resolve_trade_date", lambda value: value)
     monkeypatch.setattr(
-        pt,
+        cli_helpers,
         "resolve_prepare_symbols",
         lambda symbols, raw, universe_name=None, all_symbols=False, read_only=True: symbols,
     )
@@ -796,7 +797,7 @@ async def test_cmd_daily_prepare_snapshots_universe(monkeypatch: pytest.MonkeyPa
     )
     monkeypatch.setattr(pt, "resolve_trade_date", lambda value: value)
     monkeypatch.setattr(
-        pt,
+        cli_helpers,
         "resolve_prepare_symbols",
         lambda symbols, raw, universe_name=None, all_symbols=False, read_only=True: [
             "RELIANCE",
@@ -906,7 +907,7 @@ async def test_cmd_daily_prepare_auto_snapshots_all_symbols(
     )
     monkeypatch.setattr(pt, "resolve_trade_date", lambda value: value)
     monkeypatch.setattr(
-        pt,
+        cli_helpers,
         "resolve_prepare_symbols",
         lambda symbols, raw, universe_name=None, all_symbols=False, read_only=True: [
             "RELIANCE",
@@ -981,7 +982,7 @@ async def test_cmd_daily_prepare_refuses_mismatched_snapshot_without_force(
     )
     monkeypatch.setattr(pt, "resolve_trade_date", lambda value: value)
     monkeypatch.setattr(
-        pt,
+        cli_helpers,
         "resolve_prepare_symbols",
         lambda symbols, raw, universe_name=None, all_symbols=False, read_only=True: [
             "RELIANCE",
@@ -989,7 +990,7 @@ async def test_cmd_daily_prepare_refuses_mismatched_snapshot_without_force(
         ],
     )
     monkeypatch.setattr(
-        pt,
+        cli_helpers,
         "load_universe_symbols",
         lambda universe_name, read_only=True: (
             ["SBIN"] if universe_name == "full_2024_01_01" else []
@@ -1138,7 +1139,7 @@ async def test_cmd_daily_replay_defaults_to_saved_universe(
 
     monkeypatch.setattr(pt, "acquire_command_lock", lambda *args, **kwargs: _LockCtx())
     monkeypatch.setattr(
-        pt,
+        cli_helpers,
         "load_universe_symbols",
         lambda name, read_only=True: ["SBIN"] if name == "full_2024_01_02" else [],
     )
@@ -1274,7 +1275,7 @@ async def test_cmd_daily_live_defaults_to_saved_universe(
 
     monkeypatch.setattr(pt, "resolve_trade_date", lambda value: value)
     monkeypatch.setattr(
-        pt,
+        cli_helpers,
         "load_universe_symbols",
         lambda name, read_only=True: ["SBIN"] if name == "full_2026_04_09" else [],
     )

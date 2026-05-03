@@ -50,6 +50,33 @@ from scripts.paper_broker_cli import (
     _cmd_real_order,
     _load_json_list_arg,
 )
+from scripts.paper_cli_helpers import (
+    apply_default_saved_universe as _apply_default_saved_universe,
+)
+from scripts.paper_cli_helpers import (
+    build_real_order_config as _build_real_order_config,
+)
+from scripts.paper_cli_helpers import (
+    default_session_id as _default_session_id,
+)
+from scripts.paper_cli_helpers import (
+    load_saved_universe_for_guard as _load_saved_universe_for_guard,
+)
+from scripts.paper_cli_helpers import (
+    parse_symbols_arg as _parse_symbols_arg,
+)
+from scripts.paper_cli_helpers import (
+    real_order_notes as _real_order_notes,
+)
+from scripts.paper_cli_helpers import (
+    resolve_cli_symbols as _resolve_cli_symbols,
+)
+from scripts.paper_cli_helpers import (
+    universe_diff_summary as _universe_diff_summary,
+)
+from scripts.paper_cli_helpers import (
+    workflow_session_suffix as _workflow_session_suffix,
+)
 from scripts.paper_coverage import (
     _build_runtime_coverage_fix_lines,
     _count_duckdb_rows_for_run_ids,
@@ -60,10 +87,8 @@ from scripts.paper_live import run_live_session
 from scripts.paper_prepare import (
     CANONICAL_FULL_UNIVERSE_NAME,
     ensure_canonical_universe,
-    load_universe_symbols,
     pre_filter_symbols_for_strategy,
     prepare_runtime_for_daily_paper,
-    resolve_prepare_symbols,
     resolve_trade_date,
     snapshot_candidate_universe,
 )
@@ -177,179 +202,6 @@ def _warn_non_tradeable(symbols: list[str]) -> None:
             "Non-tradeable symbols requested: %s — these may have been delisted",
             ", ".join(sorted(dead)),
         )
-
-
-def _parse_symbols_arg(value: str | None) -> list[str] | None:
-    if not value:
-        return None
-    symbols = [symbol.strip().upper() for symbol in value.split(",") if symbol.strip()]
-    return symbols or None
-
-
-def _default_full_universe_name(trade_date: str) -> str:
-    """Return the canonical dated snapshot universe name for a trade date."""
-    return f"full_{trade_date.replace('-', '_')}"
-
-
-def _load_saved_universe_for_guard(universe_name: str) -> list[str]:
-    """Best-effort saved-universe load for defaulting and safety guards."""
-    try:
-        return load_universe_symbols(universe_name, read_only=True)
-    except Exception:
-        return []
-
-
-def _universe_diff_summary(left: list[str], right: list[str]) -> str:
-    left_set = set(left)
-    right_set = set(right)
-    only_left = sorted(left_set - right_set)
-    only_right = sorted(right_set - left_set)
-    parts = [f"counts {len(left_set)} != {len(right_set)}"]
-    if only_left:
-        parts.append(f"only_left={only_left[:5]}{'...' if len(only_left) > 5 else ''}")
-    if only_right:
-        parts.append(f"only_right={only_right[:5]}{'...' if len(only_right) > 5 else ''}")
-    return "; ".join(parts)
-
-
-def _apply_default_saved_universe(args: argparse.Namespace, trade_date: str) -> None:
-    """Default paper runs to dated snapshot, then canonical fallback."""
-    if _parse_symbols_arg(getattr(args, "symbols", None)):
-        return
-    if bool(getattr(args, "all_symbols", False)):
-        return
-    if str(getattr(args, "universe_name", "") or "").strip():
-        return
-    dated_name = _default_full_universe_name(trade_date)
-    dated_symbols = _load_saved_universe_for_guard(dated_name)
-    canonical_symbols = _load_saved_universe_for_guard(CANONICAL_FULL_UNIVERSE_NAME)
-    if dated_symbols and canonical_symbols and set(dated_symbols) != set(canonical_symbols):
-        raise SystemExit(
-            f"Refusing default universe for {trade_date}: {dated_name} differs from "
-            f"{CANONICAL_FULL_UNIVERSE_NAME} ({_universe_diff_summary(dated_symbols, canonical_symbols)}). "
-            "Repair explicitly with daily-prepare --refresh-universe-snapshot, or pass "
-            "--universe-name intentionally."
-        )
-    if dated_symbols:
-        args.universe_name = dated_name
-        return
-    if canonical_symbols:
-        args.universe_name = CANONICAL_FULL_UNIVERSE_NAME
-        return
-    args.universe_name = dated_name
-
-
-def _resolve_cli_symbols(
-    parser: argparse.ArgumentParser,
-    args: argparse.Namespace,
-    *,
-    read_only: bool = True,
-) -> list[str]:
-    symbols = _parse_symbols_arg(getattr(args, "symbols", None))
-    use_all_symbols = bool(getattr(args, "all_symbols", False))
-    universe_name = str(getattr(args, "universe_name", "") or "").strip() or None
-    if use_all_symbols and (symbols or universe_name):
-        parser.error("Use either --symbols, --universe-name, or --all-symbols, not more than one.")
-    if symbols and universe_name:
-        parser.error("Use either --symbols or --universe-name, not both.")
-    if universe_name:
-        resolved = resolve_prepare_symbols(
-            None,
-            None,
-            universe_name=universe_name,
-            read_only=read_only,
-        )
-        if not resolved:
-            parser.error(f"Universe '{universe_name}' not found or empty.")
-        return resolved
-    return resolve_prepare_symbols(symbols, None, all_symbols=use_all_symbols, read_only=read_only)
-
-
-def _session_direction_suffix(strategy: str, strategy_params: dict[str, Any] | None) -> str:
-    direction = str((strategy_params or {}).get("direction_filter", "BOTH") or "BOTH").upper()
-    if direction == "BOTH":
-        return ""
-    return direction.lower()
-
-
-def _workflow_session_suffix(mode: str, feed_source: str | None = None) -> str:
-    mode_token = str(mode or "").strip().lower()
-    feed_token = str(feed_source or "").strip().lower()
-    if not feed_token:
-        if mode_token == "replay":
-            feed_token = "historical"
-        elif mode_token == "live":
-            feed_token = "kite"
-
-    tokens: list[str] = []
-    if mode_token:
-        tokens.append(mode_token)
-    if feed_token and feed_token != mode_token:
-        tokens.append(feed_token)
-    return f"-{'-'.join(tokens)}" if tokens else ""
-
-
-def _real_order_notes(notes: str | None) -> str:
-    marker = "ZERODHA_LIVE_REAL_ORDERS"
-    if notes and marker in notes:
-        return notes
-    return f"{marker}: {notes}" if notes else marker
-
-
-def _build_real_order_config(
-    args: argparse.Namespace,
-    *,
-    strategy: str,
-    strategy_params: dict[str, Any],
-    feed_source: str,
-) -> dict[str, Any] | None:
-    if not bool(getattr(args, "real_orders", False)):
-        return None
-    if str(feed_source or "").lower() != "kite":
-        raise SystemExit("--real-orders is supported only with --feed-source kite.")
-    if bool(getattr(args, "multi", False)):
-        raise SystemExit(
-            "--multi --real-orders is intentionally blocked for the pilot. "
-            "Run one LONG or one SHORT session first."
-        )
-    if bool(getattr(args, "resume", False)):
-        raise SystemExit(
-            "--resume --real-orders is intentionally blocked for the pilot. "
-            "Reconcile live Kite state manually before starting another real-routed session."
-        )
-    resolved = build_backtest_params_from_overrides(strategy, strategy_params)
-    scale_out_pct = float(getattr(getattr(resolved, "cpr_levels", None), "scale_out_pct", 0.0) or 0)
-    if scale_out_pct > 0:
-        raise SystemExit("--real-orders does not support CPR partial scale-out yet.")
-    return {
-        "enabled": True,
-        "fixed_quantity": int(getattr(args, "real_order_fixed_qty", 1) or 1),
-        "max_positions": int(getattr(args, "real_order_max_positions", 1) or 1),
-        "cash_budget": float(getattr(args, "real_order_cash_budget", 10_000.0) or 10_000.0),
-        "require_account_cash_check": not bool(
-            getattr(args, "real_order_skip_account_cash_check", False)
-        ),
-        "entry_order_type": str(getattr(args, "real_entry_order_type", "LIMIT") or "LIMIT").upper(),
-        "entry_max_slippage_pct": float(getattr(args, "real_entry_max_slippage_pct", 0.5) or 0.5),
-        "exit_max_slippage_pct": float(getattr(args, "real_exit_max_slippage_pct", 2.0) or 2.0),
-        "product": "MIS",
-        "exchange": "NSE",
-    }
-
-
-def _default_session_id(
-    prefix: str,
-    trade_date: str,
-    strategy: str,
-    strategy_params: dict[str, Any] | None = None,
-    mode: str = "",
-    feed_source: str | None = None,
-) -> str:
-    strategy_feed_source = str((strategy_params or {}).get("feed_source") or "").strip().lower()
-    workflow_suffix = _workflow_session_suffix(mode, feed_source or strategy_feed_source)
-    direction = _session_direction_suffix(strategy, strategy_params)
-    direction_tag = f"-{direction}" if direction else ""
-    return f"{prefix}-{strategy.lower()}{direction_tag}-{trade_date}{workflow_suffix}"
 
 
 async def _ensure_daily_session(
