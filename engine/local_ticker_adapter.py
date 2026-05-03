@@ -124,7 +124,8 @@ class LocalTickerAdapter:
     """DuckDB-backed mock of KiteTickerAdapter for --feed-source local mode.
 
     Emits ClosedCandle objects directly from intraday_day_pack data.
-    Uses a global bar cursor that broadcasts to all registered sessions.
+    Uses per-session bar cursors so variants that register a few scheduler
+    ticks apart still see the same historical session from the first bar.
     Marker attribute ``_local_feed = True`` lets paper_live.py detect local mode.
     """
 
@@ -156,13 +157,10 @@ class LocalTickerAdapter:
         self._sorted_bar_times = sorted(all_times)
         self._total_bars = len(self._sorted_bar_times)
 
-        # Global bar cursor
-        self._global_bar_idx = 0
-        self._exhausted = False
-
         # Per-session state
         self._session_symbols: dict[str, set[str]] = {}
-        self._pending: dict[str, list[ClosedCandle]] = {}
+        self._session_bar_idx: dict[str, int] = {}
+        self._session_exhausted: dict[str, bool] = {}
 
         # Metrics
         self._tick_count = 0
@@ -201,7 +199,8 @@ class LocalTickerAdapter:
         wanted = {s.strip() for s in symbols if s and s.strip()}
         with self._lock:
             self._session_symbols[session_id] = wanted
-            self._pending[session_id] = []
+            self._session_bar_idx[session_id] = 0
+            self._session_exhausted[session_id] = False
         n_available = len(wanted & set(self._symbol_packs.keys()))
         logger.info(
             "LocalTicker register session=%s symbols=%d available=%d trade_date=%s",
@@ -214,7 +213,8 @@ class LocalTickerAdapter:
     def unregister_session(self, session_id: str) -> None:
         with self._lock:
             self._session_symbols.pop(session_id, None)
-            self._pending.pop(session_id, None)
+            self._session_bar_idx.pop(session_id, None)
+            self._session_exhausted.pop(session_id, None)
 
     def update_symbols(self, session_id: str, symbols: list[str]) -> None:
         wanted = {s.strip() for s in symbols if s and s.strip()}
@@ -233,70 +233,59 @@ class LocalTickerAdapter:
     # -- Core data pump --
 
     def drain_closed(self, session_id: str) -> list[ClosedCandle]:
-        """Advance global cursor by one bar, broadcast to all sessions, return this session's candles."""
+        """Advance one session by one bar and return that session's candles."""
         with self._lock:
-            # Return any pending data first, even if cursor is exhausted.
-            pending = list(self._pending.pop(session_id, []))
-            self._pending[session_id] = []
-            if pending:
-                return pending
-
-            if self._exhausted:
+            sym_set = self._session_symbols.get(session_id)
+            if not sym_set:
                 return []
 
-            if self._global_bar_idx >= self._total_bars:
-                self._exhausted = True
+            if self._session_exhausted.get(session_id, False):
                 return []
 
-            bar_time_str = self._sorted_bar_times[self._global_bar_idx]
+            bar_idx = self._session_bar_idx.get(session_id, 0)
+            if bar_idx >= self._total_bars:
+                self._session_exhausted[session_id] = True
+                return []
+
+            bar_time_str = self._sorted_bar_times[bar_idx]
             bar_end = _combine_bar_ts(self._trade_date, bar_time_str)
             bar_start = bar_end - timedelta(minutes=self._candle_interval)
-            self._global_bar_idx += 1
+            self._session_bar_idx[session_id] = bar_idx + 1
 
-            # Build candles for all symbols at this bar time
-            candles_by_session: dict[str, list[ClosedCandle]] = {
-                sid: [] for sid in self._session_symbols
-            }
-            for sid, sym_set in self._session_symbols.items():
-                for symbol in sorted(sym_set):
-                    pack = self._symbol_packs.get(symbol)
-                    if pack is None:
-                        continue
-                    # `_idx_by_time.get()` is intentional here: symbols can have
-                    # shorter histories than the global union, and missing bars
-                    # must be skipped without raising or backfilling.
-                    candle_idx = pack._idx_by_time.get(bar_time_str)
-                    if candle_idx is None:
-                        continue
+            result: list[ClosedCandle] = []
+            for symbol in sorted(sym_set):
+                pack = self._symbol_packs.get(symbol)
+                if pack is None:
+                    continue
+                # `_idx_by_time.get()` is intentional here: symbols can have
+                # shorter histories than the global union, and missing bars
+                # must be skipped without raising or backfilling.
+                candle_idx = pack._idx_by_time.get(bar_time_str)
+                if candle_idx is None:
+                    continue
 
-                    candle = ClosedCandle(
-                        symbol=symbol,
-                        bar_start=bar_start,
-                        bar_end=bar_end,
-                        open=float(pack.opens[candle_idx]),
-                        high=float(pack.highs[candle_idx]),
-                        low=float(pack.lows[candle_idx]),
-                        close=float(pack.closes[candle_idx]),
-                        volume=float(pack.volumes[candle_idx]),
-                        first_snapshot_ts=bar_start,
-                        last_snapshot_ts=bar_end,
-                    )
-                    candles_by_session[sid].append(candle)
-                    self._last_ltp[symbol] = candle.close
+                candle = ClosedCandle(
+                    symbol=symbol,
+                    bar_start=bar_start,
+                    bar_end=bar_end,
+                    open=float(pack.opens[candle_idx]),
+                    high=float(pack.highs[candle_idx]),
+                    low=float(pack.lows[candle_idx]),
+                    close=float(pack.closes[candle_idx]),
+                    volume=float(pack.volumes[candle_idx]),
+                    first_snapshot_ts=bar_start,
+                    last_snapshot_ts=bar_end,
+                )
+                result.append(candle)
+                self._last_ltp[symbol] = candle.close
 
-            # Broadcast to all session queues
-            for sid, candles in candles_by_session.items():
-                self._pending.setdefault(sid, []).extend(candles)
-                if candles:
-                    self._tick_count += len(candles)
-                    self._last_tick_ts = bar_end
+            if result:
+                self._tick_count += len(result)
+                self._last_tick_ts = bar_end
 
-            # Check exhaustion
-            if self._global_bar_idx >= self._total_bars:
-                self._exhausted = True
+            if self._session_bar_idx[session_id] >= self._total_bars:
+                self._session_exhausted[session_id] = True
 
-            result = list(self._pending.pop(session_id, []))
-            self._pending[session_id] = []  # Re-initialize for next drain
             return result
 
     def close(self) -> None:

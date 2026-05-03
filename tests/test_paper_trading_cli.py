@@ -1342,7 +1342,7 @@ async def test_cmd_daily_live_kite_feed_waits_until_market_ready(
     monkeypatch.setattr(pt, "set_alerts_suppressed", lambda value: None)
     monkeypatch.setattr(pt, "_wait_until_market_ready", fake_wait_until_market_ready)
     monkeypatch.setattr(pt, "_run_daily_workflow", fake_run_daily_workflow)
-    monkeypatch.setattr(pt, "_enforce_kite_live_setup_gate", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pt, "_enforce_live_readiness_gate", lambda *args, **kwargs: None)
 
     await pt._cmd_daily_live(
         SimpleNamespace(
@@ -1367,6 +1367,27 @@ async def test_cmd_daily_live_kite_feed_waits_until_market_ready(
 
     assert calls == [("wait", "2026-04-09")]
     assert "ticker_adapter" not in workflow_calls["workflow"]["live_kwargs"]
+
+
+def test_enforce_live_readiness_gate_blocks_when_data_quality_not_ready(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import scripts.paper_trading as pt
+    from scripts import data_quality
+
+    printed: list[dict[str, object]] = []
+
+    monkeypatch.setattr(
+        data_quality,
+        "build_trade_date_readiness_report",
+        lambda trade_date: {"trade_date": trade_date, "ready": False},
+    )
+    monkeypatch.setattr(data_quality, "print_trade_date_readiness_report", printed.append)
+
+    with pytest.raises(SystemExit):
+        pt._enforce_live_readiness_gate("2026-05-04")
+
+    assert printed == [{"trade_date": "2026-05-04", "ready": False}]
 
 
 @pytest.mark.asyncio

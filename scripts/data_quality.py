@@ -314,9 +314,9 @@ def _print_window_report(start_date: str, end_date: str) -> None:
         print(f"  {label:<20} {int(count):>10,}")
 
 
-def build_trade_date_readiness_report(trade_date: str) -> dict[str, Any]:
+def build_trade_date_readiness_report(trade_date: str, *, db: Any | None = None) -> dict[str, Any]:
     """Build a readiness report for a specific trade date."""
-    db = get_db()
+    db = db or get_db()
     pre_market = _is_pre_market(trade_date)
     candidate_symbols = sorted(db.get_symbols_with_parquet_data([trade_date]))
     symbol_source = "same-day_5min_parquet"

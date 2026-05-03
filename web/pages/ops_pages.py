@@ -29,6 +29,7 @@ from web.components import (
 )
 from web.state import (
     aflatten_both_paper_sessions,
+    aget_live_readiness,
     aget_market_breadth_snapshot,
     aget_paper_active_sessions,
     aget_paper_archived_runs,
@@ -590,6 +591,131 @@ def _render_live_paper_sessions(
         _render(selected_label)
 
 
+def _render_live_readiness(readiness: dict, colors: dict) -> None:
+    trade_date = str(readiness.get("trade_date") or "")
+    ready = bool(readiness.get("ready"))
+    requested_count = int(readiness.get("requested_count") or 0)
+    setup_mode = "SETUP-ONLY" if readiness.get("setup_only_mode") else "FULL-DAY"
+    blocking_counts = readiness.get("blocking_missing_counts") or {}
+    missing_counts = readiness.get("missing_counts") or {}
+    sparse_total = int(
+        sum(
+            int(count or 0)
+            for table, count in missing_counts.items()
+            if table not in blocking_counts
+        )
+    )
+
+    ui.label("Live Readiness").classes("text-lg font-semibold mt-2 mb-2")
+    kpi_grid(
+        [
+            dict(
+                title="Ready",
+                value="YES" if ready else "NO",
+                icon="verified" if ready else "warning",
+                color=colors["success"] if ready else colors["error"],
+            ),
+            dict(title="Trade Date", value=trade_date or "—", icon="event", color=colors["info"]),
+            dict(title="Mode", value=setup_mode, icon="manage_search", color=colors["primary"]),
+            dict(
+                title="Universe",
+                value=f"{requested_count:,}",
+                icon="groups",
+                color=colors["info"],
+            ),
+            dict(
+                title="MDS Rows",
+                value=f"{int(readiness.get('next_day_mds_count') or 0):,}",
+                icon="table_chart",
+                color=colors["success"]
+                if int(readiness.get("next_day_mds_count") or 0) > 0
+                else colors["warning"],
+            ),
+            dict(
+                title="CPR Rows",
+                value=f"{int(readiness.get('next_day_cpr_count') or 0):,}",
+                icon="table_rows",
+                color=colors["success"]
+                if int(readiness.get("next_day_cpr_count") or 0) > 0
+                else colors["warning"],
+            ),
+        ],
+        columns=3,
+    )
+
+    if readiness.get("error"):
+        info_box(f"Readiness check failed: {readiness['error']}", color="red")
+        return
+
+    if ready:
+        info_box(
+            f"{trade_date} live setup is ready from "
+            f"{readiness.get('symbol_source') or 'runtime data'}.",
+            color="green",
+        )
+    else:
+        reasons: list[str] = []
+        if readiness.get("freshness_blocking"):
+            reasons.append("runtime freshness is blocking")
+        if readiness.get("coverage_blocking"):
+            reasons.append("coverage gaps are blocking")
+        if readiness.get("next_day_rows_missing"):
+            reasons.append("next-day market/CPR setup rows are missing")
+        if readiness.get("setup_query_failed"):
+            reasons.append("09:15 setup-candle query failed")
+        reason_text = "; ".join(reasons) if reasons else "readiness gate returned NO"
+        info_box(f"{trade_date} is not live-ready: {reason_text}.", color="red")
+
+    if blocking_counts:
+        rows = [
+            {"table": str(table), "missing": int(count)}
+            for table, count in sorted(blocking_counts.items())
+        ]
+        paginated_table(
+            columns=[
+                {"name": "table", "label": "Blocking Table", "field": "table", "align": "left"},
+                {
+                    "name": "missing",
+                    "label": "Missing Symbols",
+                    "field": "missing",
+                    "align": "right",
+                    "format": "int",
+                },
+            ],
+            rows=rows,
+            row_key="table",
+            page_size=6,
+        )
+    elif sparse_total:
+        info_box(
+            f"Sparse symbol/day warnings exist ({sparse_total:,} table-symbol gaps), "
+            "but they are below the blocking threshold.",
+            color="yellow",
+        )
+
+    freshness_rows = [
+        row
+        for row in (readiness.get("freshness_rows") or [])
+        if not str(row.get("status") or "").upper().startswith("OK")
+    ]
+    if freshness_rows:
+        paginated_table(
+            columns=[
+                {"name": "table", "label": "Table", "field": "table", "align": "left"},
+                {
+                    "name": "max_trade_date",
+                    "label": "Max Trade Date",
+                    "field": "max_trade_date",
+                    "align": "left",
+                },
+                {"name": "status", "label": "Status", "field": "status", "align": "left"},
+            ],
+            rows=freshness_rows,
+            row_key="table",
+            page_size=8,
+        )
+
+
 def _parse_symbols_csv(value: object) -> list[str]:
     text = str(value or "").strip()
     if not text:
@@ -864,6 +990,7 @@ async def paper_ledger_page() -> None:
                         "color=negative"
                     )
 
+                readiness_content = ui.column().classes("w-full mb-4")
                 active_content = ui.column().classes("w-full")
             with ui.tab_panel("archived"):
                 archived_content = ui.column().classes("w-full")
@@ -881,13 +1008,21 @@ async def paper_ledger_page() -> None:
             if page_state.get("loading_active"):
                 return
             page_state["loading_active"] = True
+            trade_date = str(trade_date_input.value or "").strip() or None
             try:
-                active_sessions = await aget_paper_active_sessions()
+                readiness, active_sessions = await asyncio.gather(
+                    aget_live_readiness(trade_date),
+                    aget_paper_active_sessions(),
+                )
                 active_count = len(active_sessions)
                 status_line.text = (
                     f"Active refreshed {datetime.now().strftime('%H:%M:%S')} | "
-                    f"active={active_count}"
+                    f"active={active_count} | "
+                    f"readiness={'YES' if readiness.get('ready') else 'NO'}"
                 )
+                readiness_content.clear()
+                with readiness_content:
+                    _render_live_readiness(readiness, colors)
                 active_content.clear()
                 with active_content:
                     _render_live_paper_sessions(active_sessions, colors, page_state)

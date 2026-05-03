@@ -319,17 +319,20 @@ async def _ensure_daily_session(
     )
 
 
-def _enforce_kite_live_setup_gate(trade_date: str, symbols: list[str], *, feed_source: str) -> None:
-    """Fail before live pre-filter/session creation if previous-day prerequisites are missing."""
-    if str(feed_source or "").strip().lower() != "kite":
+def _enforce_live_readiness_gate(
+    trade_date: str,
+    *,
+    skip_coverage: bool = False,
+) -> None:
+    """Fail before live pre-filter/session creation if the DQ readiness gate is red."""
+    if skip_coverage:
         return
-    preparation = prepare_runtime_for_daily_paper(
-        trade_date=trade_date,
-        symbols=symbols,
-        mode="live",
-    )
-    if not preparation.get("coverage_ready", False):
-        _handle_coverage_gaps(preparation, trade_date=trade_date, mode="live")
+    from scripts import data_quality as _data_quality
+
+    readiness = _data_quality.build_trade_date_readiness_report(trade_date)
+    if not readiness.get("ready", False):
+        _data_quality.print_trade_date_readiness_report(readiness)
+        raise SystemExit(1)
 
 
 async def _run_daily_workflow(
@@ -724,7 +727,10 @@ async def _cmd_daily_live(args: argparse.Namespace) -> None:
         if bool(getattr(args, "wait_for_open", False)):
             await _wait_until_market_ready(trade_date)
 
-    _enforce_kite_live_setup_gate(trade_date, symbols, feed_source=feed_source)
+    _enforce_live_readiness_gate(
+        trade_date,
+        skip_coverage=bool(getattr(args, "skip_coverage", False)),
+    )
 
     filtered = pre_filter_symbols_for_strategy(
         trade_date,
@@ -1133,7 +1139,10 @@ async def _cmd_daily_live_multi(args: argparse.Namespace) -> None:
             trade_date,
             wait_for_open=bool(getattr(args, "wait_for_open", False)),
         )
-        _enforce_kite_live_setup_gate(trade_date, all_symbols, feed_source=feed_source)
+    _enforce_live_readiness_gate(
+        trade_date,
+        skip_coverage=bool(getattr(args, "skip_coverage", False)),
+    )
 
     local_union_symbols: list[str] | None = None
     strategy_upper = _assert_cpr_only_strategy(

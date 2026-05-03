@@ -289,7 +289,7 @@ def _prefetch_setup_rows(
         row: tuple[Any, ...],
         live_candles: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any] | None:
-        from engine.paper_runtime import resolve_cpr_direction
+        from engine.cpr_atr_utils import resolve_cpr_direction
 
         tc = float(row[3] or 0.0)
         bc = float(row[4] or 0.0)
@@ -302,7 +302,7 @@ def _prefetch_setup_rows(
         if direction == "NONE" and or_close_5 is None:
             direction = str(row[21] or "NONE")
         if direction == "NONE" and live_candles:
-            from engine.paper_runtime import _build_intraday_summary
+            from engine.paper_setup_loader import _build_intraday_summary
 
             intraday = _build_intraday_summary(
                 live_candles,
@@ -748,14 +748,15 @@ async def run_live_session(
         float(direction_readiness["coverage_pct"]),
         len(active_symbols),
     )
-    if (
-        deps is None
-        and active_symbols
-        and int(direction_readiness["with_setup"]) == 0
-        and not runtime_state.allow_live_setup_fallback
-    ):
+    if deps is None and active_symbols and int(direction_readiness["with_setup"]) == 0:
         reason = "startup_missing_trade_date_setup_rows"
-        logger.error("[%s] No market_day_state setup rows loaded for %s", session_id, trade_date)
+        logger.error(
+            "[STARTUP BLOCKED] %s: no market_day_state setup rows loaded for %d requested "
+            "active symbol(s) on %s. Refusing live fallback from an empty setup universe.",
+            session_id,
+            len(active_symbols),
+            trade_date,
+        )
         await _update_session(session_id, deps, status="FAILED", notes=reason)
         force_paper_db_sync(get_paper_db())
         return {
@@ -764,42 +765,6 @@ async def run_live_session(
             "terminal_reason": reason,
             "cycles": 0,
         }
-    if deps is None and active_symbols and int(direction_readiness["with_setup"]) == 0:
-        from db.duckdb import get_dashboard_db as _get_mdb
-
-        _mdb_row_count = (
-            _get_mdb()
-            .con.execute(
-                "SELECT COUNT(*) FROM market_day_state WHERE trade_date = ?::DATE", [trade_date]
-            )
-            .fetchone()
-        )
-        _mds_count = int(_mdb_row_count[0] if _mdb_row_count else 0)
-        if _mds_count == 0:
-            reason = "startup_missing_trade_date_setup_rows"
-            logger.error(
-                "[STARTUP BLOCKED] %s: market_day_state has 0 rows for %s in replica. "
-                "Fix: pivot-build --table cpr, --table thresholds, --table state, --table strategy "
-                "(all with --refresh-date %s), then pivot-sync-replica --verify --trade-date %s",
-                session_id,
-                trade_date,
-                trade_date,
-                trade_date,
-            )
-            await _update_session(session_id, deps, status="FAILED", notes=reason)
-            force_paper_db_sync(get_paper_db())
-            return {
-                "session_id": session_id,
-                "final_status": "FAILED",
-                "terminal_reason": reason,
-                "cycles": 0,
-            }
-        logger.warning(
-            "[%s] No exact-date market_day_state rows loaded for %s; live setup will be derived "
-            "from previous completed-day data plus live opening-range candles",
-            session_id,
-            trade_date,
-        )
     tracker = SessionPositionTracker(
         max_positions=int(getattr(session, "max_positions", 1) or 1),
         portfolio_value=float(getattr(params, "portfolio_value", 0.0) or 0.0),

@@ -11,6 +11,8 @@ import pytest
 
 from db.postgres import FeedState
 from engine.live_market_data import IST, ClosedCandle, FiveMinuteCandleBuilder, MarketSnapshot
+from engine.paper_runtime import PaperRuntimeState
+from scripts import paper_live
 from scripts.paper_live import LiveSessionDeps, run_live_session
 
 
@@ -79,9 +81,73 @@ def test_five_minute_candle_builder_emits_closed_bars() -> None:
     assert candle.high == pytest.approx(101.5)
     assert candle.low == pytest.approx(100.0)
     assert candle.close == pytest.approx(101.5)
-    # First tick (vol=10) has no previous reference → volume delta is 0 (unknown pre-session
+    # First tick (vol=10) has no previous reference: volume delta is 0 (unknown pre-session
     # cumulative). Second tick (vol=11): delta = 11 - 10 = 1. Bar volume = 1.
     assert candle.volume == pytest.approx(1.0)
+
+
+def test_prefetch_setup_rows_hydrates_direction_from_shared_cpr_helper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    row = (
+        "SBIN",
+        "2026-04-30",
+        100.0,
+        101.0,
+        99.0,
+        100.0,
+        103.0,
+        97.0,
+        105.0,
+        95.0,
+        2.0,
+        0.5,
+        1.0,
+        103.0,
+        100.0,
+        100.5,
+        102.0,
+        "ABOVE",
+        0.5,
+        0.1,
+        1.2,
+        None,
+        True,
+        "UP",
+        None,
+        [1.0, 1.1],
+    )
+
+    class FakeResult:
+        def __init__(self, *, rows=None, one=None):
+            self._rows = rows or []
+            self._one = one
+
+        def fetchall(self):
+            return self._rows
+
+        def fetchone(self):
+            return self._one
+
+    class FakeCon:
+        def execute(self, query, params=None):
+            if "SELECT tc, bc, atr" in query:
+                return FakeResult(one=(101.0, 99.0, 2.0))
+            return FakeResult(rows=[row])
+
+    monkeypatch.setattr(paper_live, "get_dashboard_db", lambda: SimpleNamespace(con=FakeCon()))
+
+    runtime_state = PaperRuntimeState()
+    paper_live._prefetch_setup_rows(
+        runtime_state=runtime_state,
+        symbols=["SBIN"],
+        trade_date="2026-04-30",
+        candle_interval_minutes=5,
+    )
+
+    setup_row = runtime_state.symbols["SBIN"].setup_row
+    assert setup_row is not None
+    assert setup_row["direction"] == "LONG"
 
 
 def test_five_minute_candle_builder_flushes_partial_bar() -> None:
@@ -932,7 +998,6 @@ async def test_run_live_session_fails_closed_when_setup_prefetch_loads_no_rows(
         session_id="sess-no-setup",
         symbols=["SBIN"],
         max_cycles=1,
-        allow_live_setup_fallback=False,
     )
 
     assert result == {

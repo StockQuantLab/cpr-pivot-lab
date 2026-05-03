@@ -549,14 +549,14 @@ def _fetch_run_metadata_sync(run_id: str) -> dict:
             parsed = json.loads(str(row[4]))
             if isinstance(parsed, list):
                 symbols = [str(s) for s in parsed]
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             symbols = []
     if row[5]:
         try:
             parsed = json.loads(str(row[5]))
             if isinstance(parsed, dict):
                 params = parsed
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             params = {}
 
     return {
@@ -604,7 +604,7 @@ def _fetch_scan_snapshot_sync(limit_days: int = 120) -> pl.DataFrame:
 def _fetch_market_breadth_snapshot_sync(limit_days: int = 180) -> pl.DataFrame:
     try:
         rows = int(limit_days)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         rows = 180
     if rows <= 0:
         rows = 1
@@ -1356,6 +1356,46 @@ async def aget_data_quality_detail() -> dict:
     return await loop.run_in_executor(_executor, _fetch_data_quality_detail_sync)
 
 
+def _fetch_live_readiness_sync(trade_date: str | None = None) -> dict:
+    """Live paper readiness from the dashboard market replica."""
+    from scripts.data_quality import build_trade_date_readiness_report
+    from scripts.paper_prepare import resolve_trade_date
+
+    resolved_trade_date = resolve_trade_date(trade_date or "today")
+    try:
+        report = build_trade_date_readiness_report(
+            resolved_trade_date,
+            db=get_dashboard_db(),
+        )
+    except Exception as exc:
+        logger.exception("Live readiness failed for %s", resolved_trade_date)
+        return {
+            "trade_date": resolved_trade_date,
+            "ready": False,
+            "error": str(exc),
+            "requested_count": 0,
+            "blocking_missing_counts": {},
+        }
+
+    coverage_status = report.get("coverage_status") or {}
+    missing_counts = report.get("missing_counts") or {}
+    report["requested_count"] = len(report.get("requested_symbols") or [])
+    report["blocking_missing_counts"] = {
+        table: int(missing_counts.get(table) or 0)
+        for table, status in coverage_status.items()
+        if str(status).lower() == "blocking"
+    }
+    return report
+
+
+async def aget_live_readiness(trade_date: str | None = None) -> dict:
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        _executor,
+        lambda: _fetch_live_readiness_sync(trade_date),
+    )
+
+
 async def aget_symbol_coverage() -> list[dict]:
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(_executor, _fetch_symbol_coverage_sync)
@@ -1758,7 +1798,7 @@ def _universe_size_from_json(symbols_json: object) -> int:
 
         symbols = json.loads(text)
         return len(symbols) if isinstance(symbols, list) else 0
-    except (json.JSONDecodeError, ValueError):
+    except json.JSONDecodeError, ValueError:
         return 0
 
 

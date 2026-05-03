@@ -7,6 +7,129 @@ Supersedes: `docs/PARITY_INCIDENT_LOG.md` (contents migrated below).
 
 ---
 
+## 2026-05-03 — FIXED: LIVE: daily-live could bypass the stronger data-quality readiness gate
+
+**Status:** FIXED
+**Severity:** High
+
+### Symptom
+
+The dashboard and `pivot-data-quality --date <trade_date>` could report a live trade date as
+not ready because next-day setup rows were missing, while `pivot-paper-trading daily-live`
+still used the weaker `prepare_runtime_for_daily_paper(mode="live")` prerequisite check.
+
+### Root Cause
+
+The CLI live launcher and dashboard/data-quality page enforced different readiness contracts.
+`daily-live` validated prior-day prerequisites but did not call the setup-row readiness report
+that catches missing next-day `market_day_state` / `cpr_daily` rows.
+
+### Fix
+
+Added a `daily-live` startup gate that calls `build_trade_date_readiness_report()` before
+pre-filtering or session creation. A red data-quality readiness report now blocks both single
+and `--multi` live starts unless the operator explicitly passes `--skip-coverage`.
+
+### Related
+
+Focused verification: `uv run pytest tests/test_paper_trading_cli.py::test_enforce_live_readiness_gate_blocks_when_data_quality_not_ready -q`.
+
+---
+
+## 2026-05-03 — FIXED: LIVE: startup fallback allowed an empty selected setup universe
+
+**Status:** FIXED
+**Severity:** High
+
+### Symptom
+
+Live startup could continue when `_prefetch_setup_rows()` loaded zero setup rows for the
+requested active symbols if the broader `market_day_state` table had any rows for that
+trade date.
+
+### Root Cause
+
+`scripts/paper_live.py` treated global table presence as a fallback signal. That is unsafe:
+the live session must validate setup coverage for the exact candidate universe it is about
+to trade, not just prove that some rows exist somewhere in the table.
+
+### Fix
+
+`run_live_session()` now fails closed whenever active symbols were requested and zero setup
+rows were loaded for that selected universe. The existing regression test now covers the
+default live fallback setting instead of only the explicit no-fallback path.
+
+### Related
+
+Focused verification: `uv run pytest tests/test_live_market_data.py::test_run_live_session_fails_closed_when_setup_prefetch_loads_no_rows -q`.
+
+---
+
+## 2026-05-03 — FIXED: PARITY: local-feed multi-session replay skipped the first bar for late-registered variants
+
+**Status:** FIXED
+**Severity:** High
+
+### Symptom
+
+The 2026-04-30 local-feed live validation produced exact LONG parity against the one-day
+backtest slice, but SHORT had 1 paper-only trade and 3 backtest-only trades. Logs showed
+the LONG local-feed session started at the 09:15 bar while the SHORT local-feed session first
+processed 09:20.
+
+### Root Cause
+
+`engine/local_ticker_adapter.py` used one global bar cursor shared by all sessions. In
+`daily-live --feed-source local --multi`, the first variant could register and drain the
+09:15 bar before the second variant registered, causing the second variant to start from
+09:20 and invalidating local-feed parity evidence.
+
+### Fix
+
+Changed `LocalTickerAdapter` to maintain per-session bar cursors. Each registered session now
+starts from the first historical bar independently, even when variant coroutines register a few
+scheduler ticks apart. Added a regression test for late session registration.
+
+### Related
+
+Focused verification: `uv run ruff check engine/local_ticker_adapter.py tests/test_local_ticker.py`
+and `uv run pytest tests/test_local_ticker.py -q`.
+
+---
+
+## 2026-05-03 — FIXED: BUG: local-feed live replay failed on stale CPR helper import
+
+**Status:** FIXED
+**Severity:** High
+
+### Symptom
+
+`pivot-paper-trading daily-live --feed-source local --multi --strategy CPR_LEVELS --trade-date
+2026-04-30 --all-symbols --no-alerts --complete-on-exit` failed during setup prefetch for both
+LONG and SHORT variants:
+
+`ImportError: cannot import name 'resolve_cpr_direction' from 'engine.paper_runtime'`
+
+### Root Cause
+
+`scripts/paper_live.py` still imported `resolve_cpr_direction` and `_build_intraday_summary`
+from `engine.paper_runtime` inside the batch setup hydration path. Those helpers now live in
+`engine.cpr_atr_utils` and `engine.paper_setup_loader`, so the local-feed/live setup path
+crashed before any bar processing or parity comparison could run.
+
+### Fix
+
+Updated the setup hydration imports in `scripts/paper_live.py` to use the current shared CPR
+direction helper and setup-loader intraday summary helper. Added a regression test covering
+batch setup prefetch direction hydration.
+
+### Related
+
+Focused verification: `uv run ruff check scripts/paper_live.py tests/test_live_market_data.py`
+and `uv run pytest tests/test_live_market_data.py -q`.
+
+---
+
 ## 2026-05-03 — FIXED: INFRA: Documentation roots and relative links drifted
 
 **Status:** FIXED

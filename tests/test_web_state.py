@@ -102,6 +102,31 @@ async def test_aget_paper_active_sessions_aggregates_snapshots(
     assert all(payload["summary"]["orders"] == 1 for payload in active_sessions)
 
 
+def test_fetch_live_readiness_uses_dashboard_replica(monkeypatch: pytest.MonkeyPatch) -> None:
+    from scripts import data_quality
+
+    fake_db = object()
+    monkeypatch.setattr(web_state, "get_dashboard_db", lambda: fake_db)
+
+    def fake_report(trade_date: str, *, db=None):
+        assert trade_date == "2026-04-30"
+        assert db is fake_db
+        return {
+            "trade_date": trade_date,
+            "ready": False,
+            "requested_symbols": ["SBIN", "TCS"],
+            "coverage_status": {"market_day_state": "blocking", "v_5min": "warning"},
+            "missing_counts": {"market_day_state": 2, "v_5min": 1},
+        }
+
+    monkeypatch.setattr(data_quality, "build_trade_date_readiness_report", fake_report)
+
+    result = web_state._fetch_live_readiness_sync("2026-04-30")
+
+    assert result["requested_count"] == 2
+    assert result["blocking_missing_counts"] == {"market_day_state": 2}
+
+
 @pytest.mark.asyncio
 async def test_aqueue_paper_admin_command_writes_command_file(
     tmp_path: Path,

@@ -251,6 +251,23 @@ class TestLocalTickerAdapterMultiSession:
         assert adapter.drain_closed("A") == []
         assert adapter.drain_closed("B") == []
 
+    def test_late_registered_session_starts_from_first_bar(self, patch_load):
+        from engine.local_ticker_adapter import LocalTickerAdapter
+
+        packs = {"SBIN": _make_pack(3)}
+        with patch_load(packs):
+            adapter = LocalTickerAdapter(trade_date="2024-01-15", symbols=["SBIN"])
+
+        adapter.register_session("A", ["SBIN"], FiveMinuteCandleBuilder())
+        first_a = adapter.drain_closed("A")
+        assert len(first_a) == 1
+        assert first_a[0].bar_end.strftime("%H:%M") == "09:15"
+
+        adapter.register_session("B", ["SBIN"], FiveMinuteCandleBuilder())
+        first_b = adapter.drain_closed("B")
+        assert len(first_b) == 1
+        assert first_b[0].bar_end.strftime("%H:%M") == "09:15"
+
     def test_update_symbols(self, patch_load):
         from engine.local_ticker_adapter import LocalTickerAdapter
 
