@@ -86,10 +86,14 @@ def test_archive_completed_session_stamps_paper_metadata_and_coexists_with_backt
             exit_price=104.0,
             pnl=40.0,
         )
+        session_updates: list[dict[str, object]] = []
 
         fake_paper_db = SimpleNamespace(
             get_session=lambda sid: session if sid == "paper-1" else None,
             get_session_positions=lambda sid, statuses=None: [position] if sid == "paper-1" else [],
+            update_session=lambda sid, **kwargs: session_updates.append(
+                {"session_id": sid, **kwargs}
+            ),
         )
 
         monkeypatch.setattr(paper_archive, "get_backtest_db", lambda: db)
@@ -100,6 +104,8 @@ def test_archive_completed_session_stamps_paper_metadata_and_coexists_with_backt
         assert payload["archived"] is True
         assert payload["execution_mode"] == "PAPER"
         assert payload["rows"] == 1
+        assert payload["total_pnl"] == 40.0
+        assert session_updates == [{"session_id": "paper-1", "total_pnl": 40.0}]
 
         meta = db.con.execute(
             """

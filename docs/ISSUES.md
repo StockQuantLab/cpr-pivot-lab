@@ -2632,9 +2632,9 @@ then transitions to "OK" normally. The replica syncs immediately via `_after_wri
 
 ---
 
-## 2026-04-24 — BUG: paper_sessions.total_pnl = 0.0 after flatten-all (archive step skipped)
+## 2026-04-24 — FIXED: BUG: paper_sessions.total_pnl = 0.0 after flatten-all (archive step skipped)
 
-**Status:** OPEN — no fix yet; workaround is to read pnl from paper_positions directly
+**Status:** FIXED — flatten paths now stamp session P&L and archive completed sessions
 **Severity:** Medium — dashboard and run_metrics show ₹0 P&L for any day that ended via flatten-all
 
 ### Symptom
@@ -2664,17 +2664,23 @@ WHERE session_id LIKE 'CPR_LEVELS%2026-04-24%'
 GROUP BY session_id;
 ```
 
-### Fix Options
-1. **`flatten-all` calls archive**: After `force_sync()`, call `archive_completed_session()`
-   for each completed session. Risk: archive is append-only — need to guard against double-archive
-   if the session was already archived.
-2. **Manual re-archive via CLI**: Add `pivot-paper-trading archive --session-id <id>` command
-   that detects missing `run_metrics` row and runs the archive step in isolation.
-3. **Dashboard reads from paper_positions fallback**: When `total_pnl=0.0` and positions exist,
-   compute total from positions on the fly. Low-risk cosmetic fix that doesn't require DB writes.
+### Fix
+Implemented in the flatten paths:
 
-### Files to Change
-- `scripts/paper_trading.py` — `_cmd_flatten`, `_cmd_flatten_all`: call archive after force_sync
+- `engine/paper_runtime.py` — `flatten_session_positions()` now recomputes `total_pnl` from all
+  CLOSED positions after force-closing open positions and writes it to `paper_sessions`.
+- `scripts/paper_trading.py` — `_cmd_flatten()` and `_cmd_flatten_all()` call
+  `archive_completed_session()` after marking sessions `COMPLETED`.
+- `scripts/paper_archive.py` — `archive_completed_session()` also recomputes and stamps
+  `paper_sessions.total_pnl` from CLOSED positions, so re-archive repairs historical sessions too.
+- `db/backtest_db.py` — PAPER archive writes are idempotent because `store_backtest_results()`
+  deletes existing rows for the run_id before inserting refreshed rows, then refreshes run metrics.
+- `tests/test_paper_runtime.py`, `tests/test_paper_archive.py`, and
+  `tests/test_paper_trading_workflow.py` cover the P&L stamp and archive calls.
+
+Historical sessions affected before this fix can still be repaired by re-running
+`archive_completed_session("<session_id>")` after verifying `paper_positions` has the correct
+CLOSED rows.
 
 ---
 

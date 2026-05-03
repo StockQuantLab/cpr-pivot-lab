@@ -914,6 +914,105 @@ async def test_cmd_flatten_shuts_down_dispatcher_on_error(
 
 
 @pytest.mark.asyncio
+async def test_cmd_flatten_archives_completed_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import scripts.paper_trading as pt
+    from db.paper_db import PaperSession
+
+    calls: list[tuple[str, object]] = []
+
+    async def fake_flatten_session_positions(session_id: str, *, notes: str | None = None):
+        calls.append(("flatten", session_id))
+        return {"closed_positions": 2}
+
+    async def fake_update_session_state(session_id: str, **kwargs):
+        calls.append(("state", (session_id, kwargs)))
+
+    def fake_archive_completed_session(session_id: str):
+        calls.append(("archive", session_id))
+        return {"trade_count": 2}
+
+    fake_db = SimpleNamespace(
+        get_session=lambda session_id: PaperSession(
+            session_id=session_id,
+            strategy="CPR_LEVELS",
+            status="COMPLETED",
+        ),
+        force_sync=lambda: calls.append(("force_sync", None)),
+    )
+
+    async def fake_shutdown():
+        calls.append(("shutdown", None))
+
+    monkeypatch.setattr(pt, "flatten_session_positions", fake_flatten_session_positions)
+    monkeypatch.setattr(pt, "update_session_state", fake_update_session_state)
+    monkeypatch.setattr(pt, "archive_completed_session", fake_archive_completed_session)
+    monkeypatch.setattr(pt, "_pdb", lambda: fake_db)
+    monkeypatch.setattr(pt, "maybe_shutdown_alert_dispatcher", fake_shutdown)
+    monkeypatch.setattr(pt, "register_session_start", lambda: None)
+    monkeypatch.setattr(pt, "_start_alert_dispatcher", lambda: None)
+
+    await pt._cmd_flatten(SimpleNamespace(session_id="paper-live-1", notes="manual"))
+
+    assert calls[:4] == [
+        ("flatten", "paper-live-1"),
+        ("state", ("paper-live-1", {"status": "COMPLETED", "notes": "manual"})),
+        ("archive", "paper-live-1"),
+        ("force_sync", None),
+    ]
+    assert calls[-1] == ("shutdown", None)
+
+
+@pytest.mark.asyncio
+async def test_cmd_flatten_all_archives_each_completed_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import scripts.paper_trading as pt
+
+    calls: list[tuple[str, object]] = []
+
+    class _Rows:
+        def fetchall(self):
+            return [("paper-long", "ACTIVE"), ("paper-short", "FAILED")]
+
+    fake_db = SimpleNamespace(
+        con=SimpleNamespace(execute=lambda *args, **kwargs: _Rows()),
+        force_sync=lambda: calls.append(("force_sync", None)),
+    )
+
+    async def fake_flatten_session_positions(session_id: str, *, notes: str | None = None):
+        calls.append(("flatten", session_id))
+        return {"closed_positions": 1}
+
+    async def fake_update_session_state(session_id: str, **kwargs):
+        calls.append(("state", (session_id, kwargs)))
+
+    def fake_archive_completed_session(session_id: str):
+        calls.append(("archive", session_id))
+        return {"trade_count": 1}
+
+    async def fake_shutdown():
+        calls.append(("shutdown", None))
+
+    monkeypatch.setattr(pt, "resolve_trade_date", lambda value: value)
+    monkeypatch.setattr(pt, "_pdb", lambda: fake_db)
+    monkeypatch.setattr(pt, "flatten_session_positions", fake_flatten_session_positions)
+    monkeypatch.setattr(pt, "update_session_state", fake_update_session_state)
+    monkeypatch.setattr(pt, "archive_completed_session", fake_archive_completed_session)
+    monkeypatch.setattr(pt, "maybe_shutdown_alert_dispatcher", fake_shutdown)
+    monkeypatch.setattr(pt, "register_session_start", lambda: None)
+    monkeypatch.setattr(pt, "_start_alert_dispatcher", lambda: None)
+
+    await pt._cmd_flatten_all(SimpleNamespace(trade_date="2026-04-24", notes="manual"))
+
+    assert ("archive", "paper-long") in calls
+    assert ("archive", "paper-short") in calls
+    assert calls.count(("force_sync", None)) == 1
+    assert calls[-1] == ("shutdown", None)
+
+
+@pytest.mark.asyncio
 async def test_cmd_daily_live_resume_rejects_session_without_open_positions(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

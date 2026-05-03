@@ -105,6 +105,19 @@ def archive_completed_session(
         session.status,
     )
     closed_positions = paper_db.get_session_positions(session_id, statuses=["CLOSED"])
+    total_pnl = round(
+        sum(
+            float(
+                getattr(position, "realized_pnl", None)
+                if getattr(position, "realized_pnl", None) is not None
+                else getattr(position, "pnl", 0.0) or 0.0
+            )
+            for position in closed_positions
+        ),
+        2,
+    )
+    if hasattr(paper_db, "update_session"):
+        paper_db.update_session(session_id, total_pnl=total_pnl)
     rows = [_position_to_trade_row(session, position) for position in closed_positions]
 
     if rows:
@@ -173,6 +186,7 @@ def archive_completed_session(
         "rows": len(rows),
         "symbols": sorted({row["symbol"] for row in rows}),
         "trade_count": len(rows),
+        "total_pnl": total_pnl,
         "execution_mode": "PAPER",
     }
 
