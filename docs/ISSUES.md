@@ -7,6 +7,39 @@ Supersedes: `docs/PARITY_INCIDENT_LOG.md` (contents migrated below).
 
 ---
 
+## 2026-05-04 — FIXED: BUG: Kite token CLI accepted failed login responses as token input
+
+**Status:** FIXED
+**Severity:** Low
+
+### Symptom
+
+During `pivot-kite-get-token --apply-doppler`, the browser stopped at
+`https://kite.zerodha.com/connect/finish?...sess_id=...` and displayed
+`The user is not enabled for the app` instead of redirecting with `request_token=...`.
+If that failed URL or JSON response was pasted into the CLI, the local helper could treat it
+as raw token input and only fail later with an opaque Kite exception.
+
+### Root Cause
+
+`engine/kite_token.py:extract_request_token()` only rejected full callback URLs when the URL
+parser saw a URL without `request_token`. It did not recognize Zerodha's failed
+`/connect/finish` URL or the JSON `user is not enabled` response as pre-token login failures.
+
+### Fix
+
+`extract_request_token()` now detects the failed Zerodha login response and `/connect/finish`
+URL without `request_token`, then raises an actionable error pointing operators to the Kite
+Developer Console client-ID/app-subscription checks. The Kite ingestion runbook now includes
+the same troubleshooting note.
+
+### Related
+
+Focused verification: `uv run pytest tests/test_kite_token.py -q`;
+`uv run ruff check engine/kite_token.py tests/test_kite_token.py`.
+
+---
+
 ## 2026-05-04 — FIXED: LIVE: final paper archive used read-only dashboard replica
 
 **Status:** FIXED

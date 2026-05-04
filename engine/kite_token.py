@@ -14,6 +14,14 @@ class KiteTokenWorkflowError(RuntimeError):
     """Raised when the local Kite token workflow cannot complete."""
 
 
+KITE_USER_NOT_ENABLED_MESSAGE = (
+    "Zerodha rejected the Kite login before issuing a request_token: "
+    "The user is not enabled for the app. Check the Kite Developer Console app details: "
+    "the Zerodha Client ID must exactly match the account you logged into, the app must be "
+    "active/subscribed, and Doppler KITE_API_KEY/KITE_API_SECRET must belong to that same app."
+)
+
+
 @dataclass(slots=True)
 class KiteTokenWorkflowResult:
     login_url: str
@@ -31,10 +39,19 @@ def extract_request_token(value: str) -> str:
     if not raw:
         raise KiteTokenWorkflowError("Request token input is empty")
 
+    if "user is not enabled for the app" in raw.lower():
+        raise KiteTokenWorkflowError(KITE_USER_NOT_ENABLED_MESSAGE)
+
     parsed = urlparse(raw)
     if parsed.scheme and parsed.netloc:
         request_tokens = parse_qs(parsed.query).get("request_token", [])
         if not request_tokens or not request_tokens[0].strip():
+            if parsed.netloc == "kite.zerodha.com" and parsed.path == "/connect/finish":
+                raise KiteTokenWorkflowError(
+                    "Kite login finished without a request_token. "
+                    "If the browser showed 'The user is not enabled for the app', check the "
+                    "Kite Developer Console Zerodha Client ID/app subscription and then retry."
+                )
             raise KiteTokenWorkflowError(
                 "Callback URL does not contain request_token. Paste the full redirected URL."
             )

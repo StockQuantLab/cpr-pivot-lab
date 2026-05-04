@@ -119,6 +119,19 @@ doppler secrets set KITE_ACCESS_TOKEN '<access-token>'
 
 If you already have a valid `KITE_ACCESS_TOKEN`, you can skip this step.
 
+Troubleshooting:
+
+- If the browser shows `{"status":"error","message":"The user is not enabled for the app."...}`
+  or the URL stops at `https://kite.zerodha.com/connect/finish?...sess_id=...`, Zerodha has not
+  issued a `request_token` yet. This is not a local token-exchange failure. In the Kite Developer
+  Console, open the app for the `KITE_API_KEY` printed in the login URL and verify:
+  - the app's Zerodha Client ID exactly matches the Kite account you logged into
+  - there are no leading/trailing spaces in the Client ID
+  - the app is active/subscribed
+  - Doppler `KITE_API_KEY` and `KITE_API_SECRET` are from that same app
+  Then log out of Kite in the browser, log back into the matching account, and rerun the token
+  command.
+
 ## Step 2: Refresh the instrument master
 
 Refresh the local instrument master before the first ingestion run or whenever Zerodha changes the symbol map:
