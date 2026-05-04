@@ -319,16 +319,16 @@ The 15:00 MIS safety rerun is now the canonical comparison target for all eight 
 
 | Mode | Preset | Run ID | Start → End | P/L | Calmar |
 |------|--------|--------|-------------|-----|--------|
-| Daily Reset | `CPR_LEVELS_STANDARD_LONG` | `9a317c93b934` | 2025-01-01 → 2026-04-30 | ₹1,715,879 | 208 |
-| Daily Reset | `CPR_LEVELS_STANDARD_SHORT` | `fc5bca650a39` | 2025-01-01 → 2026-04-30 | ₹1,602,868 | 89 |
-| Daily Reset | `CPR_LEVELS_RISK_LONG` | `c352c2c9e238` | 2025-01-01 → 2026-04-30 | ₹1,709,319 | 210 |
-| Daily Reset | `CPR_LEVELS_RISK_SHORT` | `b4007289822e` | 2025-01-01 → 2026-04-30 | ₹1,620,145 | 95 |
-| Compound | `CPR_LEVELS_STANDARD_LONG` | `91bfdcbcd776` | 2025-01-01 → 2026-04-30 | ₹5,485,604 | 402 |
-| Compound | `CPR_LEVELS_STANDARD_SHORT` | `ca7fa0c63e4b` | 2025-01-01 → 2026-04-30 | ₹4,928,531 | 175 |
-| Compound | `CPR_LEVELS_RISK_LONG` | `b6ac11d6998f` | 2025-01-01 → 2026-04-30 | ₹1,716,664 | 208 |
-| Compound | `CPR_LEVELS_RISK_SHORT` | `121b2b0c6461` | 2025-01-01 → 2026-04-30 | ₹1,633,514 | 86 |
+| Daily Reset | `CPR_LEVELS_STANDARD_LONG` | `034b33508e65` | 2025-01-01 → 2026-04-30 | ₹1,715,879 | 208 |
+| Daily Reset | `CPR_LEVELS_STANDARD_SHORT` | `2e2a02bc992e` | 2025-01-01 → 2026-04-30 | ₹1,602,868 | 89 |
+| Daily Reset | `CPR_LEVELS_RISK_LONG` | `7a80f9ad9606` | 2025-01-01 → 2026-04-30 | ₹1,709,319 | 210 |
+| Daily Reset | `CPR_LEVELS_RISK_SHORT` | `8c301b9069ff` | 2025-01-01 → 2026-04-30 | ₹1,620,145 | 95 |
+| Compound | `CPR_LEVELS_STANDARD_LONG` | `39383dd50560` | 2025-01-01 → 2026-04-30 | ₹5,485,604 | 402 |
+| Compound | `CPR_LEVELS_STANDARD_SHORT` | `36d74db1a72d` | 2025-01-01 → 2026-04-30 | ₹4,928,531 | 175 |
+| Compound | `CPR_LEVELS_RISK_LONG` | `31fa175a281b` | 2025-01-01 → 2026-04-30 | ₹1,716,664 | 208 |
+| Compound | `CPR_LEVELS_RISK_SHORT` | `b41819620cdc` | 2025-01-01 → 2026-04-30 | ₹1,633,514 | 86 |
 
-The 2026-05-03 promotion supersedes the 2026-05-02 15:15 comparison set and the older deleted
+The 2026-05-04 promotion supersedes the 2026-05-03 comparison set and the older deleted
 2026-04-28 `u2029` baseline rows. The retired rows should not be used as comparison targets.
 Use `full_2026_04_30` explicitly for reproducible reruns; it matched `canonical_full` at promotion
 time but the dated name is the durable reference.
