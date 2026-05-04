@@ -21,9 +21,63 @@ from engine.broker_reconciliation import (
     reconcile_local_to_broker,
 )
 
+_ZERO_FILL_TERMINAL_ORDER_STATUSES = {"REJECTED", "CANCELLED"}
+_MANUAL_PILOT_MARKERS = (
+    "ZERODHA_LIVE_REAL_ORDERS_MANUAL_PILOT",
+    "MANUAL REAL-ORDER PILOT",
+    "MANUAL REAL ORDER PILOT",
+    "MANUAL ITC REAL-ORDER PILOT",
+)
+
 
 def _pdb():
     return get_paper_db()
+
+
+def _is_manual_real_order_pilot_session(session: Any) -> bool:
+    text = " ".join(
+        str(value or "")
+        for value in (
+            getattr(session, "session_id", ""),
+            getattr(session, "name", ""),
+            getattr(session, "notes", ""),
+        )
+    ).upper()
+    return any(marker in text for marker in _MANUAL_PILOT_MARKERS)
+
+
+def _maybe_complete_zero_fill_manual_pilot(db: Any, session_id: str) -> dict[str, Any] | None:
+    session = db.get_session(session_id)
+    if session is None or str(session.status).upper() not in {"ACTIVE", "PLANNING", "PAUSED"}:
+        return None
+    if not _is_manual_real_order_pilot_session(session):
+        return None
+    if db.get_open_positions(session_id):
+        return None
+
+    broker_orders = [
+        order for order in db.get_session_orders(session_id) if str(order.broker_mode or "").strip()
+    ]
+    if not broker_orders:
+        return None
+    if any(
+        str(order.status or "").upper() not in _ZERO_FILL_TERMINAL_ORDER_STATUSES
+        or int(order.fill_qty or 0) != 0
+        for order in broker_orders
+    ):
+        return None
+
+    updated = db.update_session(
+        session_id,
+        status="COMPLETED",
+        notes="auto_completed_manual_pilot_zero_fill_terminal_orders",
+    )
+    return {
+        "session_id": session_id,
+        "status": getattr(updated, "status", "COMPLETED") if updated else "COMPLETED",
+        "reason": "zero_fill_terminal_broker_orders",
+        "orders": len(broker_orders),
+    }
 
 
 def _load_json_list_arg(value: str | None, *, label: str) -> list[dict[str, Any]]:
@@ -65,6 +119,7 @@ async def _cmd_broker_sync_orders(args: argparse.Namespace) -> None:
     local_orders = db.get_recent_orders(limit=int(args.limit), broker_only=True)
     updated: list[dict[str, Any]] = []
     missing: list[str] = []
+    touched_sessions: set[str] = set()
     for order in local_orders:
         if args.session_id and str(order.session_id) != str(args.session_id):
             continue
@@ -77,6 +132,7 @@ async def _cmd_broker_sync_orders(args: argparse.Namespace) -> None:
             continue
         changed = db.update_order_from_broker_snapshot(broker_order_id, snapshot)
         if changed:
+            touched_sessions.add(str(order.session_id))
             updated.append(
                 {
                     "local_order_id": order.order_id,
@@ -89,6 +145,11 @@ async def _cmd_broker_sync_orders(args: argparse.Namespace) -> None:
                     or snapshot.get("status_message"),
                 }
             )
+    completed_sessions = [
+        result
+        for session_id in sorted(touched_sessions)
+        if (result := _maybe_complete_zero_fill_manual_pilot(db, session_id)) is not None
+    ]
     print(
         json.dumps(
             {
@@ -96,6 +157,7 @@ async def _cmd_broker_sync_orders(args: argparse.Namespace) -> None:
                 "local_checked": len(local_orders),
                 "updated": updated,
                 "missing_kite_order_ids": missing,
+                "completed_manual_pilot_sessions": completed_sessions,
             },
             default=str,
             indent=2,

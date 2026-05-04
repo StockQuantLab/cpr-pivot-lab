@@ -8,6 +8,7 @@ import pytest
 
 from db import paper_db as paper_db_module
 from db.paper_db import PaperDB
+from scripts.paper_broker_cli import _maybe_complete_zero_fill_manual_pilot
 
 
 def test_cleanup_stale_sessions_only_cancels_stopping_rows(tmp_path: Path) -> None:
@@ -215,6 +216,72 @@ def test_update_order_from_broker_snapshot_persists_final_status(tmp_path: Path)
         assert order.broker_status_message == "17177 : Invalid PAN Number"
         assert order.broker_exchange_order_id == "exchange-1"
         assert "Invalid PAN Number" in str(order.broker_response)
+    finally:
+        db.close()
+
+
+def test_zero_fill_rejected_manual_pilot_auto_completes(tmp_path: Path) -> None:
+    db = PaperDB(db_path=tmp_path / "paper.duckdb")
+    try:
+        db.create_session(
+            session_id="manual-pilot-1",
+            name="Manual ITC real-order pilot",
+            status="ACTIVE",
+            notes="ZERODHA_LIVE_REAL_ORDERS_MANUAL_PILOT",
+        )
+        db.append_order_event(
+            session_id="manual-pilot-1",
+            symbol="ITC",
+            side="BUY",
+            order_type="LIMIT",
+            requested_qty=1,
+            fill_qty=0,
+            status="REJECTED",
+            exchange_order_id="kite-1",
+            broker_mode="LIVE",
+        )
+
+        result = _maybe_complete_zero_fill_manual_pilot(db, "manual-pilot-1")
+
+        assert result == {
+            "session_id": "manual-pilot-1",
+            "status": "COMPLETED",
+            "reason": "zero_fill_terminal_broker_orders",
+            "orders": 1,
+        }
+        session = db.get_session("manual-pilot-1")
+        assert session is not None
+        assert session.status == "COMPLETED"
+        assert session.notes == "auto_completed_manual_pilot_zero_fill_terminal_orders"
+    finally:
+        db.close()
+
+
+def test_filled_manual_pilot_does_not_auto_complete(tmp_path: Path) -> None:
+    db = PaperDB(db_path=tmp_path / "paper.duckdb")
+    try:
+        db.create_session(
+            session_id="manual-pilot-1",
+            name="Manual ITC real-order pilot",
+            status="ACTIVE",
+            notes="ZERODHA_LIVE_REAL_ORDERS_MANUAL_PILOT",
+        )
+        db.append_order_event(
+            session_id="manual-pilot-1",
+            symbol="ITC",
+            side="BUY",
+            order_type="LIMIT",
+            requested_qty=1,
+            fill_qty=1,
+            status="FILLED",
+            exchange_order_id="kite-1",
+            broker_mode="LIVE",
+        )
+
+        result = _maybe_complete_zero_fill_manual_pilot(db, "manual-pilot-1")
+
+        assert result is None
+        assert db.get_session("manual-pilot-1").status == "ACTIVE"
     finally:
         db.close()
 

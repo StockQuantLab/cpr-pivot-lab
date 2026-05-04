@@ -7,6 +7,44 @@ Supersedes: `docs/PARITY_INCIDENT_LOG.md` (contents migrated below).
 
 ---
 
+## 2026-05-04 — FIXED: BUG: rejected manual real-order pilot stayed ACTIVE
+
+**Status:** FIXED
+**Severity:** Medium
+
+### Symptom
+
+The Paper Sessions dashboard still showed
+`Manual ITC real-order pilot · CPR_LEVELS · REPLAY · HISTORICAL · ZERODHA LIVE · ACTIVE`
+after the ITC real-order pilot was rejected by Kite with `17177 : Invalid PAN Number`.
+
+### Root Cause
+
+The manual pilot session was only a broker-audit wrapper and had no paper positions, but
+`broker-sync-orders` only updated the order row. It did not finalize the wrapping manual pilot
+session after the broker order reached a zero-fill terminal state (`REJECTED`/`CANCELLED`), so
+the session remained in the Active Sessions query.
+
+### Fix
+
+Closed the stale `manual-pilot-2026-05-04` session with
+`pivot-paper-trading stop --complete --notes manual_pilot_rejected_no_positions`.
+
+`scripts/paper_broker_cli.py` now auto-completes manual real-order pilot sessions when:
+
+- the session is marked as a manual real-order pilot,
+- there are no open paper positions,
+- all broker orders for the session are zero-fill terminal orders (`REJECTED`/`CANCELLED`).
+
+It deliberately does not auto-complete filled broker orders, so a successful pilot buy can still
+be followed by sell/SL testing.
+
+### Related
+
+`manual-pilot-2026-05-04`, `scripts/paper_broker_cli.py`, `tests/test_paper_db.py`
+
+---
+
 ## 2026-05-04 — FIXED: PERF: Live readiness check takes 20-30 seconds
 
 **Status:** FIXED
