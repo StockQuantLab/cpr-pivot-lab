@@ -64,6 +64,53 @@ def _extract_tab_value(event: object) -> str | None:
     return None
 
 
+def _format_rupees(value: float | int | None) -> str:
+    return f"₹{float(value or 0.0):,.0f}"
+
+
+def _build_session_risk_cards(session: object, colors: dict) -> list[dict]:
+    portfolio_value = float(getattr(session, "portfolio_value", 0.0) or 0.0)
+    max_positions = int(getattr(session, "max_positions", 0) or 0)
+    max_position_pct = float(getattr(session, "max_position_pct", 0.0) or 0.0)
+    slot_cap = portfolio_value * max_position_pct if portfolio_value > 0 else 0.0
+    pct_label = f"{max_position_pct * 100:.0f}%" if max_position_pct > 0 else "—"
+    sizing_value = (
+        f"{max_positions:,} x {_format_rupees(slot_cap)}"
+        if max_positions > 0 and slot_cap > 0
+        else "—"
+    )
+    return [
+        dict(
+            title="Capital",
+            value=_format_rupees(portfolio_value),
+            subtitle="paper portfolio",
+            icon="account_balance_wallet",
+            color=colors["info"],
+        ),
+        dict(
+            title="Max Pos",
+            value=f"{max_positions:,}" if max_positions > 0 else "—",
+            subtitle="concurrent limit",
+            icon="format_list_numbered",
+            color=colors["primary"],
+        ),
+        dict(
+            title="Slot Cap",
+            value=_format_rupees(slot_cap) if slot_cap > 0 else "—",
+            subtitle=f"{pct_label} per position",
+            icon="pie_chart",
+            color=colors["warning"],
+        ),
+        dict(
+            title="Sizing",
+            value=sizing_value,
+            subtitle="max positions x slot cap",
+            icon="grid_view",
+            color=colors["success"],
+        ),
+    ]
+
+
 async def scans_page() -> None:
     """Render setup-bias scans from strategy_day_state snapshots."""
     snapshot = await aget_scan_snapshot(limit_days=180)
@@ -385,6 +432,8 @@ def _render_live_paper_sessions(
                     str(summary.get("latest_candle_ts") or "—"),
                     colors["info"],
                 )
+
+            kpi_grid(_build_session_risk_cards(session, colors), columns=4)
 
             kpi_grid(
                 [
