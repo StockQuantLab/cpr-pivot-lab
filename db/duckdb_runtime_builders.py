@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, cast
 
 from db.duckdb_table_ops import incremental_delete as _incremental_delete
+from db.duckdb_table_ops import incremental_replace as _incremental_replace
 from db.duckdb_table_ops import skip_if_table_fully_covered as _skip_if_table_fully_covered
 from db.duckdb_table_ops import sql_symbol_list as _sql_symbol_list
 from db.duckdb_table_ops import symbol_scoped_upsert as _symbol_scoped_upsert
@@ -377,14 +378,6 @@ class DuckDBRuntimeBuilderMixin:
         # ── Incremental mode ──────────────────────────────────────────────
         if since_date_iso and not force:
             if table_exists:
-                _incremental_delete(
-                    self.con,
-                    table="market_day_state",
-                    since_date=since_date_iso,
-                    until_date=until_date_iso,
-                    symbols=target_symbols,
-                    log_prefix="state",
-                )
                 select_sql = self._market_day_state_select_sql(
                     symbols=target_symbols,
                     cpr_max_width_pct=cpr_max_width_pct,
@@ -392,7 +385,15 @@ class DuckDBRuntimeBuilderMixin:
                     until_date=until_date_iso,
                     virgin_exists=virgin_exists,
                 )
-                self.con.execute(f"INSERT INTO market_day_state {select_sql}")
+                _incremental_replace(
+                    self.con,
+                    table="market_day_state",
+                    select_sql=select_sql,
+                    since_date=since_date_iso,
+                    until_date=until_date_iso,
+                    symbols=target_symbols,
+                    log_prefix="state",
+                )
                 n = self.con.execute("SELECT COUNT(*) FROM market_day_state").fetchone()[0]
                 print(
                     f"market_day_state refreshed: {n:,} rows (incremental since {since_date_iso}"
@@ -547,18 +548,18 @@ class DuckDBRuntimeBuilderMixin:
         # ── Incremental mode ──────────────────────────────────────────────
         if since_date_iso and not force:
             if table_exists:
-                _incremental_delete(
+                select_sql = self._strategy_day_state_select_sql(
+                    symbols=target_symbols, since_date=since_date_iso, until_date=until_date_iso
+                )
+                _incremental_replace(
                     self.con,
                     table="strategy_day_state",
+                    select_sql=select_sql,
                     since_date=since_date_iso,
                     until_date=until_date_iso,
                     symbols=target_symbols,
                     log_prefix="strategy",
                 )
-                select_sql = self._strategy_day_state_select_sql(
-                    symbols=target_symbols, since_date=since_date_iso, until_date=until_date_iso
-                )
-                self.con.execute(f"INSERT INTO strategy_day_state {select_sql}")
                 n = self.con.execute("SELECT COUNT(*) FROM strategy_day_state").fetchone()[0]
                 print(
                     f"strategy_day_state refreshed: {n:,} rows (incremental since {since_date_iso}"

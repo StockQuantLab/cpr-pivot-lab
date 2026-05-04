@@ -29,12 +29,52 @@ def test_incremental_delete_filters_date_window_and_symbols() -> None:
         log_prefix="test",
     )
 
-    assert deleted == -1
+    assert deleted == 1
     rows = con.execute("SELECT * FROM sample ORDER BY symbol, trade_date").fetchall()
     assert rows == [
         ("AAA", date(2026, 4, 1), 1),
         ("AAA", date(2026, 4, 3), 4),
         ("BBB", date(2026, 4, 2), 3),
+    ]
+
+
+def test_incremental_replace_replaces_existing_unique_keys() -> None:
+    con = duckdb.connect(":memory:")
+    con.execute("CREATE TABLE target(symbol TEXT, trade_date DATE, value INT)")
+    con.execute("CREATE UNIQUE INDEX idx_target_unique ON target(symbol, trade_date)")
+    con.execute(
+        """
+        INSERT INTO target VALUES
+        ('AAA', '2026-05-03', 1),
+        ('AAA', '2026-05-04', 2),
+        ('BBB', '2026-05-04', 3)
+        """
+    )
+    con.execute(
+        """
+        CREATE TABLE source AS
+        SELECT * FROM (VALUES
+          ('AAA', DATE '2026-05-04', 20),
+          ('CCC', DATE '2026-05-04', 40)
+        ) AS t(symbol, trade_date, value)
+        """
+    )
+
+    deleted = ops.incremental_replace(
+        con,
+        table="target",
+        select_sql="SELECT * FROM source",
+        since_date="2026-05-04",
+        until_date="2026-05-04",
+        log_prefix="test",
+    )
+
+    assert deleted == 2
+    rows = con.execute("SELECT * FROM target ORDER BY symbol, trade_date").fetchall()
+    assert rows == [
+        ("AAA", date(2026, 5, 3), 1),
+        ("AAA", date(2026, 5, 4), 20),
+        ("CCC", date(2026, 5, 4), 40),
     ]
 
 

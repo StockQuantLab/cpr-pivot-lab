@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 
 from db.duckdb import close_dashboard_db, get_dashboard_db
 from engine.cli_setup import configure_windows_stdio
+from engine.kite_ingestion import ensure_repo_process_preflight
 
 configure_windows_stdio(line_buffering=True, write_through=True)
 
@@ -216,6 +217,8 @@ def _run_eod_ingestion(
     start_from_stage: str | None = None,
 ) -> None:
     """Run the complete EOD ingestion contract in the only valid order."""
+    if not dry_run:
+        ensure_repo_process_preflight("ingest")
     stages = [
         ("refresh_instruments", _refresh_instruments_cmd()),
         (

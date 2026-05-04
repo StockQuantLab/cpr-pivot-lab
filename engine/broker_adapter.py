@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import time
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from typing import Any, Protocol
@@ -249,6 +250,7 @@ class BrokerExecutionResult:
     payload: dict[str, Any]
     idempotency_key: str
     exchange_order_id: str | None = None
+    latency_ms: float | None = None
 
 
 class BrokerAdapter(Protocol):
@@ -320,6 +322,7 @@ class ZerodhaBrokerAdapter:
                 payload=payload,
                 idempotency_key=idempotency_key,
                 exchange_order_id=f"dryrun-{_short_key(idempotency_key)}",
+                latency_ms=0.0,
             )
 
         if not self._allow_real_orders:
@@ -333,7 +336,9 @@ class ZerodhaBrokerAdapter:
             guard=guard,
             kite_client=self._kite_client,
         )
+        started = time.perf_counter()
         order_id = _call_kite_place_order(self._kite_client, payload)
+        latency_ms = (time.perf_counter() - started) * 1000.0
         return BrokerExecutionResult(
             broker="zerodha",
             mode=self.mode,
@@ -341,6 +346,7 @@ class ZerodhaBrokerAdapter:
             payload=payload,
             idempotency_key=idempotency_key,
             exchange_order_id=str(order_id),
+            latency_ms=round(latency_ms, 3),
         )
 
     async def fetch_order_snapshots(self) -> list[BrokerOrderSnapshot]:
@@ -393,6 +399,7 @@ async def record_real_dry_run_order(
         notes="REAL_DRY_RUN",
         broker_mode=result.mode,
         broker_payload=payload_json,
+        broker_latency_ms=result.latency_ms,
     )
     return {
         "order_id": order_id,
@@ -401,6 +408,7 @@ async def record_real_dry_run_order(
         "status": result.status,
         "idempotency_key": result.idempotency_key,
         "exchange_order_id": result.exchange_order_id,
+        "broker_latency_ms": result.latency_ms,
         "payload": result.payload,
     }
 
@@ -432,6 +440,7 @@ async def record_real_order(
         notes="LIVE",
         broker_mode=result.mode,
         broker_payload=payload_json,
+        broker_latency_ms=result.latency_ms,
     )
     return {
         "order_id": order_id,
@@ -440,6 +449,7 @@ async def record_real_order(
         "status": result.status,
         "idempotency_key": result.idempotency_key,
         "exchange_order_id": result.exchange_order_id,
+        "broker_latency_ms": result.latency_ms,
         "payload": result.payload,
     }
 

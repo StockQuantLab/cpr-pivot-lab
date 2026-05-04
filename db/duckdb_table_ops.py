@@ -27,7 +27,7 @@ def incremental_delete(
     symbols: list[str] | None = None,
     log_prefix: str,
 ) -> int:
-    """Delete rows matching the incremental window and return deleted count."""
+    """Delete rows matching the incremental window and return matched row count."""
     table = validate_table_identifier(table)
     delete_parts = ["trade_date >= ?::DATE"]
     delete_params: list[object] = [since_date]
@@ -36,15 +36,66 @@ def incremental_delete(
         delete_params.append(until_date)
     if symbols:
         delete_parts.append(f"symbol IN ({sql_symbol_list(symbols)})")
-    deleted = con.execute(
-        f"DELETE FROM {table} WHERE " + " AND ".join(delete_parts),
-        delete_params,
-    ).rowcount
+    where_sql = " AND ".join(delete_parts)
+    matched = int(
+        con.execute(
+            f"SELECT COUNT(*) FROM {table} WHERE {where_sql}",
+            delete_params,
+        ).fetchone()[0]
+        or 0
+    )
+    con.execute(f"DELETE FROM {table} WHERE {where_sql}", delete_params)
+    remaining = int(
+        con.execute(
+            f"SELECT COUNT(*) FROM {table} WHERE {where_sql}",
+            delete_params,
+        ).fetchone()[0]
+        or 0
+    )
     print(
-        f"  [{log_prefix}] incremental: deleted {deleted:,} rows"
+        f"  [{log_prefix}] incremental: deleted {matched:,} matched rows"
         f" for trade_date >= {since_date}" + (f" and <= {until_date}" if until_date else "")
     )
-    return deleted
+    if remaining:
+        raise RuntimeError(
+            f"{table} incremental delete left {remaining:,} rows in refresh window "
+            f"for trade_date >= {since_date}" + (f" and <= {until_date}" if until_date else "")
+        )
+    return matched
+
+
+def incremental_replace(
+    con: Any,
+    *,
+    table: str,
+    select_sql: str,
+    since_date: str,
+    until_date: str | None = None,
+    symbols: list[str] | None = None,
+    log_prefix: str,
+) -> int:
+    """Idempotently replace rows in an incremental window using DELETE + INSERT OR REPLACE."""
+    table = validate_table_identifier(table)
+    con.execute("BEGIN TRANSACTION")
+    tx_open = True
+    try:
+        deleted = incremental_delete(
+            con,
+            table=table,
+            since_date=since_date,
+            until_date=until_date,
+            symbols=symbols,
+            log_prefix=log_prefix,
+        )
+        con.execute(f"INSERT OR REPLACE INTO {table} {select_sql}")
+        con.execute("COMMIT")
+        tx_open = False
+        return deleted
+    except Exception as e:
+        if tx_open:
+            con.execute("ROLLBACK")
+        logger.exception("Failed to incrementally replace %s: %s", table, e)
+        raise
 
 
 def symbol_scoped_upsert(

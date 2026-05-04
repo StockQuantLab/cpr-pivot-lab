@@ -40,6 +40,35 @@ DATA_DIR = PROJECT_ROOT / "data"
 PAPER_DUCKDB_FILE = DATA_DIR / "paper.duckdb"
 REPLICA_DIR = DATA_DIR / "paper_replica"
 DEFERRED_SYNC_MARKER = REPLICA_DIR / "deferred_sync_pending.flag"
+_PAPER_ORDER_SELECT_COLUMNS = [
+    "order_id",
+    "session_id",
+    "position_id",
+    "signal_id",
+    "symbol",
+    "side",
+    "order_type",
+    "requested_qty",
+    "request_price",
+    "fill_price",
+    "fill_qty",
+    "status",
+    "requested_at",
+    "filled_at",
+    "exchange_order_id",
+    "idempotency_key",
+    "broker_mode",
+    "broker_payload",
+    "broker_latency_ms",
+    "broker_status_message",
+    "broker_order_timestamp",
+    "broker_exchange_order_id",
+    "broker_exchange_timestamp",
+    "broker_response",
+    "notes",
+    "created_at",
+    "updated_at",
+]
 
 
 def _loads_json(value: Any, default: Any) -> Any:
@@ -84,8 +113,14 @@ def _clear_deferred_sync_marker() -> None:
         logger.debug("Failed to clear paper deferred-sync marker: %s", exc)
 
 
-def _recover_deferred_sync_if_needed() -> None:
+def _recover_deferred_sync_if_needed(*, allow_live_db_open: bool = True) -> None:
     if not DEFERRED_SYNC_MARKER.exists():
+        return
+    if not allow_live_db_open:
+        logger.debug(
+            "Paper deferred-sync recovery skipped for replica-only caller: %s",
+            DEFERRED_SYNC_MARKER,
+        )
         return
     try:
         sync = ReplicaSync(PAPER_DUCKDB_FILE, REPLICA_DIR, min_interval_sec=0.0)
@@ -185,6 +220,12 @@ class PaperOrder:
     idempotency_key: str | None = None
     broker_mode: str | None = None
     broker_payload: str | None = None
+    broker_latency_ms: float | None = None
+    broker_status_message: str | None = None
+    broker_order_timestamp: datetime | None = None
+    broker_exchange_order_id: str | None = None
+    broker_exchange_timestamp: datetime | None = None
+    broker_response: str | None = None
     notes: str | None = None
     created_at: datetime = field(default_factory=_utcnow)
     updated_at: datetime = field(default_factory=_utcnow)
@@ -410,6 +451,12 @@ class PaperDB:
                 idempotency_key VARCHAR(200),
                 broker_mode    VARCHAR(30),
                 broker_payload VARCHAR(4000),
+                broker_latency_ms DOUBLE,
+                broker_status_message VARCHAR(1000),
+                broker_order_timestamp TIMESTAMPTZ,
+                broker_exchange_order_id VARCHAR(80),
+                broker_exchange_timestamp TIMESTAMPTZ,
+                broker_response VARCHAR(8000),
                 notes          VARCHAR(500),
                 created_at     TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
                 updated_at     TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
@@ -423,6 +470,24 @@ class PaperDB:
         )
         self.con.execute(
             "ALTER TABLE paper_orders ADD COLUMN IF NOT EXISTS broker_payload VARCHAR(4000)"
+        )
+        self.con.execute(
+            "ALTER TABLE paper_orders ADD COLUMN IF NOT EXISTS broker_latency_ms DOUBLE"
+        )
+        self.con.execute(
+            "ALTER TABLE paper_orders ADD COLUMN IF NOT EXISTS broker_status_message VARCHAR(1000)"
+        )
+        self.con.execute(
+            "ALTER TABLE paper_orders ADD COLUMN IF NOT EXISTS broker_order_timestamp TIMESTAMPTZ"
+        )
+        self.con.execute(
+            "ALTER TABLE paper_orders ADD COLUMN IF NOT EXISTS broker_exchange_order_id VARCHAR(80)"
+        )
+        self.con.execute(
+            "ALTER TABLE paper_orders ADD COLUMN IF NOT EXISTS broker_exchange_timestamp TIMESTAMPTZ"
+        )
+        self.con.execute(
+            "ALTER TABLE paper_orders ADD COLUMN IF NOT EXISTS broker_response VARCHAR(8000)"
         )
         self.con.execute("CREATE INDEX IF NOT EXISTS idx_po_session ON paper_orders(session_id)")
         self.con.execute(
@@ -1062,6 +1127,12 @@ class PaperDB:
         idempotency_key: str | None = None,
         broker_mode: str | None = None,
         broker_payload: str | None = None,
+        broker_latency_ms: float | None = None,
+        broker_status_message: str | None = None,
+        broker_order_timestamp: datetime | None = None,
+        broker_exchange_order_id: str | None = None,
+        broker_exchange_timestamp: datetime | None = None,
+        broker_response: str | None = None,
         notes: str | None = None,
     ) -> str:
         oid = f"ord-{uuid.uuid4().hex[:8]}"
@@ -1073,9 +1144,11 @@ class PaperDB:
                     order_id, session_id, position_id, signal_id, symbol, side,
                     order_type, requested_qty, request_price, fill_price, fill_qty,
                     status, requested_at, filled_at, exchange_order_id, idempotency_key,
-                    broker_mode, broker_payload, notes,
+                    broker_mode, broker_payload, broker_latency_ms, broker_status_message,
+                    broker_order_timestamp, broker_exchange_order_id,
+                    broker_exchange_timestamp, broker_response, notes,
                     created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     oid,
@@ -1096,6 +1169,12 @@ class PaperDB:
                     idempotency_key,
                     broker_mode,
                     broker_payload,
+                    broker_latency_ms,
+                    broker_status_message,
+                    broker_order_timestamp,
+                    broker_exchange_order_id,
+                    broker_exchange_timestamp,
+                    broker_response,
                     notes,
                     now,
                     now,
@@ -1115,9 +1194,11 @@ class PaperDB:
                 order_id, session_id, position_id, signal_id, symbol, side,
                 order_type, requested_qty, request_price, fill_price, fill_qty,
                 status, requested_at, filled_at, exchange_order_id, idempotency_key,
-                broker_mode, broker_payload, notes,
+                broker_mode, broker_payload, broker_latency_ms, broker_status_message,
+                broker_order_timestamp, broker_exchange_order_id,
+                broker_exchange_timestamp, broker_response, notes,
                 created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 oid,
@@ -1138,6 +1219,12 @@ class PaperDB:
                 idempotency_key,
                 broker_mode,
                 broker_payload,
+                broker_latency_ms,
+                broker_status_message,
+                broker_order_timestamp,
+                broker_exchange_order_id,
+                broker_exchange_timestamp,
+                broker_response,
                 notes,
                 now,
                 now,
@@ -1152,42 +1239,84 @@ class PaperDB:
         if symbol:
             where.append("symbol = ?")
             params.append(symbol)
+        select_cols = self._paper_order_select_sql()
         rows = self.con.execute(
-            "SELECT order_id, session_id, position_id, signal_id, symbol, side, "
-            "order_type, requested_qty, request_price, fill_price, fill_qty, "
-            "status, requested_at, filled_at, exchange_order_id, idempotency_key, "
-            "broker_mode, broker_payload, notes, "
-            "created_at, updated_at "
+            f"SELECT {select_cols} "
             f"FROM paper_orders WHERE {' AND '.join(where)} ORDER BY created_at ASC",
             params,
         ).fetchall()
         return [self._row_to_order(r) for r in rows]
 
+    def get_recent_orders(self, *, limit: int = 100, broker_only: bool = False) -> list[PaperOrder]:
+        where = ["1 = 1"]
+        if broker_only:
+            where.append("COALESCE(broker_mode, '') <> ''")
+        select_cols = self._paper_order_select_sql()
+        rows = self.con.execute(
+            f"SELECT {select_cols} "
+            f"FROM paper_orders WHERE {' AND '.join(where)} ORDER BY created_at DESC LIMIT ?",
+            [max(1, int(limit))],
+        ).fetchall()
+        return [self._row_to_order(r) for r in rows]
+
+    def update_order_from_broker_snapshot(self, broker_order_id: str, snapshot: dict) -> int:
+        broker_id = str(broker_order_id or "").strip()
+        if not broker_id:
+            return 0
+        raw_status = str(snapshot.get("status") or "").strip().upper()
+        local_status = {
+            "COMPLETE": "FILLED",
+            "REJECTED": "REJECTED",
+            "CANCELLED": "CANCELLED",
+        }.get(raw_status, "PENDING")
+        filled_qty = int(float(snapshot.get("filled_quantity") or 0))
+        average_price = float(snapshot.get("average_price") or 0.0)
+        status_message = str(
+            snapshot.get("status_message_raw") or snapshot.get("status_message") or ""
+        )
+        broker_response = json.dumps(snapshot, default=str, sort_keys=True, separators=(",", ":"))
+        filled_at = snapshot.get("exchange_timestamp") if local_status == "FILLED" else None
+        matched = int(
+            self.con.execute(
+                "SELECT COUNT(*) FROM paper_orders WHERE exchange_order_id = ?",
+                [broker_id],
+            ).fetchone()[0]
+        )
+        if matched <= 0:
+            return 0
+        self.con.execute(
+            """
+            UPDATE paper_orders
+            SET status = ?,
+                fill_qty = ?,
+                fill_price = ?,
+                filled_at = COALESCE(?, filled_at),
+                broker_status_message = ?,
+                broker_order_timestamp = COALESCE(?, broker_order_timestamp),
+                broker_exchange_order_id = COALESCE(?, broker_exchange_order_id),
+                broker_exchange_timestamp = COALESCE(?, broker_exchange_timestamp),
+                broker_response = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE exchange_order_id = ?
+            """,
+            [
+                local_status,
+                filled_qty,
+                average_price if average_price > 0 else None,
+                filled_at,
+                status_message or None,
+                snapshot.get("order_timestamp"),
+                snapshot.get("exchange_order_id"),
+                snapshot.get("exchange_timestamp"),
+                broker_response,
+                broker_id,
+            ],
+        )
+        self._after_write()
+        return matched
+
     def _row_to_order(self, row: tuple) -> PaperOrder:
-        cols = [
-            "order_id",
-            "session_id",
-            "position_id",
-            "signal_id",
-            "symbol",
-            "side",
-            "order_type",
-            "requested_qty",
-            "request_price",
-            "fill_price",
-            "fill_qty",
-            "status",
-            "requested_at",
-            "filled_at",
-            "exchange_order_id",
-            "idempotency_key",
-            "broker_mode",
-            "broker_payload",
-            "notes",
-            "created_at",
-            "updated_at",
-        ]
-        d = dict(zip(cols, row, strict=True))
+        d = dict(zip(_PAPER_ORDER_SELECT_COLUMNS, row, strict=True))
         return PaperOrder(
             order_id=d.get("order_id", ""),
             session_id=d.get("session_id", ""),
@@ -1207,10 +1336,27 @@ class PaperDB:
             idempotency_key=d.get("idempotency_key"),
             broker_mode=d.get("broker_mode"),
             broker_payload=d.get("broker_payload"),
+            broker_latency_ms=d.get("broker_latency_ms"),
+            broker_status_message=d.get("broker_status_message"),
+            broker_order_timestamp=d.get("broker_order_timestamp"),
+            broker_exchange_order_id=d.get("broker_exchange_order_id"),
+            broker_exchange_timestamp=d.get("broker_exchange_timestamp"),
+            broker_response=d.get("broker_response"),
             notes=d.get("notes"),
             created_at=d.get("created_at", _utcnow()),
             updated_at=d.get("updated_at", _utcnow()),
         )
+
+    def _paper_order_select_sql(self) -> str:
+        existing = {
+            str(row[1])
+            for row in self.con.execute("PRAGMA table_info('paper_orders')").fetchall()
+            if len(row) > 1
+        }
+        exprs = [
+            col if col in existing else f"NULL AS {col}" for col in _PAPER_ORDER_SELECT_COLUMNS
+        ]
+        return ", ".join(exprs)
 
     # ------------------------------------------------------------------
     # Feed state
@@ -1730,7 +1876,7 @@ def get_dashboard_paper_db() -> PaperDB:
     """
     global _dashboard_paper_db, _dashboard_paper_consumer, _dashboard_paper_atexit
     REPLICA_DIR.mkdir(parents=True, exist_ok=True)
-    _recover_deferred_sync_if_needed()
+    _recover_deferred_sync_if_needed(allow_live_db_open=False)
     if _dashboard_paper_consumer is None:
         _dashboard_paper_consumer = ReplicaConsumer(REPLICA_DIR, PAPER_DUCKDB_FILE.stem)
     replica_path = _dashboard_paper_consumer.get_replica_path()

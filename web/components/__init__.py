@@ -246,6 +246,7 @@ NAV_SECTIONS = [
             {"label": "Scans", "icon": "radar", "path": "/scans"},
             {"label": "Pipeline", "icon": "engineering", "path": "/pipeline"},
             {"label": "Paper Sessions", "icon": "receipt_long", "path": "/paper_ledger"},
+            {"label": "Broker Orders", "icon": "fact_check", "path": "/broker_orders"},
             {"label": "Market Monitor", "icon": "today", "path": "/daily_summary"},
         ],
     },
@@ -1185,24 +1186,16 @@ def safe_timer(delay: float, callback: Callable, once: bool = True) -> ui.timer:
 
     Both sync and async callbacks are supported.
     """
-    if inspect.iscoroutinefunction(callback):
 
-        async def _guarded_async() -> None:
-            try:
-                await callback()
-            except RuntimeError:
-                pass
+    async def _guarded() -> None:
+        try:
+            result = callback()
+            if inspect.iscoroutine(result):
+                await result
+        except RuntimeError:
+            pass
 
-        return ui.timer(delay, _guarded_async, once=once)
-    else:
-
-        def _guarded() -> None:
-            try:
-                callback()
-            except RuntimeError:
-                pass
-
-        return ui.timer(delay, _guarded, once=once)
+    return ui.timer(delay, _guarded, once=once)
 
 
 @contextmanager

@@ -217,6 +217,7 @@ def test_fetch_live_readiness_adds_operator_status_rows(monkeypatch: pytest.Monk
         }
 
     monkeypatch.setattr(data_quality, "build_trade_date_readiness_report", fake_report)
+    monkeypatch.setattr(web_state, "_today_ist_iso", lambda: "2026-05-04")
 
     result = web_state._fetch_live_readiness_sync("2026-05-04")
 
@@ -230,6 +231,20 @@ def test_fetch_live_readiness_adds_operator_status_rows(monkeypatch: pytest.Monk
         "status": "OK",
         "detail": "WARNING",
     }
+
+
+def test_live_readiness_freshness_detail_labels_next_trade_date(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(web_state, "_today_ist_iso", lambda: "2026-05-04")
+
+    detail = web_state._live_readiness_freshness_detail(
+        max_trade_date="2026-05-05",
+        raw_status="OK next-day (2026-05-05)",
+        trade_date="2026-05-05",
+    )
+
+    assert detail == "OK next trade date (2026-05-05)"
 
 
 @pytest.mark.asyncio

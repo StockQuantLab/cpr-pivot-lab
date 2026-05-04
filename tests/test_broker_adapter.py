@@ -645,6 +645,8 @@ async def test_record_real_order_writes_submitted_broker_order(tmp_path) -> None
         assert orders[0].broker_mode == "LIVE"
         assert orders[0].notes == "LIVE"
         assert orders[0].exchange_order_id == "kite-real-2"
+        assert orders[0].broker_latency_ms is not None
+        assert orders[0].broker_latency_ms >= 0
         broker_payload = json.loads(str(orders[0].broker_payload))
         assert broker_payload["tradingsymbol"] == "TCS"
         assert broker_payload["quantity"] == 1

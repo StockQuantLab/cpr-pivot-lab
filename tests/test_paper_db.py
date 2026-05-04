@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import duckdb
 import pytest
 
 from db import paper_db as paper_db_module
@@ -104,6 +105,118 @@ def test_deferred_sync_recovery_forces_snapshot_and_clears_marker(
 
     assert calls == ["force_sync", "close"]
     assert not marker.exists()
+
+
+def test_deferred_sync_recovery_can_skip_live_db_open_for_dashboard(
+    tmp_path: Path, monkeypatch
+) -> None:
+    marker = tmp_path / "replica" / "deferred_sync_pending.flag"
+    marker.parent.mkdir(parents=True)
+    marker.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(paper_db_module, "REPLICA_DIR", marker.parent)
+    monkeypatch.setattr(paper_db_module, "DEFERRED_SYNC_MARKER", marker)
+
+    def fail_paper_db_open(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("dashboard recovery must not open live paper.duckdb")
+
+    monkeypatch.setattr(paper_db_module, "PaperDB", fail_paper_db_open)
+
+    paper_db_module._recover_deferred_sync_if_needed(allow_live_db_open=False)
+
+    assert marker.exists()
+
+
+def test_recent_orders_tolerates_legacy_schema_without_broker_columns(tmp_path: Path) -> None:
+    db_path = tmp_path / "legacy_paper.duckdb"
+    con = duckdb.connect(str(db_path))
+    try:
+        con.execute("""
+            CREATE TABLE paper_orders (
+                order_id VARCHAR,
+                session_id VARCHAR,
+                position_id VARCHAR,
+                signal_id INT,
+                symbol VARCHAR,
+                side VARCHAR,
+                order_type VARCHAR,
+                requested_qty INT,
+                request_price DOUBLE,
+                fill_price DOUBLE,
+                fill_qty INT,
+                status VARCHAR,
+                requested_at TIMESTAMPTZ,
+                filled_at TIMESTAMPTZ,
+                exchange_order_id VARCHAR,
+                idempotency_key VARCHAR,
+                broker_mode VARCHAR,
+                broker_payload VARCHAR,
+                notes VARCHAR,
+                created_at TIMESTAMPTZ,
+                updated_at TIMESTAMPTZ
+            )
+        """)
+        con.execute(
+            """
+            INSERT INTO paper_orders (
+                order_id, session_id, symbol, side, order_type, requested_qty,
+                status, exchange_order_id, broker_mode, broker_payload, created_at, updated_at
+            ) VALUES ('ord-1', 'sess-1', 'ITC', 'BUY', 'LIMIT', 1, 'PENDING',
+                'kite-1', 'LIVE', '{"tradingsymbol":"ITC"}', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            """
+        )
+    finally:
+        con.close()
+
+    db = PaperDB(db_path=db_path, read_only=True)
+    try:
+        orders = db.get_recent_orders(limit=10, broker_only=True)
+        assert len(orders) == 1
+        assert orders[0].symbol == "ITC"
+        assert orders[0].broker_latency_ms is None
+        assert orders[0].broker_response is None
+    finally:
+        db.close()
+
+
+def test_update_order_from_broker_snapshot_persists_final_status(tmp_path: Path) -> None:
+    db = PaperDB(db_path=tmp_path / "paper.duckdb")
+    try:
+        db.append_order_event(
+            session_id="sess-1",
+            symbol="ITC",
+            side="BUY",
+            order_type="LIMIT",
+            requested_qty=1,
+            request_price=313.05,
+            status="PENDING",
+            exchange_order_id="kite-1",
+            broker_mode="LIVE",
+            broker_payload='{"tradingsymbol":"ITC"}',
+        )
+
+        changed = db.update_order_from_broker_snapshot(
+            "kite-1",
+            {
+                "order_id": "kite-1",
+                "exchange_order_id": "exchange-1",
+                "status": "REJECTED",
+                "status_message_raw": "17177 : Invalid PAN Number",
+                "order_timestamp": "2026-05-04 14:11:35",
+                "exchange_timestamp": "2026-05-04 14:11:35",
+                "filled_quantity": 0,
+                "average_price": 0,
+            },
+        )
+
+        order = db.get_session_orders("sess-1")[0]
+        assert changed == 1
+        assert order.status == "REJECTED"
+        assert order.broker_status_message == "17177 : Invalid PAN Number"
+        assert order.broker_exchange_order_id == "exchange-1"
+        assert "Invalid PAN Number" in str(order.broker_response)
+    finally:
+        db.close()
 
 
 def test_cleanup_stale_sessions_cancels_old_planning_rows(tmp_path: Path) -> None:

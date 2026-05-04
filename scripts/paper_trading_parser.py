@@ -36,6 +36,7 @@ def build_paper_trading_parser(
     _cmd_flatten_both = handlers["_cmd_flatten_both"]
     _cmd_reconcile = handlers["_cmd_reconcile"]
     _cmd_broker_reconcile = handlers["_cmd_broker_reconcile"]
+    _cmd_broker_sync_orders = handlers["_cmd_broker_sync_orders"]
     _cmd_pilot_check = handlers["_cmd_pilot_check"]
     _cmd_order = handlers["_cmd_order"]
     _cmd_real_dry_run_order = handlers["_cmd_real_dry_run_order"]
@@ -528,6 +529,23 @@ def build_paper_trading_parser(
         help="Exit non-zero when critical broker reconciliation findings exist",
     )
     broker_reconcile.set_defaults(handler=_cmd_broker_reconcile)
+
+    broker_sync = sub.add_parser(
+        "broker-sync-orders",
+        help="Fetch Kite orderbook and persist final broker status onto local paper_orders rows",
+    )
+    broker_sync.add_argument(
+        "--session-id",
+        default=None,
+        help="Optional paper session filter. Defaults to recent real-order rows across sessions.",
+    )
+    broker_sync.add_argument(
+        "--limit",
+        type=int,
+        default=100,
+        help="Recent local broker-order rows to inspect (default: 100)",
+    )
+    broker_sync.set_defaults(handler=_cmd_broker_sync_orders)
 
     pilot_check = sub.add_parser(
         "pilot-check",

@@ -16,6 +16,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import polars as pl
 
@@ -1405,6 +1406,24 @@ _LIVE_SETUP_TABLES = (
 )
 
 
+def _today_ist_iso() -> str:
+    return datetime.now(ZoneInfo("Asia/Kolkata")).date().isoformat()
+
+
+def _live_readiness_freshness_detail(
+    *, max_trade_date: str, raw_status: str, trade_date: str
+) -> str:
+    """Return operator-facing freshness detail for readiness rows."""
+    if max_trade_date == trade_date and raw_status.startswith("OK next-day"):
+        today = _today_ist_iso()
+        if trade_date > today:
+            return f"OK next trade date ({trade_date})"
+        if trade_date == today:
+            return f"OK current trade date ({trade_date})"
+        return f"OK prepared trade date ({trade_date})"
+    return raw_status
+
+
 def _add_live_readiness_dashboard_rows(report: dict, db: MarketDB, trade_date: str) -> None:
     """Attach dashboard-friendly OK/NOT OK rows to the readiness report."""
     setup_counts = _fetch_exact_setup_table_counts(db, trade_date)
@@ -1427,9 +1446,11 @@ def _add_live_readiness_dashboard_rows(report: dict, db: MarketDB, trade_date: s
     for row in report.get("freshness_rows") or []:
         max_trade_date = str(row.get("max_trade_date") or "missing")
         raw_status = str(row.get("status") or "")
-        detail = raw_status
-        if max_trade_date == trade_date and raw_status.startswith("OK next-day"):
-            detail = f"OK current trade date ({trade_date})"
+        detail = _live_readiness_freshness_detail(
+            max_trade_date=max_trade_date,
+            raw_status=raw_status,
+            trade_date=trade_date,
+        )
         report["freshness_status_rows"].append(
             {
                 "table": str(row.get("table") or ""),
@@ -1590,6 +1611,144 @@ async def aget_paper_session_orders(
             order for order in orders if str(getattr(order, "status", "")).upper() == wanted_status
         ]
     return orders[: max(0, int(limit))]
+
+
+def _safe_json_loads(value: object, default: object) -> object:
+    if value is None:
+        return default
+    if isinstance(value, dict | list):
+        return value
+    try:
+        return json.loads(str(value))
+    except TypeError, json.JSONDecodeError:
+        return default
+
+
+def _format_broker_ts(value: object) -> str:
+    if not value:
+        return ""
+    if isinstance(value, datetime):
+        return value.strftime("%Y-%m-%d %H:%M:%S")
+    return str(value)
+
+
+def _kite_order_status(value: object) -> str:
+    normalized = str(value or "").strip().upper()
+    return "FILLED" if normalized == "COMPLETE" else normalized
+
+
+def _broker_order_row(order: PaperOrder, kite_order: dict | None = None) -> dict[str, object]:
+    broker_payload = _safe_json_loads(getattr(order, "broker_payload", None), {})
+    payload = broker_payload if isinstance(broker_payload, dict) else {}
+    kite_status = _kite_order_status((kite_order or {}).get("status"))
+    status_message = str(
+        (kite_order or {}).get("status_message_raw")
+        or (kite_order or {}).get("status_message")
+        or getattr(order, "broker_status_message", None)
+        or ""
+    )
+    return {
+        "order_id": str(getattr(order, "order_id", "") or ""),
+        "session_id": str(getattr(order, "session_id", "") or ""),
+        "symbol": str(getattr(order, "symbol", "") or ""),
+        "side": str(getattr(order, "side", "") or ""),
+        "product": str((kite_order or {}).get("product") or payload.get("product") or ""),
+        "order_type": str(getattr(order, "order_type", "") or ""),
+        "qty": int(float(getattr(order, "requested_qty", 0) or 0)),
+        "request_price": float(getattr(order, "request_price", 0.0) or 0.0),
+        "local_status": str(getattr(order, "status", "") or ""),
+        "kite_status": kite_status or "NOT_FETCHED",
+        "avg_price": float((kite_order or {}).get("average_price") or 0.0),
+        "filled_qty": int(float((kite_order or {}).get("filled_quantity") or 0)),
+        "local_requested_at": _format_broker_ts(getattr(order, "requested_at", None)),
+        "kite_order_timestamp": str((kite_order or {}).get("order_timestamp") or ""),
+        "exchange_timestamp": str((kite_order or {}).get("exchange_timestamp") or ""),
+        "broker_order_id": str(getattr(order, "exchange_order_id", "") or ""),
+        "exchange_order_id": str(
+            (kite_order or {}).get("exchange_order_id")
+            or getattr(order, "broker_exchange_order_id", None)
+            or ""
+        ),
+        "latency_ms": (
+            round(float(getattr(order, "broker_latency_ms", 0.0) or 0.0), 1)
+            if getattr(order, "broker_latency_ms", None) is not None
+            else None
+        ),
+        "status_message": status_message,
+        "source": "LOCAL+KITE" if kite_order else "LOCAL",
+    }
+
+
+def _kite_only_order_row(order: dict) -> dict[str, object]:
+    return {
+        "order_id": "",
+        "session_id": "",
+        "symbol": str(order.get("tradingsymbol") or ""),
+        "side": str(order.get("transaction_type") or ""),
+        "product": str(order.get("product") or ""),
+        "order_type": str(order.get("order_type") or ""),
+        "qty": int(float(order.get("quantity") or 0)),
+        "request_price": float(order.get("price") or 0.0),
+        "local_status": "",
+        "kite_status": _kite_order_status(order.get("status")),
+        "avg_price": float(order.get("average_price") or 0.0),
+        "filled_qty": int(float(order.get("filled_quantity") or 0)),
+        "local_requested_at": "",
+        "kite_order_timestamp": str(order.get("order_timestamp") or ""),
+        "exchange_timestamp": str(order.get("exchange_timestamp") or ""),
+        "broker_order_id": str(order.get("order_id") or ""),
+        "exchange_order_id": str(order.get("exchange_order_id") or ""),
+        "latency_ms": None,
+        "status_message": str(order.get("status_message_raw") or order.get("status_message") or ""),
+        "source": "KITE",
+    }
+
+
+def _fetch_broker_order_audit_sync(*, include_kite: bool = False, limit: int = 100) -> dict:
+    local_orders = get_dashboard_paper_db().get_recent_orders(limit=limit, broker_only=True)
+    kite_orders: list[dict] = []
+    kite_latency_ms: float | None = None
+    kite_error: str | None = None
+    if include_kite:
+        started = time.perf_counter()
+        try:
+            from engine.kite_ingestion import get_kite_client
+
+            kite_orders = [dict(row) for row in get_kite_client().orders() or []]
+            kite_latency_ms = round((time.perf_counter() - started) * 1000.0, 1)
+        except Exception as exc:
+            kite_error = str(exc)
+            kite_latency_ms = round((time.perf_counter() - started) * 1000.0, 1)
+
+    kite_by_order_id = {str(row.get("order_id") or ""): row for row in kite_orders}
+    matched_kite_ids: set[str] = set()
+    rows: list[dict[str, object]] = []
+    for order in local_orders:
+        kite_id = str(getattr(order, "exchange_order_id", "") or "")
+        kite_row = kite_by_order_id.get(kite_id)
+        if kite_row:
+            matched_kite_ids.add(kite_id)
+        rows.append(_broker_order_row(order, kite_row))
+    for kite_row in kite_orders:
+        kite_id = str(kite_row.get("order_id") or "")
+        if kite_id and kite_id not in matched_kite_ids:
+            rows.append(_kite_only_order_row(kite_row))
+
+    return {
+        "rows": rows,
+        "local_count": len(local_orders),
+        "kite_count": len(kite_orders),
+        "kite_latency_ms": kite_latency_ms,
+        "kite_error": kite_error,
+        "fetched_kite": include_kite,
+    }
+
+
+async def aget_broker_order_audit(*, include_kite: bool = False, limit: int = 100) -> dict:
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        _executor, lambda: _fetch_broker_order_audit_sync(include_kite=include_kite, limit=limit)
+    )
 
 
 async def aget_paper_session_feed_state(session_id: str) -> object | None:

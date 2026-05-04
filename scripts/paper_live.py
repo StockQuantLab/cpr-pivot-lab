@@ -1789,7 +1789,11 @@ async def run_live_session(
             )
     if stop_is_terminal:
         force_paper_db_sync(get_paper_db())
-        if alerts_enabled and final_status == "COMPLETED":
+        if alerts_enabled and final_status in {
+            "COMPLETED",
+            "NO_TRADES_ENTRY_WINDOW_CLOSED",
+            "NO_ACTIVE_SYMBOLS",
+        }:
             dispatch_session_completed_alert(session_id=session_id)
 
     final_session = await _load_session(session_id, deps)

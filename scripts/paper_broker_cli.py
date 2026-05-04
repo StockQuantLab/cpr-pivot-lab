@@ -57,6 +57,52 @@ async def _cmd_broker_reconcile(args: argparse.Namespace) -> None:
         raise SystemExit(1)
 
 
+async def _cmd_broker_sync_orders(args: argparse.Namespace) -> None:
+    db = _pdb()
+    kite = _get_kite_client()
+    orders = [dict(row) for row in kite.orders() or []]
+    kite_by_id = {str(row.get("order_id") or ""): row for row in orders}
+    local_orders = db.get_recent_orders(limit=int(args.limit), broker_only=True)
+    updated: list[dict[str, Any]] = []
+    missing: list[str] = []
+    for order in local_orders:
+        if args.session_id and str(order.session_id) != str(args.session_id):
+            continue
+        broker_order_id = str(order.exchange_order_id or "")
+        if not broker_order_id or broker_order_id.startswith("dryrun-"):
+            continue
+        snapshot = kite_by_id.get(broker_order_id)
+        if not snapshot:
+            missing.append(broker_order_id)
+            continue
+        changed = db.update_order_from_broker_snapshot(broker_order_id, snapshot)
+        if changed:
+            updated.append(
+                {
+                    "local_order_id": order.order_id,
+                    "kite_order_id": broker_order_id,
+                    "symbol": order.symbol,
+                    "status": snapshot.get("status"),
+                    "filled_quantity": snapshot.get("filled_quantity"),
+                    "average_price": snapshot.get("average_price"),
+                    "status_message": snapshot.get("status_message_raw")
+                    or snapshot.get("status_message"),
+                }
+            )
+    print(
+        json.dumps(
+            {
+                "kite_orders": len(orders),
+                "local_checked": len(local_orders),
+                "updated": updated,
+                "missing_kite_order_ids": missing,
+            },
+            default=str,
+            indent=2,
+        )
+    )
+
+
 async def _cmd_pilot_check(args: argparse.Namespace) -> None:
     symbols = [s.strip().upper() for s in str(args.symbols or "").split(",") if s.strip()]
     payload = PilotGuardrails().validate(

@@ -342,6 +342,14 @@ class PaperOrder:
     requested_at: datetime
     filled_at: datetime | None
     exchange_order_id: str | None
+    broker_mode: str | None
+    broker_payload: str | None
+    broker_latency_ms: float | None
+    broker_status_message: str | None
+    broker_order_timestamp: datetime | None
+    broker_exchange_order_id: str | None
+    broker_exchange_timestamp: datetime | None
+    broker_response: str | None
     notes: str | None
     created_at: datetime
     updated_at: datetime
@@ -742,6 +750,14 @@ def _paper_order_from_row(row: Mapping[str, Any]) -> PaperOrder:
         requested_at=values["requested_at"],
         filled_at=values.get("filled_at"),
         exchange_order_id=values.get("exchange_order_id"),
+        broker_mode=values.get("broker_mode"),
+        broker_payload=values.get("broker_payload"),
+        broker_latency_ms=values.get("broker_latency_ms"),
+        broker_status_message=values.get("broker_status_message"),
+        broker_order_timestamp=values.get("broker_order_timestamp"),
+        broker_exchange_order_id=values.get("broker_exchange_order_id"),
+        broker_exchange_timestamp=values.get("broker_exchange_timestamp"),
+        broker_response=values.get("broker_response"),
         notes=values.get("notes"),
         created_at=values["created_at"],
         updated_at=values["updated_at"],
@@ -895,6 +911,14 @@ def _paper_order_to_postgres(order: Any) -> PaperOrder:
         requested_at=getattr(order, "requested_at", _utcnow()),
         filled_at=getattr(order, "filled_at", None),
         exchange_order_id=getattr(order, "exchange_order_id", None),
+        broker_mode=getattr(order, "broker_mode", None),
+        broker_payload=getattr(order, "broker_payload", None),
+        broker_latency_ms=getattr(order, "broker_latency_ms", None),
+        broker_status_message=getattr(order, "broker_status_message", None),
+        broker_order_timestamp=getattr(order, "broker_order_timestamp", None),
+        broker_exchange_order_id=getattr(order, "broker_exchange_order_id", None),
+        broker_exchange_timestamp=getattr(order, "broker_exchange_timestamp", None),
+        broker_response=getattr(order, "broker_response", None),
         notes=getattr(order, "notes", None),
         created_at=getattr(order, "created_at", _utcnow()),
         updated_at=getattr(order, "updated_at", _utcnow()),

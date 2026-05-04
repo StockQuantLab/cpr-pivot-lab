@@ -39,6 +39,7 @@ from scripts import data_quality as _data_quality
 from scripts.paper_archive import archive_completed_session
 from scripts.paper_broker_cli import (
     _cmd_broker_reconcile,
+    _cmd_broker_sync_orders,
     _cmd_close_position,
     _cmd_order,
     _cmd_pilot_check,
@@ -121,6 +122,7 @@ __all__ = [
 
 _BROKER_HANDLER_EXPORTS = (
     _cmd_broker_reconcile,
+    _cmd_broker_sync_orders,
     _cmd_close_position,
     _cmd_order,
     _cmd_pilot_check,

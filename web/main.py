@@ -10,6 +10,7 @@ import sys
 import nicegui.run as nicegui_run
 from nicegui import app, ui
 
+from web.pages.broker_orders import broker_orders_page
 from web.pages.compare import compare_page
 from web.pages.data_quality import data_quality_page
 from web.pages.home import home_page
@@ -108,6 +109,11 @@ async def _pipeline() -> None:
 @ui.page("/paper_ledger")
 async def _paper_ledger() -> None:
     await paper_ledger_page()
+
+
+@ui.page("/broker_orders")
+async def _broker_orders() -> None:
+    await broker_orders_page()
 
 
 @ui.page("/daily_summary")

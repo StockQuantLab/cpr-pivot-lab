@@ -7,6 +7,7 @@ import time
 from typing import Any
 
 from db.duckdb_table_ops import incremental_delete as _incremental_delete
+from db.duckdb_table_ops import incremental_replace as _incremental_replace
 from db.duckdb_table_ops import skip_if_table_fully_covered as _skip_if_table_fully_covered
 from db.duckdb_table_ops import sql_symbol_list as _sql_symbol_list
 from db.duckdb_validation import date_window_clause as _date_window_clause
@@ -257,20 +258,14 @@ class DuckDBIndicatorBuilderMixin:
         # ── Incremental mode ──────────────────────────────────────────────
         if since_date_iso and not force:
             if table_exists:
-                self.con.execute("BEGIN TRANSACTION")
-                try:
-                    _incremental_delete(
-                        self.con,
-                        table="cpr_daily",
-                        since_date=since_date_iso,
-                        until_date=until_date_iso,
-                        log_prefix="cpr",
-                    )
-                    self.con.execute(f"INSERT INTO cpr_daily {insert_sql}")
-                    self.con.execute("COMMIT")
-                except Exception:
-                    self.con.execute("ROLLBACK")
-                    raise
+                _incremental_replace(
+                    self.con,
+                    table="cpr_daily",
+                    select_sql=insert_sql,
+                    since_date=since_date_iso,
+                    until_date=until_date_iso,
+                    log_prefix="cpr",
+                )
                 n = self.con.execute("SELECT COUNT(*) FROM cpr_daily").fetchone()[0]
                 window_label = since_date_iso
                 if until_date_iso and until_date_iso != since_date_iso:
@@ -607,19 +602,10 @@ class DuckDBIndicatorBuilderMixin:
         if since_date_iso and not force:
             table_exists = self._table_exists("cpr_thresholds")
             if table_exists:
-                _incremental_delete(
-                    self.con,
-                    table="cpr_thresholds",
-                    since_date=since_date_iso,
-                    until_date=until_date_iso,
-                    symbols=target_symbols or None,
-                    log_prefix="thresholds",
-                )
                 # Recompute over full cpr_daily (rolling window needs history)
                 # but only INSERT rows >= since_date
                 pct = percentile / 100.0
-                self.con.execute(f"""
-                    INSERT INTO cpr_thresholds
+                threshold_refresh_sql = f"""
                     SELECT symbol, trade_date, cpr_threshold_pct
                     FROM (
                         SELECT
@@ -637,7 +623,16 @@ class DuckDBIndicatorBuilderMixin:
                     ) sub
                     WHERE 1=1
                     {window_filter_sql}
-                """)
+                """
+                _incremental_replace(
+                    self.con,
+                    table="cpr_thresholds",
+                    select_sql=threshold_refresh_sql,
+                    since_date=since_date_iso,
+                    until_date=until_date_iso,
+                    symbols=target_symbols or None,
+                    log_prefix="thresholds",
+                )
                 n = self.con.execute("SELECT COUNT(*) FROM cpr_thresholds").fetchone()[0]
                 print(
                     f"cpr_thresholds refreshed: {n:,} rows"

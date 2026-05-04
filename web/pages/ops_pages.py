@@ -579,6 +579,12 @@ def _render_live_paper_sessions(
                     "requested_at": _format_session_ts(getattr(order, "requested_at", None)),
                     "broker_mode": str(getattr(order, "broker_mode", "") or "PAPER"),
                     "exchange_order_id": str(getattr(order, "exchange_order_id", "") or ""),
+                    "broker_status_message": str(getattr(order, "broker_status_message", "") or ""),
+                    "broker_latency_ms": (
+                        round(float(getattr(order, "broker_latency_ms", 0.0) or 0.0), 1)
+                        if getattr(order, "broker_latency_ms", None) is not None
+                        else None
+                    ),
                 }
                 for order in orders
             ]
@@ -631,9 +637,21 @@ def _render_live_paper_sessions(
                         },
                         {
                             "name": "exchange_order_id",
-                            "label": "Exchange ID",
+                            "label": "Broker Order ID",
                             "field": "exchange_order_id",
                             "align": "left",
+                        },
+                        {
+                            "name": "broker_status_message",
+                            "label": "Broker Message",
+                            "field": "broker_status_message",
+                            "align": "left",
+                        },
+                        {
+                            "name": "broker_latency_ms",
+                            "label": "API ms",
+                            "field": "broker_latency_ms",
+                            "align": "right",
                         },
                     ],
                     rows=order_rows,

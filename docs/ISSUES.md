@@ -7,6 +7,218 @@ Supersedes: `docs/PARITY_INCIDENT_LOG.md` (contents migrated below).
 
 ---
 
+## 2026-05-04 — OPEN: PERF: Live readiness check takes 20-30 seconds
+
+**Status:** OPEN
+**Severity:** Medium
+
+### Symptom
+
+Paper Sessions Live Readiness can take roughly 20-30 seconds to render after EOD.
+
+### Root Cause
+
+Likely dashboard/readiness query cost. The readiness path calls
+`build_trade_date_readiness_report()` from `web/state.py`, which checks dated universe coverage and
+live prerequisites across ~2,000 symbols. The slowest likely path is setup-only coverage queries
+against `v_daily`/`v_5min` parquet views and exact setup-table checks on every refresh.
+
+### Fix
+
+Pending.
+
+Candidate fix direction:
+
+- add timed instrumentation per readiness subquery
+- cache readiness results briefly by trade date in the dashboard
+- avoid scanning `v_5min` parquet for future/setup-only readiness when `intraday_day_pack` and
+  next-day setup tables already prove readiness
+- use explicit refresh/count actions for expensive detail rows in the dashboard
+
+### Related
+
+Paper Sessions Live Readiness tab, `web/state.py`, `scripts/data_quality.py`
+
+---
+
+## 2026-05-04 — FIXED: UI: readiness freshness mislabeled next trade date as current trade date
+
+**Status:** FIXED
+**Severity:** Low
+
+### Symptom
+
+After EOD on 2026-05-04, the Paper Sessions readiness tab showed
+`OK current trade date (2026-05-05)` even though the wall-clock IST date was still 2026-05-04.
+The operator expected `2026-05-05` to be labelled as the next trade date until the calendar rolled
+to 2026-05-05.
+
+### Root Cause
+
+`web/state.py` converted raw `OK next-day (...)` readiness statuses into
+`OK current trade date (...)` whenever `max_trade_date == readiness_trade_date`. That compared only
+the target readiness date to the table max date and ignored the current IST calendar date.
+
+### Fix
+
+`web/state.py` now labels readiness freshness relative to current IST date:
+
+- target date greater than today: `OK next trade date (...)`
+- target date equal to today: `OK current trade date (...)`
+- target date before today: `OK prepared trade date (...)`
+
+Added a focused test in `tests/test_web_state.py`.
+
+### Related
+
+Paper Sessions Live Readiness tab, 2026-05-04 EOD readiness for 2026-05-05.
+
+---
+
+## 2026-05-04 — FIXED: DATA: EOD build_runtime duplicate key after next-day setup prepopulation
+
+**Status:** FIXED
+**Severity:** High
+
+### Symptom
+
+EOD ingestion failed during `build_runtime` with:
+
+```text
+Duplicate key "symbol: ADANIPORTS, trade_date: 2026-05-04" violates unique constraint
+```
+
+The affected overlap was observed in next-day/setup tables for `2026-05-04`, including
+`cpr_daily`, `cpr_thresholds`, `market_day_state`, and `strategy_day_state`.
+
+### Root Cause
+
+The EOD flow can write overlapping dates through two paths:
+
+- prior EOD next-day setup stages pre-populate setup rows for the next trading date
+- current EOD `build_runtime --refresh-since <today>` rebuilds the same trade date from freshly ingested data
+
+The runtime/indicator incremental builders are expected to delete the refresh window before inserting
+new rows, but the duplicate key shows at least one overlapping row survived into the insert path.
+
+Important: DuckDB Python `rowcount` may report `-1` for DML when affected-row count is unknown, so
+`deleted -1 rows` is not by itself proof that the delete did nothing. The bug is the non-idempotent
+overlap handling that allowed duplicate `(symbol, trade_date)` rows to reach the unique index.
+
+### Fix
+
+`db/duckdb_table_ops.py` now uses explicit pre/post count checks in `incremental_delete()` instead
+of treating DuckDB `rowcount` as correctness evidence. It also adds `incremental_replace()`, which
+wraps refresh-window delete plus `INSERT OR REPLACE` in a transaction.
+
+The incremental builders for the overlapping setup tables now use this idempotent replace path:
+
+- `db/duckdb_indicator_builders.py`: `cpr_daily`, `cpr_thresholds`
+- `db/duckdb_runtime_builders.py`: `market_day_state`, `strategy_day_state`
+
+This means rows prebuilt as next-day setup are deleted/replaced when that same date later becomes
+the completed EOD ingest date.
+
+Added regression coverage in `tests/test_duckdb_table_ops.py` for replacing existing unique
+`(symbol, trade_date)` keys.
+
+Immediate recovery was manual: delete overlapping `2026-05-04` rows from the affected tables, release
+the writer lock, and resume EOD from `build_runtime`.
+
+### Related
+
+2026-05-04 EOD ingestion, `scripts/refresh.py`, `db/duckdb_runtime_builders.py`,
+`db/duckdb_indicator_builders.py`, `db/duckdb_table_ops.py`
+
+---
+
+## 2026-05-04 — FIXED: INFRA: dashboard replica path attempted live paper DB recovery
+
+**Status:** FIXED
+**Severity:** Medium
+
+### Symptom
+
+Restarting the dashboard during an active paper live session repeatedly printed
+`[STARTUP BLOCKED] paper.duckdb is locked by PID 6024` and suggested `taskkill`, even though
+the dashboard itself continued working from the paper replica.
+
+### Root Cause
+
+`get_dashboard_paper_db()` correctly opens the read-only paper replica, but first called
+`_recover_deferred_sync_if_needed()`. When a deferred-sync marker existed, that helper tried to
+open the live `data/paper.duckdb` writer file to force a snapshot. During live trading this file
+is intentionally owned by the `daily-live` process, so the dashboard read path triggered the
+writer-lock diagnostic banner.
+
+### Fix
+
+`db/paper_db.py` now lets replica-only callers skip deferred-sync recovery that would open the
+live DB. `get_dashboard_paper_db()` passes `allow_live_db_open=False`, so dashboard startup reads
+only the latest replica and does not print misleading kill guidance for the live paper process.
+
+### Related
+
+Observed during `CPR_LEVELS_LONG/SHORT-2026-05-04-live-kite` while PID 6024 held the live writer.
+
+---
+
+## 2026-05-04 — FIXED: ALERTS: SESSION_COMPLETED not sent on natural exit (NO_TRADES_ENTRY_WINDOW_CLOSED)
+
+**Status:** FIXED
+**Severity:** Low
+
+### Symptom
+
+SHORT session on 2026-05-04 completed via `NO_TRADES_ENTRY_WINDOW_CLOSED` (entry window closed, no open positions). User received `FLATTEN_EOD` alert but NOT `SESSION_COMPLETED`. LONG session completed via admin `close_all` and received both correctly.
+
+### Root Cause
+
+`scripts/paper_live.py:1792` — the `SESSION_COMPLETED` alert guard checked `final_status == "COMPLETED"` only. Natural exit paths (`NO_TRADES_ENTRY_WINDOW_CLOSED`, `NO_ACTIVE_SYMBOLS`) set a different `final_status` string but are correctly included in `stop_is_terminal`. The alert gate was too narrow.
+
+### Fix
+
+Broadened the alert condition to include all clean terminal statuses:
+```python
+if alerts_enabled and final_status in {
+    "COMPLETED", "NO_TRADES_ENTRY_WINDOW_CLOSED", "NO_ACTIVE_SYMBOLS"
+}:
+    dispatch_session_completed_alert(session_id=session_id)
+```
+
+### Location
+
+`scripts/paper_live.py:1792`
+
+---
+
+## 2026-05-04 — OBSERVED: LATENCY: ~26s delay from bar close to Telegram alert in --multi live session
+
+**Status:** Open (known architectural constraint)
+**Severity:** Medium (paper mode unaffected; real-order execution would enter ~5 min into next candle)
+
+### Symptom
+
+On 2026-05-04 09:20 bar: LIVE_BAR logged at 09:20:00, first SHORT trade logged at 09:20:24, first Telegram alert delivered at 09:20:26. Full alert batch (10 trades) completed by 09:20:37. Total latency: 26–37 seconds from bar close to user notification.
+
+### Root Cause
+
+`--multi` runs both sessions (LONG + SHORT) in a single process, symbol-major (not bar-major). SHORT session scans all 812 symbols sequentially before LONG session starts. With 824 symbols each doing per-symbol setup/direction resolution fetches, processing takes ~12s per session. Sessions run back-to-back, so total delay is ~24s before any trade can open.
+
+### Impact
+
+Paper mode: no correctness impact — fill price uses `max(trigger, candle_open)` based on candle data, not wall-clock time. Real-order mode: would submit orders ~26s into the next 5-min candle, risking materially worse fills.
+
+### Fix Direction
+
+Refactor bar processing to be bar-major across sessions: process all sessions for bar N together before moving to next symbol, or run sessions in separate processes with a shared tick bus. See CLAUDE.md note: "replay remains symbol-major today, so trade logs may lag the candle heartbeat unless we refactor the loop to be bar-major."
+
+### Location
+
+`engine/paper_session_driver.py` — bar evaluation loop, `scripts/paper_trading.py` — `_cmd_daily_live_multi()` variant dispatch
+
+---
+
 ## 2026-05-04 — FIXED: BUG: Kite token CLI accepted failed login responses as token input
 
 **Status:** FIXED
