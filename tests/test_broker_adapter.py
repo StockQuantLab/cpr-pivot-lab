@@ -286,6 +286,25 @@ async def test_protected_flatten_intent_builds_bounded_limit_order() -> None:
     assert result.payload["price"] == 98.0
 
 
+@pytest.mark.asyncio
+async def test_protected_sell_flatten_rounds_inside_slippage_floor() -> None:
+    intent = build_protected_flatten_intent(
+        session_id="paper-live-1",
+        symbol="reliance",
+        side="SELL",
+        quantity=2,
+        latest_price=504.4166,
+        quote_age_sec=1.0,
+        max_slippage_pct=2.0,
+        tick_size=0.05,
+    )
+    adapter = ZerodhaBrokerAdapter(mode="REAL_DRY_RUN", governor=_NoSleepGovernor())
+
+    result = await adapter.place_order(intent)
+
+    assert result.payload["price"] == 494.35
+
+
 def test_protected_buy_flatten_intent_builds_limit_cap() -> None:
     intent = build_protected_flatten_intent(
         session_id="paper-live-1",
@@ -303,6 +322,25 @@ def test_protected_buy_flatten_intent_builds_limit_cap() -> None:
     assert payload["transaction_type"] == "BUY"
     assert payload["order_type"] == "LIMIT"
     assert payload["price"] == 102.0
+
+
+@pytest.mark.asyncio
+async def test_protected_buy_flatten_rounds_inside_slippage_cap() -> None:
+    intent = build_protected_flatten_intent(
+        session_id="paper-live-1",
+        symbol="reliance",
+        side="BUY",
+        quantity=2,
+        latest_price=1759.55,
+        quote_age_sec=1.0,
+        max_slippage_pct=2.0,
+        tick_size=0.05,
+    )
+    adapter = ZerodhaBrokerAdapter(mode="REAL_DRY_RUN", governor=_NoSleepGovernor())
+
+    result = await adapter.place_order(intent)
+
+    assert result.payload["price"] == 1794.7
 
 
 def test_protected_flatten_intent_rejects_invalid_side() -> None:

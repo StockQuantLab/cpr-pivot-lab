@@ -11,6 +11,7 @@ from typing import Any
 
 from engine.bar_orchestrator import (
     SessionPositionTracker,
+    candidate_quality_score,
     check_bar_risk_controls,
     select_entries_for_bar,
     should_process_symbol,
@@ -58,6 +59,54 @@ async def _maybe_await(value: Any) -> Any:
     if inspect.isawaitable(value):
         return await value
     return value
+
+
+def _signal_audit_base(
+    *,
+    session_id: str,
+    trade_date: str,
+    feed_source: str,
+    transport: str,
+    bar_end: datetime,
+    bar_time: str,
+    strategy: str,
+    direction_filter: str,
+    active_symbols_count: int,
+    bar_symbols_count: int,
+    open_count_before: int,
+    slots_available_before: int,
+    cash_available: float,
+) -> dict[str, Any]:
+    return {
+        "session_id": session_id,
+        "trade_date": trade_date,
+        "feed_source": feed_source,
+        "transport": transport,
+        "bar_end": bar_end,
+        "bar_time": bar_time,
+        "strategy": str(strategy or ""),
+        "direction_filter": str(direction_filter or "BOTH"),
+        "active_symbols_count": int(active_symbols_count),
+        "bar_symbols_count": int(bar_symbols_count),
+        "open_count_before": int(open_count_before),
+        "slots_available_before": int(slots_available_before),
+        "cash_available": float(cash_available or 0.0),
+    }
+
+
+def _candidate_fields(evaluation: dict[str, Any]) -> dict[str, Any]:
+    candidate = dict(evaluation.get("candidate") or {})
+    setup_row = dict(evaluation.get("setup_row") or {})
+    return {
+        "entry_price": candidate.get("entry_price"),
+        "sl_price": candidate.get("sl_price"),
+        "target_price": candidate.get("target_price"),
+        "rr_ratio": candidate.get("rr_ratio"),
+        "or_atr_ratio": candidate.get("or_atr_ratio"),
+        "position_size": candidate.get("position_size"),
+        "candidate_payload": candidate,
+        "setup_payload": setup_row,
+    }
 
 
 def apply_stage_b_direction_filter(
@@ -128,6 +177,7 @@ async def process_closed_bar_group(
     build_feed_state: Callable[..., Any] = build_summary_feed_state,
     update_symbols_cb: Callable[[list[str]], Any] | None = None,
     real_order_router: RealOrderRouter | None = None,
+    signal_audit_writer: Callable[..., Any] | None = None,
 ) -> dict[str, Any]:
     if not bar_candles:
         return {
@@ -140,15 +190,32 @@ async def process_closed_bar_group(
         }
 
     bar_candles_sorted = sorted(bar_candles, key=lambda c: c.symbol)
+    trade_date = bar_candles_sorted[0].bar_end.date().isoformat()
     bar_time = bar_candles_sorted[0].bar_end.astimezone(IST).strftime("%H:%M")
     entry_window_end = str(params.entry_window_end)
     normalized_strategy = str(strategy or "").upper()
+    audit_base = _signal_audit_base(
+        session_id=session_id,
+        trade_date=trade_date,
+        feed_source=feed_source,
+        transport=transport,
+        bar_end=bar_candles_sorted[0].bar_end,
+        bar_time=bar_time,
+        strategy=strategy,
+        direction_filter=direction_filter,
+        active_symbols_count=len(active_symbols),
+        bar_symbols_count=len(bar_candles_sorted),
+        open_count_before=tracker.open_count,
+        slots_available_before=tracker.slots_available(),
+        cash_available=tracker.cash_available,
+    )
+    signal_audit_rows: list[dict[str, Any]] = []
 
     if feed_audit_writer is not None:
         await _maybe_await(
             feed_audit_writer(
                 session_id=session_id,
-                trade_date=bar_candles_sorted[0].bar_end.date().isoformat(),
+                trade_date=trade_date,
                 feed_source=feed_source,
                 transport=transport,
                 bar_candles=bar_candles_sorted,
@@ -217,6 +284,16 @@ async def process_closed_bar_group(
     entry_candidates: list[dict[str, Any]] = []
     for _i, candle in enumerate(bar_candles_sorted):
         if tracker.has_open_position(candle.symbol):
+            signal_audit_rows.append(
+                {
+                    **audit_base,
+                    "symbol": candle.symbol,
+                    "stage": "ENTRY_SKIP",
+                    "action": "SKIP",
+                    "reason": "open_position",
+                    "setup_status": runtime_setup_status(runtime_state, candle.symbol),
+                }
+            )
             continue
         setup_status = runtime_setup_status(runtime_state, candle.symbol)
         if not should_process_symbol(
@@ -226,6 +303,16 @@ async def process_closed_bar_group(
             symbol=candle.symbol,
             setup_status=setup_status,
         ):
+            signal_audit_rows.append(
+                {
+                    **audit_base,
+                    "symbol": candle.symbol,
+                    "stage": "ENTRY_SKIP",
+                    "action": "SKIP",
+                    "reason": "should_process_false",
+                    "setup_status": setup_status,
+                }
+            )
             continue
         evaluation = await evaluate_candle_fn(
             session=session,
@@ -236,6 +323,22 @@ async def process_closed_bar_group(
             allow_entry_evaluation=True,
             real_order_router=real_order_router,
         )
+        audit_row = {
+            **audit_base,
+            "symbol": candle.symbol,
+            "stage": (
+                "ENTRY_CANDIDATE"
+                if evaluation.get("action") == "ENTRY_CANDIDATE"
+                else "ENTRY_EVALUATED"
+            ),
+            "action": str(evaluation.get("action") or ""),
+            "reason": evaluation.get("reason"),
+            "setup_status": evaluation.get("setup_status") or setup_status,
+            **_candidate_fields(evaluation),
+        }
+        if evaluation.get("action") == "ENTRY_CANDIDATE":
+            audit_row["quality_score"] = candidate_quality_score(evaluation)
+        signal_audit_rows.append(audit_row)
         if evaluation.get("action") == "ENTRY_CANDIDATE":
             entry_candidates.append(evaluation)
         if _i % 64 == 63:
@@ -243,24 +346,79 @@ async def process_closed_bar_group(
 
     # Step 3: select + execute entries.
     selected_entries = select_entries_for_bar(entry_candidates, tracker)
+    selected_symbols = {
+        str((selected.get("candidate") or {}).get("symbol") or "") for selected in selected_entries
+    }
+    ranked_candidates = sorted(
+        entry_candidates,
+        key=lambda c: (
+            -candidate_quality_score(c),
+            str((c.get("candidate") or {}).get("symbol", "")),
+        ),
+    )
+    for rank, candidate_eval in enumerate(ranked_candidates, start=1):
+        symbol = str((candidate_eval.get("candidate") or {}).get("symbol") or "")
+        signal_audit_rows.append(
+            {
+                **audit_base,
+                "symbol": symbol,
+                "stage": "ENTRY_RANKED",
+                "action": "SELECTED" if symbol in selected_symbols else "NOT_SELECTED",
+                "reason": "selected" if symbol in selected_symbols else "capacity_or_cash",
+                "setup_status": candidate_eval.get("setup_status"),
+                "candidate_rank": rank,
+                "quality_score": candidate_quality_score(candidate_eval),
+                "candidates_count": len(entry_candidates),
+                "selected_count": len(selected_entries),
+                **_candidate_fields(candidate_eval),
+            }
+        )
     for selected in selected_entries:
+        candidate = dict(selected.get("candidate") or {})
+        selected_rank = next(
+            (
+                idx
+                for idx, candidate_eval in enumerate(ranked_candidates, start=1)
+                if str((candidate_eval.get("candidate") or {}).get("symbol") or "")
+                == str(candidate.get("symbol") or "")
+            ),
+            None,
+        )
         execute_result = await execute_entry_fn(
             session=session,
-            candidate=dict(selected.get("candidate") or {}),
+            candidate=candidate,
             setup_row=dict(selected.get("setup_row") or {}),
             params=params,
             now=bar_candles_sorted[0].bar_end,
             position_tracker=tracker,
             real_order_router=real_order_router,
         )
+        signal_audit_rows.append(
+            {
+                **audit_base,
+                "symbol": str(candidate.get("symbol") or ""),
+                "stage": "ENTRY_EXECUTED",
+                "action": str(execute_result.get("action") or ""),
+                "reason": execute_result.get("reason"),
+                "setup_status": selected.get("setup_status"),
+                "selected_rank": selected_rank,
+                "quality_score": candidate_quality_score(selected),
+                "candidates_count": len(entry_candidates),
+                "selected_count": len(selected_entries),
+                "execution_payload": dict(execute_result),
+                **_candidate_fields(selected),
+            }
+        )
         if execute_result.get("action") == "OPEN":
-            candidate = dict(selected.get("candidate") or {})
             logger.info(
                 "[%s] OPEN %s @ %.2f",
                 session_id,
                 str(candidate.get("symbol") or ""),
                 float(candidate.get("entry_price") or 0.0),
             )
+
+    if signal_audit_writer is not None and signal_audit_rows:
+        await _maybe_await(signal_audit_writer(rows=signal_audit_rows))
 
     # Step 4: apply CPR LONG/SHORT direction filter as soon as any setup rows
     # are loaded. Unresolved directions remain pending and are kept alive by

@@ -372,3 +372,107 @@ async def test_process_closed_bar_group_reapplies_stage_b_when_symbols_change() 
     assert result["stage_b_applied"] is True
     assert result["active_symbols"] == ["SBIN"]
     assert updates == [["SBIN"]]
+
+
+@pytest.mark.asyncio
+async def test_process_closed_bar_group_writes_signal_decision_audit() -> None:
+    bar_end = datetime(2026, 5, 5, 9, 20, tzinfo=IST)
+    runtime_state = PaperRuntimeState()
+    runtime_state.symbols["AAA"] = SymbolRuntimeState(
+        trade_date="2026-05-05",
+        candles=[],
+        setup_row={"direction": "LONG", "direction_pending": False, "atr": 2.0},
+    )
+    runtime_state.symbols["BBB"] = SymbolRuntimeState(
+        trade_date="2026-05-05",
+        candles=[],
+        setup_row={"direction": "LONG", "direction_pending": False, "atr": 2.0},
+    )
+    tracker = SessionPositionTracker(
+        max_positions=1, portfolio_value=100_000.0, max_position_pct=1.0
+    )
+    candles = [
+        SimpleNamespace(
+            symbol="AAA",
+            bar_end=bar_end,
+            open=100.0,
+            high=101.0,
+            low=99.0,
+            close=100.0,
+            volume=1000.0,
+        ),
+        SimpleNamespace(
+            symbol="BBB",
+            bar_end=bar_end,
+            open=200.0,
+            high=201.0,
+            low=199.0,
+            close=200.0,
+            volume=1000.0,
+        ),
+    ]
+    audit_rows: list[dict[str, object]] = []
+    executed: list[str] = []
+
+    async def _evaluate_candle(**kwargs: object) -> dict[str, object]:
+        symbol = str(kwargs["candle"].symbol)
+        rr = 4.0 if symbol == "BBB" else 2.0
+        setup_row = kwargs["runtime_state"].symbols[symbol].setup_row
+        return {
+            "symbol": symbol,
+            "action": "ENTRY_CANDIDATE",
+            "reason": None,
+            "setup_status": "candidate",
+            "candidate": {
+                "symbol": symbol,
+                "direction": "LONG",
+                "entry_price": 200.0 if symbol == "BBB" else 100.0,
+                "sl_price": 190.0 if symbol == "BBB" else 95.0,
+                "target_price": 240.0 if symbol == "BBB" else 110.0,
+                "rr_ratio": rr,
+                "or_atr_ratio": 0.5,
+                "position_size": 10,
+            },
+            "advance_result": None,
+            "setup_row": setup_row,
+        }
+
+    async def _execute_entry(**kwargs: object) -> dict[str, object]:
+        symbol = str(kwargs["candidate"]["symbol"])
+        executed.append(symbol)
+        return {"action": "OPEN", "symbol": symbol}
+
+    async def _enforce_risk_controls(**_: object) -> dict[str, object]:
+        return {"triggered": False}
+
+    result = await process_closed_bar_group(
+        session_id="audit-session",
+        session=SimpleNamespace(strategy="CPR_LEVELS"),
+        bar_candles=candles,
+        runtime_state=runtime_state,
+        tracker=tracker,
+        params=SimpleNamespace(entry_window_end="10:15"),
+        active_symbols=["AAA", "BBB"],
+        strategy="CPR_LEVELS",
+        direction_filter="LONG",
+        stage_b_applied=False,
+        symbol_last_prices={},
+        last_price=None,
+        evaluate_candle_fn=_evaluate_candle,
+        execute_entry_fn=_execute_entry,
+        enforce_risk_controls=_enforce_risk_controls,
+        build_feed_state=lambda **_: SimpleNamespace(),
+        signal_audit_writer=lambda rows: audit_rows.extend(rows),
+    )
+
+    assert executed == ["BBB"]
+    assert result["triggered"] is False
+    ranked = [row for row in audit_rows if row["stage"] == "ENTRY_RANKED"]
+    assert [(row["symbol"], row["action"], row["candidate_rank"]) for row in ranked] == [
+        ("BBB", "SELECTED", 1),
+        ("AAA", "NOT_SELECTED", 2),
+    ]
+    executed_rows = [row for row in audit_rows if row["stage"] == "ENTRY_EXECUTED"]
+    assert len(executed_rows) == 1
+    assert executed_rows[0]["symbol"] == "BBB"
+    assert executed_rows[0]["selected_rank"] == 1

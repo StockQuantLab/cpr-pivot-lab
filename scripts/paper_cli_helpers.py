@@ -149,6 +149,13 @@ def real_order_notes(notes: str | None) -> str:
     return f"{marker}: {notes}" if notes else marker
 
 
+def simulated_real_order_notes(notes: str | None) -> str:
+    marker = "ZERODHA_REAL_DRY_RUN_ORDERS"
+    if notes and marker in notes:
+        return notes
+    return f"{marker}: {notes}" if notes else marker
+
+
 def build_real_order_config(
     args: argparse.Namespace,
     *,
@@ -156,16 +163,20 @@ def build_real_order_config(
     strategy_params: dict[str, Any],
     feed_source: str,
 ) -> dict[str, Any] | None:
-    if not bool(getattr(args, "real_orders", False)):
+    real_orders = bool(getattr(args, "real_orders", False))
+    simulate_real_orders = bool(getattr(args, "simulate_real_orders", False))
+    if real_orders and simulate_real_orders:
+        raise SystemExit("Use either --real-orders or --simulate-real-orders, not both.")
+    if not real_orders and not simulate_real_orders:
         return None
-    if str(feed_source or "").lower() != "kite":
+    if real_orders and str(feed_source or "").lower() != "kite":
         raise SystemExit("--real-orders is supported only with --feed-source kite.")
-    if bool(getattr(args, "multi", False)):
+    if real_orders and bool(getattr(args, "multi", False)):
         raise SystemExit(
             "--multi --real-orders is intentionally blocked for the pilot. "
             "Run one LONG or one SHORT session first."
         )
-    if bool(getattr(args, "resume", False)):
+    if real_orders and bool(getattr(args, "resume", False)):
         raise SystemExit(
             "--resume --real-orders is intentionally blocked for the pilot. "
             "Reconcile live Kite state manually before starting another real-routed session."
@@ -179,12 +190,16 @@ def build_real_order_config(
         "fixed_quantity": int(getattr(args, "real_order_fixed_qty", 1) or 1),
         "max_positions": int(getattr(args, "real_order_max_positions", 1) or 1),
         "cash_budget": float(getattr(args, "real_order_cash_budget", 10_000.0) or 10_000.0),
-        "require_account_cash_check": not bool(
-            getattr(args, "real_order_skip_account_cash_check", False)
+        "require_account_cash_check": (
+            False
+            if simulate_real_orders
+            else not bool(getattr(args, "real_order_skip_account_cash_check", False))
         ),
         "entry_order_type": str(getattr(args, "real_entry_order_type", "LIMIT") or "LIMIT").upper(),
         "entry_max_slippage_pct": float(getattr(args, "real_entry_max_slippage_pct", 0.5) or 0.5),
         "exit_max_slippage_pct": float(getattr(args, "real_exit_max_slippage_pct", 2.0) or 2.0),
         "product": "MIS",
         "exchange": "NSE",
+        "adapter_mode": "REAL_DRY_RUN" if simulate_real_orders else "LIVE",
+        "shadow": simulate_real_orders,
     }

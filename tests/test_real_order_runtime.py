@@ -6,7 +6,11 @@ import pytest
 
 from db.paper_db import PaperDB
 from engine.broker_adapter import BrokerExecutionResult, OrderSafetyError
-from engine.real_order_runtime import RealOrderRouter, RealOrderRuntimeConfig
+from engine.real_order_runtime import (
+    RealOrderRouter,
+    RealOrderRuntimeConfig,
+    build_real_order_router,
+)
 
 
 class _FakeLiveAdapter:
@@ -189,3 +193,51 @@ def test_real_order_router_rejects_budget_above_account_cash() -> None:
             adapter=_FakeLiveAdapter(),
             account_available_cash=100_000.0,
         )
+
+
+@pytest.mark.asyncio
+async def test_real_dry_run_shadow_router_records_multiple_entries_without_kite(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = PaperDB(db_path=tmp_path / "paper.duckdb")
+    monkeypatch.setattr("engine.real_order_runtime.get_paper_db", lambda: db)
+    monkeypatch.setattr(
+        "engine.real_order_runtime._get_kite_client",
+        lambda: (_ for _ in ()).throw(AssertionError("Kite client must not be loaded")),
+    )
+    try:
+        router = build_real_order_router(
+            {
+                "enabled": True,
+                "fixed_quantity": 1,
+                "max_positions": 1,
+                "cash_budget": 100.0,
+                "require_account_cash_check": False,
+                "entry_order_type": "LIMIT",
+                "adapter_mode": "REAL_DRY_RUN",
+                "shadow": True,
+            }
+        )
+        assert router is not None
+
+        await router.place_entry(
+            session_id="paper-live-1",
+            symbol="SBIN",
+            direction="LONG",
+            reference_price=750.0,
+            event_time="2026-05-04T09:20:00+05:30",
+        )
+        await router.place_entry(
+            session_id="paper-live-1",
+            symbol="RELIANCE",
+            direction="LONG",
+            reference_price=1400.0,
+            event_time="2026-05-04T09:20:00+05:30",
+        )
+
+        orders = db.get_session_orders("paper-live-1")
+        assert len(orders) == 2
+        assert {order.broker_mode for order in orders} == {"REAL_DRY_RUN"}
+        assert all(order.broker_latency_ms == 0.0 for order in orders)
+    finally:
+        db.close()

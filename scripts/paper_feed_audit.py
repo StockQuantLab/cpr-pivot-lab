@@ -8,6 +8,7 @@ The audit is intentionally compact:
 
 from __future__ import annotations
 
+import json
 from datetime import timedelta
 from typing import Any
 
@@ -88,6 +89,37 @@ def record_closed_candles(
     ]
     db = paper_db or get_paper_db()
     return db.upsert_feed_audit_rows(rows)
+
+
+def _json_default(value: Any) -> str:
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    return str(value)
+
+
+def _encode_payload(value: Any) -> str | None:
+    if value in (None, ""):
+        return None
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, default=_json_default, separators=(",", ":"))
+
+
+def record_signal_decisions(
+    *,
+    rows: list[dict[str, Any]],
+    paper_db: PaperDB | None = None,
+) -> int:
+    if not rows:
+        return 0
+    encoded: list[dict[str, Any]] = []
+    for row in rows:
+        payload = dict(row)
+        for key in ("candidate_payload", "setup_payload", "execution_payload"):
+            payload[key] = _encode_payload(payload.get(key))
+        encoded.append(payload)
+    db = paper_db or get_paper_db()
+    return db.upsert_signal_audit_rows(encoded)
 
 
 def _load_intraday_pack_lookup(
@@ -402,4 +434,72 @@ def compare_feed_audit(
     }
 
 
-__all__ = ["compare_feed_audit", "record_closed_candles"]
+def _selected_signal_rows(*, session_id: str, paper_db: PaperDB) -> list[dict[str, Any]]:
+    return paper_db.get_signal_audit_rows(session_id=session_id, stage="ENTRY_EXECUTED")
+
+
+def compare_signal_audit(
+    *,
+    session_id: str,
+    compare_session_id: str | None = None,
+    trade_date: str | None = None,
+    paper_db: PaperDB | None = None,
+) -> dict[str, Any]:
+    db = paper_db or get_dashboard_paper_db()
+    rows = (
+        db.get_signal_audit_rows(trade_date=trade_date, session_id=session_id)
+        if trade_date
+        else db.get_signal_audit_rows(session_id=session_id)
+    )
+    stage_counts: dict[str, int] = {}
+    for row in rows:
+        stage = str(row.get("stage") or "")
+        stage_counts[stage] = stage_counts.get(stage, 0) + 1
+
+    payload: dict[str, Any] = {
+        "session_id": session_id,
+        "trade_date": trade_date,
+        "rows": len(rows),
+        "stage_counts": stage_counts,
+        "ok": True,
+    }
+    if not compare_session_id:
+        return payload
+
+    left_rows = _selected_signal_rows(session_id=session_id, paper_db=db)
+    right_rows = _selected_signal_rows(session_id=compare_session_id, paper_db=db)
+
+    def key(row: dict[str, Any]) -> tuple[str, str]:
+        return (str(row.get("bar_end") or ""), str(row.get("symbol") or ""))
+
+    left = {key(row): row for row in left_rows if str(row.get("action") or "") == "OPEN"}
+    right = {key(row): row for row in right_rows if str(row.get("action") or "") == "OPEN"}
+    left_keys = set(left)
+    right_keys = set(right)
+    missing_in_compare = sorted(left_keys - right_keys)
+    extra_in_compare = sorted(right_keys - left_keys)
+    payload.update(
+        {
+            "compare_session_id": compare_session_id,
+            "executed_open_count": len(left),
+            "compare_executed_open_count": len(right),
+            "missing_in_compare": [
+                {"bar_end": bar_end, "symbol": symbol}
+                for bar_end, symbol in missing_in_compare[:50]
+            ],
+            "extra_in_compare": [
+                {"bar_end": bar_end, "symbol": symbol} for bar_end, symbol in extra_in_compare[:50]
+            ],
+            "mismatch_count": len(missing_in_compare) + len(extra_in_compare),
+        }
+    )
+    payload["ok"] = payload["mismatch_count"] == 0
+    return payload
+
+
+__all__ = [
+    "compare_feed_audit",
+    "compare_signal_audit",
+    "record_closed_candles",
+    "record_signal_decisions",
+]

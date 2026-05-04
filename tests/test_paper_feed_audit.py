@@ -5,7 +5,11 @@ from pathlib import Path
 import polars as pl
 
 from db.paper_db import PaperDB
-from scripts.paper_feed_audit import compare_feed_audit
+from scripts.paper_feed_audit import (
+    compare_feed_audit,
+    compare_signal_audit,
+    record_signal_decisions,
+)
 
 
 class _FakeRelation:
@@ -186,5 +190,58 @@ def test_compare_feed_audit_flags_value_mismatch(tmp_path: Path) -> None:
         assert result["price_exact_rows"] == 0
         assert result["volume_exact_rows"] == 1
         assert result["samples"][0]["mismatches"]["close"]["delta"] > 0.5
+    finally:
+        db.close()
+
+
+def test_record_and_compare_signal_audit(tmp_path: Path) -> None:
+    db = PaperDB(db_path=tmp_path / "paper.duckdb")
+    try:
+        for session_id, symbol in (("live-1", "SBIN"), ("replay-1", "TCS")):
+            db.create_session(
+                session_id=session_id,
+                status="COMPLETED",
+                trade_date="2026-05-05",
+            )
+            record_signal_decisions(
+                rows=[
+                    {
+                        "session_id": session_id,
+                        "trade_date": "2026-05-05",
+                        "feed_source": "kite",
+                        "transport": "websocket",
+                        "bar_end": "2026-05-05 09:20:00",
+                        "bar_time": "09:20",
+                        "strategy": "CPR_LEVELS",
+                        "direction_filter": "LONG",
+                        "symbol": symbol,
+                        "stage": "ENTRY_EXECUTED",
+                        "action": "OPEN",
+                        "selected_rank": 1,
+                        "candidate_payload": {"symbol": symbol, "rr_ratio": 2.5},
+                        "setup_payload": {"direction": "LONG"},
+                        "execution_payload": {"action": "OPEN"},
+                    }
+                ],
+                paper_db=db,
+            )
+
+        summary = compare_signal_audit(session_id="live-1", paper_db=db)
+        assert summary["rows"] == 1
+        assert summary["stage_counts"]["ENTRY_EXECUTED"] == 1
+
+        comparison = compare_signal_audit(
+            session_id="live-1",
+            compare_session_id="replay-1",
+            paper_db=db,
+        )
+        assert comparison["ok"] is False
+        assert comparison["mismatch_count"] == 2
+        assert comparison["missing_in_compare"] == [
+            {"bar_end": "2026-05-05 09:20:00+05:30", "symbol": "SBIN"}
+        ]
+        assert comparison["extra_in_compare"] == [
+            {"bar_end": "2026-05-05 09:20:00+05:30", "symbol": "TCS"}
+        ]
     finally:
         db.close()

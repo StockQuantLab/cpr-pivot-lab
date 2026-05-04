@@ -346,6 +346,7 @@ def test_delete_all_rows_clears_every_paper_table(tmp_path: Path) -> None:
             "paper_orders": 0,
             "paper_feed_state": 0,
             "paper_feed_audit": 0,
+            "paper_signal_audit": 0,
             "alert_log": 0,
         }
         assert position.session_id == session.session_id

@@ -69,6 +69,9 @@ from scripts.paper_cli_helpers import (
     resolve_cli_symbols as _resolve_cli_symbols,
 )
 from scripts.paper_cli_helpers import (
+    simulated_real_order_notes as _simulated_real_order_notes,
+)
+from scripts.paper_cli_helpers import (
     universe_diff_summary as _universe_diff_summary,
 )
 from scripts.paper_cli_helpers import (
@@ -79,9 +82,9 @@ from scripts.paper_coverage import (
     _count_duckdb_rows_for_run_ids,
     _handle_coverage_gaps,
 )
-from scripts.paper_feed_audit import compare_feed_audit
+from scripts.paper_feed_audit import compare_feed_audit, compare_signal_audit
 from scripts.paper_handler_map import build_paper_trading_handler_map
-from scripts.paper_live import run_live_session
+from scripts.paper_live import LiveMultiSessionSpec, run_live_multi_sessions, run_live_session
 from scripts.paper_prepare import (
     CANONICAL_FULL_UNIVERSE_NAME,
     ensure_canonical_universe,
@@ -142,17 +145,21 @@ def _cleanup_feed_audit_retention(*, command_name: str) -> int:
     if retention_days <= 0:
         return 0
     paper_db = _pdb()
-    deleted = paper_db.cleanup_feed_audit_older_than(retention_days)
+    deleted_feed = paper_db.cleanup_feed_audit_older_than(retention_days)
+    cleanup_signal = getattr(paper_db, "cleanup_signal_audit_older_than", None)
+    deleted_signal = int(cleanup_signal(retention_days)) if cleanup_signal is not None else 0
     deleted_alerts = paper_db.cleanup_alert_log_older_than(retention_days)
-    if deleted > 0 or deleted_alerts > 0:
+    if deleted_feed > 0 or deleted_signal > 0 or deleted_alerts > 0:
         logger.info(
-            "%s purged %d paper_feed_audit row(s) and %d alert_log row(s) older than %d day(s)",
+            "%s purged %d paper_feed_audit row(s), %d paper_signal_audit row(s), "
+            "and %d alert_log row(s) older than %d day(s)",
             command_name,
-            deleted,
+            deleted_feed,
+            deleted_signal,
             deleted_alerts,
             retention_days,
         )
-    return deleted + deleted_alerts
+    return deleted_feed + deleted_signal + deleted_alerts
 
 
 async def get_session(session_id: str):
@@ -257,6 +264,32 @@ async def _ensure_daily_session(
             **execution_kwargs,
         )
 
+    terminal_status = str(getattr(session, "status", "") or "").upper()
+    local_feed_live = (
+        mode == "live"
+        and str((requested_params or {}).get("feed_source", "") or "").lower() == "local"
+    )
+    if local_feed_live and terminal_status in {"COMPLETED", "CANCELLED", "STOPPING"}:
+        fallback_session_id = f"{requested_session_id}-{uuid4().hex[:6]}"
+        logger.warning(
+            "paper session_id %s already exists (status=%s); creating fresh local live session %s",
+            requested_session_id,
+            getattr(session, "status", "UNKNOWN"),
+            fallback_session_id,
+        )
+        return await create_paper_session(
+            session_id=fallback_session_id,
+            name=session_name,
+            strategy=strategy,
+            symbols=symbols,
+            status="ACTIVE",
+            strategy_params=requested_params,
+            trade_date=trade_date,
+            mode=mode,
+            notes=notes,
+            **execution_kwargs,
+        )
+
     if mode == "live":
         session_execution_diffs: list[str] = []
         for key, requested_value in execution_kwargs.items():
@@ -321,6 +354,56 @@ async def _ensure_daily_session(
     )
 
 
+def _select_paper_multi_variants(
+    args: argparse.Namespace,
+    strategy_upper: str,
+) -> list[tuple[str, str, dict[str, Any]]]:
+    """Return the canonical multi variants requested by direction or preset.
+
+    Multi remains preset-driven; direction/preset only selects which canonical
+    variant sessions to launch.
+    """
+    variants = [
+        (label, strat, params)
+        for label, strat, params in PAPER_STANDARD_MATRIX
+        if strat == strategy_upper
+    ]
+    requested_direction = str(getattr(args, "direction", "") or "").strip().upper()
+    if requested_direction == "BOTH":
+        requested_direction = ""
+    requested_preset = str(getattr(args, "preset", "") or "").strip().upper()
+    if requested_preset:
+        preset_direction_by_name = {
+            "CPR_LEVELS_RISK_LONG": "LONG",
+            "CPR_LEVELS_RISK_SHORT": "SHORT",
+        }
+        preset_direction = preset_direction_by_name.get(requested_preset)
+        if preset_direction is None:
+            raise SystemExit(
+                "--multi supports canonical risk presets only: "
+                "CPR_LEVELS_RISK_LONG or CPR_LEVELS_RISK_SHORT. "
+                "Run without --multi for standard/ad hoc single-preset sessions."
+            )
+        if requested_direction and requested_direction != preset_direction:
+            raise SystemExit(
+                f"--multi preset {requested_preset} conflicts with --direction "
+                f"{requested_direction}."
+            )
+        requested_direction = preset_direction
+    if requested_direction:
+        variants = [
+            variant
+            for variant in variants
+            if str(variant[2].get("direction_filter", "") or "").upper() == requested_direction
+        ]
+    if not variants:
+        raise SystemExit(
+            f"No canonical paper variants selected for strategy={strategy_upper!r} "
+            f"direction={requested_direction or 'BOTH'}."
+        )
+    return variants
+
+
 def _enforce_live_readiness_gate(
     trade_date: str,
     *,
@@ -335,6 +418,37 @@ def _enforce_live_readiness_gate(
     if not readiness.get("ready", False):
         _data_quality.print_trade_date_readiness_report(readiness)
         raise SystemExit(1)
+
+
+def _uses_feed_audit_pack_source(args: argparse.Namespace) -> bool:
+    return (
+        str(getattr(args, "pack_source", "intraday_day_pack") or "intraday_day_pack")
+        .strip()
+        .lower()
+        == "paper_feed_audit"
+    )
+
+
+def _cli_symbols_are_explicit(args: argparse.Namespace) -> bool:
+    return bool(
+        _parse_symbols_arg(getattr(args, "symbols", None))
+        or str(getattr(args, "universe_name", "") or "").strip()
+        or bool(getattr(args, "all_symbols", False))
+    )
+
+
+def _load_feed_audit_source_session(args: argparse.Namespace) -> PaperSession:
+    source_session_id = str(getattr(args, "pack_source_session_id", "") or "").strip()
+    if not source_session_id:
+        raise SystemExit(
+            "--pack-source paper_feed_audit requires --pack-source-session-id for daily-replay."
+        )
+    source_session = _pdb().get_session(source_session_id)
+    if source_session is None:
+        raise SystemExit(f"Source paper session {source_session_id!r} not found.")
+    if not source_session.symbols:
+        raise SystemExit(f"Source paper session {source_session_id!r} has no stored symbols.")
+    return source_session
 
 
 async def _run_daily_workflow(
@@ -387,6 +501,7 @@ async def _run_daily_workflow(
             leave_active=bool((replay_kwargs or {}).get("leave_active")),
             notes=notes,
             preloaded_days=(replay_kwargs or {}).get("preloaded_days"),
+            real_order_config=(replay_kwargs or {}).get("real_order_config"),
         )
     elif mode == "live":
         payload = await run_live_session(
@@ -553,30 +668,70 @@ async def _cmd_daily_prepare(args: argparse.Namespace) -> None:
 
 async def _cmd_daily_replay(args: argparse.Namespace) -> None:
     with acquire_command_lock("runtime-writer", detail="runtime writer"):
-        if (
-            str(getattr(args, "pack_source", "intraday_day_pack")).strip().lower()
-            == "paper_feed_audit"
-            and not str(getattr(args, "pack_source_session_id", "") or "").strip()
-        ):
-            raise SystemExit(
-                "--pack-source paper_feed_audit requires --pack-source-session-id for daily-replay."
-            )
+        feed_audit_source_session = (
+            _load_feed_audit_source_session(args) if _uses_feed_audit_pack_source(args) else None
+        )
         if getattr(args, "multi", False):
             await _cmd_daily_replay_multi(args)
             return
 
         trade_date = resolve_trade_date(args.trade_date)
-        _apply_default_saved_universe(args, trade_date)
-        symbols = _resolve_cli_symbols(build_parser(), args, read_only=True)
-        strategy_params = _resolve_paper_strategy_params(args.strategy, args.strategy_params, args)
+        if (
+            feed_audit_source_session is not None
+            and feed_audit_source_session.trade_date
+            and feed_audit_source_session.trade_date != trade_date
+        ):
+            raise SystemExit(
+                f"Source session {feed_audit_source_session.session_id!r} trade_date "
+                f"{feed_audit_source_session.trade_date} does not match replay trade_date {trade_date}."
+            )
+        if feed_audit_source_session is not None and not _cli_symbols_are_explicit(args):
+            symbols = list(feed_audit_source_session.symbols)
+            print(
+                f"Using {len(symbols)} stored symbols from source session "
+                f"{feed_audit_source_session.session_id}.",
+                flush=True,
+            )
+        else:
+            _apply_default_saved_universe(args, trade_date)
+            symbols = _resolve_cli_symbols(build_parser(), args, read_only=True)
+
+        if feed_audit_source_session is not None:
+            strategy = str(feed_audit_source_session.strategy or args.strategy)
+            strategy_params = dict(feed_audit_source_session.strategy_params or {})
+            strategy_params.pop("_canonical_preset", None)
+            strategy_params["pack_source"] = "paper_feed_audit"
+            strategy_params["pack_source_session_id"] = str(
+                getattr(args, "pack_source_session_id", "") or ""
+            )
+        else:
+            strategy = args.strategy
+            strategy_params = _resolve_paper_strategy_params(
+                args.strategy, args.strategy_params, args
+            )
+        real_order_config = _build_real_order_config(
+            args,
+            strategy=strategy,
+            strategy_params=strategy_params,
+            feed_source="historical",
+        )
+        session_notes = _simulated_real_order_notes(args.notes) if real_order_config else args.notes
 
         suppress_alerts = bool(getattr(args, "no_alerts", False))
         if suppress_alerts:
             set_alerts_suppressed(True)
         try:
-            filtered = pre_filter_symbols_for_strategy(
-                trade_date, symbols, args.strategy, strategy_params
-            )
+            if feed_audit_source_session is not None:
+                filtered = symbols
+                print(
+                    "Pre-filter skipped: paper_feed_audit replay uses the source "
+                    "session symbol tape.",
+                    flush=True,
+                )
+            else:
+                filtered = pre_filter_symbols_for_strategy(
+                    trade_date, symbols, strategy, strategy_params
+                )
             if not filtered:
                 raise SystemExit(
                     "No symbols remain after replay pre-filtering. "
@@ -594,11 +749,14 @@ async def _cmd_daily_replay(args: argparse.Namespace) -> None:
                 mode="replay",
                 trade_date=trade_date,
                 symbols=filtered,
-                strategy=args.strategy,
+                strategy=strategy,
                 strategy_params=strategy_params,
                 session_id=args.session_id,
-                notes=args.notes,
-                replay_kwargs={"leave_active": args.leave_active},
+                notes=session_notes,
+                replay_kwargs={
+                    "leave_active": args.leave_active,
+                    "real_order_config": real_order_config,
+                },
             )
             print(json.dumps(payload, default=str, indent=2))
         finally:
@@ -734,7 +892,13 @@ async def _cmd_daily_live(args: argparse.Namespace) -> None:
         strategy_params=strategy_params,
         feed_source=feed_source,
     )
-    session_notes = _real_order_notes(args.notes) if real_order_config else args.notes
+    session_notes = args.notes
+    if real_order_config:
+        session_notes = (
+            _simulated_real_order_notes(args.notes)
+            if bool(getattr(args, "simulate_real_orders", False))
+            else _real_order_notes(args.notes)
+        )
 
     if feed_source == "kite":
         _reject_early_kite_live_start(
@@ -923,11 +1087,7 @@ async def _run_multi_variants(
         )
 
     strategy_upper = strategy_override.upper()
-    variants = [
-        (label, strat, params)
-        for label, strat, params in PAPER_STANDARD_MATRIX
-        if strat == strategy_upper
-    ]
+    variants = _select_paper_multi_variants(args, strategy_upper)
     if not variants:
         print(f"ERROR: No variants match strategy '{strategy_override}'")
         raise SystemExit(1)
@@ -1166,11 +1326,7 @@ async def _cmd_daily_live_multi(args: argparse.Namespace) -> None:
         getattr(args, "strategy", None) or _paper_default_strategy(get_settings()),
         source="strategy",
     ).upper()
-    raw_variants = [
-        (label, strat, params)
-        for label, strat, params in PAPER_STANDARD_MATRIX
-        if strat == strategy_upper
-    ]
+    raw_variants = _select_paper_multi_variants(args, strategy_upper)
     variant_setup: list[tuple[str, str, dict[str, Any], list[str]]] = []
     for label, strategy, base_params in raw_variants:
         normalized_params = _prepare_paper_multi_strategy_params(label, strategy, base_params)
@@ -1239,18 +1395,22 @@ async def _cmd_daily_live_multi(args: argparse.Namespace) -> None:
         "allow_late_start_fallback": bool(getattr(args, "allow_late_start_fallback", False)),
     }
 
-    async def _execute_variant(
-        label: str, strategy: str, normalized_params: dict[str, Any], filtered: list[str]
-    ) -> dict[str, Any]:
+    live_specs: list[LiveMultiSessionSpec] = []
+    skipped_payloads: list[dict[str, Any]] = []
+    spec_labels: list[str] = []
+    for label, strategy, normalized_params, filtered in variant_setup:
         session_id = f"{label}-{trade_date}{_workflow_session_suffix('live', feed_source)}"
 
         if not filtered:
-            return {
-                "label": label,
-                "session_id": session_id,
-                "final_status": "SKIPPED",
-                "reason": "no symbols remain after pre-filtering",
-            }
+            skipped_payloads.append(
+                {
+                    "label": label,
+                    "session_id": session_id,
+                    "final_status": "SKIPPED",
+                    "reason": "no symbols remain after pre-filtering",
+                }
+            )
+            continue
 
         direction = (normalized_params.get("direction_filter") or "BOTH").upper()
         skip_rvol = normalized_params.get("skip_rvol_check", False)
@@ -1271,29 +1431,52 @@ async def _cmd_daily_live_multi(args: argparse.Namespace) -> None:
             notes=args.notes,
             mode="live",
         )
-
-        return await run_live_session(
-            session_id=session.session_id,
-            symbols=filtered,
-            ticker_adapter=shared_ticker,
-            poll_interval_sec=live_kwargs.get("poll_interval_sec"),
-            candle_interval_minutes=live_kwargs.get("candle_interval_minutes"),
-            max_cycles=live_kwargs.get("max_cycles"),
-            complete_on_exit=bool(live_kwargs.get("complete_on_exit")),
-            auto_flatten_on_abnormal_exit=True,
-            allow_late_start_fallback=bool(live_kwargs.get("allow_late_start_fallback", False)),
-            notes=args.notes,
+        spec_labels.append(label)
+        live_specs.append(
+            LiveMultiSessionSpec(
+                session_id=session.session_id,
+                symbols=filtered,
+                real_order_config=_build_real_order_config(
+                    args,
+                    strategy=strategy,
+                    strategy_params=normalized_params,
+                    feed_source=feed_source,
+                ),
+                notes=(
+                    _simulated_real_order_notes(args.notes)
+                    if bool(getattr(args, "simulate_real_orders", False))
+                    else args.notes
+                ),
+            )
         )
 
     try:
-        await _run_multi_variants(
-            args,
-            mode="live",
-            read_only=True,
-            banner_label="Launching",
-            execute_variant=_execute_variant,
-            retry_on_early_exit=not bool(getattr(args, "complete_on_exit", False)),
+        results = (
+            await run_live_multi_sessions(
+                specs=live_specs,
+                ticker_adapter=shared_ticker,
+                poll_interval_sec=live_kwargs.get("poll_interval_sec"),
+                candle_interval_minutes=live_kwargs.get("candle_interval_minutes"),
+                max_cycles=live_kwargs.get("max_cycles"),
+                complete_on_exit=bool(live_kwargs.get("complete_on_exit")),
+                allow_live_setup_fallback=True,
+            )
+            if live_specs
+            else []
         )
+        payloads = [
+            {"label": label, "result": result}
+            for label, result in zip(spec_labels, results, strict=True)
+        ] + [{"label": item["label"], "result": item} for item in skipped_payloads]
+        print(f"\n{'=' * 60}")
+        for payload in payloads:
+            result = payload["result"]
+            print(
+                f"  {payload['label']!s:20s} status={result.get('final_status', 'UNKNOWN')}",
+                flush=True,
+            )
+        print(f"{'=' * 60}\n")
+        print(json.dumps({"trade_date": trade_date, "variants": payloads}, default=str, indent=2))
     finally:
         _cleanup_feed_audit_retention(command_name="daily-live --multi")
         shared_ticker.close()
@@ -1319,11 +1502,7 @@ async def _cmd_daily_replay_multi(args: argparse.Namespace) -> None:
         getattr(args, "strategy", None) or _paper_default_strategy(get_settings()),
         source="strategy",
     ).upper()
-    raw_variants = [
-        (label, strat, params)
-        for label, strat, params in PAPER_STANDARD_MATRIX
-        if strat == strategy_upper
-    ]
+    raw_variants = _select_paper_multi_variants(args, strategy_upper)
     if not raw_variants:
         print(f"ERROR: No variants match strategy '{args.strategy}'")
         raise SystemExit(1)
@@ -1386,10 +1565,20 @@ async def _cmd_daily_replay_multi(args: argparse.Namespace) -> None:
                 strategy=strategy,
                 strategy_params=normalized_params,
                 session_id=session_id,
-                notes=args.notes,
+                notes=(
+                    _simulated_real_order_notes(args.notes)
+                    if bool(getattr(args, "simulate_real_orders", False))
+                    else args.notes
+                ),
                 replay_kwargs={
                     "leave_active": args.leave_active,
                     "preloaded_days": union_packs,
+                    "real_order_config": _build_real_order_config(
+                        args,
+                        strategy=strategy,
+                        strategy_params=normalized_params,
+                        feed_source="historical",
+                    ),
                 },
                 skip_preparation=True,
             )
@@ -1945,6 +2134,17 @@ async def _cmd_feed_audit(args: argparse.Namespace) -> None:
         trade_date=args.trade_date,
         feed_source=args.feed_source,
         session_id=args.session_id,
+    )
+    print(json.dumps(payload, default=str, indent=2))
+    if not payload.get("ok", False):
+        raise SystemExit(1)
+
+
+async def _cmd_signal_audit(args: argparse.Namespace) -> None:
+    payload = compare_signal_audit(
+        session_id=args.session_id,
+        compare_session_id=getattr(args, "compare_session_id", None),
+        trade_date=getattr(args, "trade_date", None),
     )
     print(json.dumps(payload, default=str, indent=2))
     if not payload.get("ok", False):

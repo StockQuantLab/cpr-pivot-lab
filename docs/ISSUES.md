@@ -7,6 +7,138 @@ Supersedes: `docs/PARITY_INCIDENT_LOG.md` (contents migrated below).
 
 ---
 
+## 2026-05-04 — OPEN: PARITY: Kite feed-audit replay does not reproduce actual live session
+
+**Status:** OPEN
+**Severity:** High
+
+### Symptom
+
+After deleting the incorrect after-hours `live-local` smoke sessions for 2026-05-04, only the
+actual Kite sessions remained:
+
+- `CPR_LEVELS_LONG-2026-05-04-live-kite`: 17 trades, +24753.32
+- `CPR_LEVELS_SHORT-2026-05-04-live-kite`: 15 trades, -3737.70
+
+Feed audit against `intraday_day_pack` failed heavily for the actual Kite sessions:
+13691 rows, 4516 matched, 8941 value mismatches, 234 missing pack rows. The 09:20 samples show
+Kite live candles often missing earlier bucket trades versus the post-EOD pack, especially open,
+high/low, and volume.
+
+Replaying from the actual captured `paper_feed_audit` candles also did not reproduce the live
+sessions:
+
+- LONG audit replay: 10 trades, +21218.73, only 5 symbols overlap with live
+- SHORT audit replay: 11 trades, -746.85, only 4 symbols overlap with live
+- Corrected source-contract audit replay (`compare-kite-audit-*-2026-05-04-v2`) still produced
+  the same mismatch after using the source live session's 824 stored symbols and stored strategy
+  parameters.
+
+### Root Cause
+
+Not fully isolated yet. The original local-feed smoke comparison was invalid because it ran only
+through 09:30 while actual Kite live ran until about 11:25-11:40. The remaining mismatch is not
+explained by local-vs-Kite feed alone because `paper_feed_audit` replay still diverges from the
+actual Kite session, pointing to a live/replay lifecycle, ordering, setup-refresh, or session-state
+contract difference.
+
+Pre-filter drift was checked after the corrected replay: each actual May 4 live session stored
+824 symbols; the current pre-filter returns 809, which is a strict subset. The 15 stored-only
+symbols are stale/non-pack symbols (`AAREYDRUGS`, `ATLANTAELE`, `BHAGYANGR`, `BIRLACABLE`,
+`HBSL`, `KAKATCEM`, `KHAITANLTD`, `MASKINVEST`, `NIFTY 100`, `NIFTY 50`, `NIFTY 500`,
+`OILCOUNTUB`, `SASTASUNDR`, `VALIANTLAB`, `ZODIAC`). There are no current-prefilter symbols
+missing from the stored live session, so pre-filter drift is not the primary explanation for
+the trade mismatch.
+
+The first trade-set divergence is already at the 09:20 entry bar. The actual live LONG session
+filled `ICEMAKE`, `JINDALSAW`, `LTFOODS`, `MAGADSUGAR`, and `MFSL`, while corrected audit replay
+filled `DELTACORP`, `EMCURE`, `GPTHEALTH`, `JAYKAY`, and `KDDL`. The actual May 4 live session
+was created before the same-day bar-major/source-contract replay fixes, so the old live
+per-symbol selection/order path may be the immediate explanation. Confirm with the next Kite
+paper session started from the fixed code before treating this as a current-code parity failure.
+
+### Fix
+
+Partially fixed:
+
+- `daily-replay --pack-source paper_feed_audit` now archives through the writable paper DB instead
+  of the read-only dashboard replica.
+- Feed-audit replay now uses the source live session's stored symbols and stored strategy params
+  instead of re-running the current saved-universe pre-filter. It strips `_canonical_preset` from
+  the comparison session because `pack_source=paper_feed_audit` is an audit-only override.
+
+Still pending: identify why exact audit-tape replay does not reproduce the live session's entry
+set. Treat true shared per-symbol scan as blocked on this comparison contract: first make
+`paper_feed_audit` replay reproduce the actual live session, then optimize shared scans.
+
+Additional live-evidence instrumentation has been added for the next Kite paper session:
+
+- `paper_signal_audit` stores per-symbol closed-bar decision rows for `ENTRY_SKIP`,
+  `ENTRY_EVALUATED`, `ENTRY_CANDIDATE`, `ENTRY_RANKED`, and `ENTRY_EXECUTED`.
+- `daily-live` and `daily-replay` write the same decision audit through the shared
+  `paper_session_driver` path.
+- `pivot-paper-trading signal-audit` compares executed `OPEN` decisions between a live
+  session and a replay session built from that live session's `paper_feed_audit` tape.
+- `--simulate-real-orders` can be used during paper-live to route paper entry/exit intents
+  through Zerodha `REAL_DRY_RUN` order building and record broker-intent latency without
+  calling Kite `place_order`.
+- Feed/signal audit retention now uses the same rolling cleanup window so the paper DB keeps
+  recent evidence without accumulating unbounded audit rows.
+
+Still pending after this instrumentation: run the next Kite paper-live session from this code,
+replay each live session from its captured `paper_feed_audit`, then compare `signal-audit`
+before making any further parity claim.
+
+### Related
+
+`CPR_LEVELS_LONG-2026-05-04-live-kite`,
+`CPR_LEVELS_SHORT-2026-05-04-live-kite`,
+`compare-kite-audit-long-2026-05-04`,
+`compare-kite-audit-short-2026-05-04`,
+`compare-kite-audit-long-2026-05-04-v2`,
+`compare-kite-audit-short-2026-05-04-v2`
+
+---
+
+## 2026-05-04 — FIXED: BUG: local multi-live simulated order drill failed on rerun and exit tick rounding
+
+**Status:** FIXED
+**Severity:** High
+
+### Symptom
+
+`daily-live --feed-source local --multi --strategy CPR_LEVELS --trade-date 2026-05-04 --simulate-real-orders`
+first failed before bar processing because the deterministic LONG/SHORT local session IDs already
+existed with `COMPLETED` status. After allowing a fresh local test session, the same drill reached
+09:25 and failed simulated real-order exits with sub-tick protected LIMIT validation errors:
+`SELL exit limit price ... is below protected floor ...` and
+`BUY exit limit price ... is above protected cap ...`.
+
+### Root Cause
+
+`daily-live --multi` always reused deterministic live session IDs, even for terminal local-feed
+test sessions. Separately, `build_protected_flatten_intent()` rounded SELL exits down and BUY exits
+up to tick size. That can cross the protected slippage boundary by less than one tick.
+
+### Fix
+
+`scripts/paper_trading.py` now creates a fresh fallback ID only for terminal `--feed-source local`
+live sessions; Kite live remains stricter so completed real-time sessions are not accidentally
+restarted. Multi mode can also explicitly select LONG, SHORT, or both via canonical risk preset or
+`--direction`.
+
+`engine/broker_adapter.py` now rounds protected exits inward: SELL exits round up to the slippage
+floor tick and BUY exits round down to the slippage cap tick. Added coverage in
+`tests/test_paper_trading_workflow.py` and `tests/test_broker_adapter.py`.
+
+### Related
+
+`CPR_LEVELS_LONG-2026-05-04-live-local-0985cb`,
+`CPR_LEVELS_SHORT-2026-05-04-live-local-8e5a9c`,
+`ORDER_LATENCY`, local-feed multi-live simulated real-order drill.
+
+---
+
 ## 2026-05-04 — FIXED: BUG: rejected manual real-order pilot stayed ACTIVE
 
 **Status:** FIXED
@@ -236,7 +368,7 @@ if alerts_enabled and final_status in {
 
 ## 2026-05-04 — OBSERVED: LATENCY: ~26s delay from bar close to Telegram alert in --multi live session
 
-**Status:** Open (known architectural constraint)
+**Status:** OPEN / PARTIALLY MITIGATED — dry-run order-intent instrumentation and first bar-major `--multi` dispatcher added; live latency measurement still required before real multi-session routing
 **Severity:** Medium (paper mode unaffected; real-order execution would enter ~5 min into next candle)
 
 ### Symptom
@@ -255,9 +387,17 @@ Paper mode: no correctness impact — fill price uses `max(trigger, candle_open)
 
 Refactor bar processing to be bar-major across sessions: process all sessions for bar N together before moving to next symbol, or run sessions in separate processes with a shared tick bus. See CLAUDE.md note: "replay remains symbol-major today, so trade logs may lag the candle heartbeat unless we refactor the loop to be bar-major."
 
+### Mitigation Applied 2026-05-04
+
+- Added `--simulate-real-orders` for `daily-live` and `daily-replay`. It routes paper entries/exits through the same `RealOrderRouter` and `ZerodhaBrokerAdapter(mode="REAL_DRY_RUN")` path used by guarded real orders, records Zerodha-shaped payloads in `paper_orders`, and never calls Kite `place_order`.
+- Added `ORDER_LATENCY` logs from the broker-intent boundary: event lag for real-time bars, intent build latency, adapter latency, and total router latency.
+- Simulation mode is shadow-only: it does not enforce the one-position pilot cap, so full paper sessions can measure every would-be broker order without changing paper strategy behavior.
+- Added `run_live_multi_sessions()` and routed `daily-live --multi` through it. The dispatcher drains closed bars for every session, groups by `bar_end`, and processes all sessions for bar N before allowing any session to advance to bar N+1. It emits `LIVE_MULTI_BAR_DISPATCH`, `LIVE_MULTI_BAR_PROCESS_START`, and `LIVE_MULTI_BAR_PROCESS_DONE` timing logs.
+- Real `--multi --real-orders` remains blocked. The new dispatcher should reduce cross-session bar skew, but a full live/local-feed timing drill with `--simulate-real-orders` is still required before enabling real multi-session routing. Further optimization may still be needed inside each session's per-symbol candidate scan.
+
 ### Location
 
-`engine/paper_session_driver.py` — bar evaluation loop, `scripts/paper_trading.py` — `_cmd_daily_live_multi()` variant dispatch
+`engine/paper_session_driver.py` — bar evaluation loop, `scripts/paper_trading.py` — `_cmd_daily_live_multi()` variant dispatch, `engine/real_order_runtime.py` — broker-intent latency instrumentation
 
 ---
 

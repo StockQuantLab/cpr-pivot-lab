@@ -44,6 +44,7 @@ def build_paper_trading_parser(
     _cmd_close_position = handlers["_cmd_close_position"]
     _cmd_cleanup = handlers["_cmd_cleanup"]
     _cmd_feed_audit = handlers["_cmd_feed_audit"]
+    _cmd_signal_audit = handlers["_cmd_signal_audit"]
     _cmd_replay = handlers["_cmd_replay"]
     _cmd_live = handlers["_cmd_live"]
     _cmd_daily_prepare = handlers["_cmd_daily_prepare"]
@@ -277,6 +278,14 @@ def build_paper_trading_parser(
             help=(
                 "Route daily-live paper entries/exits to real Zerodha orders. "
                 "Requires Doppler real-order gates; default is paper-only."
+            ),
+        )
+        sp.add_argument(
+            "--simulate-real-orders",
+            action="store_true",
+            help=(
+                "Route daily-live paper entries/exits through the Zerodha REAL_DRY_RUN "
+                "adapter and record broker-intent latency without calling Kite place_order."
             ),
         )
         sp.add_argument(
@@ -754,6 +763,23 @@ def build_paper_trading_parser(
     )
     feed_audit.set_defaults(handler=_cmd_feed_audit)
 
+    signal_audit = sub.add_parser(
+        "signal-audit",
+        help="Summarize or compare stored strategy decision audit rows",
+    )
+    signal_audit.add_argument("--session-id", required=True, help="Primary paper session ID")
+    signal_audit.add_argument(
+        "--compare-session-id",
+        default=None,
+        help="Optional second session ID to compare executed OPEN decisions against.",
+    )
+    signal_audit.add_argument(
+        "--trade-date",
+        default=None,
+        help="Optional trade date filter YYYY-MM-DD.",
+    )
+    signal_audit.set_defaults(handler=_cmd_signal_audit)
+
     replay = sub.add_parser("replay", help="Replay historical candles into paper feed state")
     replay.add_argument("--session-id", required=True, help="Session to replay into")
     _add_symbol_args(replay)
@@ -818,6 +844,38 @@ def build_paper_trading_parser(
         "--no-alerts",
         action="store_true",
         help="Suppress Telegram/email alerts during replay",
+    )
+    daily_replay.add_argument(
+        "--simulate-real-orders",
+        action="store_true",
+        help=(
+            "Replay order intents through the Zerodha REAL_DRY_RUN adapter and record "
+            "broker-intent latency without calling Kite place_order."
+        ),
+    )
+    daily_replay.add_argument(
+        "--real-order-fixed-qty",
+        type=int,
+        default=1,
+        help="Fixed simulated real quantity per order (default: 1 share).",
+    )
+    daily_replay.add_argument(
+        "--real-entry-order-type",
+        choices=["LIMIT", "MARKET"],
+        default="LIMIT",
+        help="Simulated real entry order type. LIMIT is default.",
+    )
+    daily_replay.add_argument(
+        "--real-entry-max-slippage-pct",
+        type=float,
+        default=0.5,
+        help="Marketable LIMIT entry protection percent for simulated real orders.",
+    )
+    daily_replay.add_argument(
+        "--real-exit-max-slippage-pct",
+        type=float,
+        default=2.0,
+        help="Protected LIMIT exit/flatten protection percent for simulated real orders.",
     )
     daily_replay.add_argument(
         "--multi",

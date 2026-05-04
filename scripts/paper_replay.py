@@ -12,7 +12,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from db.duckdb import get_db
-from db.paper_db import get_dashboard_paper_db, get_paper_db
+from db.paper_db import get_paper_db
 from engine import paper_session_driver as paper_session_driver
 from engine.bar_orchestrator import (
     SessionPositionTracker,
@@ -37,8 +37,9 @@ from engine.paper_runtime import (
     get_session_positions,
     load_setup_row,
 )
+from engine.real_order_runtime import build_real_order_router
 from scripts.paper_archive import archive_completed_session
-from scripts.paper_feed_audit import record_closed_candles
+from scripts.paper_feed_audit import record_closed_candles, record_signal_decisions
 
 logger = logging.getLogger(__name__)
 
@@ -397,6 +398,7 @@ async def _process_replay_bar_major(
     tracker: SessionPositionTracker,
     params: Any,
     log_candle_progress: bool = False,
+    real_order_router: Any = None,
 ) -> dict[str, Any]:
     """Process one trade date using canonical bar times + shared orchestration."""
     active_days = sorted(
@@ -477,10 +479,12 @@ async def _process_replay_bar_major(
             feed_source="replay",
             transport="replay",
             feed_audit_writer=record_closed_candles,
+            signal_audit_writer=record_signal_decisions,
             evaluate_candle_fn=evaluate_candle,
             execute_entry_fn=execute_entry,
             enforce_risk_controls=enforce_session_risk_controls,
             build_feed_state=build_summary_feed_state,
+            real_order_router=real_order_router,
         )
 
         active_symbols_after = set(driver_result["active_symbols"])
@@ -622,6 +626,7 @@ async def replay_session(
     leave_active: bool = False,
     notes: str | None = None,
     preloaded_days: list[ReplayDayPack] | None = None,
+    real_order_config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     prepared = await _prepare_replay_request(
         session_id=session_id,
@@ -634,6 +639,7 @@ async def replay_session(
         return prepared
     session, replay_symbols, normalized_start, normalized_end = prepared
     params = build_backtest_params(session)
+    real_order_router = build_real_order_router(real_order_config)
 
     if preloaded_days is not None:
         replay_symbols_set = set(replay_symbols)
@@ -767,6 +773,7 @@ async def replay_session(
             tracker=tracker,
             params=params,
             log_candle_progress=True,
+            real_order_router=real_order_router,
         )
         last_bar_ts = replay_result["last_bar_ts"] or last_bar_ts
         bars_replayed += int(replay_result["bars_replayed"])
@@ -828,7 +835,7 @@ async def replay_session(
         logger.info("Replay archive begin session_id=%s", session_id)
         archive_result = archive_completed_session(
             session_id,
-            paper_db=get_dashboard_paper_db(),
+            paper_db=_pdb(),
         )
         archive_payload = (
             await archive_result if asyncio.iscoroutine(archive_result) else archive_result

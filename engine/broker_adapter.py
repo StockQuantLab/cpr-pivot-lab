@@ -216,10 +216,10 @@ def build_protected_flatten_intent(
     side_upper = side.strip().upper()
     if side_upper == "SELL":
         raw_price = latest_price * (1.0 - max_slippage_pct / 100.0)
-        price = math.floor(raw_price / tick_size) * tick_size
+        price = _ceil_to_tick(raw_price, tick_size)
     elif side_upper == "BUY":
         raw_price = latest_price * (1.0 + max_slippage_pct / 100.0)
-        price = math.ceil(raw_price / tick_size) * tick_size
+        price = _floor_to_tick(raw_price, tick_size)
     else:
         raise ValueError("side must be BUY or SELL")
 
@@ -437,7 +437,7 @@ async def record_real_order(
         requested_at=datetime.now(UTC),
         exchange_order_id=result.exchange_order_id,
         idempotency_key=result.idempotency_key,
-        notes="LIVE",
+        notes=result.mode,
         broker_mode=result.mode,
         broker_payload=payload_json,
         broker_latency_ms=result.latency_ms,
@@ -462,6 +462,14 @@ def _default_zerodha_tag(session_id: str, role: str) -> str:
 
 def _short_key(value: str) -> str:
     return "".join(ch for ch in value.lower() if ch.isalnum())[:18] or "order"
+
+
+def _ceil_to_tick(value: float, tick_size: float) -> float:
+    return math.ceil((float(value) - 1e-12) / float(tick_size)) * float(tick_size)
+
+
+def _floor_to_tick(value: float, tick_size: float) -> float:
+    return math.floor((float(value) + 1e-12) / float(tick_size)) * float(tick_size)
 
 
 def _is_protected_exit_role(role: str) -> bool:

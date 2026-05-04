@@ -122,6 +122,7 @@ async def test_replay_session_streams_candles_and_archives_completed_session(
     updated_statuses: list[str | None] = []
     processed_candles: list[datetime] = []
     archived: list[str] = []
+    archive_dbs: list[object] = []
     risk_checks: list[dict[str, object]] = []
     session_updates: list[dict[str, object]] = []
 
@@ -193,6 +194,7 @@ async def test_replay_session_streams_candles_and_archives_completed_session(
 
     async def fake_archive_completed_session(session_id: str, paper_db=None):
         archived.append(session_id)
+        archive_dbs.append(paper_db)
         return {"session_id": session_id, "archived": True}
 
     async def fake_get_session_positions(session_id: str, statuses=None):
@@ -234,6 +236,7 @@ async def test_replay_session_streams_candles_and_archives_completed_session(
     ]
     assert "COMPLETED" in updated_statuses
     assert archived == ["paper-1"]
+    assert archive_dbs == [fake_pdb]
     assert len(risk_checks) == 2
     assert session_updates[-1]["total_pnl"] == pytest.approx(0.0)
     assert result["days_replayed"] == 1

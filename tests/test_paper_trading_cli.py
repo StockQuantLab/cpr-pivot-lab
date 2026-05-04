@@ -234,6 +234,7 @@ def test_paper_trading_parser_supports_daily_commands() -> None:
     assert daily_live_args.standard_sizing is False
     assert daily_live_args.risk_based_sizing is True
     assert daily_live_args.no_alerts is False
+    assert daily_live_args.simulate_real_orders is False
 
     daily_live_universe_args = parser.parse_args(
         [
@@ -257,6 +258,18 @@ def test_paper_trading_parser_supports_daily_commands() -> None:
         ]
     )
     assert daily_live_no_alerts_args.no_alerts is True
+
+    daily_live_sim_orders_args = parser.parse_args(
+        [
+            "daily-live",
+            "--trade-date",
+            "2024-01-03",
+            "--symbols",
+            "SBIN",
+            "--simulate-real-orders",
+        ]
+    )
+    assert daily_live_sim_orders_args.simulate_real_orders is True
 
     preset_live_args = parser.parse_args(
         [
@@ -292,6 +305,22 @@ def test_paper_trading_parser_supports_feed_audit_pack_source() -> None:
     assert args.command == "daily-replay"
     assert args.pack_source == "paper_feed_audit"
     assert args.pack_source_session_id == "CPR_LEVELS_LONG-2026-04-20-live-kite"
+
+    signal_audit_args = parser.parse_args(
+        [
+            "signal-audit",
+            "--session-id",
+            "live-1",
+            "--compare-session-id",
+            "replay-1",
+            "--trade-date",
+            "2026-05-05",
+        ]
+    )
+    assert signal_audit_args.command == "signal-audit"
+    assert signal_audit_args.session_id == "live-1"
+    assert signal_audit_args.compare_session_id == "replay-1"
+    assert signal_audit_args.trade_date == "2026-05-05"
 
     daily_live_skip_args = parser.parse_args(
         ["daily-live", "--trade-date", "2024-01-03", "--all-symbols", "--skip-coverage"]
@@ -1174,6 +1203,93 @@ async def test_cmd_daily_replay_defaults_to_saved_universe(
 
     assert seen["universe_name"] == "full_2024_01_02"
     assert seen["workflow"]["symbols"] == ["SBIN"]
+
+
+@pytest.mark.asyncio
+async def test_cmd_daily_replay_feed_audit_uses_source_session_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import scripts.paper_trading as pt
+
+    seen: dict[str, object] = {}
+    source_session = SimpleNamespace(
+        session_id="live-source",
+        strategy="CPR_LEVELS",
+        trade_date="2026-05-04",
+        symbols=["BHEL", "SBIN"],
+        strategy_params={
+            "direction_filter": "LONG",
+            "skip_rvol_check": False,
+            "max_positions": 5,
+        },
+    )
+
+    class _LockCtx:
+        def __enter__(self):
+            return None
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class _FakePaperDB:
+        def get_session(self, session_id: str):
+            assert session_id == "live-source"
+            return source_session
+
+        def cleanup_feed_audit_older_than(self, retention_days: int):
+            return 0
+
+        def cleanup_alert_log_older_than(self, retention_days: int):
+            return 0
+
+    async def fake_run_daily_workflow(**kwargs):
+        seen["workflow"] = kwargs
+        return {"status": "REPLAY"}
+
+    monkeypatch.setattr(pt, "acquire_command_lock", lambda *args, **kwargs: _LockCtx())
+    monkeypatch.setattr(pt, "_pdb", lambda: _FakePaperDB())
+    monkeypatch.setattr(pt, "_build_real_order_config", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        pt,
+        "_apply_default_saved_universe",
+        lambda *args, **kwargs: pytest.fail("feed-audit replay must not default universe"),
+    )
+    monkeypatch.setattr(
+        pt,
+        "_resolve_cli_symbols",
+        lambda *args, **kwargs: pytest.fail("feed-audit replay must use stored symbols"),
+    )
+    monkeypatch.setattr(
+        pt,
+        "pre_filter_symbols_for_strategy",
+        lambda *args, **kwargs: pytest.fail("feed-audit replay must not rerun pre-filter"),
+    )
+    monkeypatch.setattr(pt, "_run_daily_workflow", fake_run_daily_workflow)
+
+    await pt._cmd_daily_replay(
+        SimpleNamespace(
+            trade_date="2026-05-04",
+            symbols=None,
+            all_symbols=False,
+            universe_name=None,
+            strategy="CPR_LEVELS",
+            strategy_params=None,
+            session_id="audit-replay",
+            notes=None,
+            leave_active=False,
+            no_alerts=False,
+            pack_source="paper_feed_audit",
+            pack_source_session_id="live-source",
+            multi=False,
+        )
+    )
+
+    workflow = seen["workflow"]
+    assert workflow["symbols"] == ["BHEL", "SBIN"]
+    assert workflow["strategy"] == "CPR_LEVELS"
+    assert workflow["strategy_params"]["direction_filter"] == "LONG"
+    assert workflow["strategy_params"]["pack_source"] == "paper_feed_audit"
+    assert workflow["strategy_params"]["pack_source_session_id"] == "live-source"
 
 
 @pytest.mark.asyncio

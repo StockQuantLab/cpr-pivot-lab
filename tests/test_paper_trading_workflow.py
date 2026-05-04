@@ -44,6 +44,28 @@ def test_default_session_id_includes_direction_for_daily_sessions() -> None:
     )
 
 
+def test_select_paper_multi_variants_can_select_one_side() -> None:
+    long_variants = paper_trading._select_paper_multi_variants(
+        SimpleNamespace(direction="LONG", preset=None),
+        "CPR_LEVELS",
+    )
+    short_variants = paper_trading._select_paper_multi_variants(
+        SimpleNamespace(direction=None, preset="CPR_LEVELS_RISK_SHORT"),
+        "CPR_LEVELS",
+    )
+
+    assert [label for label, _, _ in long_variants] == ["CPR_LEVELS_LONG"]
+    assert [label for label, _, _ in short_variants] == ["CPR_LEVELS_SHORT"]
+
+
+def test_select_paper_multi_variants_rejects_conflicting_side() -> None:
+    with pytest.raises(SystemExit, match="conflicts"):
+        paper_trading._select_paper_multi_variants(
+            SimpleNamespace(direction="LONG", preset="CPR_LEVELS_RISK_SHORT"),
+            "CPR_LEVELS",
+        )
+
+
 def test_real_order_config_defaults_to_disabled() -> None:
     args = SimpleNamespace(real_orders=False)
 
@@ -90,6 +112,8 @@ def test_real_order_config_marks_pilot_session_and_blocks_multi() -> None:
         "exit_max_slippage_pct": 2.0,
         "product": "MIS",
         "exchange": "NSE",
+        "adapter_mode": "LIVE",
+        "shadow": False,
     }
     assert paper_trading._real_order_notes(None) == "ZERODHA_LIVE_REAL_ORDERS"
 
@@ -101,6 +125,35 @@ def test_real_order_config_marks_pilot_session_and_blocks_multi() -> None:
             strategy_params={"direction_filter": "LONG"},
             feed_source="kite",
         )
+
+
+def test_simulated_real_order_config_allows_multi_and_local_feed() -> None:
+    args = SimpleNamespace(
+        real_orders=False,
+        simulate_real_orders=True,
+        multi=True,
+        resume=False,
+        real_order_fixed_qty=1,
+        real_order_max_positions=1,
+        real_order_cash_budget=10_000.0,
+        real_order_skip_account_cash_check=False,
+        real_entry_order_type="LIMIT",
+        real_entry_max_slippage_pct=0.5,
+        real_exit_max_slippage_pct=2.0,
+    )
+
+    config = paper_trading._build_real_order_config(
+        args,
+        strategy="CPR_LEVELS",
+        strategy_params={"direction_filter": "SHORT"},
+        feed_source="local",
+    )
+
+    assert config is not None
+    assert config["adapter_mode"] == "REAL_DRY_RUN"
+    assert config["shadow"] is True
+    assert config["require_account_cash_check"] is False
+    assert paper_trading._simulated_real_order_notes(None) == "ZERODHA_REAL_DRY_RUN_ORDERS"
 
 
 def test_reject_early_kite_live_start_aborts_before_market_open(
@@ -245,6 +298,7 @@ async def test_run_daily_workflow_replay_uses_shared_preparation_and_session(
         leave_active: bool,
         notes: str | None,
         preloaded_days=None,
+        real_order_config=None,
     ):
         calls["replay"] = {
             "session_id": session_id,
@@ -253,6 +307,7 @@ async def test_run_daily_workflow_replay_uses_shared_preparation_and_session(
             "end_date": end_date,
             "leave_active": leave_active,
             "notes": notes,
+            "real_order_config": real_order_config,
         }
         return {"status": "REPLAYED", "bars": 12}
 
@@ -293,6 +348,7 @@ async def test_run_daily_workflow_replay_uses_shared_preparation_and_session(
         "end_date": "2024-01-02",
         "leave_active": True,
         "notes": "daily replay",
+        "real_order_config": None,
     }
     assert payload["session_id"] == "paper-2024-01-02"
     assert payload["preparation"]["coverage_ready"] is True
@@ -417,6 +473,85 @@ async def test_run_daily_workflow_live_uses_live_session_kwargs(
     }
     assert payload["session_id"] == "paper-live-1"
     assert payload["status"] == "LIVE"
+
+
+@pytest.mark.asyncio
+async def test_cmd_daily_live_multi_uses_bar_major_dispatcher(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: dict[str, object] = {}
+
+    class FakeTicker:
+        def close(self) -> None:
+            calls["ticker_closed"] = True
+
+    class FakeLocalTickerAdapter:
+        def __init__(self, **kwargs):
+            calls["ticker_kwargs"] = kwargs
+
+        def close(self) -> None:
+            calls["ticker_closed"] = True
+
+    async def fake_ensure_daily_session(**kwargs):
+        return SimpleNamespace(session_id=kwargs["session_id"])
+
+    async def fake_run_live_multi_sessions(**kwargs):
+        calls["multi"] = kwargs
+        return [
+            {"session_id": spec.session_id, "final_status": "COMPLETED"} for spec in kwargs["specs"]
+        ]
+
+    monkeypatch.setattr(paper_trading, "_apply_default_saved_universe", lambda *_args: None)
+    monkeypatch.setattr(paper_trading, "_resolve_cli_symbols", lambda *_args, **_kwargs: ["SBIN"])
+    monkeypatch.setattr(paper_trading, "_enforce_live_readiness_gate", lambda *_args, **_kw: None)
+    monkeypatch.setattr(
+        paper_trading,
+        "pre_filter_symbols_for_strategy",
+        lambda _date, symbols, _strategy, _params, **_kw: list(symbols),
+    )
+    monkeypatch.setattr(paper_trading, "_ensure_daily_session", fake_ensure_daily_session)
+    monkeypatch.setattr(paper_trading, "run_live_multi_sessions", fake_run_live_multi_sessions)
+    monkeypatch.setattr("engine.local_ticker_adapter.LocalTickerAdapter", FakeLocalTickerAdapter)
+
+    args = SimpleNamespace(
+        trade_date="2026-05-04",
+        feed_source="local",
+        no_alerts=False,
+        wait_for_open=False,
+        strategy="CPR_LEVELS",
+        strategy_params=None,
+        skip_coverage=False,
+        candle_interval_minutes=5,
+        poll_interval_sec=1.0,
+        max_cycles=1,
+        complete_on_exit=True,
+        allow_late_start_fallback=False,
+        notes=None,
+        simulate_real_orders=False,
+        real_orders=False,
+        real_order_fixed_qty=1,
+        real_order_max_positions=1,
+        real_order_cash_budget=10_000.0,
+        real_order_skip_account_cash_check=False,
+        real_entry_order_type="LIMIT",
+        real_entry_max_slippage_pct=0.5,
+        real_exit_max_slippage_pct=2.0,
+    )
+
+    await paper_trading._cmd_daily_live_multi(args)
+
+    multi = calls["multi"]
+    assert isinstance(multi, dict)
+    assert isinstance(multi["ticker_adapter"], FakeLocalTickerAdapter)
+    assert multi["max_cycles"] == 1
+    assert multi["complete_on_exit"] is True
+    specs = multi["specs"]
+    assert len(specs) == 2
+    assert [spec.session_id for spec in specs] == [
+        "CPR_LEVELS_LONG-2026-05-04-live-local",
+        "CPR_LEVELS_SHORT-2026-05-04-live-local",
+    ]
+    assert calls["ticker_closed"] is True
 
 
 @pytest.mark.asyncio
@@ -712,6 +847,42 @@ async def test_ensure_daily_session_creates_fallback_for_replay_collisions(
 
     assert session.session_id == "paper-replay-1-abcdef"
     assert calls and calls[0]["session_id"] == "paper-replay-1-abcdef"
+    assert calls[0]["status"] == "ACTIVE"
+
+
+@pytest.mark.asyncio
+async def test_ensure_daily_session_creates_fallback_for_local_live_terminal_collision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import scripts.paper_trading as pt
+
+    existing = SimpleNamespace(session_id="paper-live-local-1", status="COMPLETED")
+    calls: list[dict[str, object]] = []
+
+    async def fake_get_session(session_id: str):
+        assert session_id == "paper-live-local-1"
+        return existing
+
+    async def fake_create_paper_session(**kwargs):
+        calls.append(dict(kwargs))
+        return SimpleNamespace(session_id=kwargs["session_id"])
+
+    monkeypatch.setattr(pt, "get_session", fake_get_session)
+    monkeypatch.setattr(pt, "create_paper_session", fake_create_paper_session)
+    monkeypatch.setattr(pt, "uuid4", lambda: SimpleNamespace(hex="123456abcdef"))
+
+    session = await pt._ensure_daily_session(
+        session_id="paper-live-local-1",
+        trade_date="2026-05-04",
+        strategy="CPR_LEVELS",
+        symbols=["SBIN"],
+        strategy_params={"direction_filter": "LONG", "feed_source": "local"},
+        notes="local drill",
+        mode="live",
+    )
+
+    assert session.session_id == "paper-live-local-1-123456"
+    assert calls and calls[0]["session_id"] == "paper-live-local-1-123456"
     assert calls[0]["status"] == "ACTIVE"
 
 

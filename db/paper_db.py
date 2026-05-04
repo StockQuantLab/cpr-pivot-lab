@@ -536,6 +536,52 @@ class PaperDB:
         )
 
         self.con.execute("""
+            CREATE TABLE IF NOT EXISTS paper_signal_audit (
+                session_id            VARCHAR(50) NOT NULL,
+                trade_date            VARCHAR(10) NOT NULL,
+                feed_source           VARCHAR(20) NOT NULL,
+                transport             VARCHAR(20) NOT NULL,
+                bar_end               TIMESTAMPTZ NOT NULL,
+                bar_time              VARCHAR(5) NOT NULL,
+                strategy              VARCHAR(20),
+                direction_filter      VARCHAR(10),
+                symbol                VARCHAR(20) NOT NULL,
+                stage                 VARCHAR(30) NOT NULL,
+                action                VARCHAR(50),
+                reason                VARCHAR(100),
+                setup_status          VARCHAR(30),
+                candidate_rank        INT,
+                selected_rank         INT,
+                quality_score         DOUBLE,
+                open_count_before     INT,
+                slots_available_before INT,
+                active_symbols_count  INT,
+                bar_symbols_count     INT,
+                candidates_count      INT,
+                selected_count        INT,
+                cash_available        DOUBLE,
+                entry_price           DOUBLE,
+                sl_price              DOUBLE,
+                target_price          DOUBLE,
+                rr_ratio              DOUBLE,
+                or_atr_ratio          DOUBLE,
+                position_size         INT,
+                candidate_payload     VARCHAR(8000),
+                setup_payload         VARCHAR(8000),
+                execution_payload     VARCHAR(4000),
+                created_at            TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+                updated_at            TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (session_id, bar_end, symbol, stage)
+            )
+        """)
+        self.con.execute(
+            "CREATE INDEX IF NOT EXISTS idx_psa_session_bar ON paper_signal_audit(session_id, bar_end)"
+        )
+        self.con.execute(
+            "CREATE INDEX IF NOT EXISTS idx_psa_trade_date ON paper_signal_audit(trade_date, session_id)"
+        )
+
+        self.con.execute("""
             CREATE SEQUENCE IF NOT EXISTS alert_log_seq START 1
         """)
         self.con.execute("""
@@ -1445,6 +1491,94 @@ class PaperDB:
                 pass
         return len(rows)
 
+    def upsert_signal_audit_rows(self, rows: list[dict[str, Any]]) -> int:
+        if not rows:
+            return 0
+        columns = [
+            "session_id",
+            "trade_date",
+            "feed_source",
+            "transport",
+            "bar_end",
+            "bar_time",
+            "strategy",
+            "direction_filter",
+            "symbol",
+            "stage",
+            "action",
+            "reason",
+            "setup_status",
+            "candidate_rank",
+            "selected_rank",
+            "quality_score",
+            "open_count_before",
+            "slots_available_before",
+            "active_symbols_count",
+            "bar_symbols_count",
+            "candidates_count",
+            "selected_count",
+            "cash_available",
+            "entry_price",
+            "sl_price",
+            "target_price",
+            "rr_ratio",
+            "or_atr_ratio",
+            "position_size",
+            "candidate_payload",
+            "setup_payload",
+            "execution_payload",
+        ]
+        normalized_rows = [{column: row.get(column) for column in columns} for row in rows]
+        df = pl.DataFrame(normalized_rows).select(columns)
+        self.con.register("_tmp_paper_signal_audit", df.to_arrow())
+        try:
+            self.con.execute("BEGIN TRANSACTION")
+            self.con.execute(
+                f"""
+                INSERT OR REPLACE INTO paper_signal_audit (
+                    {", ".join(columns)}
+                )
+                SELECT {", ".join(columns)} FROM _tmp_paper_signal_audit
+                """
+            )
+            self.con.execute("COMMIT")
+            self._after_write()
+        except Exception:
+            self.con.execute("ROLLBACK")
+            raise
+        finally:
+            try:
+                self.con.unregister("_tmp_paper_signal_audit")
+            except Exception:
+                pass
+        return len(rows)
+
+    def get_signal_audit_rows(
+        self,
+        *,
+        trade_date: str | None = None,
+        session_id: str | None = None,
+        stage: str | None = None,
+    ) -> list[dict[str, Any]]:
+        where: list[str] = []
+        params: list[Any] = []
+        if trade_date is not None:
+            where.append("trade_date = ?")
+            params.append(trade_date)
+        if session_id is not None:
+            where.append("session_id = ?")
+            params.append(session_id)
+        if stage is not None:
+            where.append("stage = ?")
+            params.append(stage)
+        sql = "SELECT * FROM paper_signal_audit"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY session_id, bar_end, stage, selected_rank NULLS LAST, candidate_rank NULLS LAST, symbol"
+        rows = self.con.execute(sql, params).fetchall()
+        columns = [str(desc[0]) for desc in self.con.description]
+        return [dict(zip(columns, row, strict=True)) for row in rows]
+
     def get_feed_audit_rows(
         self,
         *,
@@ -1529,6 +1663,39 @@ class PaperDB:
         self.con.execute("BEGIN TRANSACTION")
         try:
             self.con.execute(f"DELETE FROM paper_feed_audit WHERE {cutoff_expr} < ?", [cutoff])
+            self.con.execute("COMMIT")
+            self._after_write()
+        except Exception:
+            self.con.execute("ROLLBACK")
+            raise
+        return deleted
+
+    def cleanup_signal_audit_older_than(self, retention_days: int) -> int:
+        """Delete strategy decision audit rows older than the retention window."""
+
+        retention_days = int(retention_days or 0)
+        if retention_days <= 0:
+            return 0
+
+        cutoff = datetime.now(UTC) - timedelta(days=retention_days)
+        cutoff_expr = """
+            COALESCE(
+                bar_end,
+                CAST(trade_date AS TIMESTAMPTZ),
+                created_at
+            )
+        """
+        count_row = self.con.execute(
+            f"SELECT COUNT(*) FROM paper_signal_audit WHERE {cutoff_expr} < ?",
+            [cutoff],
+        ).fetchone()
+        deleted = int(count_row[0] or 0) if count_row else 0
+        if deleted == 0:
+            return 0
+
+        self.con.execute("BEGIN TRANSACTION")
+        try:
+            self.con.execute(f"DELETE FROM paper_signal_audit WHERE {cutoff_expr} < ?", [cutoff])
             self.con.execute("COMMIT")
             self._after_write()
         except Exception:
@@ -1661,6 +1828,7 @@ class PaperDB:
             "paper_orders",
             "paper_feed_state",
             "paper_feed_audit",
+            "paper_signal_audit",
             "alert_log",
         ]
         result: dict[str, int] = {}
@@ -1688,6 +1856,7 @@ class PaperDB:
             "paper_orders",
             "paper_feed_state",
             "paper_feed_audit",
+            "paper_signal_audit",
             "paper_sessions",
             "alert_log",
         ]
@@ -1742,6 +1911,7 @@ class PaperDB:
                 "paper_orders": 0,
                 "paper_feed_state": 0,
                 "paper_feed_audit": 0,
+                "paper_signal_audit": 0,
                 "alert_log": 0,
                 "matched_sessions": 0,
             }
@@ -1756,6 +1926,7 @@ class PaperDB:
                 "paper_orders",
                 "paper_feed_state",
                 "paper_feed_audit",
+                "paper_signal_audit",
             ):
                 row = self.con.execute(
                     f"SELECT COUNT(*) FROM {table} WHERE session_id IN ({placeholders})",

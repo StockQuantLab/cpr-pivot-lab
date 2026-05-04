@@ -53,7 +53,7 @@ from engine.paper_runtime import (
 from engine.real_order_runtime import build_real_order_router
 from scripts import paper_live_helpers as _live_helpers
 from scripts.paper_archive import archive_completed_session
-from scripts.paper_feed_audit import record_closed_candles
+from scripts.paper_feed_audit import record_closed_candles, record_signal_decisions
 from scripts.paper_prepare import pre_filter_symbols_for_strategy
 
 logger = logging.getLogger(__name__)
@@ -101,6 +101,40 @@ class LiveSessionDeps:
     sleep_fn: Callable[[float], Awaitable[None]] | None = None
     now_fn: Callable[[], datetime] | None = None
     alerts_enabled: bool | None = None
+
+
+@dataclass(slots=True)
+class LiveMultiSessionSpec:
+    session_id: str
+    symbols: list[str]
+    notes: str | None = None
+    real_order_config: dict[str, Any] | None = None
+
+
+@dataclass(slots=True)
+class _LiveMultiContext:
+    session_id: str
+    session: Any
+    strategy: str
+    params: Any
+    direction_filter: str
+    active_symbols: list[str]
+    runtime_state: PaperRuntimeState
+    tracker: SessionPositionTracker
+    real_order_router: Any
+    symbol_last_prices: dict[str, float]
+    builder: FiveMinuteCandleBuilder
+    notes: str | None
+    stage_b_applied: bool = False
+    entries_disabled: bool = False
+    entry_resume_symbols: list[str] | None = None
+    closed_bars: int = 0
+    quote_events: int = 0
+    final_status: str = "ACTIVE"
+    terminal_reason: str | None = None
+    last_bar_ts: datetime | None = None
+    last_snapshot_ts: datetime | None = None
+    last_price: float | None = None
 
 
 def _cleanup_feed_audit_if_needed(
@@ -469,6 +503,204 @@ def _prefetch_setup_rows(
     runtime_state.invalid_setup_rows += len(invalid_symbols)
 
 
+async def _prepare_live_multi_context(
+    *,
+    spec: LiveMultiSessionSpec,
+    ticker_adapter: Any,
+    candle_interval: int,
+    allow_live_setup_fallback: bool,
+) -> _LiveMultiContext:
+    session = await _load_session(spec.session_id)
+    if session is None:
+        raise RuntimeError(f"session {spec.session_id!r} not found")
+    session_status = str(getattr(session, "status", "") or "").upper()
+    if session_status in {"COMPLETED", "CANCELLED", "STOPPING"}:
+        raise RuntimeError(f"session {spec.session_id!r} already terminal: {session_status}")
+
+    trade_date = _resolve_trade_date(session)
+    strategy = str(getattr(session, "strategy", "") or "CPR_LEVELS")
+    strategy_params = dict(getattr(session, "strategy_params", {}) or {})
+    active_symbols = pre_filter_symbols_for_strategy(
+        trade_date,
+        _resolve_active_symbols(session, spec.symbols),
+        strategy,
+        strategy_params,
+        require_trade_date_rows=not bool(getattr(ticker_adapter, "_local_feed", False)),
+    )
+    if not active_symbols:
+        raise RuntimeError(f"session {spec.session_id!r} has no symbols after Stage A pre-filter")
+    if session_status not in {"ACTIVE", "PAUSED"}:
+        session = await _update_session(spec.session_id, None, status="ACTIVE", notes=spec.notes)
+        force_paper_db_sync(get_paper_db())
+
+    params = build_backtest_params(session)
+    runtime_state = PaperRuntimeState(
+        allow_live_setup_fallback=allow_live_setup_fallback,
+        bar_end_offset=timedelta(minutes=5)
+        if getattr(ticker_adapter, "_local_feed", False)
+        else None,
+    )
+    _prefetch_setup_rows(
+        runtime_state=runtime_state,
+        symbols=active_symbols,
+        trade_date=trade_date,
+        candle_interval_minutes=candle_interval,
+        regime_index_symbol=str(strategy_params.get("regime_index_symbol") or ""),
+        regime_snapshot_minutes=int(strategy_params.get("regime_snapshot_minutes") or 30),
+    )
+    direction_readiness = _log_direction_readiness(
+        session_id=spec.session_id,
+        runtime_state=runtime_state,
+        active_symbols=active_symbols,
+    )
+    if active_symbols and int(direction_readiness["with_setup"]) == 0:
+        reason = "startup_missing_trade_date_setup_rows"
+        await _update_session(spec.session_id, None, status="FAILED", notes=reason)
+        force_paper_db_sync(get_paper_db())
+        raise RuntimeError(f"session {spec.session_id!r} startup blocked: {reason}")
+
+    tracker = SessionPositionTracker(
+        max_positions=int(getattr(session, "max_positions", 1) or 1),
+        portfolio_value=float(getattr(params, "portfolio_value", 0.0) or 0.0),
+        max_position_pct=float(getattr(params, "max_position_pct", 0.0) or 0.0),
+    )
+    tracker.seed_open_positions(await get_session_positions(spec.session_id, statuses=["OPEN"]))
+    for closed_pos in await get_session_positions(
+        spec.session_id, statuses=["CLOSED", "FLATTENED"]
+    ):
+        tracker.mark_traded(closed_pos.symbol)
+        runtime_state.for_symbol(closed_pos.symbol).position_closed_today = True
+
+    real_order_router = build_real_order_router(spec.real_order_config)
+    if real_order_router is not None:
+        logger.warning(
+            "[%s] broker order routing enabled for multi-live mode=%s fixed_qty=%d",
+            spec.session_id,
+            real_order_router.adapter.mode,
+            real_order_router.config.fixed_quantity,
+        )
+
+    builder = FiveMinuteCandleBuilder(interval_minutes=candle_interval)
+    ticker_adapter.register_session(spec.session_id, active_symbols, builder)
+    await _write_feed_state(
+        None,
+        session_id=spec.session_id,
+        status="CONNECTING",
+        last_event_ts=None,
+        last_bar_ts=None,
+        last_price=None,
+        stale_reason=None,
+        raw_state={"mode": "multi_startup", "symbols": len(active_symbols)},
+    )
+    if session_status in {"PLANNING", ""}:
+        dispatch_session_started_alert(
+            session_id=spec.session_id,
+            strategy=strategy,
+            direction=str(getattr(params, "direction_filter", "BOTH") or "BOTH").upper(),
+            symbol_count=len(active_symbols),
+            trade_date=trade_date,
+        )
+    return _LiveMultiContext(
+        session_id=spec.session_id,
+        session=session,
+        strategy=strategy,
+        params=params,
+        direction_filter=str(getattr(params, "direction_filter", "BOTH") or "BOTH").upper(),
+        active_symbols=active_symbols,
+        runtime_state=runtime_state,
+        tracker=tracker,
+        real_order_router=real_order_router,
+        symbol_last_prices={},
+        builder=builder,
+        notes=spec.notes,
+        entry_resume_symbols=list(active_symbols),
+    )
+
+
+async def _process_live_multi_bar(
+    *,
+    ctx: _LiveMultiContext,
+    bar_end: datetime,
+    bar_candles: list[ClosedCandle],
+    ticker_adapter: Any,
+    feed_source: str,
+    transport: str,
+) -> None:
+    bar_candles = sorted(bar_candles, key=lambda c: c.symbol)
+    for candle in bar_candles:
+        ctx.closed_bars += 1
+        ctx.last_bar_ts = candle.bar_end
+        ctx.last_price = candle.close
+        ctx.symbol_last_prices[candle.symbol] = candle.close
+        state = ctx.runtime_state.symbols.get(candle.symbol)
+        setup_row = state.setup_row if state is not None else None
+        _log_parity_trace(session_id=ctx.session_id, candle=candle, setup_row=setup_row)
+
+    logger.info(
+        "LIVE_MULTI_BAR_PROCESS_START session=%s bar_end=%s symbols=%d",
+        ctx.session_id,
+        bar_end.isoformat(),
+        len(bar_candles),
+    )
+    started = datetime.now(IST)
+    get_paper_db().defer_sync()
+    try:
+        driver_result = await paper_session_driver.process_closed_bar_group(
+            session_id=ctx.session_id,
+            session=ctx.session,
+            bar_candles=bar_candles,
+            runtime_state=ctx.runtime_state,
+            tracker=ctx.tracker,
+            params=ctx.params,
+            active_symbols=(
+                _entry_disabled_symbols(tracker=ctx.tracker, active_symbols=ctx.active_symbols)
+                if ctx.entries_disabled
+                else ctx.active_symbols
+            ),
+            strategy=ctx.strategy,
+            direction_filter=ctx.direction_filter,
+            stage_b_applied=ctx.stage_b_applied,
+            symbol_last_prices=ctx.symbol_last_prices,
+            last_price=ctx.last_price,
+            feed_source=feed_source,
+            transport=transport,
+            feed_audit_writer=record_closed_candles,
+            signal_audit_writer=record_signal_decisions,
+            evaluate_candle_fn=evaluate_candle,
+            execute_entry_fn=execute_entry,
+            enforce_risk_controls=enforce_session_risk_controls,
+            build_feed_state=build_summary_feed_state,
+            real_order_router=ctx.real_order_router,
+            update_symbols_cb=lambda symbols: ticker_adapter.update_symbols(
+                ctx.session_id, symbols
+            ),
+        )
+    finally:
+        get_paper_db().flush_deferred_sync()
+    elapsed_ms = (datetime.now(IST) - started).total_seconds() * 1000.0
+    logger.info(
+        "LIVE_MULTI_BAR_PROCESS_DONE session=%s bar_end=%s elapsed_ms=%.3f active_symbols=%d",
+        ctx.session_id,
+        bar_end.isoformat(),
+        elapsed_ms,
+        len(driver_result["active_symbols"]),
+    )
+    ctx.active_symbols = list(driver_result["active_symbols"])
+    if not ctx.entries_disabled:
+        ctx.entry_resume_symbols = list(ctx.active_symbols)
+    ctx.last_price = driver_result["last_price"]
+    ctx.stage_b_applied = bool(driver_result["stage_b_applied"])
+    if driver_result["should_complete"]:
+        ctx.final_status = "NO_TRADES_ENTRY_WINDOW_CLOSED"
+        ctx.terminal_reason = driver_result.get("stop_reason") or "entry_window_closed"
+    elif not ctx.active_symbols and not ctx.entries_disabled:
+        ctx.final_status = "NO_ACTIVE_SYMBOLS"
+        ctx.terminal_reason = "no_active_symbols"
+    elif driver_result["triggered"]:
+        ctx.final_status = "STOPPING"
+        ctx.terminal_reason = "risk_control_triggered"
+
+
 async def _finalize_live_session(
     *,
     session_id: str,
@@ -499,6 +731,236 @@ async def _finalize_live_session(
         ),
         notes=notes,
     )
+
+
+async def _finalize_live_multi_context(
+    *,
+    ctx: _LiveMultiContext,
+    ticker_adapter: Any,
+    complete_on_exit: bool,
+) -> dict[str, Any]:
+    if ctx.final_status in {"COMPLETED", "NO_ACTIVE_SYMBOLS", "NO_TRADES_ENTRY_WINDOW_CLOSED"}:
+        try:
+            await flatten_session_positions(
+                ctx.session_id,
+                notes=ctx.notes or "multi session flatten",
+                feed_state=_live_mark_feed_state(
+                    session_id=ctx.session_id,
+                    symbol_last_prices=ctx.symbol_last_prices,
+                    ticker_adapter=ticker_adapter,
+                    symbols=list(ctx.tracker._open.keys()) or ctx.active_symbols,
+                ),
+                real_order_router=ctx.real_order_router,
+            )
+        except Exception:
+            logger.warning("[%s] Multi final flatten failed", ctx.session_id, exc_info=True)
+            ctx.final_status = "FAILED"
+            ctx.terminal_reason = "multi_final_flatten_failed"
+    stop_is_terminal = complete_on_exit or ctx.final_status in {
+        "NO_ACTIVE_SYMBOLS",
+        "NO_TRADES_ENTRY_WINDOW_CLOSED",
+        "COMPLETED",
+    }
+    try:
+        await paper_session_driver.complete_session(
+            session_id=ctx.session_id,
+            complete_on_exit=stop_is_terminal,
+            last_bar_ts=ctx.last_bar_ts,
+            stale_timeout=0,
+            notes=ctx.notes,
+            update_session_state=lambda sid, **kwargs: _update_session(sid, None, **kwargs),
+        )
+    except Exception:
+        logger.exception("[%s] Multi final session completion failed", ctx.session_id)
+        ctx.final_status = "FAILED"
+        ctx.terminal_reason = "session_finalize_failed"
+    final_session = await _load_session(ctx.session_id)
+    if final_session is not None and getattr(final_session, "status", None):
+        loaded_status = str(final_session.status)
+        if loaded_status.upper() != "ACTIVE":
+            ctx.final_status = loaded_status
+            ctx.terminal_reason = ctx.terminal_reason or f"db_status:{loaded_status.lower()}"
+    archive_payload = None
+    if final_session and final_session.status in ("COMPLETED", "FAILED"):
+        try:
+            archive_payload = archive_completed_session(ctx.session_id, paper_db=get_paper_db())
+        except Exception:
+            logger.exception("[%s] Multi paper session archive failed", ctx.session_id)
+            archive_payload = {
+                "session_id": ctx.session_id,
+                "archived": False,
+                "error": "archive_failed",
+            }
+    if stop_is_terminal and ctx.final_status in {
+        "COMPLETED",
+        "NO_TRADES_ENTRY_WINDOW_CLOSED",
+        "NO_ACTIVE_SYMBOLS",
+    }:
+        dispatch_session_completed_alert(session_id=ctx.session_id)
+    feed_state = get_paper_db().get_feed_state(ctx.session_id)
+    return {
+        "session_id": ctx.session_id,
+        "strategy": ctx.strategy,
+        "symbols": ctx.active_symbols,
+        "quote_events": ctx.quote_events,
+        "closed_bars": ctx.closed_bars,
+        "last_snapshot_ts": ctx.last_snapshot_ts.isoformat() if ctx.last_snapshot_ts else None,
+        "last_bar_ts": ctx.last_bar_ts.isoformat() if ctx.last_bar_ts else None,
+        "terminal_reason": ctx.terminal_reason,
+        "broker_execution": "ZERODHA_LIVE" if ctx.real_order_router is not None else "PAPER_LIVE",
+        "real_orders_enabled": ctx.real_order_router is not None,
+        "final_status": ctx.final_status
+        if ctx.final_status != "ACTIVE"
+        else getattr(final_session, "status", "ACTIVE"),
+        "feed_state": asdict(feed_state) if feed_state else None,
+        "archive": archive_payload,
+    }
+
+
+async def run_live_multi_sessions(
+    *,
+    specs: list[LiveMultiSessionSpec],
+    ticker_adapter: Any,
+    poll_interval_sec: float | None = None,
+    candle_interval_minutes: int | None = None,
+    max_cycles: int | None = None,
+    complete_on_exit: bool = False,
+    allow_live_setup_fallback: bool = True,
+) -> list[dict[str, Any]]:
+    """Run multiple live paper sessions with one bar-major dispatcher."""
+    if not specs:
+        return []
+    settings = get_settings()
+    candle_interval = _resolve_candle_interval(settings, candle_interval_minutes)
+    poll_interval = _resolve_poll_interval(settings, poll_interval_sec, candle_interval)
+    local_feed = bool(getattr(ticker_adapter, "_local_feed", False))
+    transport = "local" if local_feed else "websocket"
+    feed_source = "local" if local_feed else "kite"
+    contexts: list[_LiveMultiContext] = []
+    register_session_start()
+    _start_alert_dispatcher()
+    try:
+        for spec in specs:
+            contexts.append(
+                await _prepare_live_multi_context(
+                    spec=spec,
+                    ticker_adapter=ticker_adapter,
+                    candle_interval=candle_interval,
+                    allow_live_setup_fallback=allow_live_setup_fallback,
+                )
+            )
+        last_ticker_tick_count = ticker_adapter.tick_count if ticker_adapter is not None else 0
+        last_bucket_start = _floor_bucket_start(datetime.now(IST), candle_interval)
+        cycles = 0
+        while max_cycles is None or cycles < max_cycles:
+            cycles += 1
+            now = datetime.now(IST)
+            active_contexts = [ctx for ctx in contexts if ctx.final_status == "ACTIVE"]
+            if not active_contexts:
+                break
+            current_ticks = ticker_adapter.tick_count
+            tick_delta = current_ticks - last_ticker_tick_count
+            if tick_delta > 0:
+                for ctx in active_contexts:
+                    ctx.quote_events += tick_delta
+                    ctx.last_snapshot_ts = ticker_adapter.last_tick_ts
+            last_ticker_tick_count = current_ticks
+            session_candles: dict[str, list[ClosedCandle]] = {}
+            if local_feed:
+                for ctx in active_contexts:
+                    session_candles[ctx.session_id] = ticker_adapter.drain_closed(ctx.session_id)
+            else:
+                current_bucket_start = _floor_bucket_start(now, candle_interval)
+                if current_bucket_start <= last_bucket_start:
+                    await asyncio.sleep(max(0.1, poll_interval))
+                    continue
+                for ctx in active_contexts:
+                    ticker_adapter.synthesize_quiet_symbols(ctx.session_id, ctx.active_symbols, now)
+                    session_candles[ctx.session_id] = ticker_adapter.drain_closed(ctx.session_id)
+                last_bucket_start = current_bucket_start
+            bars_by_end: dict[datetime, list[tuple[_LiveMultiContext, list[ClosedCandle]]]] = {}
+            for ctx in active_contexts:
+                candles = sorted(
+                    session_candles.get(ctx.session_id, []),
+                    key=lambda candle: (candle.bar_end, candle.symbol),
+                )
+                _log_bar_heartbeats(
+                    session_id=ctx.session_id,
+                    active_symbols=ctx.active_symbols,
+                    cycle_closed=candles,
+                )
+                if candles:
+                    _log_ticker_health(
+                        session_id=ctx.session_id,
+                        ticker_adapter=ticker_adapter,
+                        active_symbols=ctx.active_symbols,
+                    )
+                grouped: dict[datetime, list[ClosedCandle]] = {}
+                for candle in candles:
+                    grouped.setdefault(candle.bar_end, []).append(candle)
+                for bar_end, bar_candles in grouped.items():
+                    bars_by_end.setdefault(bar_end, []).append((ctx, bar_candles))
+            if not bars_by_end:
+                if local_feed and all(
+                    getattr(ticker_adapter, "_session_exhausted", {}).get(ctx.session_id, False)
+                    for ctx in active_contexts
+                ):
+                    for ctx in active_contexts:
+                        ctx.final_status = "COMPLETED"
+                        ctx.terminal_reason = "local_feed_exhausted"
+                    break
+                await asyncio.sleep(max(0.1, poll_interval))
+                continue
+            for bar_end in sorted(bars_by_end):
+                logger.info(
+                    "LIVE_MULTI_BAR_DISPATCH bar_end=%s sessions=%d",
+                    bar_end.isoformat(),
+                    len(bars_by_end[bar_end]),
+                )
+                for ctx, bar_candles in sorted(
+                    bars_by_end[bar_end], key=lambda item: item[0].session_id
+                ):
+                    if ctx.final_status != "ACTIVE":
+                        continue
+                    try:
+                        await _process_live_multi_bar(
+                            ctx=ctx,
+                            bar_end=bar_end,
+                            bar_candles=bar_candles,
+                            ticker_adapter=ticker_adapter,
+                            feed_source=feed_source,
+                            transport=transport,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "[%s] Multi bar group processing failed bar_end=%s",
+                            ctx.session_id,
+                            bar_end.isoformat(),
+                        )
+                        ctx.final_status = "FAILED"
+                        ctx.terminal_reason = "bar_processing_error"
+                        dispatch_session_error_alert(
+                            session_id=ctx.session_id,
+                            reason="bar_processing_error",
+                            details=f"bar_end={bar_end.isoformat()} symbols={len(bar_candles)}",
+                        )
+            await asyncio.sleep(0)
+    finally:
+        results = []
+        for ctx in contexts:
+            try:
+                ticker_adapter.unregister_session(ctx.session_id)
+            except Exception:
+                logger.debug("[%s] Multi unregister failed", ctx.session_id, exc_info=True)
+            results.append(
+                await _finalize_live_multi_context(
+                    ctx=ctx,
+                    ticker_adapter=ticker_adapter,
+                    complete_on_exit=complete_on_exit,
+                )
+            )
+        await maybe_shutdown_alert_dispatcher()
+    return results
 
 
 async def run_live_session(
@@ -1037,6 +1499,7 @@ async def run_live_session(
                                 feed_source=audit_feed_source,
                                 transport=audit_transport,
                                 feed_audit_writer=record_closed_candles,
+                                signal_audit_writer=record_signal_decisions,
                                 evaluate_candle_fn=evaluate_candle,
                                 execute_entry_fn=execute_entry,
                                 enforce_risk_controls=enforce_session_risk_controls,
@@ -1626,6 +2089,7 @@ async def run_live_session(
                         feed_source=audit_feed_source,
                         transport=audit_transport,
                         feed_audit_writer=record_closed_candles,
+                        signal_audit_writer=record_signal_decisions,
                         evaluate_candle_fn=evaluate_candle,
                         execute_entry_fn=execute_entry,
                         enforce_risk_controls=enforce_session_risk_controls,

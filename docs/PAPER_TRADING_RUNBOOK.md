@@ -139,8 +139,14 @@ Expected result:
 **Start live paper:**
 ```bash
 doppler run -- uv run pivot-paper-supervisor -- \
-  --multi --strategy CPR_LEVELS --trade-date today
+  --multi --strategy CPR_LEVELS --trade-date today \
+  --simulate-real-orders
 ```
+
+Use `--simulate-real-orders` during the paper-to-live transition window. It keeps the session
+paper-only, but routes every paper entry/exit intent through the Zerodha `REAL_DRY_RUN` order
+adapter so broker-intent payloads and order latency are recorded without calling Kite
+`place_order`.
 
 **In-session safety drills after LONG/SHORT session IDs exist:**
 ```bash
@@ -327,26 +333,29 @@ Reference sets (Apr 2026):
 | Daily Reset Std SHORT | `1d6e5e93618e` | 2025-01-01 → 2026-04-09 | ₹1,041,450 |
 | Daily Reset Std LONG | `84a85d954f99` | 2025-01-01 → 2026-04-09 | ₹827,381 |
 
-**Current CPR baselines (2026-05-03 `full_2026_04_30` / 2038-symbol 15:00 all-8 rerun):**
+**Current CPR baselines (2026-05-04 `full_2026_04_30` / 2038-symbol all-8 rerun through 2026-05-04):**
 
 SHORT presets now use `short_trail_atr_multiplier = 1.25`. LONG keeps `trail_atr_multiplier = 1.0`.
 Canonical sizing is now `max_positions=5`, `capital=200000`, `max_position_pct=0.2`.
 Daily-reset risk is the live-paper sizing reference.
-The 15:00 MIS safety rerun is now the canonical comparison target for all eight CPR baselines:
+The May 4 extension is now the canonical comparison target for all eight CPR baselines:
 
 | Mode | Preset | Run ID | Start → End | P/L | Calmar |
 |------|--------|--------|-------------|-----|--------|
-| Daily Reset | `CPR_LEVELS_STANDARD_LONG` | `034b33508e65` | 2025-01-01 → 2026-04-30 | ₹1,715,879 | 208 |
-| Daily Reset | `CPR_LEVELS_STANDARD_SHORT` | `2e2a02bc992e` | 2025-01-01 → 2026-04-30 | ₹1,602,868 | 89 |
-| Daily Reset | `CPR_LEVELS_RISK_LONG` | `7a80f9ad9606` | 2025-01-01 → 2026-04-30 | ₹1,709,319 | 210 |
-| Daily Reset | `CPR_LEVELS_RISK_SHORT` | `8c301b9069ff` | 2025-01-01 → 2026-04-30 | ₹1,620,145 | 95 |
-| Compound | `CPR_LEVELS_STANDARD_LONG` | `39383dd50560` | 2025-01-01 → 2026-04-30 | ₹5,485,604 | 402 |
-| Compound | `CPR_LEVELS_STANDARD_SHORT` | `36d74db1a72d` | 2025-01-01 → 2026-04-30 | ₹4,928,531 | 175 |
-| Compound | `CPR_LEVELS_RISK_LONG` | `31fa175a281b` | 2025-01-01 → 2026-04-30 | ₹1,716,664 | 208 |
-| Compound | `CPR_LEVELS_RISK_SHORT` | `b41819620cdc` | 2025-01-01 → 2026-04-30 | ₹1,633,514 | 86 |
+| Daily Reset | `CPR_LEVELS_STANDARD_LONG` | `1089ce2684e3` | 2025-01-01 → 2026-05-04 | ₹1,728,353 | 207 |
+| Daily Reset | `CPR_LEVELS_STANDARD_SHORT` | `f9eacc07c317` | 2025-01-01 → 2026-05-04 | ₹1,602,288 | 88 |
+| Daily Reset | `CPR_LEVELS_RISK_LONG` | `785a0ae8bc76` | 2025-01-01 → 2026-05-04 | ₹1,721,793 | 209 |
+| Daily Reset | `CPR_LEVELS_RISK_SHORT` | `49488023a79d` | 2025-01-01 → 2026-05-04 | ₹1,619,565 | 94 |
+| Compound | `CPR_LEVELS_STANDARD_LONG` | `eb3c979cbae2` | 2025-01-01 → 2026-05-04 | ₹5,579,446 | 402 |
+| Compound | `CPR_LEVELS_STANDARD_SHORT` | `5e5d105ee842` | 2025-01-01 → 2026-05-04 | ₹4,926,210 | 172 |
+| Compound | `CPR_LEVELS_RISK_LONG` | `521c0fad74af` | 2025-01-01 → 2026-05-04 | ₹1,729,140 | 207 |
+| Compound | `CPR_LEVELS_RISK_SHORT` | `eeae3af65dd1` | 2025-01-01 → 2026-05-04 | ₹1,632,929 | 85 |
 
-The 2026-05-04 promotion supersedes the 2026-05-03 comparison set and the older deleted
-2026-04-28 `u2029` baseline rows. The retired rows should not be used as comparison targets.
+The 2026-05-04 promotion supersedes the prior 2026-04-30-ended comparison set, the
+2026-05-03 comparison set, and the older deleted 2026-04-28 `u2029` baseline rows. The
+retired rows should not be used as comparison targets. The only added trading date versus the
+previous current set is 2026-05-04; 2026-05-01 was a market holiday and 2026-05-02/03 were
+weekend days.
 Use `full_2026_04_30` explicitly for reproducible reruns; it matched `canonical_full` at promotion
 time but the dated name is the durable reference.
 
@@ -827,6 +836,38 @@ doppler run -- uv run pivot-paper-trading feed-audit --trade-date 2026-04-13 --f
 ```
 
 Use `--feed-source local` or `--feed-source replay` for local-feed/replay investigations.
+
+### Live signal audit recommendation
+
+`daily-live` and `daily-replay` also write `paper_signal_audit`, one compact decision row per
+symbol per closed bar. This is the decision tape to use when feed bars match but trades still
+do not:
+
+- `ENTRY_SKIP`: symbol was not eligible for evaluation, with the skip reason
+- `ENTRY_EVALUATED`: symbol was evaluated but did not become an entry candidate
+- `ENTRY_CANDIDATE`: candidate fields before portfolio selection
+- `ENTRY_RANKED`: candidate rank and selected/not-selected result
+- `ENTRY_EXECUTED`: final paper entry execution result and selected rank
+
+After the Kite live session completes, replay the captured Kite tape and compare both audits:
+
+```bash
+doppler run -- uv run pivot-paper-trading daily-replay \
+  --strategy CPR_LEVELS \
+  --trade-date today \
+  --pack-source paper_feed_audit \
+  --pack-source-session-id <LIVE_SESSION_ID> \
+  --session-id compare-kite-audit-<direction>-YYYY-MM-DD-v1 \
+  --no-alerts
+
+doppler run -- uv run pivot-paper-trading signal-audit \
+  --session-id <LIVE_SESSION_ID> \
+  --compare-session-id compare-kite-audit-<direction>-YYYY-MM-DD-v1 \
+  --trade-date YYYY-MM-DD
+```
+
+Use `signal-audit` first for trade-selection mismatch. Use `feed-audit` first for OHLCV/source
+drift.
 
 Running variants as separate commands (without `--multi`) executes them sequentially — each
 command acquires the `runtime-writer` lock exclusively. Use `--multi` to avoid this.

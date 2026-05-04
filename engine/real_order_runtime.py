@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from db.paper_db import get_paper_db
@@ -32,6 +33,8 @@ class RealOrderRuntimeConfig:
     exit_max_slippage_pct: float = DEFAULT_EXIT_MAX_SLIPPAGE_PCT
     product: str = "MIS"
     exchange: str = "NSE"
+    adapter_mode: str = "LIVE"
+    shadow: bool = False
 
     @classmethod
     def from_mapping(cls, raw: dict[str, Any] | None) -> RealOrderRuntimeConfig:
@@ -49,6 +52,8 @@ class RealOrderRuntimeConfig:
             ),
             product=str(data.get("product") or "MIS").upper(),
             exchange=str(data.get("exchange") or "NSE").upper(),
+            adapter_mode=str(data.get("adapter_mode") or "LIVE").upper(),
+            shadow=bool(data.get("shadow", False)),
         ).validate()
 
     def validate(self) -> RealOrderRuntimeConfig:
@@ -68,6 +73,8 @@ class RealOrderRuntimeConfig:
             raise OrderSafetyError("automated CPR real-order pilot supports MIS only")
         if self.exchange != "NSE":
             raise OrderSafetyError("automated CPR real-order pilot supports NSE only")
+        if self.adapter_mode not in {"LIVE", "REAL_DRY_RUN"}:
+            raise OrderSafetyError("real-order adapter mode must be LIVE or REAL_DRY_RUN")
         return self
 
 
@@ -117,7 +124,9 @@ class RealOrderRouter:
     ) -> dict[str, Any]:
         if not self.enabled:
             return {}
-        if self._open_real_positions >= self.config.max_positions:
+        started = time.perf_counter()
+        event_lag_ms = _event_lag_ms(event_time)
+        if not self.config.shadow and self._open_real_positions >= self.config.max_positions:
             raise OrderSafetyError(
                 f"real-order max open positions reached ({self.config.max_positions})"
             )
@@ -129,8 +138,12 @@ class RealOrderRouter:
             reference_price=reference_price,
             event_time=_event_time_value(event_time),
         )
+        intent_latency_ms = (time.perf_counter() - started) * 1000.0
         entry_notional = _intent_notional(intent)
-        if self._used_cash_notional + entry_notional > self.config.cash_budget:
+        if (
+            not self.config.shadow
+            and self._used_cash_notional + entry_notional > self.config.cash_budget
+        ):
             raise OrderSafetyError(
                 f"real-order cash budget exceeded: requested cumulative notional "
                 f"{self._used_cash_notional + entry_notional:.2f} > "
@@ -141,10 +154,21 @@ class RealOrderRouter:
             intent=intent,
             adapter=self.adapter,
         )
+        total_latency_ms = (time.perf_counter() - started) * 1000.0
         self._open_real_positions += 1
         self._used_cash_notional += entry_notional
         self._open_notional_by_symbol[symbol.upper()] = (
             self._open_notional_by_symbol.get(symbol.upper(), 0.0) + entry_notional
+        )
+        _log_order_latency(
+            session_id=session_id,
+            symbol=symbol,
+            role="entry",
+            mode=str(result.get("mode") or self.adapter.mode),
+            event_lag_ms=event_lag_ms,
+            intent_latency_ms=intent_latency_ms,
+            broker_latency_ms=result.get("broker_latency_ms"),
+            total_latency_ms=total_latency_ms,
         )
         return {
             "real_order_qty": self.config.fixed_quantity,
@@ -153,6 +177,11 @@ class RealOrderRouter:
             "real_entry_side": side,
             "real_entry_payload": result.get("payload"),
             "real_remaining_qty": self.config.fixed_quantity,
+            "real_entry_mode": result.get("mode") or self.adapter.mode,
+            "real_entry_intent_latency_ms": round(intent_latency_ms, 3),
+            "real_entry_broker_latency_ms": result.get("broker_latency_ms"),
+            "real_entry_total_latency_ms": round(total_latency_ms, 3),
+            "real_entry_event_lag_ms": event_lag_ms,
         }
 
     async def place_exit(
@@ -170,6 +199,8 @@ class RealOrderRouter:
     ) -> dict[str, Any]:
         if not self.enabled or quantity <= 0:
             return {}
+        started = time.perf_counter()
+        event_lag_ms = _event_lag_ms(event_time)
         side = "SELL" if direction.upper() == "LONG" else "BUY"
         intent = build_protected_flatten_intent(
             session_id=session_id,
@@ -185,19 +216,36 @@ class RealOrderRouter:
             max_slippage_pct=self.config.exit_max_slippage_pct,
             event_time=_event_time_value(event_time),
         )
+        intent_latency_ms = (time.perf_counter() - started) * 1000.0
         result = await record_real_order(
             paper_db=get_paper_db(),
             intent=intent,
             adapter=self.adapter,
         )
+        total_latency_ms = (time.perf_counter() - started) * 1000.0
         self._open_real_positions = max(0, self._open_real_positions - 1)
         released = self._open_notional_by_symbol.pop(symbol.upper(), 0.0)
         self._used_cash_notional = max(0.0, self._used_cash_notional - released)
+        _log_order_latency(
+            session_id=session_id,
+            symbol=symbol,
+            role=role,
+            mode=str(result.get("mode") or self.adapter.mode),
+            event_lag_ms=event_lag_ms,
+            intent_latency_ms=intent_latency_ms,
+            broker_latency_ms=result.get("broker_latency_ms"),
+            total_latency_ms=total_latency_ms,
+        )
         return {
             "real_exit_order_id": result.get("exchange_order_id"),
             "real_exit_order_type": intent.order_type,
             "real_exit_side": side,
             "real_exit_payload": result.get("payload"),
+            "real_exit_mode": result.get("mode") or self.adapter.mode,
+            "real_exit_intent_latency_ms": round(intent_latency_ms, 3),
+            "real_exit_broker_latency_ms": result.get("broker_latency_ms"),
+            "real_exit_total_latency_ms": round(total_latency_ms, 3),
+            "real_exit_event_lag_ms": event_lag_ms,
         }
 
     def exit_quantity_for_position(self, position: Any) -> int:
@@ -256,6 +304,12 @@ def build_real_order_router(
     )
     if not runtime_config.enabled:
         return None
+    if runtime_config.adapter_mode == "REAL_DRY_RUN":
+        return RealOrderRouter(
+            runtime_config,
+            adapter=ZerodhaBrokerAdapter(mode="REAL_DRY_RUN"),
+            account_available_cash=None,
+        )
     if runtime_config.require_account_cash_check:
         kite_client = _get_kite_client()
         return RealOrderRouter(
@@ -311,6 +365,58 @@ def _intent_notional(intent: BrokerOrderIntent) -> float:
     if not math.isfinite(float(price)) or float(price) <= 0:
         raise OrderSafetyError("real-order cash budget price must be positive")
     return float(price) * int(normalized.quantity)
+
+
+def _event_lag_ms(event_time: datetime | str | None) -> float | None:
+    event = _coerce_event_datetime(event_time)
+    if event is None:
+        return None
+    now = datetime.now(event.tzinfo)
+    lag = now - event
+    # Historical replay/local-feed drills use old candle timestamps. Report
+    # event lag only for real-time bars so the latency number stays meaningful.
+    if lag < timedelta(seconds=-5) or lag > timedelta(hours=6):
+        return None
+    return round(lag.total_seconds() * 1000.0, 3)
+
+
+def _coerce_event_datetime(event_time: datetime | str | None) -> datetime | None:
+    if isinstance(event_time, datetime):
+        return event_time if event_time.tzinfo is not None else event_time.astimezone()
+    if isinstance(event_time, str) and event_time.strip():
+        try:
+            parsed = datetime.fromisoformat(event_time.strip())
+        except ValueError:
+            return None
+        return parsed if parsed.tzinfo is not None else parsed.astimezone()
+    return None
+
+
+def _log_order_latency(
+    *,
+    session_id: str,
+    symbol: str,
+    role: str,
+    mode: str,
+    event_lag_ms: float | None,
+    intent_latency_ms: float,
+    broker_latency_ms: Any,
+    total_latency_ms: float,
+) -> None:
+    import logging
+
+    logging.getLogger(__name__).info(
+        "ORDER_LATENCY session_id=%s symbol=%s role=%s mode=%s "
+        "event_lag_ms=%s intent_ms=%.3f broker_ms=%s total_ms=%.3f",
+        session_id,
+        symbol.upper(),
+        role,
+        mode,
+        "n/a" if event_lag_ms is None else f"{event_lag_ms:.3f}",
+        intent_latency_ms,
+        "n/a" if broker_latency_ms is None else f"{float(broker_latency_ms):.3f}",
+        total_latency_ms,
+    )
 
 
 def _fetch_available_cash(kite_client: Any) -> float | None:

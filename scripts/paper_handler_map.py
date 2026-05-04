@@ -27,6 +27,7 @@ PAPER_TRADING_HANDLER_NAMES: tuple[str, ...] = (
     "_cmd_close_position",
     "_cmd_cleanup",
     "_cmd_feed_audit",
+    "_cmd_signal_audit",
     "_cmd_replay",
     "_cmd_live",
     "_cmd_daily_prepare",
