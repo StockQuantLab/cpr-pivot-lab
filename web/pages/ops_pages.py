@@ -12,6 +12,11 @@ import plotly.graph_objects as go
 import polars as pl
 from nicegui import ui
 
+from engine.execution_defaults import (
+    DEFAULT_MAX_POSITION_PCT,
+    DEFAULT_MAX_POSITIONS,
+    DEFAULT_PORTFOLIO_VALUE,
+)
 from web.components import (
     COLORS,
     THEME,
@@ -68,10 +73,34 @@ def _format_rupees(value: float | int | None) -> str:
     return f"₹{float(value or 0.0):,.0f}"
 
 
+def _strategy_param_value(params: dict, key: str) -> object | None:
+    if key in params and params.get(key) not in (None, ""):
+        return params.get(key)
+    resolved = params.get("_resolved_strategy_config")
+    if isinstance(resolved, dict) and resolved.get(key) not in (None, ""):
+        return resolved.get(key)
+    return None
+
+
 def _build_session_risk_cards(session: object, colors: dict) -> list[dict]:
-    portfolio_value = float(getattr(session, "portfolio_value", 0.0) or 0.0)
-    max_positions = int(getattr(session, "max_positions", 0) or 0)
-    max_position_pct = float(getattr(session, "max_position_pct", 0.0) or 0.0)
+    params = getattr(session, "strategy_params", {}) or {}
+    if not isinstance(params, dict):
+        params = {}
+    portfolio_value = float(
+        getattr(session, "portfolio_value", 0.0)
+        or _strategy_param_value(params, "portfolio_value")
+        or DEFAULT_PORTFOLIO_VALUE
+    )
+    max_positions = int(
+        getattr(session, "max_positions", 0)
+        or _strategy_param_value(params, "max_positions")
+        or DEFAULT_MAX_POSITIONS
+    )
+    max_position_pct = float(
+        getattr(session, "max_position_pct", 0.0)
+        or _strategy_param_value(params, "max_position_pct")
+        or DEFAULT_MAX_POSITION_PCT
+    )
     slot_cap = portfolio_value * max_position_pct if portfolio_value > 0 else 0.0
     pct_label = f"{max_position_pct * 100:.0f}%" if max_position_pct > 0 else "—"
     sizing_value = (

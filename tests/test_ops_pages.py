@@ -64,3 +64,25 @@ def test_build_session_risk_cards_reflects_ten_by_one_lakh_sizing() -> None:
     values = {card["title"]: card["value"] for card in cards}
     assert values["Sizing"] == "10 x ₹100,000"
     assert values["Slot Cap"] == "₹100,000"
+
+
+def test_build_session_risk_cards_falls_back_to_strategy_params() -> None:
+    cards = _build_session_risk_cards(
+        SimpleNamespace(
+            portfolio_value=0,
+            max_positions=0,
+            max_position_pct=0,
+            strategy_params={
+                "_resolved_strategy_config": {
+                    "portfolio_value": 1_000_000,
+                    "max_positions": 5,
+                    "max_position_pct": 0.20,
+                }
+            },
+        ),
+        {"info": "i", "primary": "p", "warning": "w", "success": "s"},
+    )
+
+    values = {card["title"]: card["value"] for card in cards}
+    assert values["Capital"] == "₹1,000,000"
+    assert values["Sizing"] == "5 x ₹200,000"
