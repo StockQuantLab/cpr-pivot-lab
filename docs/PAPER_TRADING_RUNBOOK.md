@@ -39,6 +39,12 @@ PYTHONUNBUFFERED=1 doppler run -- uv run pivot-paper-trading daily-live \
   mode this checks today's saved universe against the previous completed trading day's
   `v_daily`, `v_5min`, `atr_intraday`, and `cpr_thresholds` data; it does not require today's
   intraday candles or future-dated `market_day_state` rows.
+- After market open, readiness/status checks must be read-only: use only
+  `doppler run -- uv run pivot-data-quality --date today`, `pivot-paper-trading status`,
+  dashboard Live Readiness, and log monitoring. Do not run `daily-prepare`, `pivot-build`,
+  `pivot-refresh`, or EOD/Kite ingest after market open unless the operator explicitly approves
+  a recovery action. `daily-prepare --status` is not a valid status command and should not be
+  used by agents.
 - Start `daily-live --feed-source kite` at/after 09:16 IST. The CLI now fails fast before
   09:16 unless `--wait-for-open` is explicitly supplied; do not use the wait mode for normal ops.
 - CPR exits open positions at 15:00 IST by default. Zerodha publishes intraday auto square-off
@@ -84,6 +90,17 @@ Required result:
 - `status` shows no unexpected active sessions before launch.
 - `universes` includes today's `full_YYYY_MM_DD` snapshot.
 - `pivot-lock-status` shows no live writer PID before startup.
+
+**After market open status-only commands:**
+```bash
+doppler run -- uv run pivot-data-quality --date today
+doppler run -- uv run pivot-paper-trading status
+uv run pivot-lock-status --json
+```
+
+Do not run `daily-prepare`, `pivot-refresh`, `pivot-build`, or ingestion commands after market
+open unless this is an explicit operator-approved recovery. Those commands are pre-market/EOD
+operations, not live status checks. `daily-prepare --status` is not a supported command.
 
 **Historical replay validation bundle:**
 ```bash
@@ -529,6 +546,12 @@ used by live.
 
 **Dashboard note**: The dashboard can remain open during live sessions — the `paper.duckdb` replica avoids
 file-lock conflicts.
+
+**Post-open agent boundary**: after market open, agents must not run `daily-prepare`,
+`pivot-refresh`, `pivot-build`, or ingestion as a readiness/status check. Use
+`pivot-data-quality --date today`, `pivot-paper-trading status`, dashboard Live Readiness, and
+logs only. Any rebuild/refresh after open is a recovery action and requires explicit operator
+approval.
 
 **If `daily-prepare` fails with "Runtime coverage incomplete":**
 - Re-run `pivot-refresh --since <prev_trading_date> --prepare-paper --trade-date today` and check for errors
