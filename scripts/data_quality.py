@@ -171,6 +171,86 @@ def _coverage_blocking_tables(
     }
 
 
+def _coverage_blocking_counts(
+    missing_counts: dict[str, int],
+    *,
+    requested_count: int,
+    tables: tuple[str, ...],
+) -> dict[str, str]:
+    return {
+        table: _coverage_status(
+            requested_count=requested_count,
+            missing_count=int(missing_counts.get(table) or 0),
+        )
+        for table in tables
+    }
+
+
+def _count_distinct_symbols_before(
+    db: Any,
+    table: str,
+    trade_date: str,
+    *,
+    include_trade_date: bool = False,
+) -> int:
+    operator = "<=" if include_trade_date else "<"
+    try:
+        row = db.con.execute(
+            f"SELECT COUNT(DISTINCT symbol) FROM {table} WHERE trade_date {operator} ?::DATE",
+            [trade_date],
+        ).fetchone()
+        return int((row or [0])[0] or 0)
+    except Exception:
+        return 0
+
+
+def _live_prereq_missing_counts_fast(
+    db: Any,
+    *,
+    requested_count: int,
+    trade_date: str,
+    table_max_dates: dict[str, str | None],
+) -> dict[str, int]:
+    """Return dashboard-fast setup-only prerequisite missing counts.
+
+    This intentionally avoids full symbol-list scans over large Parquet/runtime tables.
+    The detailed CLI/live gate can still use _live_prereq_coverage when symbol lists matter.
+    """
+    pack_date = table_max_dates.get("intraday_day_pack")
+    cpr_daily_date = table_max_dates.get("cpr_daily")
+    threshold_date = table_max_dates.get("cpr_thresholds")
+    atr_date = table_max_dates.get("atr_intraday")
+    if atr_date is None and hasattr(db, "get_table_max_trade_dates"):
+        try:
+            atr_date = db.get_table_max_trade_dates(["atr_intraday"]).get("atr_intraday")
+        except Exception:
+            atr_date = None
+
+    cpr_daily_count = _count_distinct_symbols_before(
+        db,
+        "cpr_daily",
+        trade_date,
+        include_trade_date=True,
+    )
+    pack_count = _count_distinct_symbols_before(db, "intraday_day_pack", trade_date)
+    atr_count = _count_distinct_symbols_before(db, "atr_intraday", trade_date)
+    threshold_count = _count_distinct_symbols_before(db, "cpr_thresholds", trade_date)
+
+    def missing(present: int) -> int:
+        return max(0, requested_count - max(0, int(present or 0)))
+
+    return {
+        "v_daily": missing(cpr_daily_count),
+        "v_5min": missing(pack_count),
+        "atr_intraday": missing(atr_count),
+        "cpr_thresholds": missing(threshold_count),
+        "atr_date_mismatch": 0 if atr_date == pack_date else requested_count,
+        "cpr_threshold_date_mismatch": 0
+        if cpr_daily_date == trade_date and threshold_date == trade_date
+        else requested_count,
+    }
+
+
 def _live_prereq_coverage(db: Any, symbols: list[str], trade_date: str) -> dict[str, list[str]]:
     """Return live prerequisites missing for current/future trade date setup."""
     coverage = {
@@ -185,14 +265,34 @@ def _live_prereq_coverage(db: Any, symbols: list[str], trade_date: str) -> dict[
         return coverage
     placeholders = ", ".join("?" for _ in symbols)
     params = [*symbols, trade_date]
-    daily_rows = db.con.execute(
-        f"SELECT symbol, MAX(date)::VARCHAR FROM v_daily WHERE symbol IN ({placeholders}) AND date < ?::DATE GROUP BY symbol",
-        params,
-    ).fetchall()
-    five_min_rows = db.con.execute(
-        f"SELECT symbol, MAX(date)::VARCHAR FROM v_5min WHERE symbol IN ({placeholders}) AND date < ?::DATE GROUP BY symbol",
-        params,
-    ).fetchall()
+    try:
+        # For setup-only readiness, intraday_day_pack is the runtime proof that
+        # 5-minute Parquet was ingested and built. Querying it avoids scanning
+        # the large v_5min Parquet view on every dashboard readiness load.
+        five_min_rows = db.con.execute(
+            f"SELECT symbol, MAX(trade_date)::VARCHAR FROM intraday_day_pack WHERE symbol IN ({placeholders}) AND trade_date < ?::DATE GROUP BY symbol",
+            params,
+        ).fetchall()
+    except Exception:
+        five_min_rows = db.con.execute(
+            f"SELECT symbol, MAX(date)::VARCHAR FROM v_5min WHERE symbol IN ({placeholders}) AND date < ?::DATE GROUP BY symbol",
+            params,
+        ).fetchall()
+    try:
+        # Exact trade-date CPR rows are the setup-only proof that daily Parquet
+        # was ingested and used to build live setup. Avoid scanning v_daily
+        # across all history for every dashboard readiness request.
+        daily_rows = db.con.execute(
+            f"SELECT symbol FROM cpr_daily WHERE symbol IN ({placeholders}) AND trade_date = ?::DATE",
+            params,
+        ).fetchall()
+        daily_from_setup = True
+    except Exception:
+        daily_rows = db.con.execute(
+            f"SELECT symbol, MAX(date)::VARCHAR FROM v_daily WHERE symbol IN ({placeholders}) AND date < ?::DATE GROUP BY symbol",
+            params,
+        ).fetchall()
+        daily_from_setup = False
     atr_rows = db.con.execute(
         f"SELECT symbol, MAX(trade_date)::VARCHAR FROM atr_intraday WHERE symbol IN ({placeholders}) AND trade_date < ?::DATE GROUP BY symbol",
         params,
@@ -201,10 +301,17 @@ def _live_prereq_coverage(db: Any, symbols: list[str], trade_date: str) -> dict[
         f"SELECT symbol, MAX(trade_date)::VARCHAR FROM cpr_thresholds WHERE symbol IN ({placeholders}) AND trade_date < ?::DATE GROUP BY symbol",
         params,
     ).fetchall()
-    daily_map = {str(row[0]): str(row[1]) if row[1] is not None else None for row in daily_rows}
     five_min_map = {
         str(row[0]): str(row[1]) if row[1] is not None else None for row in five_min_rows
     }
+    if daily_from_setup:
+        daily_map = {
+            str(row[0]): five_min_map.get(str(row[0]))
+            for row in daily_rows
+            if row and row[0] and five_min_map.get(str(row[0])) is not None
+        }
+    else:
+        daily_map = {str(row[0]): str(row[1]) if row[1] is not None else None for row in daily_rows}
     atr_map = {str(row[0]): str(row[1]) if row[1] is not None else None for row in atr_rows}
     threshold_map = {
         str(row[0]): str(row[1]) if row[1] is not None else None for row in threshold_rows
@@ -314,16 +421,15 @@ def _print_window_report(start_date: str, end_date: str) -> None:
         print(f"  {label:<20} {int(count):>10,}")
 
 
-def build_trade_date_readiness_report(trade_date: str, *, db: Any | None = None) -> dict[str, Any]:
+def build_trade_date_readiness_report(
+    trade_date: str,
+    *,
+    db: Any | None = None,
+    fast_counts_only: bool = False,
+) -> dict[str, Any]:
     """Build a readiness report for a specific trade date."""
     db = db or get_db()
     pre_market = _is_pre_market(trade_date)
-    candidate_symbols = sorted(db.get_symbols_with_parquet_data([trade_date]))
-    symbol_source = "same-day_5min_parquet"
-    setup_only_mode = False
-    if not candidate_symbols:
-        symbol_source, candidate_symbols = _load_default_universe_symbols(db, trade_date)
-        setup_only_mode = bool(candidate_symbols)
 
     # Tables expected to be at trade_date after a correct EOD build (one day ahead of pack).
     # Being at exactly trade_date with pack behind = valid post-EOD state.
@@ -345,6 +451,16 @@ def build_trade_date_readiness_report(trade_date: str, *, db: Any | None = None)
     ]
     table_max_dates = db.get_table_max_trade_dates(freshness_tables)
     pack_date = table_max_dates.get("intraday_day_pack")
+    if pack_date is not None and str(trade_date) > str(pack_date):
+        candidate_symbols = []
+    else:
+        candidate_symbols = sorted(db.get_symbols_with_parquet_data([trade_date]))
+    symbol_source = "same-day_5min_parquet"
+    setup_only_mode = False
+    if not candidate_symbols:
+        symbol_source, candidate_symbols = _load_default_universe_symbols(db, trade_date)
+        setup_only_mode = bool(candidate_symbols)
+
     freshness_rows: list[dict[str, str | None]] = []
     freshness_blocking = False
     for table in freshness_tables:
@@ -424,12 +540,6 @@ def build_trade_date_readiness_report(trade_date: str, *, db: Any | None = None)
         symbol for symbol in candidate_symbols if symbol not in set(setup_capable_symbols)
     ]
 
-    if setup_only_mode:
-        coverage = _live_prereq_coverage(db, candidate_symbols, trade_date)
-    else:
-        coverage = db.get_runtime_trade_date_coverage(candidate_symbols, trade_date)
-    missing_counts = {table: len(symbols) for table, symbols in coverage.items()}
-
     blocking_tables = (
         (
             "v_daily",
@@ -442,11 +552,30 @@ def build_trade_date_readiness_report(trade_date: str, *, db: Any | None = None)
         if setup_only_mode
         else ("cpr_daily", "market_day_state", "strategy_day_state", "intraday_day_pack")
     )
-    coverage_status = _coverage_blocking_tables(
-        coverage,
-        requested_count=len(candidate_symbols),
-        tables=blocking_tables,
-    )
+    if setup_only_mode and fast_counts_only:
+        coverage = {}
+        missing_counts = _live_prereq_missing_counts_fast(
+            db,
+            requested_count=len(candidate_symbols),
+            trade_date=trade_date,
+            table_max_dates=table_max_dates,
+        )
+        coverage_status = _coverage_blocking_counts(
+            missing_counts,
+            requested_count=len(candidate_symbols),
+            tables=blocking_tables,
+        )
+    else:
+        if setup_only_mode:
+            coverage = _live_prereq_coverage(db, candidate_symbols, trade_date)
+        else:
+            coverage = db.get_runtime_trade_date_coverage(candidate_symbols, trade_date)
+        missing_counts = {table: len(symbols) for table, symbols in coverage.items()}
+        coverage_status = _coverage_blocking_tables(
+            coverage,
+            requested_count=len(candidate_symbols),
+            tables=blocking_tables,
+        )
     coverage_blocking = any(status == "blocking" for status in coverage_status.values())
 
     # Direction coverage: how many strategy_day_state rows for this date have

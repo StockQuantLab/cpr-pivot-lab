@@ -196,8 +196,10 @@ def test_pre_market_mode_reports_ready_when_previous_day_prereqs_current(monkeyp
 
     class _FakeCon:
         def execute(self, sql, params=None):
-            if "FROM v_daily" in sql or "FROM v_5min" in sql:
+            if "FROM v_daily" in sql or "FROM v_5min" in sql or "FROM intraday_day_pack" in sql:
                 return _FakeResult([("SBIN", prev_iso), ("TCS", prev_iso)])
+            if "FROM cpr_daily" in sql:
+                return _FakeResult([("SBIN",), ("TCS",)])
             if "FROM atr_intraday" in sql or "FROM cpr_thresholds" in sql:
                 return _FakeResult([("SBIN", prev_iso), ("TCS", prev_iso)])
             if "FROM strategy_day_state" in sql and "GROUP BY 1" in sql:
@@ -245,8 +247,10 @@ def test_setup_only_mode_falls_back_to_canonical_universe(monkeypatch):
 
     class _FakeCon:
         def execute(self, sql, params=None):
-            if "FROM v_daily" in sql or "FROM v_5min" in sql:
+            if "FROM v_daily" in sql or "FROM v_5min" in sql or "FROM intraday_day_pack" in sql:
                 return _FakeResult([("SBIN", prev_iso), ("TCS", prev_iso)])
+            if "FROM cpr_daily" in sql:
+                return _FakeResult([("SBIN",), ("TCS",)])
             if "FROM atr_intraday" in sql or "FROM cpr_thresholds" in sql:
                 return _FakeResult([("SBIN", prev_iso), ("TCS", prev_iso)])
             if "FROM strategy_day_state" in sql and "GROUP BY 1" in sql:
@@ -338,8 +342,10 @@ def test_pre_market_mode_warns_on_sparse_missing_symbols(monkeypatch):
         def execute(self, sql, params=None):
             if "FROM strategy_day_state" in sql and "GROUP BY 1" in sql:
                 return _FakeResult([("NONE", len(present_symbols))])
-            if "FROM v_daily" in sql or "FROM v_5min" in sql:
+            if "FROM v_daily" in sql or "FROM v_5min" in sql or "FROM intraday_day_pack" in sql:
                 return _FakeResult([(symbol, "2026-04-28") for symbol in present_symbols])
+            if "FROM cpr_daily" in sql:
+                return _FakeResult([(symbol,) for symbol in present_symbols])
             if "FROM atr_intraday" in sql or "FROM cpr_thresholds" in sql:
                 return _FakeResult([(symbol, "2026-04-28") for symbol in present_symbols])
             return _FakeResult([])
@@ -366,6 +372,39 @@ def test_pre_market_mode_warns_on_sparse_missing_symbols(monkeypatch):
     assert report["coverage_status"]["v_daily"] == "warning"
 
 
+def test_live_prereq_coverage_uses_runtime_pack_for_5min_prereq():
+    queries: list[str] = []
+
+    class _FakeResult:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def fetchall(self):
+            return self._rows
+
+    class _FakeCon:
+        def execute(self, sql, params=None):
+            queries.append(sql)
+            if "FROM v_daily" in sql:
+                return _FakeResult([("SBIN", "2026-05-04")])
+            if "FROM intraday_day_pack" in sql:
+                return _FakeResult([("SBIN", "2026-05-04")])
+            if "FROM atr_intraday" in sql:
+                return _FakeResult([("SBIN", "2026-05-04")])
+            if "FROM cpr_thresholds" in sql:
+                return _FakeResult([("SBIN", "2026-05-04")])
+            raise AssertionError(f"Unexpected query: {sql}")
+
+    class _FakeDb:
+        con = _FakeCon()
+
+    coverage = data_quality._live_prereq_coverage(_FakeDb(), ["SBIN"], "2026-05-05")
+
+    assert coverage["v_5min"] == []
+    assert any("FROM intraday_day_pack" in query for query in queries)
+    assert not any("FROM v_5min" in query for query in queries)
+
+
 def test_setup_only_mode_next_day_state_at_trade_date_is_valid(monkeypatch):
     """Ready=YES when state tables are at trade_date and pack at prev_day.
 
@@ -388,8 +427,10 @@ def test_setup_only_mode_next_day_state_at_trade_date_is_valid(monkeypatch):
 
     class _FakeCon:
         def execute(self, sql, params=None):
-            if "FROM v_daily" in sql or "FROM v_5min" in sql:
+            if "FROM v_daily" in sql or "FROM v_5min" in sql or "FROM intraday_day_pack" in sql:
                 return _FakeResult([("SBIN", prev_iso)])
+            if "FROM cpr_daily" in sql and "SELECT COUNT(*)" not in sql:
+                return _FakeResult([("SBIN",)])
             if "FROM atr_intraday" in sql or "FROM cpr_thresholds" in sql:
                 return _FakeResult([("SBIN", prev_iso)])
             if "FROM strategy_day_state" in sql and "GROUP BY 1" in sql:
@@ -458,8 +499,10 @@ def test_setup_only_mode_blocks_state_rows_beyond_trade_date(monkeypatch):
 
     class _FakeCon:
         def execute(self, sql, params=None):
-            if "FROM v_daily" in sql or "FROM v_5min" in sql:
+            if "FROM v_daily" in sql or "FROM v_5min" in sql or "FROM intraday_day_pack" in sql:
                 return _FakeResult([("SBIN", prev_iso)])
+            if "FROM cpr_daily" in sql and "SELECT COUNT(*)" not in sql:
+                return _FakeResult([("SBIN",)])
             if "FROM atr_intraday" in sql or "FROM cpr_thresholds" in sql:
                 return _FakeResult([("SBIN", prev_iso)])
             if "FROM strategy_day_state" in sql and "GROUP BY 1" in sql:
@@ -511,8 +554,10 @@ def test_setup_only_fails_when_next_day_market_day_state_missing(monkeypatch):
 
     class _FakeCon:
         def execute(self, sql, params=None):
-            if "FROM v_daily" in sql or "FROM v_5min" in sql:
+            if "FROM v_daily" in sql or "FROM v_5min" in sql or "FROM intraday_day_pack" in sql:
                 return _FakeResult([("SBIN", prev_iso)])
+            if "FROM cpr_daily" in sql and "SELECT COUNT(*)" not in sql:
+                return _FakeResult([("SBIN",)])
             if "FROM atr_intraday" in sql or "FROM cpr_thresholds" in sql:
                 return _FakeResult([("SBIN", prev_iso)])
             if "FROM strategy_day_state" in sql and "GROUP BY 1" in sql:
@@ -567,7 +612,7 @@ def test_setup_only_passes_when_next_day_state_exists_without_pack(monkeypatch):
 
     class _FakeCon:
         def execute(self, sql, params=None):
-            if "FROM v_daily" in sql or "FROM v_5min" in sql:
+            if "FROM v_daily" in sql or "FROM v_5min" in sql or "FROM intraday_day_pack" in sql:
                 return _FakeResult([("SBIN", prev_iso)])
             if "FROM atr_intraday" in sql or "FROM cpr_thresholds" in sql:
                 return _FakeResult([("SBIN", prev_iso)])
@@ -578,6 +623,8 @@ def test_setup_only_passes_when_next_day_state_exists_without_pack(monkeypatch):
                 "FROM market_day_state" in sql or "FROM cpr_daily" in sql
             ):
                 return _FakeResult([(2032,)])
+            if "FROM cpr_daily" in sql:
+                return _FakeResult([("SBIN",)])
             return _FakeResult([])
 
     class _FakeDb:

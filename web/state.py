@@ -1373,6 +1373,7 @@ def _fetch_live_readiness_sync(trade_date: str | None = None) -> dict:
         report = build_trade_date_readiness_report(
             resolved_trade_date,
             db=db,
+            fast_counts_only=True,
         )
     except Exception as exc:
         logger.exception("Live readiness failed for %s", resolved_trade_date)

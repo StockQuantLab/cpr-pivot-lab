@@ -7,9 +7,9 @@ Supersedes: `docs/PARITY_INCIDENT_LOG.md` (contents migrated below).
 
 ---
 
-## 2026-05-04 — OPEN: PERF: Live readiness check takes 20-30 seconds
+## 2026-05-04 — FIXED: PERF: Live readiness check takes 20-30 seconds
 
-**Status:** OPEN
+**Status:** FIXED
 **Severity:** Medium
 
 ### Symptom
@@ -18,26 +18,30 @@ Paper Sessions Live Readiness can take roughly 20-30 seconds to render after EOD
 
 ### Root Cause
 
-Likely dashboard/readiness query cost. The readiness path calls
-`build_trade_date_readiness_report()` from `web/state.py`, which checks dated universe coverage and
-live prerequisites across ~2,000 symbols. The slowest likely path is setup-only coverage queries
-against `v_daily`/`v_5min` parquet views and exact setup-table checks on every refresh.
+The dashboard readiness path called `build_trade_date_readiness_report()` in detailed mode.
+For setup-only future/live dates, that still performed avoidable Parquet/runtime scans:
+first probing future-date `v_5min`, then collecting full per-symbol prerequisite lists across
+`v_daily`, `intraday_day_pack`, `atr_intraday`, and `cpr_thresholds`.
 
 ### Fix
 
-Pending.
+`scripts/data_quality.py` now skips the same-day `v_5min` probe when the target trade date is
+ahead of `intraday_day_pack`, uses `intraday_day_pack` instead of `v_5min` for detailed setup-only
+5-minute coverage, and supports `fast_counts_only` for dashboard readiness. `web/state.py` uses
+that fast path, which computes operator counts/status from runtime table counts instead of full
+missing-symbol lists.
 
-Candidate fix direction:
+Verification on the local dashboard market replica for `2026-05-05`:
 
-- add timed instrumentation per readiness subquery
-- cache readiness results briefly by trade date in the dashboard
-- avoid scanning `v_5min` parquet for future/setup-only readiness when `intraday_day_pack` and
-  next-day setup tables already prove readiness
-- use explicit refresh/count actions for expensive detail rows in the dashboard
+- Before: 18.298s measured for `_fetch_live_readiness_sync("2026-05-05")`
+- After skipping future `v_5min`: 14.870s
+- After dashboard `fast_counts_only`: 1.580s, `ready=True`, `requested=2038`,
+  prerequisite missing counts all zero
 
 ### Related
 
-Paper Sessions Live Readiness tab, `web/state.py`, `scripts/data_quality.py`
+Paper Sessions Live Readiness tab, `web/state.py`, `scripts/data_quality.py`,
+`tests/test_data_quality_cli.py`, `tests/test_web_state.py`
 
 ---
 

@@ -108,9 +108,10 @@ def test_fetch_live_readiness_uses_dashboard_replica(monkeypatch: pytest.MonkeyP
     fake_db = object()
     monkeypatch.setattr(web_state, "get_dashboard_db", lambda: fake_db)
 
-    def fake_report(trade_date: str, *, db=None):
+    def fake_report(trade_date: str, *, db=None, fast_counts_only: bool = False):
         assert trade_date == "2026-04-30"
         assert db is fake_db
+        assert fast_counts_only is True
         return {
             "trade_date": trade_date,
             "ready": False,
@@ -145,9 +146,10 @@ def test_fetch_live_readiness_defaults_to_prepared_runtime_date(
     fake_db = FakeDB()
     monkeypatch.setattr(web_state, "get_dashboard_db", lambda: fake_db)
 
-    def fake_report(trade_date: str, *, db=None):
+    def fake_report(trade_date: str, *, db=None, fast_counts_only: bool = False):
         assert trade_date == "2026-05-04"
         assert db is fake_db
+        assert fast_counts_only is True
         return {
             "trade_date": trade_date,
             "ready": True,
@@ -193,9 +195,10 @@ def test_fetch_live_readiness_adds_operator_status_rows(monkeypatch: pytest.Monk
     fake_db = FakeDB()
     monkeypatch.setattr(web_state, "get_dashboard_db", lambda: fake_db)
 
-    def fake_report(trade_date: str, *, db=None):
+    def fake_report(trade_date: str, *, db=None, fast_counts_only: bool = False):
         assert trade_date == "2026-05-04"
         assert db is fake_db
+        assert fast_counts_only is True
         return {
             "trade_date": trade_date,
             "ready": True,
