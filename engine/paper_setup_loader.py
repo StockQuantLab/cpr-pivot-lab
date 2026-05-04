@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 from datetime import time as dt_time
 from typing import Any
 
-from db.duckdb import get_dashboard_db
+from db.duckdb import get_live_market_db
 from engine.cpr_atr_shared import regime_snapshot_close_col
 from engine.cpr_atr_utils import (
     calculate_gap_pct,
@@ -84,7 +84,7 @@ def _load_live_setup_row(
     or_minutes: int,
     bar_end_offset: timedelta | None = None,
 ) -> dict[str, Any] | None:
-    db = get_dashboard_db()
+    db = get_live_market_db()
     with _MARKET_DB_READ_LOCK:
         setup_base = db.con.execute(
             """
@@ -230,7 +230,7 @@ def load_setup_row(
     regime_index_symbol: str | None = None,
     regime_snapshot_minutes: int = 30,
 ) -> dict[str, Any] | None:
-    db = get_dashboard_db()
+    db = get_live_market_db()
     regime_symbol = str(regime_index_symbol or "").strip().upper()
     regime_close_col = regime_snapshot_close_col(regime_snapshot_minutes)
     with _MARKET_DB_READ_LOCK:
@@ -470,7 +470,7 @@ def refresh_pending_setup_rows_for_bar(
     if not pending_symbols:
         return {"resolved": 0, "pending": 0, "missing": 0, "updated": 0}
 
-    db = get_dashboard_db()
+    db = get_live_market_db()
     placeholders = ", ".join(["?"] * len(pending_symbols))
     query = f"""
         SELECT

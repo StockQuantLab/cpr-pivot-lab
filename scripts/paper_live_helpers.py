@@ -276,9 +276,14 @@ def log_ticker_health(
     except Exception:
         logger.debug("ticker health_stats failed", exc_info=True)
         return None
+    ts_sources = stats.get("timestamp_source_counts") or {}
+    ts_fallbacks = sum(
+        int(ts_sources.get(key, 0) or 0) for key in ("timestamp", "last_trade_time", "receive-time")
+    )
     logger.info(
         "TICKER_HEALTH session=%s connected=%s ticks=%d last_tick_age=%s "
-        "closes=%d reconnects=%d subs=%d coverage=%.0f%% (%d/%d) stale=%d missing=%d",
+        "closes=%d reconnects=%d subs=%d coverage=%.0f%% (%d/%d) stale=%d missing=%d "
+        "ts_exchange=%d ts_fallback=%d ts_receive=%d",
         session_id,
         stats["connected"],
         stats["tick_count"],
@@ -291,6 +296,9 @@ def log_ticker_health(
         coverage["total"],
         coverage["stale"],
         coverage["missing"],
+        int(ts_sources.get("exchange_timestamp", 0) or 0),
+        ts_fallbacks,
+        int(ts_sources.get("receive-time", 0) or 0),
     )
     return {"stats": stats, "coverage": coverage}
 

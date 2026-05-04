@@ -135,7 +135,7 @@ def test_prefetch_setup_rows_hydrates_direction_from_shared_cpr_helper(
                 return FakeResult(one=(101.0, 99.0, 2.0))
             return FakeResult(rows=[row])
 
-    monkeypatch.setattr(paper_live, "get_dashboard_db", lambda: SimpleNamespace(con=FakeCon()))
+    monkeypatch.setattr(paper_live, "get_live_market_db", lambda: SimpleNamespace(con=FakeCon()))
 
     runtime_state = PaperRuntimeState()
     paper_live._prefetch_setup_rows(
@@ -824,8 +824,8 @@ async def test_run_live_session_survives_all_pending_startup(
 
     fake_db = SimpleNamespace(con=FakeCon())
 
-    monkeypatch.setattr(paper_live, "get_dashboard_db", lambda: fake_db)
-    monkeypatch.setattr("engine.paper_setup_loader.get_dashboard_db", lambda: fake_db)
+    monkeypatch.setattr(paper_live, "get_live_market_db", lambda: fake_db)
+    monkeypatch.setattr("engine.paper_setup_loader.get_live_market_db", lambda: fake_db)
     monkeypatch.setattr(
         paper_live, "pre_filter_symbols_for_strategy", lambda *args, **kwargs: ["SBIN", "RELIANCE"]
     )
@@ -1439,3 +1439,68 @@ async def test_run_live_session_reports_websocket_watchdog_failure(
     assert any(alert["reason"] == "websocket_reconnect_stalled" for alert in alerts)
     assert any(alert["reason"] == "websocket_reconnect_failed" for alert in alerts)
     assert updates and all("status" not in update for update in updates)
+
+
+@pytest.mark.asyncio
+async def test_run_live_session_blocks_real_orders_with_partial_scale_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = SimpleNamespace(
+        session_id="sess-real-partial",
+        status="PLANNING",
+        symbols=["SBIN"],
+        strategy="CPR_LEVELS",
+        strategy_params={},
+        stale_feed_timeout_sec=0,
+    )
+    updates: list[dict[str, object]] = []
+
+    async def fake_session_loader(session_id: str):
+        assert session_id == "sess-real-partial"
+        return session
+
+    async def fake_session_updater(session_id: str, **kwargs):
+        assert session_id == "sess-real-partial"
+        updates.append(dict(kwargs))
+        for key, value in kwargs.items():
+            setattr(session, key, value)
+        return session
+
+    monkeypatch.setattr("scripts.paper_live.register_session_start", lambda: None)
+    monkeypatch.setattr(
+        "scripts.paper_live.build_backtest_params",
+        lambda _session: SimpleNamespace(
+            direction_filter="LONG",
+            cpr_levels=SimpleNamespace(scale_out_pct=0.8),
+            portfolio_value=100000.0,
+            max_position_pct=0.1,
+        ),
+    )
+    monkeypatch.setattr(
+        "scripts.paper_live.build_real_order_router",
+        lambda _config: SimpleNamespace(
+            enabled=True,
+            config=SimpleNamespace(fixed_quantity=1, entry_order_type="MARKET"),
+        ),
+    )
+
+    result = await run_live_session(
+        session_id="sess-real-partial",
+        ticker_adapter=SimpleNamespace(),
+        real_order_config={"enabled": True},
+        max_cycles=1,
+        deps=LiveSessionDeps(
+            session_loader=fake_session_loader,
+            session_updater=fake_session_updater,
+            feed_writer=lambda **kwargs: SimpleNamespace(**kwargs),
+            sleep_fn=lambda _: None,
+        ),
+    )
+
+    assert result == {
+        "session_id": "sess-real-partial",
+        "final_status": "FAILED",
+        "terminal_reason": "real_order_partial_scale_out_unsupported",
+        "cycles": 0,
+    }
+    assert any(update.get("status") == "FAILED" for update in updates)

@@ -48,7 +48,6 @@ def _position_to_trade_row(session: PaperSession, position: PaperPosition) -> di
         "CLOSE_POSITIONS": "TIME",
         "CLOSE_ALL": "TIME",
         "FLATTEN": "TIME",
-        "MOMENTUM_FAIL": "CANDLE_EXIT",
     }
     exit_reason = exit_reason_map.get(raw_exit_reason.strip().upper(), raw_exit_reason)
     sl_phase = str(trail_state.get("sl_phase") or "PROTECT")

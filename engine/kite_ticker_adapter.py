@@ -72,6 +72,13 @@ class KiteTickerAdapter:
         self._session_symbols: dict[str, set[str]] = {}
         # Per-symbol tick timestamps for coverage telemetry.
         self._symbol_last_tick_ts: dict[str, datetime] = {}
+        self._timestamp_source_counts: dict[str, int] = {
+            "exchange_timestamp": 0,
+            "timestamp": 0,
+            "last_trade_time": 0,
+            "receive-time": 0,
+        }
+        self._last_timestamp_source_counts: dict[str, int] = {}
         self._last_close_ts: datetime | None = None
         self._close_count = 0
         self._last_recovery_attempt_ts: datetime | None = None
@@ -426,6 +433,7 @@ class KiteTickerAdapter:
         ltp_updates: dict[str, float] = {}
         tick_count = 0
         fallback_count = 0
+        batch_source_counts: dict[str, int] = defaultdict(int)
         latest_ts: datetime | None = None
         for tick in ticks:
             token = tick.get("instrument_token")
@@ -439,6 +447,7 @@ class KiteTickerAdapter:
             if last_price is None:
                 continue
             ts, ts_source = _coerce_tick_timestamp(tick, now)
+            batch_source_counts[ts_source] += 1
             if ts_source != "exchange_timestamp":
                 fallback_count += 1
             volume = tick.get("volume_traded")
@@ -469,6 +478,11 @@ class KiteTickerAdapter:
             self._tick_count += tick_count
             if latest_ts is not None:
                 self._last_tick_ts = latest_ts
+            self._last_timestamp_source_counts = dict(batch_source_counts)
+            for source, count in batch_source_counts.items():
+                self._timestamp_source_counts[source] = (
+                    self._timestamp_source_counts.get(source, 0) + count
+                )
             for sym, snaps in snapshots_by_symbol.items():
                 if snaps:
                     self._symbol_last_tick_ts[sym] = snaps[-1].ts
@@ -519,6 +533,8 @@ class KiteTickerAdapter:
             subscribed = len(self._subscribed_tokens)
             sessions = list(self._session_symbols.keys())
             per_symbol = dict(self._symbol_last_tick_ts)
+            timestamp_source_counts = dict(self._timestamp_source_counts)
+            last_timestamp_source_counts = dict(self._last_timestamp_source_counts)
         last_tick_age_sec: float | None = None
         if last_tick is not None:
             last_tick_age_sec = (now - last_tick).total_seconds()
@@ -539,6 +555,8 @@ class KiteTickerAdapter:
             "subscribed_tokens": subscribed,
             "sessions": sessions,
             "per_symbol_last_tick_count": len(per_symbol),
+            "timestamp_source_counts": timestamp_source_counts,
+            "last_timestamp_source_counts": last_timestamp_source_counts,
         }
 
     def symbol_coverage(self, symbols: list[str], within_sec: float = 300.0) -> dict[str, Any]:

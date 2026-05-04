@@ -1076,6 +1076,9 @@ _dashboard_db: MarketDB | None = None
 _dashboard_consumer: ReplicaConsumer | None = None
 _dashboard_lock = threading.Lock()
 _dashboard_atexit_registered = False
+_live_market_db: MarketDB | None = None
+_live_market_lock = threading.Lock()
+_live_market_atexit_registered = False
 
 
 def get_dashboard_db() -> MarketDB:
@@ -1114,8 +1117,37 @@ def get_dashboard_db() -> MarketDB:
     return _dashboard_db
 
 
+def get_live_market_db() -> MarketDB:
+    """Return a read-only MarketDB instance pinned to the source market DB.
+
+    Live/replay runtime setup reads should not depend on the dashboard replica
+    selection contract. This accessor names that ownership explicitly while
+    keeping the connection read-only.
+    """
+    global _live_market_db, _live_market_atexit_registered
+    if _db is not None:
+        logger.info("Live market DB reusing existing source connection source=%s", _db.db_path)
+        return _db
+    if _live_market_db is None:
+        with _live_market_lock:
+            if _live_market_db is None:
+                _live_market_db = MarketDB(db_path=DUCKDB_FILE, read_only=True)
+                logger.info("Live market DB opened source=%s read_only=True", DUCKDB_FILE)
+                if not _live_market_atexit_registered:
+                    atexit.register(close_live_market_db)
+                    _live_market_atexit_registered = True
+    return _live_market_db
+
+
 def close_dashboard_db() -> None:
     global _dashboard_db
     if _dashboard_db is not None:
         _dashboard_db.close()
         _dashboard_db = None
+
+
+def close_live_market_db() -> None:
+    global _live_market_db
+    if _live_market_db is not None:
+        _live_market_db.close()
+        _live_market_db = None

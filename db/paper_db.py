@@ -39,6 +39,7 @@ PROJECT_ROOT = Path(__file__).parent.parent
 DATA_DIR = PROJECT_ROOT / "data"
 PAPER_DUCKDB_FILE = DATA_DIR / "paper.duckdb"
 REPLICA_DIR = DATA_DIR / "paper_replica"
+DEFERRED_SYNC_MARKER = REPLICA_DIR / "deferred_sync_pending.flag"
 
 
 def _loads_json(value: Any, default: Any) -> Any:
@@ -63,6 +64,38 @@ def _utcnow() -> datetime:
 
 def _utcnow_iso() -> str:
     return _utcnow().isoformat()
+
+
+def _write_deferred_sync_marker() -> None:
+    try:
+        REPLICA_DIR.mkdir(parents=True, exist_ok=True)
+        DEFERRED_SYNC_MARKER.write_text(
+            json.dumps({"created_at": _utcnow_iso()}, separators=(",", ":")),
+            encoding="utf-8",
+        )
+    except Exception as exc:
+        logger.debug("Failed to write paper deferred-sync marker: %s", exc)
+
+
+def _clear_deferred_sync_marker() -> None:
+    try:
+        DEFERRED_SYNC_MARKER.unlink(missing_ok=True)
+    except Exception as exc:
+        logger.debug("Failed to clear paper deferred-sync marker: %s", exc)
+
+
+def _recover_deferred_sync_if_needed() -> None:
+    if not DEFERRED_SYNC_MARKER.exists():
+        return
+    try:
+        sync = ReplicaSync(PAPER_DUCKDB_FILE, REPLICA_DIR, min_interval_sec=0.0)
+        recovery_db = PaperDB(replica_sync=sync)
+        try:
+            recovery_db.force_sync()
+        finally:
+            recovery_db.close()
+    except Exception as exc:
+        logger.warning("Paper deferred-sync recovery skipped: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -478,6 +511,8 @@ class PaperDB:
                 self._sync.force_sync(self.con)
             except Exception as exc:
                 logger.warning("Paper replica force_sync skipped after error: %s", exc)
+            else:
+                _clear_deferred_sync_marker()
 
     def defer_sync(self) -> None:
         """Defer replica sync until flush_deferred_sync() is called.
@@ -486,6 +521,8 @@ class PaperDB:
         triggering maybe_sync() on every individual write. Call before processing
         a bar group, then call flush_deferred_sync() after the bar is complete.
         """
+        if self._sync:
+            _write_deferred_sync_marker()
         self._sync_deferred = True
         self._sync_dirty = False
 
@@ -501,7 +538,11 @@ class PaperDB:
                 self._sync.force_sync(self.con)
             except Exception as exc:
                 logger.warning("Paper deferred replica sync skipped after error: %s", exc)
+            else:
+                _clear_deferred_sync_marker()
             self._sync_dirty = False
+        elif not self._sync_dirty:
+            _clear_deferred_sync_marker()
 
     # ------------------------------------------------------------------
     # Sessions
@@ -1689,6 +1730,7 @@ def get_dashboard_paper_db() -> PaperDB:
     """
     global _dashboard_paper_db, _dashboard_paper_consumer, _dashboard_paper_atexit
     REPLICA_DIR.mkdir(parents=True, exist_ok=True)
+    _recover_deferred_sync_if_needed()
     if _dashboard_paper_consumer is None:
         _dashboard_paper_consumer = ReplicaConsumer(REPLICA_DIR, PAPER_DUCKDB_FILE.stem)
     replica_path = _dashboard_paper_consumer.get_replica_path()

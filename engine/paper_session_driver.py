@@ -266,28 +266,29 @@ async def process_closed_bar_group(
     # are loaded. Unresolved directions remain pending and are kept alive by
     # should_process_symbol(); resolved opposite-direction rows are dropped
     # immediately so we do not trade the wrong side while waiting on slow ticks.
-    if not stage_b_applied and normalized_strategy == "CPR_LEVELS":
+    if normalized_strategy == "CPR_LEVELS":
         resolved, pending, with_setup, coverage = _direction_readiness(
             runtime_state, active_symbols
         )
         if with_setup > 0:
-            log_fn = logger.warning if pending > 0 and coverage < 0.80 else logger.info
-            log_fn(
-                "[%s] Stage B applied: resolved=%d pending=%d with_setup=%d coverage=%.0f%% "
-                "bar_time=%s direction=%s",
-                session_id,
-                resolved,
-                pending,
-                with_setup,
-                coverage * 100,
-                bar_time,
-                direction_filter,
-            )
             active_symbols = apply_stage_b_direction_filter(
                 active_symbols=active_symbols,
                 runtime_state=runtime_state,
                 direction_filter=direction_filter,
             )
+            if not stage_b_applied or pending > 0:
+                log_fn = logger.warning if pending > 0 and coverage < 0.80 else logger.info
+                log_fn(
+                    "[%s] Stage B evaluated: resolved=%d pending=%d with_setup=%d coverage=%.0f%% "
+                    "bar_time=%s direction=%s",
+                    session_id,
+                    resolved,
+                    pending,
+                    with_setup,
+                    coverage * 100,
+                    bar_time,
+                    direction_filter,
+                )
             stage_b_applied = True
             if update_symbols_cb is not None:
                 update_symbols_cb(active_symbols)

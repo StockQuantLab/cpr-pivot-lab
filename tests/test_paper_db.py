@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from db import paper_db as paper_db_module
 from db.paper_db import PaperDB
 
 
@@ -28,6 +29,81 @@ def test_cleanup_stale_sessions_only_cancels_stopping_rows(tmp_path: Path) -> No
         assert "auto-cancelled" in (db.get_session(stopping.session_id).notes or "")
     finally:
         db.close()
+
+
+def test_deferred_sync_marker_written_and_cleared(tmp_path: Path, monkeypatch) -> None:
+    marker = tmp_path / "replica" / "deferred_sync_pending.flag"
+    monkeypatch.setattr(paper_db_module, "REPLICA_DIR", marker.parent)
+    monkeypatch.setattr(paper_db_module, "DEFERRED_SYNC_MARKER", marker)
+
+    class FakeSync:
+        def __init__(self) -> None:
+            self.force_sync_calls = 0
+
+        def mark_dirty(self) -> None:
+            return None
+
+        def maybe_sync(self, _con) -> None:
+            return None
+
+        def force_sync(self, _con) -> None:
+            self.force_sync_calls += 1
+
+    sync = FakeSync()
+    db = PaperDB(db_path=tmp_path / "paper.duckdb", replica_sync=sync)
+    try:
+        db.create_session(session_id="paper-sync", status="ACTIVE")
+        db.defer_sync()
+        assert marker.exists()
+
+        db.open_position(
+            session_id="paper-sync",
+            symbol="SBIN",
+            direction="LONG",
+            qty=1,
+            entry_price=100.0,
+        )
+        db.flush_deferred_sync()
+
+        assert sync.force_sync_calls == 1
+        assert not marker.exists()
+    finally:
+        db.close()
+
+
+def test_deferred_sync_recovery_forces_snapshot_and_clears_marker(
+    tmp_path: Path, monkeypatch
+) -> None:
+    marker = tmp_path / "replica" / "deferred_sync_pending.flag"
+    marker.parent.mkdir(parents=True)
+    marker.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(paper_db_module, "REPLICA_DIR", marker.parent)
+    monkeypatch.setattr(paper_db_module, "DEFERRED_SYNC_MARKER", marker)
+
+    calls: list[str] = []
+
+    class FakeSync:
+        def __init__(self, *args, **kwargs) -> None:
+            del args, kwargs
+
+    class FakePaperDB:
+        def __init__(self, *args, **kwargs) -> None:
+            del args, kwargs
+
+        def force_sync(self) -> None:
+            calls.append("force_sync")
+            marker.unlink(missing_ok=True)
+
+        def close(self) -> None:
+            calls.append("close")
+
+    monkeypatch.setattr(paper_db_module, "ReplicaSync", FakeSync)
+    monkeypatch.setattr(paper_db_module, "PaperDB", FakePaperDB)
+
+    paper_db_module._recover_deferred_sync_if_needed()
+
+    assert calls == ["force_sync", "close"]
+    assert not marker.exists()
 
 
 def test_cleanup_stale_sessions_cancels_old_planning_rows(tmp_path: Path) -> None:

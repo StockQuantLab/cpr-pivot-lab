@@ -14,8 +14,8 @@ from types import SimpleNamespace
 from typing import Any
 
 from config.settings import get_settings
-from db.duckdb import get_dashboard_db
-from db.paper_db import get_dashboard_paper_db, get_paper_db
+from db.duckdb import get_live_market_db
+from db.paper_db import get_paper_db
 from engine import paper_session_driver as paper_session_driver
 from engine.bar_orchestrator import SessionPositionTracker
 from engine.cpr_atr_shared import regime_snapshot_close_col
@@ -227,7 +227,7 @@ def _log_setup_row_parity(symbol: str, trade_date: str, setup_row: dict[str, Any
         return
     from engine.paper_runtime import _MARKET_DB_READ_LOCK
 
-    db = get_dashboard_db()
+    db = get_live_market_db()
     with _MARKET_DB_READ_LOCK:
         row = db.con.execute(
             """
@@ -346,7 +346,7 @@ def _prefetch_setup_rows(
         try:
             from engine.paper_runtime import _MARKET_DB_READ_LOCK
 
-            db = get_dashboard_db()
+            db = get_live_market_db()
             placeholders = ", ".join(["?"] * len(unique_symbols))
             query = f"""
                 SELECT
@@ -601,6 +601,25 @@ async def run_live_session(
             real_order_router.config.fixed_quantity,
             real_order_router.config.entry_order_type,
         )
+        scale_out_pct = float(
+            getattr(getattr(params, "cpr_levels", None), "scale_out_pct", 0.0) or 0.0
+        )
+        if scale_out_pct > 0:
+            reason = "real_order_partial_scale_out_unsupported"
+            logger.error(
+                "[%s] Startup blocked: real-order routing does not support CPR partial "
+                "scale-out exits scale_out_pct=%.4f",
+                session_id,
+                scale_out_pct,
+            )
+            await _update_session(session_id, deps, status="FAILED", notes=reason)
+            force_paper_db_sync(get_paper_db())
+            return {
+                "session_id": session_id,
+                "final_status": "FAILED",
+                "terminal_reason": reason,
+                "cycles": 0,
+            }
 
     runtime_state = PaperRuntimeState(
         allow_live_setup_fallback=allow_live_setup_fallback,
@@ -726,6 +745,7 @@ async def run_live_session(
     last_disconnect_alert_ts: datetime | None = None
     last_stale_alert_ts: datetime | None = None
     entries_disabled = False
+    entry_resume_symbols = list(active_symbols)
     alerts_enabled = True if deps is None else bool(deps.alerts_enabled)
     last_feed_audit_cleanup: datetime | None = None
     audit_feed_source = "kite"
@@ -1051,6 +1071,8 @@ async def run_live_session(
                         stop_requested = True
                         break
                     active_symbols = list(driver_result["active_symbols"])
+                    if not entries_disabled:
+                        entry_resume_symbols = list(active_symbols)
                     if entries_disabled:
                         monitor_symbols = _entry_disabled_symbols(
                             tracker=tracker,
@@ -1359,15 +1381,16 @@ async def run_live_session(
                                 )
                         elif _action == "resume_entries":
                             entries_disabled = False
-                            active_symbols = list(entry_universe_symbols)
+                            active_symbols = list(entry_resume_symbols)
                             if use_websocket and ticker_adapter is not None:
                                 ticker_adapter.update_symbols(session_id, active_symbols)
                             logger.warning(
-                                "[%s] Entries resumed by %s reason=%s symbols=%d",
+                                "[%s] Entries resumed by %s reason=%s symbols=%d original_universe=%d",
                                 session_id,
                                 _requester,
                                 _reason,
                                 len(active_symbols),
+                                len(entry_universe_symbols),
                             )
                             try:
                                 get_paper_db().update_session(
@@ -1795,9 +1818,15 @@ async def run_live_session(
             )
             archive_payload = None
         else:
-            archive_payload = archive_completed_session(
-                session_id, paper_db=get_dashboard_paper_db()
-            )
+            try:
+                archive_payload = archive_completed_session(session_id, paper_db=get_paper_db())
+            except Exception:
+                logger.exception("[%s] Paper session archive failed", session_id)
+                archive_payload = {
+                    "session_id": session_id,
+                    "archived": False,
+                    "error": "archive_failed",
+                }
 
     feed_state = get_paper_db().get_feed_state(session_id)
     logger.info(

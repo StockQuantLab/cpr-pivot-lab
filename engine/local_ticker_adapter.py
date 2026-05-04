@@ -12,7 +12,7 @@ from datetime import date, datetime, timedelta
 from datetime import time as dt_time
 from typing import Any
 
-from db.duckdb import get_dashboard_db
+from db.duckdb import get_live_market_db
 from engine.cpr_atr_strategy import DayPack
 from engine.live_market_data import IST, ClosedCandle, FiveMinuteCandleBuilder
 
@@ -45,9 +45,9 @@ def _load_day_packs(
     symbols: list[str],
 ) -> dict[str, DayPack]:
     """Load intraday_day_pack for one date, return {symbol: DayPack}."""
-    # Use the read-only dashboard replica so local simulation does not contend
-    # with the primary market.duckdb writer lock.
-    db = get_dashboard_db()
+    # Use the explicit live market accessor so local live/replay validation is
+    # pinned to the market source rather than the dashboard replica contract.
+    db = get_live_market_db()
     pack_time_mode = (
         "minute_arr" if _has_column(db, "intraday_day_pack", "minute_arr") else "time_arr"
     )

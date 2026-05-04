@@ -1423,15 +1423,21 @@ def _add_live_readiness_dashboard_rows(report: dict, db: MarketDB, trade_date: s
         for table in _LIVE_SETUP_TABLES
     ]
 
-    report["freshness_status_rows"] = [
-        {
-            "table": str(row.get("table") or ""),
-            "value": str(row.get("max_trade_date") or "missing"),
-            "status": "OK" if _readiness_detail_is_ok(row.get("status")) else "NOT OK",
-            "detail": str(row.get("status") or ""),
-        }
-        for row in (report.get("freshness_rows") or [])
-    ]
+    report["freshness_status_rows"] = []
+    for row in report.get("freshness_rows") or []:
+        max_trade_date = str(row.get("max_trade_date") or "missing")
+        raw_status = str(row.get("status") or "")
+        detail = raw_status
+        if max_trade_date == trade_date and raw_status.startswith("OK next-day"):
+            detail = f"OK current trade date ({trade_date})"
+        report["freshness_status_rows"].append(
+            {
+                "table": str(row.get("table") or ""),
+                "value": max_trade_date,
+                "status": "OK" if _readiness_detail_is_ok(raw_status) else "NOT OK",
+                "detail": detail,
+            }
+        )
 
     coverage_status = report.get("coverage_status") or {}
     missing_counts = report.get("missing_counts") or {}

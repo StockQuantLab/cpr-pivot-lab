@@ -67,11 +67,11 @@ def test_load_day_packs_uses_dashboard_replica(monkeypatch: pytest.MonkeyPatch) 
             del table
             return column in {"minute_arr", "rvol_baseline_arr"}
 
-    def fake_get_dashboard_db():
+    def fake_get_live_market_db():
         called["dashboard"] += 1
         return _FakeDB()
 
-    monkeypatch.setattr(lta, "get_dashboard_db", fake_get_dashboard_db)
+    monkeypatch.setattr(lta, "get_live_market_db", fake_get_live_market_db)
 
     packs = lta._load_day_packs("2024-01-15", ["SBIN"])
 

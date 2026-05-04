@@ -192,7 +192,7 @@ def test_archive_completed_session_normalizes_manual_close_exit_reason(
         db.close()
 
 
-def test_position_to_trade_row_uses_float_quantity_and_maps_momentum_fail() -> None:
+def test_position_to_trade_row_uses_float_quantity_and_preserves_momentum_fail() -> None:
     session = SimpleNamespace(session_id="paper-fractional")
     position = SimpleNamespace(
         position_id="pos-fractional",
@@ -218,7 +218,7 @@ def test_position_to_trade_row_uses_float_quantity_and_maps_momentum_fail() -> N
     assert row["position_value"] == pytest.approx(1050.0)
     assert row["profit_loss"] == pytest.approx(21.0)
     assert row["profit_loss_pct"] == pytest.approx(2.0)
-    assert row["exit_reason"] == "CANDLE_EXIT"
+    assert row["exit_reason"] == "MOMENTUM_FAIL"
 
 
 def test_archive_completed_session_includes_flattened_positions(

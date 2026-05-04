@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 import os
+from types import SimpleNamespace
 
 import pytest
 
+from db import duckdb as duckdb_module
 from db.duckdb import MarketDB
 
 
@@ -34,3 +36,11 @@ def test_marketdb_write_lock_recovers_from_stale_lock(tmp_path) -> None:
         db.close()
 
     assert not lock_path.exists()
+
+
+def test_live_market_db_reuses_existing_source_connection(monkeypatch) -> None:
+    existing = SimpleNamespace(db_path="source.duckdb")
+    monkeypatch.setattr(duckdb_module, "_db", existing)
+    monkeypatch.setattr(duckdb_module, "_live_market_db", None)
+
+    assert duckdb_module.get_live_market_db() is existing

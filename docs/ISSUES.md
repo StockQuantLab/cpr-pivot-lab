@@ -7,6 +7,37 @@ Supersedes: `docs/PARITY_INCIDENT_LOG.md` (contents migrated below).
 
 ---
 
+## 2026-05-04 — FIXED: LIVE: final paper archive used read-only dashboard replica
+
+**Status:** FIXED
+**Severity:** High
+
+### Symptom
+
+The 2026-04-30 local-feed live validation completed both paper sessions, but final archive
+raised `DuckDB InvalidInputException: Cannot execute UPDATE on read-only ... paper_replica`.
+That left the session completed in PostgreSQL/DuckDB paper state while the PAPER analytics
+archive was missing.
+
+### Root Cause
+
+`scripts/paper_live.py` passed `get_dashboard_paper_db()` into
+`archive_completed_session()`. The archive path updates `paper_sessions.total_pnl`, so it
+must use the live writable paper DB connection, not the dashboard read-only replica.
+
+### Fix
+
+Final live archiving now uses `get_paper_db()`. Archive failure is also caught and returned
+as an explicit archive payload error so a completed live session does not crash into a retry
+loop after trading has already finished.
+
+### Related
+
+Found during `daily-live --multi --strategy CPR_LEVELS --trade-date 2026-04-30
+--feed-source local --no-alerts` validation.
+
+---
+
 ## 2026-05-03 — FIXED: UI: live readiness hid OK/NOT OK prerequisite details
 
 **Status:** FIXED
@@ -30,6 +61,8 @@ readiness report without dashboard-friendly OK/NOT OK rows.
 `web/state.py` now adds `setup_table_status_rows`, `freshness_status_rows`, and
 `coverage_status_rows` to the readiness payload. `web/pages/ops_pages.py` renders those rows
 with explicit `OK` / `NOT OK` status labels in the Live Readiness tab.
+Dashboard freshness details now relabel exact selected-date rows from `OK next-day (...)` to
+`OK current trade date (...)`, so the operator view is not confusing on the live trade date.
 
 ### Related
 
@@ -483,9 +516,9 @@ should not fail after a successful readiness calculation because of console enco
 
 ---
 
-## 2026-04-30 — OPEN: Live path reads market data through dashboard replica accessor
+## 2026-04-30 — FIXED: Live path reads market data through dashboard replica accessor
 
-**Status:** OPEN — design hardening required
+**Status:** FIXED
 **Severity:** High — live trading should not depend on an implicit "latest dashboard replica"
 
 ### Problem
@@ -519,8 +552,10 @@ reduce this risk, but the architecture is still ambiguous.
 
 ### Required follow-up
 
-Audit `engine/paper_runtime.py`, `scripts/paper_live.py`, and `engine/local_ticker_adapter.py`
-for all `get_dashboard_db()` call sites and split dashboard reads from live market reads.
+`db/duckdb.py` now exposes `get_live_market_db()` as an explicit read-only source-DB accessor.
+`engine/paper_setup_loader.py`, `scripts/paper_live.py`, and `engine/local_ticker_adapter.py`
+now use it for live/replay runtime setup and local-feed pack reads instead of the dashboard
+replica accessor.
 
 ---
 
@@ -5896,9 +5931,9 @@ The tracker's `_open[symbol].current_qty` is never reduced. `record_close()` is 
 
 ---
 
-## 2026-05-03 — OPEN: RUNTIME: partial exit with real-order routing raises RuntimeError, crashing candle loop
+## 2026-05-03 — FIXED: RUNTIME: partial exit with real-order routing raises RuntimeError, crashing candle loop
 
-**Status:** OPEN
+**Status:** FIXED
 **Severity:** High
 
 ### Symptom
@@ -5921,6 +5956,12 @@ Any live session with `real_order_router` enabled and `scale_out_pct > 0` will c
 ### Location
 
 `engine/paper_runtime.py:1211-1212`
+
+### Fix
+
+`scripts/paper_live.py` now blocks startup when real-order routing is enabled with
+`cpr_levels.scale_out_pct > 0`, marks the session `FAILED`, and returns
+`real_order_partial_scale_out_unsupported` before any candle loop can crash.
 
 ---
 
@@ -6282,9 +6323,9 @@ activate normally.
 
 ---
 
-## 2026-05-03 — OPEN: LIVE: deferred sync window leaves replica stale on crash
+## 2026-05-03 — FIXED: LIVE: deferred sync window leaves replica stale on crash
 
-**Status:** OPEN
+**Status:** FIXED
 **Severity:** High
 
 ### Symptom
@@ -6310,6 +6351,12 @@ Dashboard shows old position data after an abnormal exit. Operators may not see 
 ### Location
 
 `scripts/paper_live.py:1111-1143`
+
+### Fix
+
+`db/paper_db.py` now writes a `paper_replica/deferred_sync_pending.flag` marker when sync is
+deferred, clears it after a successful flush/force-sync, and makes dashboard replica access
+attempt a recovery force-sync if a marker survived an abnormal process exit.
 
 ---
 
@@ -6445,9 +6492,9 @@ operator inspection.
 
 ---
 
-## 2026-05-03 — OPEN: LIVE: stage-B direction filter applied as one-way latch, can freeze universe too early
+## 2026-05-03 — FIXED: LIVE: stage-B direction filter applied as one-way latch, can freeze universe too early
 
-**Status:** OPEN
+**Status:** FIXED
 **Severity:** Medium
 
 ### Symptom
@@ -6472,11 +6519,17 @@ A session that applies stage-B before the full symbol universe is loaded may tra
 
 `engine/paper_session_driver.py:265-289`
 
+### Fix
+
+`engine/paper_session_driver.py` now re-evaluates the CPR Stage-B direction filter on each
+bar instead of treating `stage_b_applied` as a one-way gate. Newly added or late-resolved
+symbols are filtered against the current direction state.
+
 ---
 
-## 2026-05-03 — OPEN: LIVE: resume_entries admin command restores original universe, ignoring post-open pruning
+## 2026-05-03 — FIXED: LIVE: resume_entries admin command restores original universe, ignoring post-open pruning
 
-**Status:** OPEN
+**Status:** FIXED
 **Severity:** Medium
 
 ### Symptom
@@ -6500,6 +6553,12 @@ Re-activating entries can attempt to open positions in symbols that were already
 ### Location
 
 `scripts/paper_live.py:1470-1473`
+
+### Fix
+
+`scripts/paper_live.py` now preserves the latest filtered entry universe in
+`entry_resume_symbols` and uses that set on `resume_entries`, rather than restoring the
+original Stage-A universe.
 
 ---
 
@@ -6642,9 +6701,9 @@ Marginal entries at the exact trigger boundary may have lower follow-through pro
 
 ---
 
-## 2026-05-03 — OPEN: KITE: tick timestamp source silently discarded, receive-time fallbacks mixed with exchange time
+## 2026-05-03 — FIXED: KITE: tick timestamp source silently discarded, receive-time fallbacks mixed with exchange time
 
-**Status:** OPEN
+**Status:** FIXED
 **Severity:** Medium
 
 ### Symptom
@@ -6662,6 +6721,13 @@ Parity comparisons and latency audits cannot distinguish bars built from exchang
 ### Location
 
 `engine/kite_ticker_adapter.py:439-447`
+
+### Fix
+
+`engine/kite_ticker_adapter.py` now tracks cumulative and last-batch timestamp-source counts
+for `exchange_timestamp`, SDK `timestamp`, `last_trade_time`, and receive-time fallbacks.
+`scripts/paper_live_helpers.py` includes exchange/fallback/receive-time counts in
+`TICKER_HEALTH` logs.
 
 ---
 
@@ -7045,7 +7111,7 @@ self.phase = "TRAIL"
 
 ---
 
-## 2026-05-03 — FIXED: ARCHIVE: exit_reason normalization incomplete — MOMENTUM_FAIL not mapped
+## 2026-05-03 — FIXED: ARCHIVE: exit_reason normalization incomplete for MOMENTUM_FAIL
 
 **Status:** FIXED
 **Severity:** Medium
@@ -7064,7 +7130,9 @@ Archive crash for sessions with momentum-failure exits. The session remains unar
 
 ### Fix Direction
 
-Add `"MOMENTUM_FAIL": "REVERSAL"` (or `"CANDLE_EXIT"`) to the `exit_reason_map` in `paper_archive.py`. Also align CHECK constraints between `duckdb_backtest_results.py` and `backtest_db.py`.
+Preserve `MOMENTUM_FAIL` in the archive when the active `backtest_results` schema supports
+it, so paper-vs-backtest comparisons keep the same exit reason semantics. Older fallback
+constraints should be aligned instead of silently downgrading the reason.
 
 ### Location
 
@@ -7072,9 +7140,10 @@ Add `"MOMENTUM_FAIL": "REVERSAL"` (or `"CANDLE_EXIT"`) to the `exit_reason_map` 
 
 ### Fix
 
-Paper archive normalization now maps `MOMENTUM_FAIL` to `CANDLE_EXIT`, which is accepted by
-the DuckDB `backtest_results` CHECK constraint. Regression coverage:
-`tests/test_paper_archive.py::test_position_to_trade_row_uses_float_quantity_and_maps_momentum_fail`.
+Paper archive normalization preserves `MOMENTUM_FAIL`. The 2026-04-30 local-live parity
+validation showed matching trade sets and prices, and this fix removes the remaining
+paper-archive `CANDLE_EXIT` vs backtest `MOMENTUM_FAIL` semantic diff. Regression coverage:
+`tests/test_paper_archive.py::test_position_to_trade_row_uses_float_quantity_and_preserves_momentum_fail`.
 
 ---
 

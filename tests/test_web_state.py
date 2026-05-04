@@ -222,6 +222,7 @@ def test_fetch_live_readiness_adds_operator_status_rows(monkeypatch: pytest.Monk
 
     assert {row["status"] for row in result["setup_table_status_rows"]} == {"OK"}
     assert result["freshness_status_rows"][0]["status"] == "OK"
+    assert result["freshness_status_rows"][0]["detail"] == ("OK current trade date (2026-05-04)")
     coverage_rows = {row["table"]: row for row in result["coverage_status_rows"]}
     assert coverage_rows["v_5min"] == {
         "table": "v_5min",

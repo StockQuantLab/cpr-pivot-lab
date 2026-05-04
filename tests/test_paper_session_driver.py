@@ -302,3 +302,73 @@ async def test_process_closed_bar_group_applies_stage_b_immediately_for_resolved
     assert result["stage_b_applied"] is True
     assert result["active_symbols"] == ["RELIANCE"]
     assert symbols_updates == [["RELIANCE"]]
+
+
+@pytest.mark.asyncio
+async def test_process_closed_bar_group_reapplies_stage_b_when_symbols_change() -> None:
+    bar_end = datetime(2026, 4, 15, 9, 30, tzinfo=IST)
+    runtime_state = PaperRuntimeState()
+    runtime_state.symbols["SBIN"] = SymbolRuntimeState(
+        trade_date="2026-04-15",
+        candles=[],
+        setup_row={"direction": "LONG", "direction_pending": False},
+    )
+    runtime_state.symbols["TCS"] = SymbolRuntimeState(
+        trade_date="2026-04-15",
+        candles=[],
+        setup_row={"direction": "SHORT", "direction_pending": False},
+    )
+    tracker = SessionPositionTracker(
+        max_positions=10, portfolio_value=1_000_000.0, max_position_pct=0.10
+    )
+    candles = [
+        SimpleNamespace(
+            symbol="SBIN",
+            bar_end=bar_end,
+            open=100.0,
+            high=101.0,
+            low=99.0,
+            close=100.5,
+            volume=1000.0,
+        ),
+        SimpleNamespace(
+            symbol="TCS",
+            bar_end=bar_end,
+            open=200.0,
+            high=201.0,
+            low=199.0,
+            close=200.5,
+            volume=1000.0,
+        ),
+    ]
+    updates: list[list[str]] = []
+
+    async def _evaluate_candle(**_: object) -> dict[str, object]:
+        return {"action": "SKIP", "setup_status": "candidate", "advance_result": None}
+
+    async def _enforce_risk_controls(**_: object) -> dict[str, object]:
+        return {"triggered": False}
+
+    result = await process_closed_bar_group(
+        session_id="s1",
+        session=SimpleNamespace(strategy="CPR_LEVELS"),
+        bar_candles=candles,
+        runtime_state=runtime_state,
+        tracker=tracker,
+        params=SimpleNamespace(entry_window_end="10:15"),
+        active_symbols=["SBIN", "TCS"],
+        strategy="CPR_LEVELS",
+        direction_filter="LONG",
+        stage_b_applied=True,
+        symbol_last_prices={},
+        last_price=None,
+        evaluate_candle_fn=_evaluate_candle,
+        execute_entry_fn=lambda **_: {"action": "SKIP"},
+        enforce_risk_controls=_enforce_risk_controls,
+        build_feed_state=lambda **_: SimpleNamespace(),
+        update_symbols_cb=lambda symbols: updates.append(list(symbols)),
+    )
+
+    assert result["stage_b_applied"] is True
+    assert result["active_symbols"] == ["SBIN"]
+    assert updates == [["SBIN"]]

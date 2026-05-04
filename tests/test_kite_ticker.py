@@ -132,6 +132,9 @@ def test_kite_ticker_adapter_uses_timestamp_fallback(monkeypatch) -> None:
     assert closed[0].symbol == "SBIN"
     assert closed[0].bar_start == datetime(2024, 1, 1, 9, 15, tzinfo=IST)
     assert closed[0].bar_end == datetime(2024, 1, 1, 9, 20, tzinfo=IST)
+    stats = adapter.health_stats()
+    assert stats["timestamp_source_counts"]["timestamp"] == 1
+    assert stats["last_timestamp_source_counts"] == {"timestamp": 1}
     adapter.close()
 
 

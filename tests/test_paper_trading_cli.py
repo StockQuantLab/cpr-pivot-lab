@@ -719,6 +719,7 @@ async def test_cmd_daily_prepare_runs_readiness_gate(monkeypatch: pytest.MonkeyP
         fake_print_trade_date_readiness_report,
     )
     monkeypatch.setattr(pt, "resolve_trade_date", lambda value: value)
+    monkeypatch.setattr(pt, "_load_saved_universe_for_guard", lambda _name: [])
     monkeypatch.setattr(
         cli_helpers,
         "resolve_prepare_symbols",
@@ -796,6 +797,7 @@ async def test_cmd_daily_prepare_snapshots_universe(monkeypatch: pytest.MonkeyPa
         lambda trade_date=None: (["RELIANCE", "SBIN"], False),
     )
     monkeypatch.setattr(pt, "resolve_trade_date", lambda value: value)
+    monkeypatch.setattr(pt, "_load_saved_universe_for_guard", lambda _name: [])
     monkeypatch.setattr(
         cli_helpers,
         "resolve_prepare_symbols",
