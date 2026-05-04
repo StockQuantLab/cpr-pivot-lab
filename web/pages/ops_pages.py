@@ -1028,7 +1028,7 @@ async def paper_ledger_page() -> None:
         )
         page_state: dict[str, object] = {
             "auto_refresh": True,
-            "selected_tab": "readiness",
+            "selected_tab": "active",
             "timer": None,
             "selected_active_session_id": "",
         }
@@ -1040,12 +1040,12 @@ async def paper_ledger_page() -> None:
 
         tabs = ui.tabs().classes("w-full")
         with tabs:
-            ui.tab("readiness", label="Live Readiness", icon="verified")
             ui.tab("active", label="Active Sessions", icon="sensors")
+            ui.tab("readiness", label="Live Readiness", icon="verified")
             ui.tab("archived", label="Archived Sessions", icon="archive")
             ui.tab("daily", label="Daily Summary", icon="calendar_view_day")
 
-        with ui.tab_panels(tabs, value="readiness", keep_alive=True).classes("w-full"):
+        with ui.tab_panels(tabs, value="active", keep_alive=True).classes("w-full"):
             with ui.tab_panel("readiness"):
                 with ui.row().classes("mb-4 items-center gap-3 flex-wrap"):
                     readiness_date_input = (
@@ -1254,7 +1254,7 @@ async def paper_ledger_page() -> None:
                 page_state["loading_daily"] = False
 
         async def _load() -> None:
-            selected = str(page_state.get("selected_tab") or "readiness")
+            selected = str(page_state.get("selected_tab") or "active")
             if selected == "readiness":
                 await _load_readiness()
             elif selected == "active":
@@ -1281,9 +1281,9 @@ async def paper_ledger_page() -> None:
                 safe_timer(0.01, _load_daily)
 
         tabs.on("update:model-value", _on_tab_change)
-        _loading(readiness_content, "Checking live readiness...")
-        page_state["readiness_loaded"] = True
-        safe_timer(0.1, _load_readiness)
+        _loading(active_content, "Loading active paper sessions...")
+        page_state["active_loaded"] = True
+        safe_timer(0.1, _load_active)
         safe_timer(
             3.0,
             lambda: (
