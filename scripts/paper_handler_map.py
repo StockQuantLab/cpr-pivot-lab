@@ -21,6 +21,7 @@ PAPER_TRADING_HANDLER_NAMES: tuple[str, ...] = (
     "_cmd_broker_reconcile",
     "_cmd_broker_sync_orders",
     "_cmd_pilot_check",
+    "_cmd_real_pilot_plan",
     "_cmd_order",
     "_cmd_real_dry_run_order",
     "_cmd_real_order",

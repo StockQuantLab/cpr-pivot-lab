@@ -1175,6 +1175,25 @@ Default real-order safety posture:
 - every real order requires fresh `--reference-price` and `--reference-price-age-sec`
 - real placement also requires `--confirm-real-order`
 
+No-placement planner for a one-symbol pilot:
+
+```bash
+doppler run -- uv run pivot-paper-trading real-pilot-plan \
+  --symbol ITC \
+  --quantity 1 \
+  --max-notional 1000 \
+  --acknowledgement I_ACCEPT_REAL_ORDER_RISK
+```
+
+`real-pilot-plan` fetches fresh Kite LTP, validates the pilot guardrails, and prints exact gated
+`real-order` commands for a LIMIT buy, MARKET fallback buy, protected LIMIT sell/flatten,
+optional SL order, and `broker-sync-orders` monitoring. It does **not** submit orders and does
+not open `paper.duckdb`, so it can be run while paper-live is still holding the writer lock. The
+MARKET fallback command only works if Doppler allows `MARKET` in
+`CPR_ZERODHA_REAL_ALLOWED_ORDER_TYPES`. If the optional broker-side SL order is placed and the
+position is later sold manually, cancel the pending SL order in Kite first to avoid unintended
+exposure.
+
 Example manual real LIMIT buy:
 
 ```bash

@@ -1529,7 +1529,7 @@ class PaperDB:
             "execution_payload",
         ]
         normalized_rows = [{column: row.get(column) for column in columns} for row in rows]
-        df = pl.DataFrame(normalized_rows).select(columns)
+        df = pl.DataFrame(normalized_rows, infer_schema_length=None).select(columns)
         self.con.register("_tmp_paper_signal_audit", df.to_arrow())
         try:
             self.con.execute("BEGIN TRANSACTION")

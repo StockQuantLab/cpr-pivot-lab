@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
+import shlex
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +14,7 @@ from db.paper_db import get_paper_db
 from engine.broker_adapter import (
     BrokerOrderIntent,
     ZerodhaBrokerAdapter,
+    build_protected_flatten_intent,
     record_real_dry_run_order,
     record_real_order,
 )
@@ -180,6 +184,171 @@ async def _cmd_pilot_check(args: argparse.Namespace) -> None:
         raise SystemExit(1)
 
 
+async def _cmd_real_pilot_plan(args: argparse.Namespace) -> None:
+    """Build a no-placement one-symbol real-order pilot plan from fresh Kite LTP."""
+
+    symbol = str(args.symbol or "").strip().upper()
+    exchange = str(args.exchange or "NSE").strip().upper()
+    quantity = int(args.quantity)
+    product = str(args.product or "MIS").strip().upper()
+    max_slippage_pct = float(args.max_slippage_pct)
+    tick_size = float(args.tick_size)
+    session_id = str(args.session_id or "").strip() or (
+        f"manual-pilot-{datetime.now(UTC).date().isoformat()}-{symbol.lower()}"
+    )
+    kite = _get_kite_client()
+    ltp = _fetch_ltp(kite, exchange=exchange, symbol=symbol)
+    fetched_at = datetime.now(UTC).isoformat()
+    buy_price = _ceil_to_tick(
+        ltp * (1.0 + (float(args.buy_limit_offset_pct) / 100.0)),
+        tick_size,
+    )
+    exit_intent = build_protected_flatten_intent(
+        session_id=session_id,
+        symbol=symbol,
+        side="SELL",
+        quantity=quantity,
+        latest_price=ltp,
+        quote_age_sec=float(args.reference_price_age_sec),
+        role="manual_flatten",
+        product=product,
+        exchange=exchange,
+        max_slippage_pct=max_slippage_pct,
+        tick_size=tick_size,
+        event_time=fetched_at,
+    )
+    stop_trigger = _floor_to_tick(ltp * (1.0 - (float(args.stop_loss_pct) / 100.0)), tick_size)
+    stop_limit = _floor_to_tick(
+        stop_trigger * (1.0 - (float(args.stop_limit_buffer_pct) / 100.0)),
+        tick_size,
+    )
+    guardrails = PilotGuardrails(max_notional=float(args.max_notional)).validate(
+        symbols=[symbol],
+        order_quantity=quantity,
+        estimated_notional=ltp * quantity,
+        product=product,
+        order_type="LIMIT",
+        acknowledgement=args.acknowledgement,
+    )
+    buy_argv = _real_order_argv(
+        session_id=session_id,
+        symbol=symbol,
+        side="BUY",
+        quantity=quantity,
+        role="manual",
+        order_type="LIMIT",
+        price=buy_price,
+        reference_price=ltp,
+        reference_price_age_sec=float(args.reference_price_age_sec),
+        product=product,
+        exchange=exchange,
+    )
+    market_buy_argv = _real_order_argv(
+        session_id=session_id,
+        symbol=symbol,
+        side="BUY",
+        quantity=quantity,
+        role="manual_market_fallback",
+        order_type="MARKET",
+        reference_price=ltp,
+        reference_price_age_sec=float(args.reference_price_age_sec),
+        market_protection=float(args.market_protection),
+        product=product,
+        exchange=exchange,
+    )
+    sell_argv = _real_order_argv(
+        session_id=session_id,
+        symbol=symbol,
+        side="SELL",
+        quantity=quantity,
+        role="manual_flatten",
+        order_type="LIMIT",
+        price=float(exit_intent.price or 0.0),
+        reference_price=ltp,
+        reference_price_age_sec=float(args.reference_price_age_sec),
+        max_slippage_pct=max_slippage_pct,
+        product=product,
+        exchange=exchange,
+    )
+    sl_argv = _real_order_argv(
+        session_id=session_id,
+        symbol=symbol,
+        side="SELL",
+        quantity=quantity,
+        role="manual_stop_loss",
+        order_type="SL",
+        price=stop_limit,
+        trigger_price=stop_trigger,
+        reference_price=ltp,
+        reference_price_age_sec=float(args.reference_price_age_sec),
+        product=product,
+        exchange=exchange,
+    )
+    payload: dict[str, Any] = {
+        "places_real_orders": False,
+        "session_id": session_id,
+        "symbol": symbol,
+        "exchange": exchange,
+        "quantity": quantity,
+        "product": product,
+        "ltp": ltp,
+        "ltp_fetched_at_utc": fetched_at,
+        "estimated_notional": round(ltp * quantity, 2),
+        "guardrails": guardrails,
+        "buy_limit": {
+            "price": buy_price,
+            "argv": buy_argv,
+            "command": shlex.join(buy_argv),
+        },
+        "market_buy_fallback": {
+            "market_protection": float(args.market_protection),
+            "requires_allowed_order_type": "MARKET",
+            "warning": (
+                "Use only if LIMIT does not fill and Doppler allows MARKET in "
+                "CPR_ZERODHA_REAL_ALLOWED_ORDER_TYPES."
+            ),
+            "argv": market_buy_argv,
+            "command": shlex.join(market_buy_argv),
+        },
+        "protected_sell_limit": {
+            "price": exit_intent.price,
+            "max_slippage_pct": max_slippage_pct,
+            "argv": sell_argv,
+            "command": shlex.join(sell_argv),
+        },
+        "stop_loss_limit": {
+            "trigger_price": stop_trigger,
+            "price": stop_limit,
+            "warning": (
+                "If you place this actual SL order and later manually sell, cancel the pending "
+                "SL order first to avoid unintended exposure."
+            ),
+            "argv": sl_argv,
+            "command": shlex.join(sl_argv),
+        },
+        "post_order_monitoring": {
+            "sync_command": shlex.join(
+                [
+                    "doppler",
+                    "run",
+                    "--",
+                    "uv",
+                    "run",
+                    "pivot-paper-trading",
+                    "broker-sync-orders",
+                    "--session-id",
+                    session_id,
+                ]
+            ),
+            "note": (
+                "Run broker-sync-orders after each actual order. Use Kite Console for broker-side "
+                "cancels until a guarded cancel CLI exists."
+            ),
+        },
+    }
+    print(json.dumps(payload, default=str, indent=2))
+
+
 async def _cmd_order(args: argparse.Namespace) -> None:
     order_id = _pdb().append_order_event(
         session_id=args.session_id,
@@ -245,6 +414,82 @@ def _build_broker_order_intent(args: argparse.Namespace) -> BrokerOrderIntent:
         tag=args.tag,
         event_time=args.event_time,
     )
+
+
+def _fetch_ltp(kite: Any, *, exchange: str, symbol: str) -> float:
+    key = f"{exchange}:{symbol}"
+    data = kite.ltp([key])
+    row = dict((data or {}).get(key) or {})
+    price = row.get("last_price")
+    if price is None:
+        raise SystemExit(f"Kite LTP did not return last_price for {key}")
+    return float(price)
+
+
+def _ceil_to_tick(value: float, tick_size: float) -> float:
+    return round(math.ceil((float(value) - 1e-12) / float(tick_size)) * float(tick_size), 4)
+
+
+def _floor_to_tick(value: float, tick_size: float) -> float:
+    return round(math.floor((float(value) + 1e-12) / float(tick_size)) * float(tick_size), 4)
+
+
+def _real_order_argv(
+    *,
+    session_id: str,
+    symbol: str,
+    side: str,
+    quantity: int,
+    role: str,
+    order_type: str,
+    reference_price: float,
+    reference_price_age_sec: float,
+    product: str,
+    exchange: str,
+    price: float | None = None,
+    trigger_price: float | None = None,
+    max_slippage_pct: float | None = None,
+    market_protection: float | None = None,
+) -> list[str]:
+    argv = [
+        "doppler",
+        "run",
+        "--",
+        "uv",
+        "run",
+        "pivot-paper-trading",
+        "real-order",
+        "--session-id",
+        session_id,
+        "--symbol",
+        symbol,
+        "--side",
+        side,
+        "--quantity",
+        str(quantity),
+        "--role",
+        role,
+        "--order-type",
+        order_type,
+        "--reference-price",
+        f"{float(reference_price):.4f}",
+        "--reference-price-age-sec",
+        f"{float(reference_price_age_sec):.2f}",
+        "--product",
+        product,
+        "--exchange",
+        exchange,
+    ]
+    if price is not None:
+        argv.extend(["--price", f"{float(price):.4f}"])
+    if trigger_price is not None:
+        argv.extend(["--trigger-price", f"{float(trigger_price):.4f}"])
+    if max_slippage_pct is not None:
+        argv.extend(["--max-slippage-pct", f"{float(max_slippage_pct):.2f}"])
+    if market_protection is not None:
+        argv.extend(["--market-protection", f"{float(market_protection):.2f}"])
+    argv.append("--confirm-real-order")
+    return argv
 
 
 def _get_kite_client():

@@ -7,6 +7,208 @@ Supersedes: `docs/PARITY_INCIDENT_LOG.md` (contents migrated below).
 
 ---
 
+## 2026-05-05 — FIXED: OPS: no-placement real-order pilot planner
+
+**Status:** FIXED
+**Severity:** Low
+
+### Symptom
+
+The one-share real-order pilot still required hand-building multiple guarded `real-order` commands
+from a fresh LTP. That is operationally error-prone during the post-15:00 test window, especially
+when validating buy, protected sell/flatten, optional SL, and broker sync latency.
+
+### Root Cause
+
+The real-order safety gates existed, but there was no no-placement planner that combined fresh Kite
+LTP, pilot guardrail validation, tick rounding, and exact command generation for a single-symbol
+manual pilot.
+
+### Fix
+
+Added `pivot-paper-trading real-pilot-plan`. It fetches fresh Kite LTP and prints JSON containing
+the gated LIMIT buy, MARKET fallback buy, protected LIMIT sell/flatten, optional SL order, and
+`broker-sync-orders` commands. It does not submit any broker order. CLI startup now skips
+stale-session DB cleanup for `real-pilot-plan` and `pilot-check`, so the planner works while
+paper-live holds `paper.duckdb`.
+
+### Related
+
+Manual ITC 1-share pilot, `scripts/paper_broker_cli.py`, `scripts/paper_trading_parser.py`,
+`docs/PAPER_TRADING_RUNBOOK.md`.
+
+---
+
+## 2026-05-05 — FIXED: BUG: signal_audit Polars schema crash killed both sessions at first bar
+
+**Status:** FIXED
+**Severity:** Critical
+
+### Symptom
+
+Both `CPR_LEVELS_LONG` and `CPR_LEVELS_SHORT` sessions for 2026-05-05 crashed at the 09:20 bar
+(first bar after session start). The crash killed the process after positions had already been
+opened — 5 LONG and 5 SHORT positions were stranded in OPEN state with the session still showing
+ACTIVE in paper.duckdb (FAILED status was never written because the crash occurred mid-bar).
+
+```
+polars.exceptions.ComputeError: could not append value: 1 of type: i64 to the builder;
+make sure that all rows have the same schema or consider increasing infer_schema_length
+```
+
+Traceback: `paper_live.py → _process_live_multi_bar → process_closed_bar_group →
+signal_audit_writer → record_signal_decisions → upsert_signal_audit_rows →
+pl.DataFrame(normalized_rows).select(columns)` — in `db/paper_db.py:1532`.
+
+### Root Cause
+
+`upsert_signal_audit_rows` builds a Polars DataFrame from `normalized_rows` — a mixed list
+containing `ENTRY_SKIP`, `ENTRY_EVALUATED`, `ENTRY_CANDIDATE`, `ENTRY_RANKED`, and
+`ENTRY_EXECUTED` rows. Rows earlier in the list (ENTRY_SKIP) have `None` for numeric fields
+(`selected_count`, `candidates_count`, etc.). Polars infers the column type as `Null` from the
+first row. When a later row (ENTRY_EXECUTED) has `selected_count = 1` (i64), Polars can't cast
+and raises ComputeError.
+
+The crash propagated as `bar_processing_error` and terminated both sessions (they share the same
+asyncio multi-bar dispatch). Auto-flatten did NOT run because the FAILED status was never written
+to paper.duckdb — the crash killed the process before the `finally` block completed its DB write.
+
+This is the first live session using the new `paper_signal_audit` instrumentation added for the
+May 2026 parity investigation. The bug was not visible in `daily-replay` because replay sessions
+have uniform signal_audit row types (no live mixed-type ENTRY_EXECUTED rows).
+
+### Fix
+
+`db/paper_db.py:1532` — added `infer_schema_length=None` to scan all rows before schema
+inference:
+
+```python
+# before
+df = pl.DataFrame(normalized_rows).select(columns)
+# after
+df = pl.DataFrame(normalized_rows, infer_schema_length=None).select(columns)
+```
+
+### Recovery
+
+1. Both sessions were ACTIVE in DB with 10 OPEN positions (5 LONG + 5 SHORT).
+2. `pivot-paper-trading flatten` closed all positions at entry price (crash happened within
+   the same bar as entry, so prices matched). Total paper PnL: ~₹0.
+3. Sessions archived to `backtest.duckdb` (PAPER execution mode), then deleted from
+   `paper.duckdb` (cleanup found 0 rows — sessions were already archived).
+4. Paper.duckdb scrubbed manually (dependency-order DELETE by session_id).
+5. Sessions restarted at 09:28 IST. Fix confirmed at 09:30 bar — both sessions processed
+   without crash. LONG and SHORT each opened 5 positions.
+
+### Related
+
+`CPR_LEVELS_LONG-2026-05-05-live-kite`, `CPR_LEVELS_SHORT-2026-05-05-live-kite`,
+`paper_signal_audit`, `record_signal_decisions`, `upsert_signal_audit_rows`,
+`--simulate-real-orders` (first live session with signal audit + broker latency recording).
+
+---
+
+## 2026-05-05 — INFO: OPS: Operator drills — pause_entries/resume_entries/set_risk_budget/cancel_pending_intents
+
+**Status:** IN PROGRESS
+**Severity:** Info
+
+### Plan
+
+Operator command-queue drills on live sessions for 2026-05-05. Using `pivot-paper-trading
+send-command` to drop JSON files into `.tmp_logs/cmd_<session_id>/`.
+
+### Results
+
+**Drills 1+2 (pause_entries / resume_entries):**
+- Commands queued at 09:16:44/09:16:46 (pause) and 09:16:58/09:17:01 (resume) for both
+  sessions. Sessions were ACTIVE and WebSocket connected. Commands were NOT processed because
+  the command polling loop fires at bar boundaries, not continuously — no bar had closed yet
+  in the 09:16–09:19 window.
+- Sessions crashed at 09:20 first bar (signal_audit bug above). Stale command files cleaned.
+- Drills 1+2 re-queued at 09:29 (pause then resume, both sessions) to fire at 09:35 bar.
+  Pending confirmation.
+
+**Drills 3–5 (set_risk_budget / cancel_pending_intents / reconcile):**
+- Scheduled after 10:20 when entry window is closed.
+
+### Findings
+
+**Admin commands NOT wired in multi-live path (new bug — see below).** The `send-command` CLI
+correctly drops JSON files into `.tmp_logs/cmd_<session_id>/`. For single-session `daily-live`
+(no `--multi`), the cmd dir is polled in `run_live_session` (paper_live.py:1646). For
+`--multi`, the cmd dir is **never read** — `run_live_multi_sessions` dispatches to
+`_process_live_multi_bar` which respects `ctx.entries_disabled` but has no code to read or
+process cmd files. Commands queued at 09:29, 09:30, 09:35 never fired.
+
+Result: drills 1+2+3+4 are blocked until the multi-live command loop is wired. Only drill 5
+(reconcile, run after session ends) remains testable today.
+
+---
+
+## 2026-05-05 — OPEN: BUG: operator admin commands not wired in --multi (run_live_multi_sessions)
+
+**Status:** OPEN
+**Severity:** High
+
+### Symptom
+
+`pause_entries`, `resume_entries`, `set_risk_budget`, `cancel_pending_intents`, and per-session
+flatten (sentinel file) are all silently ignored when running `daily-live --multi`. Confirmed
+during 2026-05-05 live operator drills — cmd files persisted across multiple bars (09:30, 09:35)
+without being picked up. Sessions continued normally but all operator controls were unreachable.
+
+This also means **SHORT-only flatten is impossible while LONG runs in the same multi process**:
+sentinel file is in `run_live_session` only; `flatten --session-id` CLI is blocked by the DB
+write lock that the multi process holds for LONG.
+
+The root issue is architectural: `--multi` owns the DB lock but does not poll operator-control
+channels. Operator controls are not a missing feature — they are a first-class gap.
+
+### Root Cause
+
+Two missing checks in `run_live_multi_sessions` (`paper_live.py:820`):
+
+1. **No cmd dir poll.** The command polling loop (`paper_live.py:1646–1900`) lives entirely in
+   `run_live_session`. `run_live_multi_sessions` calls `_process_live_multi_bar` per bar and
+   `asyncio.sleep` between bars, but neither reads `.tmp_logs/cmd_<session_id>/`.
+   `_LiveMultiContext` carries `entries_disabled` and `entry_resume_symbols` and
+   `_process_live_multi_bar` respects them — the *application* is wired, the *reading* is not.
+
+2. **No per-context sentinel file poll.** `run_live_session:1609` checks
+   `.tmp_logs/flatten_<session_id>.signal` every poll cycle. There is no equivalent check in
+   the multi loop, so a per-session graceful flatten is also impossible.
+
+### Fix Plan
+
+1. Extract `_apply_admin_command(ctx, cmd_file)` from `run_live_session:1669–1900` into a
+   shared helper that operates on a `_LiveMultiContext`-shaped interface.
+2. Add cmd dir poll per active context in `run_live_multi_sessions`, either post-bar or in the
+   inter-bar `asyncio.sleep` cycle.
+3. Add per-context sentinel file check (`flatten_<session_id>.signal`) in the same poll point.
+4. Keep one multi process, one DB writer — no architectural change, just missing wiring.
+5. Test with `daily-live --feed-source local --multi` before next Kite live session.
+
+### Today's impact (2026-05-05)
+
+Decision: let both sessions run naturally (Option A). Today's session still provides:
+- Clean `--multi` bar-major live run
+- `ORDER_LATENCY` data from `--simulate-real-orders`
+- `paper_feed_audit` + `paper_signal_audit` rows
+- Natural SL/target/trail/time exits
+- Final reconcile after process exits
+
+What cannot be tested today: SHORT-only flatten, pause/resume entries, set_risk_budget,
+cancel_pending_intents, reconcile while sibling session runs.
+
+### Related
+
+`run_live_multi_sessions`, `_process_live_multi_bar`, `_LiveMultiContext.entries_disabled`,
+`paper_live.py:1646`, `paper_live.py:1609`, `pivot-paper-trading send-command`,
+2026-05-05 operator drills.
+
+---
+
 ## 2026-05-05 — FIXED: OPS: same-day daily-prepare rerun caused readiness confusion
 
 **Status:** FIXED

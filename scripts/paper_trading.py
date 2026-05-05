@@ -45,6 +45,7 @@ from scripts.paper_broker_cli import (
     _cmd_pilot_check,
     _cmd_real_dry_run_order,
     _cmd_real_order,
+    _cmd_real_pilot_plan,
     _load_json_list_arg,
 )
 from scripts.paper_cli_helpers import (
@@ -131,6 +132,7 @@ _BROKER_HANDLER_EXPORTS = (
     _cmd_pilot_check,
     _cmd_real_dry_run_order,
     _cmd_real_order,
+    _cmd_real_pilot_plan,
 )
 
 
@@ -2268,9 +2270,11 @@ def main() -> None:
     )
     parser = build_parser()
     args = parser.parse_args()
-    # Startup: cancel any stale sessions left from a previous crash.
-    file_only_commands = {"send-command"}
-    if getattr(args, "command", "") not in file_only_commands:
+    # Startup: cancel any stale sessions left from a previous crash. Skip commands
+    # that are intentionally file-only or broker-read-only so they work while a
+    # live paper session holds paper.duckdb.
+    startup_cleanup_skip_commands = {"send-command", "pilot-check", "real-pilot-plan"}
+    if getattr(args, "command", "") not in startup_cleanup_skip_commands:
         stale = _pdb().cleanup_stale_sessions()
         if stale:
             print(f"Cleaned up {stale} stale session(s) from previous run(s)", flush=True)

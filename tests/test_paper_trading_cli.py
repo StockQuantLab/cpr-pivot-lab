@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 from types import SimpleNamespace
 
@@ -151,6 +152,124 @@ def test_paper_trading_parser_supports_real_order_confirmation() -> None:
     assert args.confirm_real_order is True
     assert args.order_type == "LIMIT"
     assert args.reference_price == 700.0
+
+
+def test_paper_trading_parser_supports_real_pilot_plan() -> None:
+    parser = build_parser()
+
+    args = parser.parse_args(
+        [
+            "real-pilot-plan",
+            "--symbol",
+            "ITC",
+            "--quantity",
+            "1",
+            "--max-notional",
+            "1000",
+            "--acknowledgement",
+            "I_ACCEPT_REAL_ORDER_RISK",
+        ]
+    )
+
+    assert args.command == "real-pilot-plan"
+    assert args.symbol == "ITC"
+    assert args.quantity == 1
+    assert args.max_notional == 1000.0
+    assert args.exchange == "NSE"
+    assert args.product == "MIS"
+    assert args.tick_size == 0.05
+    assert args.market_protection == 2.0
+
+
+def test_real_pilot_plan_skips_startup_paper_db_cleanup(monkeypatch: pytest.MonkeyPatch) -> None:
+    import scripts.paper_trading as pt
+
+    calls: list[str] = []
+
+    async def fake_handler(args: SimpleNamespace) -> None:
+        calls.append(f"handler:{args.command}")
+
+    def fail_pdb():
+        raise AssertionError("real-pilot-plan must not open paper.duckdb at startup")
+
+    def fake_run_asyncio(coro):
+        calls.append("run_asyncio")
+        coro.close()
+
+    monkeypatch.setattr(sys, "argv", ["pivot-paper-trading", "real-pilot-plan", "--symbol", "ITC"])
+    monkeypatch.setattr(pt, "_cmd_real_pilot_plan", fake_handler)
+    monkeypatch.setattr(pt, "_pdb", fail_pdb)
+    monkeypatch.setattr(pt, "run_asyncio", fake_run_asyncio)
+    monkeypatch.setattr(pt, "configure_windows_stdio", lambda **kwargs: None)
+    monkeypatch.setattr(pt, "configure_windows_asyncio", lambda: None)
+
+    pt.main()
+
+    assert calls == ["run_asyncio"]
+
+
+@pytest.mark.asyncio
+async def test_real_pilot_plan_outputs_no_placement_commands(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import scripts.paper_broker_cli as broker_cli
+
+    class _FakeKite:
+        def ltp(self, keys: list[str]) -> dict[str, dict[str, float]]:
+            assert keys == ["NSE:ITC"]
+            return {"NSE:ITC": {"last_price": 309.85}}
+
+    monkeypatch.setattr(broker_cli, "_get_kite_client", lambda: _FakeKite())
+
+    await broker_cli._cmd_real_pilot_plan(
+        SimpleNamespace(
+            symbol="ITC",
+            exchange="NSE",
+            quantity=1,
+            product="MIS",
+            session_id="manual-pilot-test-itc",
+            max_notional=1000.0,
+            acknowledgement="I_ACCEPT_REAL_ORDER_RISK",
+            buy_limit_offset_pct=0.0,
+            max_slippage_pct=2.0,
+            market_protection=2.0,
+            stop_loss_pct=1.0,
+            stop_limit_buffer_pct=0.2,
+            tick_size=0.05,
+            reference_price_age_sec=1.0,
+        )
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["places_real_orders"] is False
+    assert payload["session_id"] == "manual-pilot-test-itc"
+    assert payload["symbol"] == "ITC"
+    assert payload["ltp"] == 309.85
+    assert payload["estimated_notional"] == 309.85
+    assert payload["guardrails"]["ok"] is True
+    assert payload["buy_limit"]["price"] == 309.85
+    assert payload["market_buy_fallback"]["requires_allowed_order_type"] == "MARKET"
+    assert "--market-protection" in payload["market_buy_fallback"]["argv"]
+    assert "manual_market_fallback" in payload["market_buy_fallback"]["argv"]
+    assert payload["protected_sell_limit"]["price"] == 303.7
+    assert payload["stop_loss_limit"]["trigger_price"] == 306.75
+    assert payload["stop_loss_limit"]["price"] == 306.1
+    assert payload["buy_limit"]["argv"][:6] == [
+        "doppler",
+        "run",
+        "--",
+        "uv",
+        "run",
+        "pivot-paper-trading",
+    ]
+    assert "real-order" in payload["buy_limit"]["argv"]
+    assert "--confirm-real-order" in payload["buy_limit"]["argv"]
+    assert "--max-slippage-pct" in payload["protected_sell_limit"]["argv"]
+    assert payload["post_order_monitoring"]["sync_command"].endswith(
+        "broker-sync-orders --session-id manual-pilot-test-itc"
+    )
 
 
 def test_paper_trading_parser_supports_replay() -> None:

@@ -38,6 +38,7 @@ def build_paper_trading_parser(
     _cmd_broker_reconcile = handlers["_cmd_broker_reconcile"]
     _cmd_broker_sync_orders = handlers["_cmd_broker_sync_orders"]
     _cmd_pilot_check = handlers["_cmd_pilot_check"]
+    _cmd_real_pilot_plan = handlers["_cmd_real_pilot_plan"]
     _cmd_order = handlers["_cmd_order"]
     _cmd_real_dry_run_order = handlers["_cmd_real_dry_run_order"]
     _cmd_real_order = handlers["_cmd_real_order"]
@@ -581,6 +582,70 @@ def build_paper_trading_parser(
         help="Exit non-zero when guardrail findings exist",
     )
     pilot_check.set_defaults(handler=_cmd_pilot_check)
+
+    pilot_plan = sub.add_parser(
+        "real-pilot-plan",
+        help="Build a no-placement one-symbol real-order pilot plan from fresh Kite LTP",
+    )
+    pilot_plan.add_argument("--symbol", required=True, help="NSE tradingsymbol")
+    pilot_plan.add_argument("--quantity", type=int, default=1, help="Pilot quantity")
+    pilot_plan.add_argument("--session-id", default=None, help="Manual pilot session id")
+    pilot_plan.add_argument("--exchange", default="NSE", help="Exchange, default NSE")
+    pilot_plan.add_argument("--product", default="MIS", help="Product, default MIS")
+    pilot_plan.add_argument(
+        "--max-notional",
+        type=float,
+        default=10_000.0,
+        help="Pilot guardrail notional cap.",
+    )
+    pilot_plan.add_argument(
+        "--acknowledgement",
+        default=None,
+        help="Must be I_ACCEPT_REAL_ORDER_RISK for guardrail ok=true.",
+    )
+    pilot_plan.add_argument(
+        "--buy-limit-offset-pct",
+        type=float,
+        default=0.0,
+        help="Optional buy LIMIT offset above fresh LTP, default 0.",
+    )
+    pilot_plan.add_argument(
+        "--max-slippage-pct",
+        type=float,
+        default=2.0,
+        help="Protected sell max slippage percent, default 2.",
+    )
+    pilot_plan.add_argument(
+        "--market-protection",
+        type=float,
+        default=2.0,
+        help="Zerodha market_protection for generated MARKET fallback, default 2.",
+    )
+    pilot_plan.add_argument(
+        "--stop-loss-pct",
+        type=float,
+        default=1.0,
+        help="Stop-loss trigger percent below fresh LTP, default 1.",
+    )
+    pilot_plan.add_argument(
+        "--stop-limit-buffer-pct",
+        type=float,
+        default=0.2,
+        help="SL limit buffer below trigger percent, default 0.2.",
+    )
+    pilot_plan.add_argument(
+        "--tick-size",
+        type=float,
+        default=0.05,
+        help="Price tick used for generated LIMIT/SL prices, default 0.05.",
+    )
+    pilot_plan.add_argument(
+        "--reference-price-age-sec",
+        type=float,
+        default=1.0,
+        help="Reference price age inserted in generated commands, default 1.",
+    )
+    pilot_plan.set_defaults(handler=_cmd_real_pilot_plan)
 
     order = sub.add_parser("order", help="Append a paper order event")
     order.add_argument("--session-id", required=True, help="Session for the order")
