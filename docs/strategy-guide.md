@@ -1,4 +1,18 @@
-> This guide answers the “what is the difference between CPR_LEVELS and FBR?” question for operators, analysts, and reviewers.
+> This guide answers the “what is the difference between CPR_LEVELS and FBR?” question for
+> operators, analysts, and reviewers. It is written so a trader can understand the choices
+> without reading code.
+
+## Quick Glossary
+
+| Term | Trader meaning | Simple example |
+|---|---|---|
+| `TC` / `BC` | Top and bottom of the CPR zone from yesterday's candle. Treat it like the day's decision zone. | Price above `TC` means buyers are stronger; below `BC` means sellers are stronger. |
+| `R1` / `S1` | First upside/downside pivot target. | LONG exits at `R1`; SHORT exits at `S1`. |
+| `R2` / `S2` | Farther second target. | Tested, but rejected for the current CPR strategy. |
+| `OR` | Opening range from the first 5-minute candle. | A quiet opening bar means weak momentum; a huge opening bar means the move may already be done. |
+| `ATR` | Normal daily movement size for that stock. | A ₹500 stock with ATR ₹10 normally moves about ₹10 per day. |
+| `RR` | Reward divided by risk. | Risk ₹5 to target ₹10 profit = 2.0 RR. |
+| `RVOL` | Current volume compared with normal volume for that time of day. | `1.0` means normal volume; `1.5` means 50% above normal. |
 
 ## Data Basis (both strategies)
 
@@ -15,6 +29,13 @@ else             => no setup
 
 When opening behavior is neither clearly above TC nor below BC, both strategies do not open a trade.
 
+Example:
+
+- Yesterday's CPR zone is `BC = ₹98`, `TC = ₹100`.
+- Today's 09:15 candle closes at `₹101`.
+- Because `₹101 > TC`, the day has a LONG bias for CPR_LEVELS.
+- If the candle closes at `₹99`, it is inside the CPR zone, so there is no setup.
+
 ## CPR_LEVELS (baseline directional setup)
 
 **Idea:** wait for price interaction with the daily CPR boundary and target the same-day floor pivot extension.
@@ -25,6 +46,14 @@ When opening behavior is neither clearly above TC nor below BC, both strategies 
   - SHORT: close <= `BC - buffer`
 - Set stop at the opposite CPR boundary with ATR noise buffer.
 - Set target at `R1` (LONG) / `S1` (SHORT) and apply standard trailing logic.
+
+Plain example:
+
+- Yesterday's CPR zone is `BC = ₹98`, `TC = ₹100`.
+- Today's first candle closes at `₹101`, so the stock has LONG bias.
+- The strategy waits for a valid candle close above `TC + buffer`.
+- If entry is near `₹101`, stop is near `BC`, and target is `R1`.
+- For SHORT, mirror the same logic: close below `BC`, stop near `TC`, target `S1`.
 <!-- REJECTED_VARIANTS -->
 - **cpr_hold_confirm (SHORT):** Helped on a two-day slice, but full-period return dropped from `112.32%` → `12.45%`.
 - **cpr_confirm_entry (SHORT):** Trades fell from `2,823` → `468`, return `6.96%`. Filtered out too many good shorts.
@@ -41,6 +70,47 @@ When opening behavior is neither clearly above TC nor below BC, both strategies 
   - entry fill would be invalid (`target` behind fill),
   - effective RR < minimum required (`min_effective_rr`, default `2.0`),
   - or risk filters fail (`OR/ATR`, `gap`, optional RVOL, CPR width checks).
+
+### Plain Trader Examples: Targets and Scale-Out
+
+Assume a simple LONG trade:
+
+- Buy 100 shares at `₹100`
+- Stop loss is `₹95`
+- First target `R1` is `₹110`
+- Second target `R2` is `₹120`
+
+These examples explain the experiment settings in trader language. The current default remains the
+first row: sell the full position at R1/S1.
+
+| Setting | What happens | If price reaches R1 then reverses | If price reaches R2 | Current verdict |
+|---|---|---:|---:|---|
+| `scale_out_pct = 0.0` | Sell all 100 shares at R1 (`₹110`) | `₹1,000` profit; trade done | Not applicable; already exited | **Default** |
+| `scale_out_pct = 0.5` | Sell 50 shares at R1, keep 50 for R2 | `₹500` profit if runner exits near entry | `₹1,500` total profit | Rejected |
+| `scale_out_pct = 0.8` | Sell 80 shares at R1, keep 20 for R2 | `₹800` profit if runner exits near entry | `₹1,200` total profit | Rejected |
+| `target_level = SECOND` | Skip R1 exit; sell all 100 shares only at R2 | Can give back the R1 profit if price reverses | `₹2,000` profit | Rejected |
+| `rr_gate_target_level = SECOND` | Only enter trades whose R2 distance looks good enough | Fewer/lower-quality R1 exits may remain | Higher win-rate filter, but lower total P/L in tests | Rejected |
+
+Why rejected: scale-out looks safer because it locks some profit early, but corrected full-period
+tests showed it reduced total strategy P/L. The canonical CPR edge is to take the full position at
+R1/S1 rather than reserve part of the trade for R2/S2.
+
+### Plain Trader Examples: Entry Filters
+
+Assume the same LONG setup: `TC = ₹100`, `BC = ₹98`, ATR = `₹4`, entry around `₹102`, target
+`R1 = ₹110`.
+
+| Option | What it asks in trader language | Example pass/fail |
+|---|---|---|
+| `cpr_percentile = 33` | Is today's CPR zone narrow enough compared with this stock's own history? | Narrow CPR passes; wide CPR skips. |
+| `cpr_min_close_atr = 0.5` | Did the 09:15 close move far enough beyond CPR, not just barely touch it? | Need at least `0.5 × ATR = ₹2` beyond `TC`; close at `₹102.20` passes, `₹100.50` fails. |
+| `narrowing_filter = true` | Is today's CPR tighter than yesterday's CPR? | Today width `0.20%`, yesterday `0.35%` passes. |
+| `buffer_pct = 0.05%` | Add a tiny cushion beyond CPR before accepting entry. | `TC = ₹100`, trigger is about `₹100.05`; close at `₹100.02` fails. |
+| `min_effective_rr = 2.0` | Is the target at least twice as far as the stop risk? | Risk `₹4`, reward `₹8.50` passes; reward `₹6` fails. |
+| `or_atr_min = 0.3` | Did the first candle show enough movement? | ATR `₹4`, first candle range must be at least `₹1.20`. |
+| `or_atr_max = 2.5` | Was the first candle too large already? | ATR `₹4`, first candle range above `₹10` skips. |
+| `max_gap_pct = 1.5` | Did the stock gap too much before we could enter? | Previous close `₹100`, open above `₹101.50` or below `₹98.50` skips. |
+| `rvol_threshold = 1.0` | Is volume at least normal for this time of day? | Normal 09:25 volume is 10,000 shares; current volume must be at least 10,000. |
 
 RR semantics:
 
@@ -83,11 +153,25 @@ The promoted long default is `rvol_threshold = 1.0`.
 - Stop uses the failed breakout extreme + ATR/reversal buffer.
 - Target uses configured `rr_ratio`, then trailing rules.
 
+Plain example:
+
+- Opening range high is `₹105`, low is `₹100`.
+- Price first breaks above `₹105`, so it looks like a LONG breakout.
+- A few candles later it falls back inside the opening range, for example to `₹103`.
+- FBR treats that as a failed LONG breakout and looks for a SHORT reversal trade.
+- If price never comes back inside the range within the allowed window, FBR skips it.
+
 ## Why both can show different edge
 
 - `CPR_LEVELS` is a directional momentum test (break of a CPR boundary).
 - `FBR` is a reversal-contingency test (momentum failed and turned).
 - They are complementary. Running LONG-only vs SHORT-only can isolate when one side fails in specific market regimes.
+
+Trader translation:
+
+- CPR_LEVELS says: "The stock opened strong/weak around CPR; follow that direction."
+- FBR says: "The first breakout failed; trade the reversal."
+- A trend day can favor CPR_LEVELS. A trap/reversal day can favor FBR.
 
 ## Trailing Stop Mechanics
 
@@ -126,6 +210,13 @@ the operator-level version.
   profit-improving change we wanted to preserve for the morning baseline set.
 - TIME\_EXIT at 15:00 takes priority — any open position is force-closed regardless of phase.
 
+Plain example:
+
+- Buy at `₹100`, stop `₹95`; risk is `₹5`, so `1R = ₹5`.
+- At `₹105`, the trade has reached `1R`; stop can move to breakeven near `₹100`.
+- At `₹110`, the trade has reached `2R`; trailing can start.
+- If the stock keeps rising, the stop follows upward. If it reverses, the trailing stop exits.
+
 For candle-by-candle worked examples (including the April 2026 intraday-high bug and its fix)
 see `docs/trailing-stop-explained.md`.
 
@@ -155,20 +246,26 @@ dashboard to see a one-line tooltip; this page provides the full explanation and
 **Strategy** · `CPR_LEVELS` or `FBR`
 Which strategy the engine ran. CPR_LEVELS = daily pivot boundary touch entry.
 FBR = failed opening breakout reversal.
+Example: choose `CPR_LEVELS` when testing "follow the CPR break"; choose `FBR` when testing
+"fade a failed opening breakout".
 
 **Direction** · `LONG`, `SHORT`, or `BOTH`
 Filters which side of the market the engine trades.
 - `LONG`: only buy setups (price breaks above TC).
 - `SHORT`: only sell setups (price breaks below BC).
 - `BOTH`: takes whichever direction the 09:15 bar signals.
+Example: if market conditions are bearish, run only `SHORT`; if bullish, run only `LONG`;
+if neutral, run both as separate sessions.
 
 **Execution Mode** · `BACKTEST`, `PAPER`, `LIVE`
 How the run was executed. Affects commission model and position sizing source.
+Example: `BACKTEST` is historical research, `PAPER` is live simulation, `LIVE` is real-time operation.
 
 **Commission Model** · `zerodha` or `zero`
 `zerodha` applies the actual Zerodha brokerage + STT + exchange charges.
 At ₹100 stock with 100 shares (~₹10,000 position), commission ≈ ₹85 round-trip.
 `zero` is used for pure strategy analysis without cost drag.
+Example: use `zerodha` for realistic P/L; use `zero` only to understand raw strategy behavior.
 
 ---
 
@@ -210,6 +307,8 @@ full bar to close through the boundary.
 *What:* Number of bars after the initial breakout to look for a reversal that re-enters
 the Opening Range. Only relevant when `Strategy = FBR`.
 *Best value:* 10 bars (Calmar 4.08 vs 3.93 at 8). See ISSUES.md tuning results.
+*Trader example:* If a breakout happens at 09:25 and `failure_window = 8`, FBR watches roughly
+the next 40 minutes for the breakout to fail.
 
 ---
 
@@ -244,6 +343,8 @@ SL 12 points away → trade is skipped.
 in your favour), the stop is moved to the entry price (breakeven).
 *Result:* Position can only lose commission from this point forward. Activates the
 BREAKEVEN phase of the trailing stop.
+*Example:* Entry `₹100`, stop `₹95`, risk `₹5`. Once price reaches `₹105`, breakeven logic can
+move the stop near `₹100`.
 
 **Risk-Based Sizing** · `ON` or `OFF`
 *What:* When ON, position size is calculated to risk exactly `risk_pct` (default 1%) of
@@ -269,6 +370,8 @@ unprocessed admin intents with `cancel_pending_intents`. These are not strategy 
 resize already-open positions. Existing positions keep their normal SL/target/trailing management;
 new entries use the current operator budget/entry-gate state after the command is processed. If
 current open notional already consumes a reduced budget, new entries are disabled until exposure falls.
+Example: if market suddenly turns choppy, `pause_entries` stops new trades but keeps monitoring
+open positions. `set_risk_budget` can reduce future entries without manually closing current trades.
 
 ---
 
@@ -330,7 +433,8 @@ tick data ≈ 4.0-5.0 on REST data).
 *What:* All open positions are force-closed at this time regardless of phase.
 *Why 15:00 not later:* Keeps MIS positions away from Zerodha's intraday auto-square-off window
 and leaves time for operator intervention if an exit order is rejected.
-widening and to allow Zerodha's execution engine to process MOC orders normally.
+*Example:* A trade opened at 10:00 is still open at 15:00. Even if target/SL did not hit, the
+system exits it at the 15:00 candle close.
 
 ---
 
@@ -358,6 +462,13 @@ The difference between `paper_feed_audit` and `intraday_day_pack`:
 
 The live engine uses `paper_feed_audit` data to build its bars. The backtest uses
 `intraday_day_pack`. They are the same stock, same time window, different data sources.
+
+Plain example:
+
+- Historical REST data might say the 09:15 candle high-low range was `₹10`.
+- Live WebSocket ticks might only see `₹6` of that movement.
+- A filter like `or_atr_max` can therefore reject the historical backtest but allow the live
+  session. The audit feed lets us replay the exact live bars later.
 
 ### Three uses
 
