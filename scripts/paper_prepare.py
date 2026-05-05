@@ -14,7 +14,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from config.settings import get_settings
-from db.duckdb import get_db
+from db.duckdb import _use_market_read_replica, get_dashboard_db, get_db
 from engine.command_lock import acquire_command_lock
 from engine.constants import normalize_symbol
 
@@ -24,6 +24,8 @@ CANONICAL_FULL_UNIVERSE_NAME = "canonical_full"
 
 
 def _open_runtime_db(*, read_only: bool):
+    if read_only and _use_market_read_replica():
+        return get_dashboard_db()
     # Paper workflows need the canonical market DB, not the dashboard replica:
     # the replica can lag behind immediately after ingestion / snapshot writes.
     return get_db()

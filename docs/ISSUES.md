@@ -7,6 +7,499 @@ Supersedes: `docs/PARITY_INCIDENT_LOG.md` (contents migrated below).
 
 ---
 
+## 2026-05-05 — FIXED: OPS: EOD log monitoring was delayed by buffered non-TTY stdout
+
+**Status:** FIXED
+**Severity:** Medium
+
+### Symptom
+
+During the 2026-05-05 EOD ingestion, the redirected EOD log appeared silent for long stretches and
+then flushed large bursts of output. This made healthy stages look stalled and made the noisy
+`daily-prepare --all-symbols` stage harder to interpret.
+
+### Root Cause
+
+The EOD command was launched without `PYTHONUNBUFFERED=1` even though it was a redirected non-TTY
+run. Python stdout therefore used block buffering. Monitoring also relied too heavily on the log
+tail instead of direct progress signals such as Kite checkpoint JSON files, `market.duckdb` table
+counts, and worker process memory/CPU.
+
+### Fix
+
+Updated EOD operator docs and the local `eod-ingest` skill to require:
+
+```bash
+PYTHONUNBUFFERED=1 doppler run -- uv run pivot-refresh --eod-ingest ...
+```
+
+The runbook now also recommends direct EOD progress checks:
+
+- Kite checkpoint files under `data/raw/kite/checkpoints/`
+- targeted `market.duckdb` row counts for build / universe stages
+- `tasklist` worker memory/CPU checks
+- schedule the next progress wakeup only after the current check completes
+
+### Related
+
+2026-05-05 EOD ingestion for `--date 2026-05-05 --trade-date 2026-05-06`,
+`docs/PAPER_TRADING_RUNBOOK.md`, `docs/KITE_INGESTION.md`, `.codex/skills/eod-ingest/SKILL.md`.
+
+---
+
+## 2026-05-05 — FIXED: LIVE: real-order emergency flatten can be blocked by stale quote age
+
+**Status:** FIXED
+**Severity:** Critical
+
+### Symptom
+
+When `daily-live --real-orders` tries to flatten positions during a stale-feed event, the real
+broker exit can be rejected before the paper position is marked closed. The session can then fail
+with positions still open locally and potentially still open at the broker.
+
+### Root Cause
+
+`flatten_session_positions()` passes `_feed_quote_age_sec(feed_state, now)` into
+`RealOrderRouter.place_exit()` with a `manual_flatten:*` role. That builds a protected flatten
+LIMIT intent. `engine/broker_adapter.py::_validate_protected_exit()` applies the same
+`DEFAULT_MAX_QUOTE_AGE_SEC = 5.0` freshness gate to normal exits and emergency/manual flattens.
+
+For the emergency case, the quote is stale by definition. `OrderSafetyError` propagates out of the
+position loop before `append_order_event()` / `update_position(status="CLOSED")` run for that
+position.
+
+### Fix
+
+Separated normal exit freshness from emergency/manual flatten freshness. Normal `exit:*` roles
+still reject references older than 5 seconds. Emergency/manual flatten roles now keep the protected
+LIMIT price/slippage guard but do not block solely because the last quote is stale.
+
+Regression coverage:
+`tests/test_broker_adapter.py::test_zerodha_rejects_stale_normal_exit_reference_price` and
+`tests/test_broker_adapter.py::test_zerodha_allows_stale_emergency_flatten_reference_price`.
+
+### Related
+
+`engine/paper_runtime.py::flatten_session_positions`,
+`engine/broker_adapter.py::_validate_protected_exit`,
+`engine/real_order_runtime.py::RealOrderRouter.place_exit`.
+
+---
+
+## 2026-05-05 — FIXED: LIVE: lower-level real-order PARTIAL path still hard-raises if startup guard is bypassed
+
+**Status:** FIXED
+**Severity:** Medium
+
+### Symptom
+
+The supported live startup path blocks `--real-orders` when CPR partial scale-out is configured, so
+canonical CPR real-order sessions should not reach this state today. However, the lower-level
+runtime still raises `RuntimeError` if a `PARTIAL` candle decision is evaluated with an enabled
+real-order router.
+
+### Root Cause
+
+`engine/paper_runtime.py::_advance_open_position()` raises:
+
+```python
+RuntimeError("automated real-order routing does not support partial scale-out exits")
+```
+
+for `decision.action == "PARTIAL"` and `real_order_router.enabled`. This was previously guarded at
+startup in `scripts/paper_live.py`, but the runtime itself is still not fail-safe if called by a
+test harness, future entry point, or resume path that bypasses the guard.
+
+### Fix
+
+Kept the startup block and made the lower-level runtime fail closed. If a future path bypasses the
+startup guard, `PARTIAL` with an enabled real-order router logs a warning and becomes `HOLD`, so
+the full broker position remains monitored for SL, target, manual flatten, or time exit.
+
+### Related
+
+Existing fixed startup guard entry: `2026-05-03 — FIXED: RUNTIME: partial exit with real-order routing raises RuntimeError, crashing candle loop`.
+
+---
+
+## 2026-05-05 — FIXED: BUG: partial-exit realized PnL can go stale in in-memory tracker
+
+**Status:** FIXED
+**Severity:** High
+
+### Symptom
+
+For partial scale-out positions, the DB row receives the partial realized PnL, but the in-memory
+`PaperPosition` cached by `SessionPositionTracker` does not receive the updated `realized_pnl`.
+The later full close can start from stale `realized_so_far`, understating live dashboard PnL during
+the session and risking an overwrite of the position-level realized PnL.
+
+### Root Cause
+
+`SessionPositionTracker.record_partial()` updates `current_qty` and cash only. It does not accept
+or update realized PnL. `_advance_open_position()` computes cumulative `realized` for the partial
+branch and writes it with `update_position(... realized_pnl=realized)`, but it returns no updated
+position object to refresh `position.realized_pnl` in memory.
+
+### Fix
+
+Threaded cumulative realized PnL through the partial tracking path. The partial branch now refreshes
+the cached position quantity and realized PnL, and session PnL accumulation uses deltas so the later
+runner close does not double-count or drop the partial leg.
+
+Regression coverage:
+`tests/test_bar_orchestrator.py::test_session_position_tracker_partial_reduces_qty_and_credits_cash`
+and `tests/test_paper_runtime.py::test_process_closed_candle_scales_out_then_runners`.
+
+### Related
+
+`engine/paper_runtime.py::_advance_open_position`,
+`engine/bar_orchestrator.py::SessionPositionTracker.record_partial`.
+
+---
+
+## 2026-05-05 — FIXED: LIVE: real-order account cash check fails open when Kite cash cannot be read
+
+**Status:** FIXED
+**Severity:** Medium
+
+### Symptom
+
+If the Kite margins payload is missing, malformed, or unavailable, real-order router startup can
+continue even though `require_account_cash_check=True`. A too-large `cash_budget` can therefore
+pass local validation when the account cash lookup failed.
+
+### Root Cause
+
+`RealOrderRouter.__init__()` only enforces the budget limit when
+`account_available_cash is not None`. `_fetch_available_cash()` returns `None` when the Kite
+margins API is missing or `_extract_available_cash()` cannot parse the payload. For a required
+safety check, `None` should be treated as a failed precondition, not as permission to skip.
+
+### Fix
+
+For LIVE real-order routers, `require_account_cash_check=True` now raises `OrderSafetyError` if
+`account_available_cash is None`. The explicit opt-out path remains available only through
+`require_account_cash_check=False`.
+
+Regression coverage:
+`tests/test_real_order_runtime.py::test_real_order_router_rejects_missing_required_account_cash`.
+
+### Related
+
+`engine/real_order_runtime.py::RealOrderRouter.__init__`,
+`engine/real_order_runtime.py::_fetch_available_cash`.
+
+---
+
+## 2026-05-05 — FIXED: OPS: unknown admin command actions are deleted without operator feedback
+
+**Status:** FIXED
+**Severity:** Medium
+
+### Symptom
+
+If an operator command file contains an unrecognized `action`, the live loop logs the generic
+"Admin command" line, marks the command processed, deletes the file, and gives no explicit warning
+that the action was ignored.
+
+### Root Cause
+
+Both the multi-session and single-session admin command handlers use an `if` / `elif` chain for
+known actions (`close_all`, `close_positions`, `set_risk_budget`, `pause_entries`,
+`resume_entries`, `cancel_pending_intents`) with no final `else` branch.
+
+### Fix
+
+Added explicit unknown-action warnings in both multi-session and single-session command loops. The
+malformed command file is still deleted after logging so it does not reprocess forever.
+
+Regression coverage:
+`tests/test_paper_admin_commands.py::test_live_multi_operator_controls_logs_unknown_action`.
+
+### Related
+
+`scripts/paper_live.py::_apply_live_multi_operator_controls`,
+`scripts/paper_live.py::run_live_session`.
+
+---
+
+## 2026-05-05 — FIXED: CLEANUP: stale paper-only entry builder and weak FLATTEN_EOD alert-log match
+
+**Status:** FIXED
+**Severity:** Low
+
+### Symptom
+
+Two low-risk cleanup items remain in the live paper runtime:
+
+1. `_entry_candidate()` in `engine/paper_runtime.py` is defined but no longer called; entry scanning
+   now goes through the shared CPR path.
+2. `_has_flatten_eod_in_alert_log()` dedupes with `subject LIKE '%<session_id>%' OR body LIKE ...`.
+   This is practical but can false-match similar test session IDs if they embed another session ID.
+
+### Root Cause
+
+`_entry_candidate()` is leftover paper-only code from before the shared CPR entry scan. The alert
+dedupe query predates a stricter session identifier contract in alert metadata.
+
+### Fix
+
+Removed the dead `_entry_candidate()` helper and unused imports. Tightened persisted `FLATTEN_EOD`
+dedupe to match the exact rendered session tag in the alert body (`Session:
+<code>{session_id}</code>`) instead of matching any subject/body substring.
+
+### Related
+
+`engine/paper_runtime.py::_entry_candidate`,
+`engine/paper_runtime.py::_has_flatten_eod_in_alert_log`.
+
+---
+
+## 2026-05-05 — OPEN: OPS: tomorrow end-to-end real-order and operator-drill validation
+
+**Status:** OPEN
+**Severity:** High
+
+### Objective
+
+Complete the remaining live-readiness items that were deferred while the 2026-05-05 paper-live
+session and the first ITC real-order round-trip were in progress.
+
+### Pending Work
+
+1. **Fixed IP / Kite IP whitelist**: run `real-readiness --expected-ip <WHITELISTED_IP>` after the
+   daily Kite token refresh. The command proves the current outbound IP and compares it to the
+   expected whitelisted value, but Kite does not expose the whitelist through a read API. If the
+   ISP IP changed, update Kite developer console or use a fixed-IP VPN/static IP.
+2. **Broker cancel path**: validate `broker-cancel-order` against a real pending 1-share order or
+   a real pending SL order, then run `broker-sync-orders` and confirm `/broker_orders` reflects
+   `CANCELLED` without manual replica intervention.
+3. **Kite WebSocket operator drill**: run `operator-drill` with temporary paper DB and Kite feed,
+   then test pause/resume entries, set risk budget, cancel pending intents, and per-session
+   flatten on DRILL-prefixed sessions only.
+4. **Strategy-routed real-order canary**: run one single-direction `daily-live --real-orders`
+   session first with max positions 1 and a cash budget around ₹10,000. If testing capital
+   allocation instead of a 1-share canary, use `--real-order-sizing-mode cash-budget` and ensure
+   Doppler `CPR_ZERODHA_REAL_MAX_QTY` is high enough for the computed quantity.
+5. **Dual-direction real routing decision**: `--multi --real-orders` remains blocked until a
+   guarded implementation is explicitly enabled and tested. Loading ₹20,000 can support the
+   budget idea (₹10,000 LONG + ₹10,000 SHORT), but cash alone does not remove the code-level pilot
+   block or the risk of broker-side netting if LONG and SHORT touch the same symbol.
+6. **Final sync/reconcile**: after every real-order test, run `broker-sync-orders`, refresh
+   `/broker_orders`, and run `reconcile --strict` for the paper session.
+
+### Related
+
+`broker-cancel-order`, `operator-drill`, `daily-live --real-orders`,
+`CPR_LEVELS_LONG-2026-05-05-live-kite`, `CPR_LEVELS_SHORT-2026-05-05-live-kite`,
+`manual-pilot-2026-05-05-itc`.
+
+---
+
+## 2026-05-05 — FIXED: LIVE: late-start Kite sessions could proxy OR from first seen bar
+
+**Status:** FIXED
+**Severity:** High
+
+### Symptom
+
+If `daily-live --feed-source kite` starts after the opening-range window and true same-day
+`or_close_5` / direction rows are unavailable, Kite WebSocket only provides future ticks. It does
+not replay the 09:15-09:20 candle. The current live setup fallback can then synthesize the OR from
+the first in-memory bar seen after startup.
+
+### Root Cause
+
+`engine.paper_setup_loader._build_intraday_summary()` has a "late-start continuity mode" that
+returns `or_proxy=True` and uses the first seen candle when no candle falls inside the true
+09:15-09:20 OR window. That may be acceptable for paper continuity diagnostics, but it is not
+acceptable for strategy-routed real orders because it shifts the strategy context from true OR to
+late-start first bar.
+
+### Fix
+
+For Kite real-order sessions, startup now first loads DB setup rows, then uses Kite historical
+`5minute` data to fetch the true 09:15-09:20 opening-range candle for unresolved symbols, then
+reruns setup hydration before entries are enabled. If true OR still cannot be proven, real-order
+entries remain blocked.
+
+`PaperRuntimeState` now has `allow_or_proxy_setup`. Paper/live diagnostics can still use the
+diagnostic OR proxy when explicitly allowed, but strategy-routed real-order sessions set
+`allow_or_proxy_setup=False`, so `or_proxy=True` rows do not qualify entries. The batch prefetch
+path also falls back to the live setup loader when the `market_day_state` row is absent but true OR
+has been supplied from historical catch-up.
+
+Review follow-up: the first implementation fetched the historical OR candle but one hydration path
+could still leave `open_915`, `or_high_5`, and `or_low_5` at zero when a same-day
+`market_day_state` row existed with missing OR fields. Both `load_setup_row()` and the multi-live
+batch prefetch hydrator now copy the caught-up true OR values into the setup row and recompute the
+derived open/gap/OR-ATR fields.
+
+Regression coverage:
+`tests/test_paper_runtime.py::test_process_closed_candle_blocks_or_proxy_setup_when_runtime_disallows_it`,
+`tests/test_paper_live_polling.py::test_catch_up_true_or_from_kite_merges_historical_or_candle`,
+and
+`tests/test_paper_live_polling.py::test_prefetch_batch_path_falls_back_to_live_setup_when_market_row_missing`.
+Follow-up coverage:
+`tests/test_paper_runtime.py::test_load_setup_row_market_row_fills_missing_or_from_live_candle` and
+`tests/test_paper_live_polling.py::test_prefetch_batch_path_fills_missing_or_from_caught_up_candle`.
+
+### Related
+
+`engine/paper_setup_loader.py::_build_intraday_summary`,
+`refresh_pending_setup_rows_for_bar`, `daily-live --feed-source kite`,
+`daily-live --real-orders`.
+
+---
+
+## 2026-05-05 — FIXED: OPS: strategy-routed real orders support cash-budget sizing
+
+**Status:** FIXED — code/test complete; needs live canary validation
+**Severity:** High
+
+### Symptom
+
+`daily-live --real-orders` always used `--real-order-fixed-qty`, so a ₹10,000
+`--real-order-cash-budget` only acted as a cap. It did not allocate the available slot capital to
+the real canary position.
+
+### Root Cause
+
+`RealOrderRouter._entry_intent()` always set `quantity=self.config.fixed_quantity`; the cash budget
+was checked after intent construction but was not used for sizing.
+
+### Fix
+
+Added `--real-order-sizing-mode fixed-qty|cash-budget`. The default remains `fixed-qty`.
+`cash-budget` computes `floor(cash_budget / protected_entry_price)` at entry time, where protected
+entry price includes the LIMIT slippage buffer. Doppler `CPR_ZERODHA_REAL_MAX_QTY` remains the
+outer safety cap and must be raised deliberately before a larger pilot.
+
+Review follow-up: explicit zero values for `cash_budget`, fixed quantity, max positions, and
+slippage are now preserved through config parsing so `RealOrderRuntimeConfig.validate()` rejects
+them instead of silently replacing them with defaults.
+
+### Related
+
+`engine/real_order_runtime.py`, `scripts/paper_cli_helpers.py`,
+`scripts/paper_trading_parser.py`,
+`tests/test_real_order_runtime.py::test_real_order_router_can_size_entry_from_cash_budget`,
+`tests/test_paper_trading_workflow.py::test_real_order_config_supports_cash_budget_sizing`,
+`tests/test_real_order_runtime.py::test_real_order_runtime_config_rejects_explicit_zero_cash_budget`,
+`tests/test_paper_trading_workflow.py::test_real_order_config_preserves_zero_budget_for_fail_closed_validation`.
+
+---
+
+## 2026-05-05 — FIXED: OPS: real-order preflight checks token, cash, gates, and outbound IP
+
+**Status:** FIXED — code/test complete; run live tomorrow after token refresh
+**Severity:** High
+
+### Symptom
+
+The real-order pilot required a manual Kite token refresh and a separate manual public-IP check
+before order placement. After the 2026-05-05 IP whitelist failure, there was no single read-only
+command to verify the local machine's current public IP, Kite token/profile, cash, and real-order
+environment gates before a live pilot.
+
+### Root Cause
+
+`pivot-data-quality --date today` validates strategy/runtime data readiness, not broker execution
+readiness. `pilot-check` validates static pilot scope only and does not call Kite profile, margins,
+LTP, or public-IP discovery.
+
+### Fix
+
+Added `pivot-paper-trading real-readiness`. The command is read-only and checks Kite profile/token,
+available cash, optional LTP/notional for a pilot symbol, real-order Doppler gates, quantity/product
+/ order-type allow lists, and current public outbound IP. It compares the current IP with
+`--expected-ip` or `CPR_ZERODHA_EXPECTED_OUTBOUND_IP`; Kite still does not expose a whitelist read
+API, so this is a local proof plus expected-value comparison, not broker-side whitelist inspection.
+
+Review follow-up: strict readiness now fails if public-IP lookup fails unless
+`--skip-public-ip` is explicitly supplied, and `--quantity 0` is reported as invalid instead of
+being coerced to `1`.
+
+### Related
+
+`scripts/paper_broker_cli.py`, `scripts/paper_trading_parser.py`,
+`tests/test_paper_trading_cli.py::test_real_readiness_reports_ip_token_cash_and_gates`,
+`tests/test_paper_trading_cli.py::test_real_readiness_fails_when_public_ip_lookup_fails`,
+`tests/test_paper_trading_cli.py::test_real_readiness_rejects_non_positive_quantity`,
+`CPR_ZERODHA_EXPECTED_OUTBOUND_IP`.
+
+---
+
+## 2026-05-05 — FIXED: OPS: guarded broker cancel CLI for pending real orders
+
+**Status:** FIXED — code/test complete; needs live broker validation on a pending order
+**Severity:** High
+
+### Symptom
+
+The real-order pilot planner could generate an optional broker-side SL order, but the repo had no
+CLI path to cancel a pending real Kite order after a manual exit. That made actual SL placement too
+risky: a stale pending SL could fire after the position had already been sold.
+
+### Root Cause
+
+The broker CLI supported order placement, dry-run payload generation, and broker status sync, but
+not Kite `cancel_order()`.
+
+### Fix
+
+Added `pivot-paper-trading broker-cancel-order`. The command requires `--confirm-cancel`, requires
+a local `paper_orders.exchange_order_id` match for the supplied `--session-id`, refuses arbitrary
+broker-order cancellation, calls Kite `cancel_order(variety, order_id)`, updates the local broker
+snapshot, and forces a dashboard replica sync.
+
+### Related
+
+`scripts/paper_broker_cli.py`, `scripts/paper_trading_parser.py`,
+`tests/test_broker_reconciliation.py::test_broker_cancel_order_calls_kite_and_syncs_local_status`,
+Kite Connect order cancel API.
+
+---
+
+## 2026-05-05 — FIXED: OPS: isolated operator drill DB for Kite WebSocket live-runtime tests
+
+**Status:** FIXED — local code/test fix; no dashboard integration by design
+**Severity:** Medium
+
+### Symptom
+
+Operator-control bugs in `daily-live --multi` could only be validated on the next market session
+because a second paper-live process cannot write to the production `data/paper.duckdb` while the
+actual live process is active.
+
+### Root Cause
+
+DuckDB allows only one writer process per database file. The live runtime and test/drill runtime
+were both hard-bound to `data/paper.duckdb`, so any realistic live-runtime drill conflicted with
+the production paper-live writer lock.
+
+### Fix
+
+Added a narrow `PIVOT_PAPER_DB_PATH` / `PIVOT_PAPER_REPLICA_DIR` override for `get_paper_db()` and
+added `pivot-paper-trading operator-drill`. The drill launches a child
+`daily-live --multi --feed-source kite` process with a temporary paper DB under
+`.tmp_logs/operator_drills/<run_id>/paper.duckdb`. Drill session IDs are prefixed with
+`DRILL-<run_id>-`, so admin command directories and flatten sentinel files cannot collide with the
+actual paper-live sessions. The child sets `PIVOT_MARKET_READ_REPLICA=1` so setup reads use the
+market replica instead of contending with the active production market DB connection. Explicit
+timing overrides are accepted for drill-time tests after the normal entry window. Real and
+simulated-real order flags are rejected, alerts are disabled, and the dashboard remains pointed at
+the production paper DB.
+
+### Related
+
+`db/paper_db.py`, `scripts/paper_trading.py`, `scripts/paper_trading_parser.py`,
+`tests/test_paper_db.py`, `tests/test_paper_trading_cli.py`.
+
+---
+
 ## 2026-05-05 — FIXED: OPS: no-placement real-order pilot planner
 
 **Status:** FIXED
@@ -36,6 +529,157 @@ paper-live holds `paper.duckdb`.
 
 Manual ITC 1-share pilot, `scripts/paper_broker_cli.py`, `scripts/paper_trading_parser.py`,
 `docs/PAPER_TRADING_RUNBOOK.md`.
+
+---
+
+## 2026-05-05 — INFO: OPS: First successful real-order round-trip via Kite API (ITC 1 share)
+
+**Status:** COMPLETED
+**Severity:** Info
+
+### Summary
+
+First end-to-end real-order placement, fill confirmation, and position close via the
+`pivot-paper-trading real-order` + `broker-sync-orders` CLI stack. 1 share of ITC,
+MIS product, post-market close (15:06–15:07 IST).
+
+### Results
+
+| Step | CLI | Kite order ID | Fill price | Latency |
+|---|---|---|---|---|
+| BUY LIMIT ₹312.10 | `real-order --side BUY` | `260505151883172` | ₹311.50 | 232ms |
+| SELL LIMIT ₹310.65 | `real-order --side SELL` | `260505151887426` | ₹311.60 | 280ms |
+
+Net P&L: +₹0.10 (1 pip, before brokerage). Confirmed in Zerodha console (timestamps
+and prices match). No open ITC position remaining. `broker-sync-orders` matched all
+local records to broker state with zero discrepancy (`missing_kite_order_ids: []`).
+
+Price improvement on both legs: LIMIT BUY at ₹312.10 filled at ₹311.50 (better by ₹0.60);
+LIMIT SELL at ₹310.65 filled at ₹311.60 (better by ₹0.95). NSE price-time priority
+executes at the counterparty's price when your limit is aggressive.
+
+### Issues found during test
+
+1. **`--reference-price-age-sec` stale gate**: The order safety gate rejects if
+   `--reference-price-age-sec` exceeds configured max (5s). Must fetch fresh LTP immediately
+   before placing each order and pass the actual age (≤5s). Batch fetch + place in one
+   Python subprocess to avoid clock drift between fetch and submit.
+
+2. **Kite IP whitelist blocks real orders**: Home ISP dynamic IPs change daily. Must update
+   Kite developer console IP whitelist each morning before live session.
+   Fix options: (a) leave whitelist blank if permitted, (b) add ISP CIDR range,
+   (c) use fixed-IP VPN — required for automated `daily-live --real-orders`.
+
+### Commands used
+
+```bash
+# Step 1 — no-placement plan
+doppler run -- uv run pivot-paper-trading real-pilot-plan \
+  --symbol ITC --quantity 1 --acknowledgement I_ACCEPT_REAL_ORDER_RISK
+
+# Step 2 — dry-run BUY
+doppler run -- uv run pivot-paper-trading real-dry-run-order \
+  --session-id manual-pilot-2026-05-05-itc --symbol ITC --side BUY \
+  --quantity 1 --order-type LIMIT --price 312.00 --role pilot_entry \
+  --reference-price 311.85
+
+# Step 3 — actual BUY (fetch LTP inline, pass fresh reference price)
+# Step 4 — actual SELL (fetch LTP inline)
+# (both executed as single Python subprocess to keep reference price fresh)
+
+# Step 5 — sync
+doppler run -- uv run pivot-paper-trading broker-sync-orders \
+  --session-id manual-pilot-2026-05-05-itc
+```
+
+### Related
+
+`real-order`, `real-pilot-plan`, `real-dry-run-order`, `broker-sync-orders`,
+`engine/broker_adapter.py`, `_validate_real_order_gate`,
+`CPR_ZERODHA_REAL_ORDERS_ENABLED`, `CPR_ZERODHA_REAL_MAX_NOTIONAL=1000`.
+
+---
+
+## 2026-05-05 — FIXED: INFRA: broker-sync updated paper.duckdb but dashboard replica stayed stale
+
+**Status:** FIXED
+**Severity:** Medium
+
+### Symptom
+
+After the ITC real-order BUY and SELL completed in Kite and `broker-sync-orders` reported the
+correct broker fills, `/broker_orders` still showed the real BUY as `PENDING` from an older
+dashboard replica version.
+
+### Root Cause
+
+`broker-sync-orders` updated `paper_orders` through `update_order_from_broker_snapshot()`, which
+uses the normal debounced `_after_write()` / `maybe_sync()` path. That debounce is correct for
+high-frequency live-session writes, but a short-lived CLI command can exit before a final dashboard
+replica publish happens.
+
+### Fix
+
+`scripts/paper_broker_cli.py` now calls `db.force_sync()` once after broker order updates or
+manual-pilot completion updates. This bypasses the debounce for the CLI exit path while leaving
+live-session write throttling unchanged. Added
+`tests/test_broker_reconciliation.py::test_broker_sync_orders_force_syncs_after_broker_updates`.
+
+### Related
+
+`manual-pilot-2026-05-05-itc`, Kite orders `260505151883172` and `260505151887426`,
+dashboard replica `paper_replica_v10679`.
+
+---
+
+## 2026-05-05 — FIXED: BUG: multi-live feed status stuck at CONNECTING for entire session
+
+**Status:** FIXED
+**Severity:** Medium
+
+### Symptom
+
+Dashboard shows feed status as `CONNECTING` for both LONG and SHORT sessions throughout the
+entire `--multi` live session. Confirmed: `paper_feed_state` rows show `updated_at=09:28:29`
+(startup time), `last_bar_ts=None`, `last_event_ts=None` — never updated after bars processed.
+
+### Root Cause
+
+`_prepare_live_multi_context` writes `status="CONNECTING"` to `paper_feed_state` at session
+startup (`paper_live.py:586`). `_process_live_multi_bar` processes every bar but never calls
+`_write_feed_state` — so the startup CONNECTING state persists for the full session. The
+single-session path (`run_live_session`) writes `status="OK"` after each bar via `latest_raw_state`;
+no equivalent write exists in the multi-live bar processor.
+
+### Fix
+
+Added `_write_feed_state` call at the end of `_process_live_multi_bar` (after ctx state
+updates, line ~704):
+
+```python
+connected = bool(
+    ticker_adapter is not None and getattr(ticker_adapter, "is_connected", True)
+)
+await _write_feed_state(
+    None,
+    session_id=ctx.session_id,
+    status="OK" if connected else "STALE",
+    last_event_ts=getattr(ticker_adapter, "last_tick_ts", None),
+    last_bar_ts=ctx.last_bar_ts,
+    last_price=ctx.last_price,
+    stale_reason=None if connected else "ticker_not_connected",
+    raw_state={"connected": connected, "active_symbols": len(ctx.active_symbols),
+               "closed_bars": ctx.closed_bars},
+)
+```
+
+Dashboard will now update to `OK` after the first bar of each multi-live session, and flip
+to `STALE` if the WebSocket drops. Takes effect from the next session start.
+
+### Related
+
+`_process_live_multi_bar`, `_prepare_live_multi_context`, `paper_live.py:586`,
+`paper_feed_state`, `get_dashboard_paper_db`, 2026-05-05 live session.
 
 ---
 
@@ -130,7 +774,8 @@ send-command` to drop JSON files into `.tmp_logs/cmd_<session_id>/`.
   Pending confirmation.
 
 **Drills 3–5 (set_risk_budget / cancel_pending_intents / reconcile):**
-- Scheduled after 10:20 when entry window is closed.
+- 2026-05-05 running process cannot pick up the new command-loop fix; validate these drills in the
+  next local/live `--multi` process.
 
 ### Findings
 
@@ -141,14 +786,15 @@ correctly drops JSON files into `.tmp_logs/cmd_<session_id>/`. For single-sessio
 `_process_live_multi_bar` which respects `ctx.entries_disabled` but has no code to read or
 process cmd files. Commands queued at 09:29, 09:30, 09:35 never fired.
 
-Result: drills 1+2+3+4 are blocked until the multi-live command loop is wired. Only drill 5
-(reconcile, run after session ends) remains testable today.
+Result: drills 1+2+3+4 were blocked in the already-running 2026-05-05 process. The multi-live
+command loop is now wired locally; the next `--multi` process should validate these drills
+end-to-end.
 
 ---
 
-## 2026-05-05 — OPEN: BUG: operator admin commands not wired in --multi (run_live_multi_sessions)
+## 2026-05-05 — FIXED: BUG: operator admin commands not wired in --multi (run_live_multi_sessions)
 
-**Status:** OPEN
+**Status:** FIXED — local code/test fix; next live/local `--multi` run should validate end-to-end
 **Severity:** High
 
 ### Symptom
@@ -181,13 +827,15 @@ Two missing checks in `run_live_multi_sessions` (`paper_live.py:820`):
 
 ### Fix Plan
 
-1. Extract `_apply_admin_command(ctx, cmd_file)` from `run_live_session:1669–1900` into a
-   shared helper that operates on a `_LiveMultiContext`-shaped interface.
-2. Add cmd dir poll per active context in `run_live_multi_sessions`, either post-bar or in the
-   inter-bar `asyncio.sleep` cycle.
-3. Add per-context sentinel file check (`flatten_<session_id>.signal`) in the same poll point.
-4. Keep one multi process, one DB writer — no architectural change, just missing wiring.
-5. Test with `daily-live --feed-source local --multi` before next Kite live session.
+1. Added `_apply_live_multi_operator_controls(...)` for `_LiveMultiContext`.
+2. Added per-context `.tmp_logs/cmd_<session_id>/` polling in `run_live_multi_sessions` before
+   bar processing on every poll cycle.
+3. Added per-context `.tmp_logs/flatten_<session_id>.signal` handling in the same poll point.
+4. Added global flatten handling for `--multi`.
+5. `cancel_pending_intents` is processed before other queued commands in the same poll cycle so it
+   can cancel unprocessed intents instead of arriving too late.
+6. Added focused tests for pause/resume, risk budget update, cancel pending, and per-session
+   flatten signal.
 
 ### Today's impact (2026-05-05)
 
@@ -198,14 +846,15 @@ Decision: let both sessions run naturally (Option A). Today's session still prov
 - Natural SL/target/trail/time exits
 - Final reconcile after process exits
 
-What cannot be tested today: SHORT-only flatten, pause/resume entries, set_risk_budget,
-cancel_pending_intents, reconcile while sibling session runs.
+What could not be tested in the already-running 2026-05-05 process: SHORT-only flatten,
+pause/resume entries, set_risk_budget, cancel_pending_intents, reconcile while sibling session
+runs. The fix applies to newly started `--multi` processes only.
 
 ### Related
 
 `run_live_multi_sessions`, `_process_live_multi_bar`, `_LiveMultiContext.entries_disabled`,
-`paper_live.py:1646`, `paper_live.py:1609`, `pivot-paper-trading send-command`,
-2026-05-05 operator drills.
+`_apply_live_multi_operator_controls`, `pivot-paper-trading send-command`, 2026-05-05 operator
+drills.
 
 ---
 

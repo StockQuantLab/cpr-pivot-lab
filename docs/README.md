@@ -1,6 +1,6 @@
 # Documentation Index
 
-Last reviewed: 2026-05-03
+Last reviewed: 2026-05-05
 
 This directory is the home for project documentation. Keep the repository root limited to
 `README.md`, `STRATEGY.md`, and source-control metadata; operational plans, architecture notes,

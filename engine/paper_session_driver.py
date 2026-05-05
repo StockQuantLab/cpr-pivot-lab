@@ -273,6 +273,7 @@ async def process_closed_bar_group(
                 candle.symbol,
                 float(advance.get("exit_value") or 0.0),
                 float(advance.get("remaining_qty") or 0.0),
+                float(advance["realized_pnl"]) if advance.get("realized_pnl") is not None else None,
             )
         if _i % 64 == 63:
             await asyncio.sleep(0)

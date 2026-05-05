@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import asyncio
+from types import SimpleNamespace
+
 from db.paper_db import PaperDB
 from engine.broker_reconciliation import (
     BrokerOrderSnapshot,
@@ -304,6 +307,126 @@ def test_broker_snapshot_mapping_normalizes_kite_payloads() -> None:
     assert position.symbol == "TCS"
     assert position.quantity == -2
     assert position.average_price == 123.45
+
+
+def test_broker_sync_orders_force_syncs_after_broker_updates(monkeypatch) -> None:
+    import scripts.paper_broker_cli as broker_cli
+
+    calls: list[str] = []
+    local_order = SimpleNamespace(
+        order_id="local-1",
+        session_id="manual-pilot-1",
+        exchange_order_id="kite-1",
+        symbol="ITC",
+    )
+
+    class FakeDB:
+        def get_recent_orders(self, *, limit: int, broker_only: bool):
+            assert limit == 50
+            assert broker_only is True
+            return [local_order]
+
+        def update_order_from_broker_snapshot(self, broker_order_id: str, snapshot):
+            assert broker_order_id == "kite-1"
+            assert snapshot["status"] == "COMPLETE"
+            calls.append("update")
+            return True
+
+        def get_session(self, session_id: str):
+            return None
+
+        def force_sync(self):
+            calls.append("force_sync")
+
+    class FakeKite:
+        def orders(self):
+            return [
+                {
+                    "order_id": "kite-1",
+                    "tradingsymbol": "ITC",
+                    "status": "COMPLETE",
+                    "filled_quantity": 1,
+                    "average_price": 311.5,
+                }
+            ]
+
+    monkeypatch.setattr(broker_cli, "_pdb", lambda: FakeDB())
+    monkeypatch.setattr(broker_cli, "_get_kite_client", lambda: FakeKite())
+
+    asyncio.run(
+        broker_cli._cmd_broker_sync_orders(SimpleNamespace(session_id="manual-pilot-1", limit=50))
+    )
+
+    assert calls == ["update", "force_sync"]
+
+
+def test_broker_cancel_order_calls_kite_and_syncs_local_status(monkeypatch) -> None:
+    import scripts.paper_broker_cli as broker_cli
+
+    calls: list[tuple[str, object]] = []
+    local_order = SimpleNamespace(
+        order_id="local-1",
+        session_id="manual-pilot-1",
+        exchange_order_id="kite-1",
+        symbol="ITC",
+    )
+
+    class FakeDB:
+        def get_recent_orders(self, *, limit: int, broker_only: bool):
+            assert limit == 500
+            assert broker_only is True
+            return [local_order]
+
+        def update_order_from_broker_snapshot(self, broker_order_id: str, snapshot):
+            calls.append(("update", (broker_order_id, snapshot["status"])))
+            return 1
+
+        def force_sync(self):
+            calls.append(("force_sync", None))
+
+    class FakeKite:
+        def __init__(self):
+            self.cancelled = False
+
+        def orders(self):
+            status = "CANCELLED" if self.cancelled else "OPEN"
+            return [
+                {
+                    "order_id": "kite-1",
+                    "tradingsymbol": "ITC",
+                    "variety": "regular",
+                    "status": status,
+                    "filled_quantity": 0,
+                    "average_price": 0,
+                }
+            ]
+
+        def cancel_order(self, *, variety: str, order_id: str, parent_order_id=None):
+            calls.append(("cancel", (variety, order_id, parent_order_id)))
+            self.cancelled = True
+            return order_id
+
+    monkeypatch.setattr(broker_cli, "_pdb", lambda: FakeDB())
+    monkeypatch.setattr(broker_cli, "_get_kite_client", lambda: FakeKite())
+
+    asyncio.run(
+        broker_cli._cmd_broker_cancel_order(
+            SimpleNamespace(
+                session_id="manual-pilot-1",
+                kite_order_id="kite-1",
+                variety="regular",
+                parent_order_id=None,
+                limit=500,
+                confirm_cancel=True,
+            )
+        )
+    )
+
+    assert calls == [
+        ("cancel", ("regular", "kite-1", None)),
+        ("update", ("kite-1", "CANCELLED")),
+        ("force_sync", None),
+    ]
 
 
 def test_pilot_guardrails_require_tiny_scope_and_acknowledgement() -> None:

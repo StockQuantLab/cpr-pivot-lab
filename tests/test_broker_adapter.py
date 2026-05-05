@@ -205,7 +205,7 @@ async def test_zerodha_rejects_raw_market_flatten_orders() -> None:
 
 
 @pytest.mark.asyncio
-async def test_zerodha_rejects_stale_flatten_reference_price() -> None:
+async def test_zerodha_rejects_stale_normal_exit_reference_price() -> None:
     adapter = ZerodhaBrokerAdapter(mode="REAL_DRY_RUN", governor=_NoSleepGovernor())
 
     with pytest.raises(OrderSafetyError, match="stale"):
@@ -215,13 +215,34 @@ async def test_zerodha_rejects_stale_flatten_reference_price() -> None:
                 symbol="RELIANCE",
                 side="SELL",
                 quantity=2,
-                role="manual_flatten",
+                role="exit:target",
                 order_type="LIMIT",
                 price=98.0,
                 reference_price=100.0,
                 reference_price_age_sec=30.0,
             )
         )
+
+
+@pytest.mark.asyncio
+async def test_zerodha_allows_stale_emergency_flatten_reference_price() -> None:
+    adapter = ZerodhaBrokerAdapter(mode="REAL_DRY_RUN", governor=_NoSleepGovernor())
+
+    result = await adapter.place_order(
+        BrokerOrderIntent(
+            session_id="paper-live-1",
+            symbol="RELIANCE",
+            side="SELL",
+            quantity=2,
+            role="manual_flatten:feed_stale",
+            order_type="LIMIT",
+            price=98.0,
+            reference_price=100.0,
+            reference_price_age_sec=300.0,
+        )
+    )
+
+    assert result.status == "DRY_RUN"
 
 
 @pytest.mark.asyncio

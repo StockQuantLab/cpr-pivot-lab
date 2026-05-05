@@ -5,15 +5,22 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import shlex
+import urllib.error
+import urllib.request
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from db.paper_db import get_paper_db
 from engine.broker_adapter import (
+    REAL_ORDER_ACK_VALUE,
     BrokerOrderIntent,
+    RealOrderGuardConfig,
     ZerodhaBrokerAdapter,
+    _ceil_to_tick,
+    _floor_to_tick,
     build_protected_flatten_intent,
     record_real_dry_run_order,
     record_real_order,
@@ -26,6 +33,8 @@ from engine.broker_reconciliation import (
 )
 
 _ZERO_FILL_TERMINAL_ORDER_STATUSES = {"REJECTED", "CANCELLED"}
+_BROKER_CANCEL_TERMINAL_STATUSES = {"COMPLETE", "REJECTED", "CANCELLED"}
+_EXPECTED_OUTBOUND_IP_ENV = "CPR_ZERODHA_EXPECTED_OUTBOUND_IP"
 _MANUAL_PILOT_MARKERS = (
     "ZERODHA_LIVE_REAL_ORDERS_MANUAL_PILOT",
     "MANUAL REAL-ORDER PILOT",
@@ -154,6 +163,8 @@ async def _cmd_broker_sync_orders(args: argparse.Namespace) -> None:
         for session_id in sorted(touched_sessions)
         if (result := _maybe_complete_zero_fill_manual_pilot(db, session_id)) is not None
     ]
+    if updated or completed_sessions:
+        db.force_sync()
     print(
         json.dumps(
             {
@@ -162,6 +173,88 @@ async def _cmd_broker_sync_orders(args: argparse.Namespace) -> None:
                 "updated": updated,
                 "missing_kite_order_ids": missing,
                 "completed_manual_pilot_sessions": completed_sessions,
+            },
+            default=str,
+            indent=2,
+        )
+    )
+
+
+async def _cmd_broker_cancel_order(args: argparse.Namespace) -> None:
+    if not bool(getattr(args, "confirm_cancel", False)):
+        raise SystemExit("--confirm-cancel is required for broker order cancellation")
+    session_id = str(args.session_id or "").strip()
+    broker_order_id = str(args.kite_order_id or "").strip()
+    if not session_id:
+        raise SystemExit("--session-id is required")
+    if not broker_order_id:
+        raise SystemExit("--kite-order-id is required")
+
+    db = _pdb()
+    local_orders = [
+        order
+        for order in db.get_recent_orders(limit=int(args.limit), broker_only=True)
+        if str(order.session_id) == session_id
+        and str(order.exchange_order_id or "") == broker_order_id
+    ]
+    if not local_orders:
+        raise SystemExit(
+            f"Refusing broker cancel: no local broker order found for "
+            f"session_id={session_id!r} kite_order_id={broker_order_id!r}."
+        )
+
+    kite = _get_kite_client()
+    before_orders = [dict(row) for row in kite.orders() or []]
+    broker_row = next(
+        (row for row in before_orders if str(row.get("order_id") or "") == broker_order_id),
+        None,
+    )
+    if broker_row is None:
+        raise SystemExit(f"Kite order {broker_order_id!r} was not found in today's orderbook")
+
+    status = str(broker_row.get("status") or "").strip().upper()
+    if status in _BROKER_CANCEL_TERMINAL_STATUSES:
+        changed = db.update_order_from_broker_snapshot(broker_order_id, broker_row)
+        if changed:
+            db.force_sync()
+        print(
+            json.dumps(
+                {
+                    "cancelled": False,
+                    "reason": "already_terminal",
+                    "kite_order_id": broker_order_id,
+                    "status": status,
+                    "local_updated": changed,
+                },
+                default=str,
+                indent=2,
+            )
+        )
+        return
+
+    started = datetime.now(UTC)
+    returned_order_id = kite.cancel_order(
+        variety=str(args.variety or broker_row.get("variety") or "regular"),
+        order_id=broker_order_id,
+        parent_order_id=getattr(args, "parent_order_id", None),
+    )
+    after_orders = [dict(row) for row in kite.orders() or []]
+    latest_row = next(
+        (row for row in after_orders if str(row.get("order_id") or "") == broker_order_id),
+        broker_row,
+    )
+    changed = db.update_order_from_broker_snapshot(broker_order_id, latest_row)
+    if changed:
+        db.force_sync()
+    print(
+        json.dumps(
+            {
+                "cancelled": True,
+                "kite_order_id": broker_order_id,
+                "returned_order_id": str(returned_order_id),
+                "requested_at": started.isoformat(),
+                "status": str(latest_row.get("status") or ""),
+                "local_updated": changed,
             },
             default=str,
             indent=2,
@@ -181,6 +274,197 @@ async def _cmd_pilot_check(args: argparse.Namespace) -> None:
     )
     print(json.dumps(payload, default=str, indent=2))
     if not payload.get("ok", False) and bool(getattr(args, "strict", False)):
+        raise SystemExit(1)
+
+
+async def _cmd_real_readiness(args: argparse.Namespace) -> None:
+    """Read-only readiness check for real-order pilot starts."""
+    findings: list[dict[str, Any]] = []
+    kite_ok = False
+    profile_payload: dict[str, Any] = {}
+    cash: float | None = None
+    ltp: float | None = None
+    estimated_notional: float | None = None
+    symbol = str(getattr(args, "symbol", "") or "").strip().upper()
+    exchange = str(getattr(args, "exchange", "NSE") or "NSE").strip().upper()
+    raw_quantity = getattr(args, "quantity", 1)
+    quantity = int(raw_quantity if raw_quantity is not None else 1)
+    product = str(getattr(args, "product", "MIS") or "MIS").strip().upper()
+    order_type = str(getattr(args, "order_type", "LIMIT") or "LIMIT").strip().upper()
+
+    guard = RealOrderGuardConfig.from_env()
+    if quantity <= 0:
+        findings.append(
+            {
+                "severity": "error",
+                "code": "REAL_ORDER_QTY_NOT_POSITIVE",
+                "message": "Requested quantity must be positive.",
+            }
+        )
+    if not guard.enabled:
+        findings.append(
+            {
+                "severity": "error",
+                "code": "REAL_ORDERS_DISABLED",
+                "message": "CPR_ZERODHA_REAL_ORDERS_ENABLED is not true.",
+            }
+        )
+    if guard.acknowledgement != REAL_ORDER_ACK_VALUE:
+        findings.append(
+            {
+                "severity": "error",
+                "code": "REAL_ORDER_ACK_MISSING",
+                "message": "CPR_ZERODHA_REAL_ORDER_ACK does not match the required value.",
+            }
+        )
+    if quantity > guard.max_quantity:
+        findings.append(
+            {
+                "severity": "error",
+                "code": "REAL_ORDER_QTY_TOO_HIGH",
+                "message": f"Requested quantity {quantity} exceeds max {guard.max_quantity}.",
+            }
+        )
+    if product not in guard.allowed_products:
+        findings.append(
+            {
+                "severity": "error",
+                "code": "REAL_ORDER_PRODUCT_NOT_ALLOWED",
+                "message": f"Product {product} is not allowed.",
+            }
+        )
+    if order_type not in guard.allowed_order_types:
+        findings.append(
+            {
+                "severity": "error",
+                "code": "REAL_ORDER_TYPE_NOT_ALLOWED",
+                "message": f"Order type {order_type} is not allowed.",
+            }
+        )
+
+    try:
+        kite = _get_kite_client()
+        profile_fn = getattr(kite, "profile", None)
+        if callable(profile_fn):
+            raw_profile = profile_fn() or {}
+            if isinstance(raw_profile, dict):
+                profile_payload = {
+                    "user_id": raw_profile.get("user_id"),
+                    "user_name": raw_profile.get("user_name"),
+                    "email": raw_profile.get("email"),
+                    "broker": raw_profile.get("broker"),
+                }
+        cash = _fetch_available_cash(kite)
+        if symbol:
+            ltp = _fetch_ltp(kite, exchange=exchange, symbol=symbol)
+            estimated_notional = ltp * quantity
+        kite_ok = True
+    except Exception as exc:
+        findings.append(
+            {
+                "severity": "error",
+                "code": "KITE_TOKEN_OR_API_FAILED",
+                "message": str(exc),
+            }
+        )
+
+    if estimated_notional is not None and estimated_notional > guard.max_notional:
+        findings.append(
+            {
+                "severity": "error",
+                "code": "REAL_ORDER_NOTIONAL_TOO_HIGH",
+                "message": (
+                    f"Estimated notional {estimated_notional:.2f} exceeds max "
+                    f"{guard.max_notional:.2f}."
+                ),
+            }
+        )
+    if cash is not None and estimated_notional is not None and estimated_notional > cash:
+        findings.append(
+            {
+                "severity": "error",
+                "code": "REAL_ORDER_CASH_TOO_LOW",
+                "message": (
+                    f"Estimated notional {estimated_notional:.2f} exceeds available cash "
+                    f"{cash:.2f}."
+                ),
+            }
+        )
+
+    current_ip: str | None = None
+    expected_ip = str(
+        getattr(args, "expected_ip", None) or os.getenv(_EXPECTED_OUTBOUND_IP_ENV, "") or ""
+    ).strip()
+    if not bool(getattr(args, "skip_public_ip", False)):
+        current_ip = _fetch_public_ip(timeout_sec=float(getattr(args, "ip_timeout_sec", 4.0)))
+    ip_matches_expected: bool | None = None
+    if not bool(getattr(args, "skip_public_ip", False)) and not current_ip:
+        findings.append(
+            {
+                "severity": "error",
+                "code": "OUTBOUND_IP_LOOKUP_FAILED",
+                "message": (
+                    "Could not determine current outbound public IP. Use --skip-public-ip only "
+                    "for non-placement diagnostics."
+                ),
+            }
+        )
+    elif current_ip and expected_ip:
+        ip_matches_expected = current_ip == expected_ip
+        if not ip_matches_expected:
+            findings.append(
+                {
+                    "severity": "error",
+                    "code": "OUTBOUND_IP_MISMATCH",
+                    "message": (
+                        f"Current outbound IP {current_ip} does not match expected "
+                        f"whitelisted IP {expected_ip}."
+                    ),
+                }
+            )
+    elif current_ip and not expected_ip:
+        findings.append(
+            {
+                "severity": "warning",
+                "code": "OUTBOUND_IP_EXPECTED_VALUE_MISSING",
+                "message": (
+                    f"Current outbound IP is {current_ip}. Compare this with Kite developer "
+                    f"console, or set {_EXPECTED_OUTBOUND_IP_ENV} after whitelisting it."
+                ),
+            }
+        )
+
+    errors = [item for item in findings if item.get("severity") == "error"]
+    payload = {
+        "ok": not errors,
+        "kite_ok": kite_ok,
+        "profile": profile_payload,
+        "available_cash": cash,
+        "symbol": symbol or None,
+        "ltp": ltp,
+        "quantity": quantity,
+        "estimated_notional": estimated_notional,
+        "real_order_gates": {
+            "enabled": guard.enabled,
+            "ack_ok": guard.acknowledgement == REAL_ORDER_ACK_VALUE,
+            "max_quantity": guard.max_quantity,
+            "max_notional": guard.max_notional,
+            "allowed_products": sorted(guard.allowed_products),
+            "allowed_order_types": sorted(guard.allowed_order_types),
+        },
+        "outbound_ip": {
+            "current": current_ip,
+            "expected": expected_ip or None,
+            "matches_expected": ip_matches_expected,
+            "note": (
+                "Kite does not expose a read API for the app IP whitelist; this check proves "
+                "the machine's current outbound IP and compares it to the expected value only."
+            ),
+        },
+        "findings": findings,
+    }
+    print(json.dumps(payload, default=str, indent=2))
+    if errors and bool(getattr(args, "strict", False)):
         raise SystemExit(1)
 
 
@@ -426,12 +710,52 @@ def _fetch_ltp(kite: Any, *, exchange: str, symbol: str) -> float:
     return float(price)
 
 
-def _ceil_to_tick(value: float, tick_size: float) -> float:
-    return round(math.ceil((float(value) - 1e-12) / float(tick_size)) * float(tick_size), 4)
+def _fetch_available_cash(kite: Any) -> float | None:
+    margins = getattr(kite, "margins", None)
+    if not callable(margins):
+        return None
+    try:
+        payload = margins("equity")
+    except TypeError:
+        payload = margins()
+    if not isinstance(payload, dict):
+        return None
+    candidates = [
+        ("equity", "available", "cash"),
+        ("available", "cash"),
+        ("cash",),
+        ("live_balance",),
+        ("opening_balance",),
+    ]
+    for path in candidates:
+        current: Any = payload
+        for key in path:
+            if not isinstance(current, dict) or key not in current:
+                current = None
+                break
+            current = current[key]
+        if current is None:
+            continue
+        try:
+            value = float(current)
+        except TypeError, ValueError:
+            continue
+        if math.isfinite(value):
+            return value
+    return None
 
 
-def _floor_to_tick(value: float, tick_size: float) -> float:
-    return round(math.floor((float(value) + 1e-12) / float(tick_size)) * float(tick_size), 4)
+def _fetch_public_ip(*, timeout_sec: float = 4.0) -> str | None:
+    try:
+        with urllib.request.urlopen(
+            "https://api.ipify.org?format=json",
+            timeout=max(1.0, float(timeout_sec)),
+        ) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except OSError, TimeoutError, urllib.error.URLError, json.JSONDecodeError:
+        return None
+    ip = str((payload or {}).get("ip") or "").strip()
+    return ip or None
 
 
 def _real_order_argv(

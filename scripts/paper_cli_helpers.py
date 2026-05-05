@@ -185,19 +185,27 @@ def build_real_order_config(
     scale_out_pct = float(getattr(getattr(resolved, "cpr_levels", None), "scale_out_pct", 0.0) or 0)
     if scale_out_pct > 0:
         raise SystemExit("--real-orders does not support CPR partial scale-out yet.")
+    fixed_quantity = getattr(args, "real_order_fixed_qty", 1)
+    max_positions = getattr(args, "real_order_max_positions", 1)
+    cash_budget = getattr(args, "real_order_cash_budget", 10_000.0)
+    entry_slippage = getattr(args, "real_entry_max_slippage_pct", 0.5)
+    exit_slippage = getattr(args, "real_exit_max_slippage_pct", 2.0)
     return {
         "enabled": True,
-        "fixed_quantity": int(getattr(args, "real_order_fixed_qty", 1) or 1),
-        "max_positions": int(getattr(args, "real_order_max_positions", 1) or 1),
-        "cash_budget": float(getattr(args, "real_order_cash_budget", 10_000.0) or 10_000.0),
+        "sizing_mode": str(getattr(args, "real_order_sizing_mode", "fixed-qty") or "fixed-qty")
+        .replace("-", "_")
+        .upper(),
+        "fixed_quantity": int(fixed_quantity if fixed_quantity is not None else 1),
+        "max_positions": int(max_positions if max_positions is not None else 1),
+        "cash_budget": float(cash_budget if cash_budget is not None else 10_000.0),
         "require_account_cash_check": (
             False
             if simulate_real_orders
             else not bool(getattr(args, "real_order_skip_account_cash_check", False))
         ),
         "entry_order_type": str(getattr(args, "real_entry_order_type", "LIMIT") or "LIMIT").upper(),
-        "entry_max_slippage_pct": float(getattr(args, "real_entry_max_slippage_pct", 0.5) or 0.5),
-        "exit_max_slippage_pct": float(getattr(args, "real_exit_max_slippage_pct", 2.0) or 2.0),
+        "entry_max_slippage_pct": float(entry_slippage if entry_slippage is not None else 0.5),
+        "exit_max_slippage_pct": float(exit_slippage if exit_slippage is not None else 2.0),
         "product": "MIS",
         "exchange": "NSE",
         "adapter_mode": "REAL_DRY_RUN" if simulate_real_orders else "LIVE",

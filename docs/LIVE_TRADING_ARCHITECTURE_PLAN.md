@@ -1592,8 +1592,8 @@ The `--portfolio-value` flag allows changing the base capital (e.g., ₹500K on 
   - Missing same-day `market_day_state` rows are tolerated and skipped so small gaps do not
     force a rebuild.
   - Historical note: early drafts allowed candle-derived recovery for a late start via
-    `--allow-late-start-fallback`. That path is no longer the default operator flow and is kept
-    here only as design history.
+    `--allow-late-start-fallback`. The current real-order operator flow uses true opening-range
+    catch-up from Kite historical `5minute` candles and refuses diagnostic OR-proxy setup rows.
 
 5. CPR-only policy enforced in paper workflows
 - `pivot-paper-trading` strategy and preset surface now enforce CPR-only execution.
@@ -1715,7 +1715,8 @@ The `--portfolio-value` flag allows changing the base capital (e.g., ₹500K on 
 - Final operational default is now strict for invalid setup rows, while missing same-day
   `market_day_state` rows are skipped instead of forcing another build.
 - Historical note: late-start fallback was once CLI-driven (`--allow-late-start-fallback`).
-  The current operator flow no longer relies on that path.
+  The current real-order operator flow no longer relies on that path; it uses true Kite historical
+  catch-up for unresolved OR rows and blocks entries that still cannot prove true OR/direction.
 
 ### Pending / Open (Post Phase 0–5)
 

@@ -76,6 +76,19 @@ def _build_intraday_summary(
     }
 
 
+def _or_proxy_and_source(live_intraday: dict[str, Any] | None) -> tuple[bool, str]:
+    or_proxy = bool((live_intraday or {}).get("or_proxy"))
+    setup_source = "market_day_state_or_proxy" if or_proxy else "market_day_state"
+    return or_proxy, setup_source
+
+
+def setup_row_uses_or_proxy(setup_row: dict[str, Any] | None) -> bool:
+    if not setup_row:
+        return False
+    source = str(setup_row.get("setup_source") or "").lower()
+    return "late_start" in source or "or_proxy" in source or bool(setup_row.get("or_proxy"))
+
+
 def _load_live_setup_row(
     symbol: str,
     trade_date: str,
@@ -215,6 +228,7 @@ def _load_live_setup_row(
         "direction": direction,
         "direction_pending": direction not in {"LONG", "SHORT"},
         "is_narrowing": int(cpr_width_pct < cpr_threshold),
+        "or_proxy": bool(intraday.get("or_proxy")),
         "setup_source": setup_source,
     }
 
@@ -288,22 +302,48 @@ def load_setup_row(
         )
 
     open_side = str(row[16] or "")
+    tc = float(row[2] or 0.0)
+    bc = float(row[3] or 0.0)
+    atr = float(row[9] or 0.0)
+    prev_close = _float_or_none(row[1])
+    db_or_high = float(row[12] or 0.0)
+    db_or_low = float(row[13] or 0.0)
+    db_open_915 = float(row[14] or 0.0)
     or_close_5 = _float_or_none(row[15])
-    direction = resolve_cpr_direction(
-        or_close_5, float(row[2] or 0.0), float(row[3] or 0.0), fallback="NONE"
-    )
+    direction = resolve_cpr_direction(or_close_5, tc, bc, fallback="NONE")
     if direction == "NONE" and or_close_5 is None:
         direction = str(row[20] or "NONE")
-    if direction == "NONE" and live_candles:
+    live_intraday: dict[str, Any] | None = None
+    if live_candles and (
+        direction == "NONE"
+        or db_or_high <= 0.0
+        or db_or_low <= 0.0
+        or db_open_915 <= 0.0
+        or or_close_5 is None
+    ):
         intraday = _build_intraday_summary(
             live_candles, or_minutes=or_minutes, bar_end_offset=bar_end_offset
         )
+        live_intraday = intraday
         live_or_close_5 = intraday.get("or_close_5")
         if live_or_close_5 is not None:
-            direction = resolve_cpr_direction(
-                live_or_close_5, float(row[2] or 0.0), float(row[3] or 0.0), fallback="NONE"
-            )
+            direction = resolve_cpr_direction(live_or_close_5, tc, bc, fallback="NONE")
             or_close_5 = live_or_close_5
+    or_high_5 = db_or_high
+    or_low_5 = db_or_low
+    open_915 = db_open_915
+    if live_intraday is not None:
+        or_high_5 = db_or_high or float(live_intraday.get("or_high_5") or 0.0)
+        or_low_5 = db_or_low or float(live_intraday.get("or_low_5") or 0.0)
+        open_915 = db_open_915 or float(live_intraday.get("open_915") or 0.0)
+        if open_915 > 0 and tc > 0 and bc > 0:
+            cpr_lower, cpr_upper = normalize_cpr_bounds(tc, bc)
+            if open_915 < cpr_lower:
+                open_side = "BELOW"
+            elif open_915 > cpr_upper:
+                open_side = "ABOVE"
+            else:
+                open_side = "INSIDE"
 
     rvol_baseline: list[float | None] | None = None
     try:
@@ -318,35 +358,50 @@ def load_setup_row(
     except Exception:
         pass
 
-    return {
+    open_to_cpr_atr = _float_or_none(row[17])
+    gap_abs_pct = _float_or_none(row[18])
+    or_atr_5 = _float_or_none(row[19])
+    if live_intraday is not None and open_915 > 0 and or_high_5 > 0 and or_low_5 > 0 and atr > 0:
+        cpr_lower, cpr_upper = normalize_cpr_bounds(tc, bc)
+        open_to_cpr_atr = (
+            abs(open_915 - (cpr_lower if open_side == "BELOW" else cpr_upper)) / atr
+            if open_side in {"BELOW", "ABOVE"}
+            else 0.0
+        )
+        if prev_close is not None:
+            gap_abs_pct = abs(calculate_gap_pct(open_915, prev_close))
+        or_atr_5 = calculate_or_atr_ratio(or_high_5, or_low_5, atr)
+
+    result = {
         "trade_date": str(row[0] or trade_date),
-        "prev_day_close": _float_or_none(row[1]),
-        "tc": float(row[2] or 0.0),
-        "bc": float(row[3] or 0.0),
+        "prev_day_close": prev_close,
+        "tc": tc,
+        "bc": bc,
         "pivot": float(row[4] or 0.0),
         "r1": float(row[5] or 0.0),
         "s1": float(row[6] or 0.0),
         "r2": float(row[7] or 0.0),
         "s2": float(row[8] or 0.0),
-        "atr": float(row[9] or 0.0),
+        "atr": atr,
         "cpr_width_pct": float(row[10] or 0.0),
         "cpr_threshold": float(row[11] or 0.0),
-        "or_high_5": float(row[12] or 0.0),
-        "or_low_5": float(row[13] or 0.0),
-        "open_915": float(row[14] or 0.0),
+        "or_high_5": or_high_5,
+        "or_low_5": or_low_5,
+        "open_915": open_915,
         "or_close_5": or_close_5,
         "open_side": open_side,
-        "open_to_cpr_atr": _float_or_none(row[17]),
-        "gap_abs_pct": _float_or_none(row[18]),
-        "or_atr_5": _float_or_none(row[19]),
+        "open_to_cpr_atr": open_to_cpr_atr,
+        "gap_abs_pct": gap_abs_pct,
+        "or_atr_5": or_atr_5,
         "direction": direction,
         "direction_pending": direction not in {"LONG", "SHORT"},
         "is_narrowing": bool(row[21]),
         "cpr_shift": str(row[22] or "OVERLAP"),
         "regime_move_pct": float(row[23]) if row[23] is not None else None,
         "rvol_baseline": rvol_baseline,
-        "setup_source": "market_day_state",
     }
+    result["or_proxy"], result["setup_source"] = _or_proxy_and_source(live_intraday)
+    return result
 
 
 def _live_setup_status(setup_row: dict[str, Any] | None) -> str:
@@ -406,6 +461,7 @@ def _hydrate_setup_row_from_market_row(
         open_915_val = _db_open_915 or float(live_intraday.get("open_915") or 0.0)
     else:
         or_high_5, or_low_5, open_915_val = _db_or_high, _db_or_low, _db_open_915
+    or_proxy, setup_source = _or_proxy_and_source(live_intraday)
     rvol_baseline: list[float | None] | None = None
     if row[24]:
         rvol_baseline = [float(v) if v is not None else None for v in row[24]]
@@ -435,7 +491,8 @@ def _hydrate_setup_row_from_market_row(
         "is_narrowing": bool(row[22]),
         "cpr_shift": str(row[23] or "OVERLAP"),
         "rvol_baseline": rvol_baseline,
-        "setup_source": "market_day_state",
+        "or_proxy": or_proxy,
+        "setup_source": setup_source,
     }
 
 
@@ -535,6 +592,11 @@ def refresh_pending_setup_rows_for_bar(
                     bar_end_offset=runtime_state.bar_end_offset,
                 )
                 if fallback_row is not None:
+                    if not runtime_state.allow_or_proxy_setup and setup_row_uses_or_proxy(
+                        fallback_row
+                    ):
+                        pending += 1
+                        continue
                     state.setup_row = fallback_row
                     updated += 1
                     if bool(fallback_row.get("direction_pending")):
@@ -551,6 +613,9 @@ def refresh_pending_setup_rows_for_bar(
         )
         if setup_row is None:
             missing += 1
+            continue
+        if not runtime_state.allow_or_proxy_setup and setup_row_uses_or_proxy(setup_row):
+            pending += 1
             continue
         state.setup_row = setup_row
         updated += 1
@@ -577,4 +642,5 @@ __all__ = [
     "load_setup_row",
     "refresh_pending_setup_rows_for_bar",
     "runtime_setup_status",
+    "setup_row_uses_or_proxy",
 ]

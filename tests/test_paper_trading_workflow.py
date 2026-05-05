@@ -8,6 +8,8 @@ from types import SimpleNamespace
 import pytest
 
 import scripts.paper_trading as paper_trading
+from engine.broker_adapter import OrderSafetyError
+from engine.real_order_runtime import build_real_order_router
 
 
 def test_default_session_id_includes_direction_for_daily_sessions() -> None:
@@ -85,6 +87,7 @@ def test_real_order_config_marks_pilot_session_and_blocks_multi() -> None:
         real_orders=True,
         multi=False,
         resume=False,
+        real_order_sizing_mode="fixed-qty",
         real_order_fixed_qty=1,
         real_order_max_positions=1,
         real_order_cash_budget=10_000.0,
@@ -103,6 +106,7 @@ def test_real_order_config_marks_pilot_session_and_blocks_multi() -> None:
 
     assert config == {
         "enabled": True,
+        "sizing_mode": "FIXED_QTY",
         "fixed_quantity": 1,
         "max_positions": 1,
         "cash_budget": 10_000.0,
@@ -133,6 +137,7 @@ def test_simulated_real_order_config_allows_multi_and_local_feed() -> None:
         simulate_real_orders=True,
         multi=True,
         resume=False,
+        real_order_sizing_mode="fixed-qty",
         real_order_fixed_qty=1,
         real_order_max_positions=1,
         real_order_cash_budget=10_000.0,
@@ -154,6 +159,61 @@ def test_simulated_real_order_config_allows_multi_and_local_feed() -> None:
     assert config["shadow"] is True
     assert config["require_account_cash_check"] is False
     assert paper_trading._simulated_real_order_notes(None) == "ZERODHA_REAL_DRY_RUN_ORDERS"
+
+
+def test_real_order_config_supports_cash_budget_sizing() -> None:
+    args = SimpleNamespace(
+        real_orders=True,
+        multi=False,
+        resume=False,
+        real_order_sizing_mode="cash-budget",
+        real_order_fixed_qty=1,
+        real_order_max_positions=1,
+        real_order_cash_budget=10_000.0,
+        real_order_skip_account_cash_check=False,
+        real_entry_order_type="LIMIT",
+        real_entry_max_slippage_pct=0.5,
+        real_exit_max_slippage_pct=2.0,
+    )
+
+    config = paper_trading._build_real_order_config(
+        args,
+        strategy="CPR_LEVELS",
+        strategy_params={"direction_filter": "LONG"},
+        feed_source="kite",
+    )
+
+    assert config is not None
+    assert config["sizing_mode"] == "CASH_BUDGET"
+    assert config["cash_budget"] == 10_000.0
+
+
+def test_real_order_config_preserves_zero_budget_for_fail_closed_validation() -> None:
+    args = SimpleNamespace(
+        real_orders=True,
+        multi=False,
+        resume=False,
+        real_order_sizing_mode="cash-budget",
+        real_order_fixed_qty=1,
+        real_order_max_positions=1,
+        real_order_cash_budget=0.0,
+        real_order_skip_account_cash_check=True,
+        real_entry_order_type="LIMIT",
+        real_entry_max_slippage_pct=0.5,
+        real_exit_max_slippage_pct=2.0,
+    )
+
+    config = paper_trading._build_real_order_config(
+        args,
+        strategy="CPR_LEVELS",
+        strategy_params={"direction_filter": "LONG"},
+        feed_source="kite",
+    )
+
+    assert config is not None
+    assert config["cash_budget"] == 0.0
+    with pytest.raises(OrderSafetyError, match="cash budget must be positive"):
+        build_real_order_router(config)
 
 
 def test_reject_early_kite_live_start_aborts_before_market_open(
@@ -511,6 +571,7 @@ async def test_cmd_daily_live_multi_uses_bar_major_dispatcher(
     )
     monkeypatch.setattr(paper_trading, "_ensure_daily_session", fake_ensure_daily_session)
     monkeypatch.setattr(paper_trading, "run_live_multi_sessions", fake_run_live_multi_sessions)
+    monkeypatch.setattr(paper_trading, "_cleanup_feed_audit_retention", lambda **_kwargs: 0)
     monkeypatch.setattr("engine.local_ticker_adapter.LocalTickerAdapter", FakeLocalTickerAdapter)
 
     args = SimpleNamespace(
@@ -529,6 +590,7 @@ async def test_cmd_daily_live_multi_uses_bar_major_dispatcher(
         notes=None,
         simulate_real_orders=False,
         real_orders=False,
+        real_order_sizing_mode="fixed-qty",
         real_order_fixed_qty=1,
         real_order_max_positions=1,
         real_order_cash_budget=10_000.0,

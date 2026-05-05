@@ -400,6 +400,127 @@ def test_load_setup_row_falls_back_to_live_intraday_context(
     assert row["direction_pending"] is False
 
 
+def test_load_setup_row_market_row_marks_non_proxy_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _FakeCon:
+        def execute(self, query: str, params: list[object]):
+            if "FROM market_day_state" in query:
+                return SimpleNamespace(
+                    fetchone=lambda: (
+                        "2024-01-08",
+                        105.0,
+                        101.0,
+                        99.0,
+                        100.0,
+                        103.0,
+                        97.0,
+                        106.0,
+                        94.0,
+                        4.0,
+                        1.9,
+                        2.5,
+                        108.0,
+                        95.0,
+                        96.0,
+                        107.0,
+                        "ABOVE",
+                        0.5,
+                        0.2,
+                        3.0,
+                        "LONG",
+                        True,
+                        "OVERLAP",
+                        0.1,
+                    )
+                )
+            if "FROM intraday_day_pack" in query:
+                return SimpleNamespace(fetchone=lambda: None)
+            raise AssertionError(f"Unexpected query: {query}")
+
+    class _FakeDB:
+        con = _FakeCon()
+
+    monkeypatch.setattr(paper_setup_loader, "get_live_market_db", lambda: _FakeDB())
+
+    row = paper_setup_loader.load_setup_row("SBIN", "2024-01-08")
+
+    assert row is not None
+    assert row["direction"] == "LONG"
+    assert row["or_proxy"] is False
+    assert row["setup_source"] == "market_day_state"
+
+
+def test_load_setup_row_market_row_fills_missing_or_from_live_candle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _FakeCon:
+        def execute(self, query: str, params: list[object]):
+            if "FROM market_day_state" in query:
+                return SimpleNamespace(
+                    fetchone=lambda: (
+                        "2024-01-08",
+                        105.0,
+                        101.0,
+                        99.0,
+                        100.0,
+                        103.0,
+                        97.0,
+                        106.0,
+                        94.0,
+                        4.0,
+                        1.9,
+                        2.5,
+                        0.0,
+                        0.0,
+                        0.0,
+                        None,
+                        "",
+                        None,
+                        None,
+                        None,
+                        "NONE",
+                        True,
+                        "OVERLAP",
+                        None,
+                    )
+                )
+            if "FROM intraday_day_pack" in query:
+                return SimpleNamespace(fetchone=lambda: None)
+            raise AssertionError(f"Unexpected query: {query}")
+
+    class _FakeDB:
+        con = _FakeCon()
+
+    monkeypatch.setattr(paper_setup_loader, "get_live_market_db", lambda: _FakeDB())
+
+    row = paper_setup_loader.load_setup_row(
+        "SBIN",
+        "2024-01-08",
+        live_candles=[
+            {
+                "time_str": "09:20",
+                "bar_end": datetime(2024, 1, 8, 9, 20, tzinfo=UTC),
+                "open": 96.0,
+                "high": 108.0,
+                "low": 95.0,
+                "close": 107.0,
+                "volume": 1000.0,
+            }
+        ],
+    )
+
+    assert row is not None
+    assert row["direction"] == "LONG"
+    assert row["open_915"] == pytest.approx(96.0)
+    assert row["or_high_5"] == pytest.approx(108.0)
+    assert row["or_low_5"] == pytest.approx(95.0)
+    assert row["or_close_5"] == pytest.approx(107.0)
+    assert row["open_side"] == "BELOW"
+    assert row["or_proxy"] is False
+    assert row["setup_source"] == "market_day_state"
+
+
 def test_load_setup_row_waits_for_full_opening_range_window(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -547,6 +668,51 @@ async def test_process_closed_candle_loads_setup_row_from_runtime_path(
     assert called["kwargs"]["regime_snapshot_minutes"] == 30
     assert result["reason"] == "setup_pending"
     assert result["setup_status"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_process_closed_candle_blocks_or_proxy_setup_when_runtime_disallows_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = _make_session("CPR_LEVELS")
+    state = PaperRuntimeState(allow_or_proxy_setup=False)
+    tracker = _make_tracker(session)
+
+    def fake_load_setup_row(symbol: str, trade_date: str, live_candles=None, **kwargs):
+        return {
+            **_make_cpr_setup_row(),
+            "direction": "LONG",
+            "direction_pending": False,
+            "or_proxy": True,
+            "setup_source": "live_fallback_late_start",
+        }
+
+    async def fake_get_session_positions(session_id: str, symbol: str | None = None, statuses=None):
+        return []
+
+    monkeypatch.setattr("engine.paper_runtime.load_setup_row", fake_load_setup_row)
+    monkeypatch.setattr("engine.paper_runtime.get_session_positions", fake_get_session_positions)
+
+    candle = _make_candle(
+        symbol="SBIN",
+        bar_end=datetime(2024, 1, 1, 9, 35, tzinfo=UTC),
+        open_price=100.0,
+        high=101.0,
+        low=99.5,
+        close=100.5,
+        volume=1_000.0,
+    )
+
+    result = await process_closed_candle(
+        session=session,
+        candle=candle,
+        runtime_state=state,
+        now=candle.bar_end,
+        position_tracker=tracker,
+    )
+
+    assert result["reason"] == "no_setup"
+    assert state.for_symbol("SBIN").setup_row is None
 
 
 @pytest.mark.asyncio

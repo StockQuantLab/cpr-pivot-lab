@@ -14,6 +14,7 @@ from engine.strategy_presets import ALL_STRATEGY_PRESETS
 from scripts.paper_trading import (
     PAPER_STANDARD_MATRIX,
     _apply_default_saved_universe,
+    _apply_multi_cli_strategy_overrides,
     _cmd_daily_prepare,
     _parse_json,
     _prepare_paper_multi_strategy_params,
@@ -154,6 +155,25 @@ def test_paper_trading_parser_supports_real_order_confirmation() -> None:
     assert args.reference_price == 700.0
 
 
+def test_paper_trading_parser_supports_broker_cancel_confirmation() -> None:
+    parser = build_parser()
+
+    args = parser.parse_args(
+        [
+            "broker-cancel-order",
+            "--session-id",
+            "pilot-1",
+            "--kite-order-id",
+            "250505000000001",
+            "--confirm-cancel",
+        ]
+    )
+
+    assert args.command == "broker-cancel-order"
+    assert args.variety == "regular"
+    assert args.confirm_cancel is True
+
+
 def test_paper_trading_parser_supports_real_pilot_plan() -> None:
     parser = build_parser()
 
@@ -181,6 +201,29 @@ def test_paper_trading_parser_supports_real_pilot_plan() -> None:
     assert args.market_protection == 2.0
 
 
+def test_paper_trading_parser_supports_real_readiness() -> None:
+    parser = build_parser()
+
+    args = parser.parse_args(
+        [
+            "real-readiness",
+            "--symbol",
+            "ITC",
+            "--quantity",
+            "1",
+            "--expected-ip",
+            "61.2.157.74",
+            "--strict",
+        ]
+    )
+
+    assert args.command == "real-readiness"
+    assert args.symbol == "ITC"
+    assert args.quantity == 1
+    assert args.expected_ip == "61.2.157.74"
+    assert args.strict is True
+
+
 def test_real_pilot_plan_skips_startup_paper_db_cleanup(monkeypatch: pytest.MonkeyPatch) -> None:
     import scripts.paper_trading as pt
 
@@ -206,6 +249,126 @@ def test_real_pilot_plan_skips_startup_paper_db_cleanup(monkeypatch: pytest.Monk
     pt.main()
 
     assert calls == ["run_asyncio"]
+
+
+def test_operator_drill_skips_startup_paper_db_cleanup(monkeypatch: pytest.MonkeyPatch) -> None:
+    import scripts.paper_trading as pt
+
+    calls: list[str] = []
+
+    async def fake_handler(args: SimpleNamespace) -> None:
+        calls.append(f"handler:{args.command}")
+
+    def fail_pdb():
+        raise AssertionError("operator-drill parent must not open production paper.duckdb")
+
+    def fake_run_asyncio(coro):
+        calls.append("run_asyncio")
+        coro.close()
+
+    monkeypatch.setattr(sys, "argv", ["pivot-paper-trading", "operator-drill", "--max-cycles", "1"])
+    monkeypatch.setattr(pt, "_cmd_operator_drill", fake_handler)
+    monkeypatch.setattr(pt, "_pdb", fail_pdb)
+    monkeypatch.setattr(pt, "run_asyncio", fake_run_asyncio)
+    monkeypatch.setattr(pt, "configure_windows_stdio", lambda **kwargs: None)
+    monkeypatch.setattr(pt, "configure_windows_asyncio", lambda: None)
+
+    pt.main()
+
+    assert calls == ["run_asyncio"]
+
+
+@pytest.mark.asyncio
+async def test_operator_drill_launches_isolated_kite_multi_child(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import scripts.paper_trading as pt
+
+    monkeypatch.chdir(tmp_path)
+    captured: dict[str, object] = {}
+
+    class _FakeCompleted:
+        returncode = 0
+        stdout = '{"status":"ok"}\n'
+
+    def fake_run(cmd, *, cwd, env, text, stdout, stderr, check):
+        captured["cmd"] = list(cmd)
+        captured["cwd"] = cwd
+        captured["env"] = dict(env)
+        captured["text"] = text
+        captured["stdout"] = stdout
+        captured["stderr_name"] = getattr(stderr, "name", "")
+        captured["check"] = check
+        return _FakeCompleted()
+
+    monkeypatch.setattr(pt.subprocess, "run", fake_run)
+    monkeypatch.setattr(pt, "resolve_trade_date", lambda value: "2026-05-04")
+
+    await pt._cmd_operator_drill(
+        SimpleNamespace(
+            trade_date="2026-05-04",
+            run_id="unit-drill",
+            strategy="CPR_LEVELS",
+            symbols="SBIN,RELIANCE",
+            universe_name=None,
+            poll_interval_sec=0.1,
+            candle_interval_minutes=5,
+            max_cycles=3,
+            or_minutes=5,
+            entry_window_end="15:05",
+            time_exit="15:10",
+            cpr_entry_start="14:45",
+            real_orders=False,
+            simulate_real_orders=False,
+        )
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    cmd = captured["cmd"]
+    env = captured["env"]
+
+    assert payload["ok"] is True
+    assert payload["run_id"] == "unit-drill"
+    assert payload["paper_db"].endswith("operator_drills\\unit-drill\\paper.duckdb") or payload[
+        "paper_db"
+    ].endswith("operator_drills/unit-drill/paper.duckdb")
+    assert "daily-live" in cmd
+    assert "--multi" in cmd
+    assert "--feed-source" in cmd
+    assert "kite" in cmd
+    assert "--no-alerts" in cmd
+    assert "--skip-coverage" in cmd
+    assert "--entry-window-end" in cmd
+    assert "15:05" in cmd
+    assert "--time-exit" in cmd
+    assert "15:10" in cmd
+    assert "--cpr-entry-start" in cmd
+    assert "14:45" in cmd
+    assert "--real-orders" not in cmd
+    assert "--simulate-real-orders" not in cmd
+    assert str(env["PIVOT_PAPER_DB_PATH"]).endswith(
+        "operator_drills\\unit-drill\\paper.duckdb"
+    ) or str(env["PIVOT_PAPER_DB_PATH"]).endswith("operator_drills/unit-drill/paper.duckdb")
+    assert env["PIVOT_MARKET_READ_REPLICA"] == "1"
+    assert env["PIVOT_PAPER_SESSION_ID_PREFIX"] == "DRILL-unit-drill-"
+    assert "PIVOT_LOCAL_FEED_BAR_DELAY_SEC" not in env
+
+
+@pytest.mark.asyncio
+async def test_operator_drill_rejects_real_order_flags() -> None:
+    import scripts.paper_trading as pt
+
+    with pytest.raises(SystemExit, match="paper-only"):
+        await pt._cmd_operator_drill(
+            SimpleNamespace(
+                trade_date="2026-05-04",
+                run_id="bad-drill",
+                real_orders=True,
+                simulate_real_orders=False,
+            )
+        )
 
 
 @pytest.mark.asyncio
@@ -270,6 +433,145 @@ async def test_real_pilot_plan_outputs_no_placement_commands(
     assert payload["post_order_monitoring"]["sync_command"].endswith(
         "broker-sync-orders --session-id manual-pilot-test-itc"
     )
+
+
+@pytest.mark.asyncio
+async def test_real_readiness_reports_ip_token_cash_and_gates(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import scripts.paper_broker_cli as broker_cli
+
+    class _FakeKite:
+        def profile(self) -> dict[str, str]:
+            return {"user_id": "AB1234", "user_name": "Pilot", "broker": "ZERODHA"}
+
+        def margins(self, segment: str) -> dict[str, object]:
+            assert segment == "equity"
+            return {"available": {"cash": 25000.0}}
+
+        def ltp(self, keys: list[str]) -> dict[str, dict[str, float]]:
+            assert keys == ["NSE:ITC"]
+            return {"NSE:ITC": {"last_price": 311.5}}
+
+    monkeypatch.setenv("CPR_ZERODHA_REAL_ORDERS_ENABLED", "true")
+    monkeypatch.setenv("CPR_ZERODHA_REAL_ORDER_ACK", "I_UNDERSTAND_REAL_MONEY_ORDERS")
+    monkeypatch.setenv("CPR_ZERODHA_REAL_MAX_QTY", "1")
+    monkeypatch.setenv("CPR_ZERODHA_REAL_MAX_NOTIONAL", "1000")
+    monkeypatch.setenv("CPR_ZERODHA_REAL_ALLOWED_PRODUCTS", "MIS")
+    monkeypatch.setenv("CPR_ZERODHA_REAL_ALLOWED_ORDER_TYPES", "LIMIT,SL,SL-M")
+    monkeypatch.setattr(broker_cli, "_get_kite_client", lambda: _FakeKite())
+    monkeypatch.setattr(broker_cli, "_fetch_public_ip", lambda **_kwargs: "61.2.157.74")
+
+    await broker_cli._cmd_real_readiness(
+        SimpleNamespace(
+            symbol="ITC",
+            exchange="NSE",
+            quantity=1,
+            product="MIS",
+            order_type="LIMIT",
+            expected_ip="61.2.157.74",
+            skip_public_ip=False,
+            ip_timeout_sec=1.0,
+            strict=True,
+        )
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["ok"] is True
+    assert payload["kite_ok"] is True
+    assert payload["profile"]["user_id"] == "AB1234"
+    assert payload["available_cash"] == 25000.0
+    assert payload["ltp"] == 311.5
+    assert payload["estimated_notional"] == 311.5
+    assert payload["outbound_ip"]["current"] == "61.2.157.74"
+    assert payload["outbound_ip"]["matches_expected"] is True
+    assert payload["findings"] == []
+
+
+@pytest.mark.asyncio
+async def test_real_readiness_fails_when_public_ip_lookup_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import scripts.paper_broker_cli as broker_cli
+
+    class _FakeKite:
+        def profile(self) -> dict[str, str]:
+            return {"user_id": "AB1234"}
+
+        def margins(self, segment: str) -> dict[str, object]:
+            assert segment == "equity"
+            return {"available": {"cash": 25000.0}}
+
+        def ltp(self, keys: list[str]) -> dict[str, dict[str, float]]:
+            assert keys == ["NSE:ITC"]
+            return {"NSE:ITC": {"last_price": 311.5}}
+
+    monkeypatch.setenv("CPR_ZERODHA_REAL_ORDERS_ENABLED", "true")
+    monkeypatch.setenv("CPR_ZERODHA_REAL_ORDER_ACK", "I_UNDERSTAND_REAL_MONEY_ORDERS")
+    monkeypatch.setenv("CPR_ZERODHA_REAL_MAX_QTY", "1")
+    monkeypatch.setenv("CPR_ZERODHA_REAL_MAX_NOTIONAL", "1000")
+    monkeypatch.setenv("CPR_ZERODHA_REAL_ALLOWED_PRODUCTS", "MIS")
+    monkeypatch.setenv("CPR_ZERODHA_REAL_ALLOWED_ORDER_TYPES", "LIMIT")
+    monkeypatch.setattr(broker_cli, "_get_kite_client", lambda: _FakeKite())
+    monkeypatch.setattr(broker_cli, "_fetch_public_ip", lambda **_kwargs: None)
+
+    with pytest.raises(SystemExit):
+        await broker_cli._cmd_real_readiness(
+            SimpleNamespace(
+                symbol="ITC",
+                exchange="NSE",
+                quantity=1,
+                product="MIS",
+                order_type="LIMIT",
+                expected_ip="61.2.157.74",
+                skip_public_ip=False,
+                ip_timeout_sec=1.0,
+                strict=True,
+            )
+        )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is False
+    assert any(item["code"] == "OUTBOUND_IP_LOOKUP_FAILED" for item in payload["findings"])
+
+
+@pytest.mark.asyncio
+async def test_real_readiness_rejects_non_positive_quantity(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import scripts.paper_broker_cli as broker_cli
+
+    monkeypatch.setenv("CPR_ZERODHA_REAL_ORDERS_ENABLED", "true")
+    monkeypatch.setenv("CPR_ZERODHA_REAL_ORDER_ACK", "I_UNDERSTAND_REAL_MONEY_ORDERS")
+    monkeypatch.setenv("CPR_ZERODHA_REAL_MAX_QTY", "1")
+    monkeypatch.setenv("CPR_ZERODHA_REAL_MAX_NOTIONAL", "1000")
+    monkeypatch.setenv("CPR_ZERODHA_REAL_ALLOWED_PRODUCTS", "MIS")
+    monkeypatch.setenv("CPR_ZERODHA_REAL_ALLOWED_ORDER_TYPES", "LIMIT")
+    monkeypatch.setattr(broker_cli, "_fetch_public_ip", lambda **_kwargs: "61.2.157.74")
+    monkeypatch.setattr(broker_cli, "_get_kite_client", lambda: object())
+
+    with pytest.raises(SystemExit):
+        await broker_cli._cmd_real_readiness(
+            SimpleNamespace(
+                symbol="",
+                exchange="NSE",
+                quantity=0,
+                product="MIS",
+                order_type="LIMIT",
+                expected_ip="61.2.157.74",
+                skip_public_ip=False,
+                ip_timeout_sec=1.0,
+                strict=True,
+            )
+        )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is False
+    assert any(item["code"] == "REAL_ORDER_QTY_NOT_POSITIVE" for item in payload["findings"])
 
 
 def test_paper_trading_parser_supports_replay() -> None:
@@ -595,6 +897,44 @@ def test_paper_multi_params_fail_fast_on_preset_drift() -> None:
 
     with pytest.raises(SystemExit, match="do not match preset CPR_LEVELS_RISK_LONG"):
         _prepare_paper_multi_strategy_params("CPR_LEVELS_LONG", "CPR_LEVELS", drifted)
+
+
+def test_paper_multi_params_accept_explicit_timing_override_without_canonical_marker() -> None:
+    params = _prepare_paper_multi_strategy_params(
+        "CPR_LEVELS_LONG",
+        "CPR_LEVELS",
+        ALL_STRATEGY_PRESETS["CPR_LEVELS_RISK_LONG"]["overrides"],
+    )
+    args = SimpleNamespace(
+        direction="BOTH",
+        skip_rvol=False,
+        no_skip_rvol=False,
+        standard_sizing=False,
+        risk_based_sizing=True,
+        min_price=None,
+        regime_index_symbol=None,
+        regime_min_move_pct=None,
+        regime_snapshot_minutes=None,
+        pack_source=None,
+        pack_source_session_id=None,
+        cpr_min_close_atr=None,
+        cpr_scale_out_pct=None,
+        narrowing_filter=False,
+        or_minutes=5,
+        entry_window_end="15:05",
+        time_exit="15:10",
+        cpr_entry_start="14:45",
+    )
+
+    overridden = _apply_multi_cli_strategy_overrides("CPR_LEVELS", params, args)
+
+    assert "_canonical_preset" not in overridden
+    assert overridden["direction_filter"] == "LONG"
+    assert overridden["or_minutes"] == 5
+    assert overridden["entry_window_end"] == "15:05"
+    assert overridden["time_exit"] == "15:10"
+    assert overridden["cpr_levels_config"]["cpr_entry_start"] == "14:45"
+    assert overridden["_resolved_strategy_config"]["entry_window_end"] == "15:05"
 
 
 def test_single_preset_params_are_marked_canonical() -> None:

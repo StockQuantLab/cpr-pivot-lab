@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import logging
 import os
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
+from datetime import time as dt_time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -50,6 +52,7 @@ from engine.paper_runtime import (
     maybe_shutdown_alert_dispatcher,
     register_session_start,
 )
+from engine.paper_setup_loader import _or_proxy_and_source, setup_row_uses_or_proxy
 from engine.real_order_runtime import build_real_order_router
 from scripts import paper_live_helpers as _live_helpers
 from scripts.paper_archive import archive_completed_session
@@ -92,6 +95,183 @@ except ValueError:
     _FEED_STALE_ALERT_COOLDOWN_SEC = 900.0
 
 
+def _or_range_end(trade_date: str, or_minutes: int) -> datetime:
+    trading_day = datetime.fromisoformat(str(trade_date)).date()
+    return datetime.combine(trading_day, dt_time(9, 15), tzinfo=IST) + timedelta(
+        minutes=max(1, int(or_minutes or 5))
+    )
+
+
+def _coerce_kite_candle_start(value: Any) -> datetime | None:
+    if not isinstance(value, datetime):
+        try:
+            value = datetime.fromisoformat(str(value))
+        except ValueError:
+            return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=IST)
+    return value.astimezone(IST)
+
+
+def _kite_history_to_live_candles(
+    symbol: str,
+    candles: list[dict[str, Any]],
+    *,
+    trade_date: str,
+    or_minutes: int,
+) -> list[dict[str, Any]]:
+    range_start = datetime.combine(
+        datetime.fromisoformat(str(trade_date)).date(), dt_time(9, 15), tzinfo=IST
+    )
+    range_end = range_start + timedelta(minutes=max(1, int(or_minutes or 5)))
+    live_candles: list[dict[str, Any]] = []
+    for candle in candles:
+        bar_start = _coerce_kite_candle_start(candle.get("date"))
+        if bar_start is None or not (range_start <= bar_start < range_end):
+            continue
+        bar_end = bar_start + timedelta(minutes=5)
+        live_candles.append(
+            {
+                "symbol": symbol,
+                "time_str": bar_end.strftime("%H:%M"),
+                "bar_end": bar_end,
+                "open": float(candle["open"]),
+                "high": float(candle["high"]),
+                "low": float(candle["low"]),
+                "close": float(candle["close"]),
+                "volume": float(candle.get("volume") or 0.0),
+            }
+        )
+    return sorted(live_candles, key=lambda row: row["bar_end"])
+
+
+def _merge_state_candles(state: SymbolRuntimeState, candles: list[dict[str, Any]]) -> None:
+    if not candles:
+        return
+    merged: dict[datetime, dict[str, Any]] = {}
+    for candle in [*candles, *state.candles]:
+        bar_end = candle.get("bar_end")
+        if isinstance(bar_end, datetime):
+            merged[bar_end] = dict(candle)
+    state.candles = [merged[key] for key in sorted(merged)]
+
+
+def _symbols_needing_true_or(runtime_state: PaperRuntimeState, symbols: list[str]) -> list[str]:
+    needed: list[str] = []
+    for symbol in dict.fromkeys(symbols):
+        state = runtime_state.symbols.get(symbol)
+        setup_row = state.setup_row if state is not None else None
+        if (
+            setup_row is None
+            or bool(setup_row.get("direction_pending"))
+            or float(setup_row.get("open_915") or 0.0) <= 0.0
+            or float(setup_row.get("or_high_5") or 0.0) <= 0.0
+            or float(setup_row.get("or_low_5") or 0.0) <= 0.0
+            or setup_row.get("or_close_5") is None
+            or setup_row_uses_or_proxy(setup_row)
+        ):
+            needed.append(symbol)
+    return needed
+
+
+def _clear_unresolved_setup_rows(runtime_state: PaperRuntimeState, symbols: list[str]) -> None:
+    for symbol in symbols:
+        state = runtime_state.symbols.get(symbol)
+        if state is None or state.setup_row is None:
+            continue
+        if (
+            bool(state.setup_row.get("direction_pending"))
+            or float(state.setup_row.get("open_915") or 0.0) <= 0.0
+            or float(state.setup_row.get("or_high_5") or 0.0) <= 0.0
+            or float(state.setup_row.get("or_low_5") or 0.0) <= 0.0
+            or state.setup_row.get("or_close_5") is None
+            or setup_row_uses_or_proxy(state.setup_row)
+        ):
+            state.setup_row = None
+
+
+def _catch_up_true_or_from_kite(
+    *,
+    runtime_state: PaperRuntimeState,
+    symbols: list[str],
+    trade_date: str,
+    or_minutes: int,
+    session_id: str,
+) -> dict[str, int]:
+    if not symbols:
+        return {"requested": 0, "fetched": 0, "missing": 0, "errors": 0}
+    if datetime.now(IST) < _or_range_end(trade_date, or_minutes):
+        logger.info(
+            "[%s] OR historical catch-up skipped: OR window still open for %s",
+            session_id,
+            trade_date,
+        )
+        return {"requested": len(symbols), "fetched": 0, "missing": 0, "errors": 0}
+
+    from engine.kite_ingestion import (
+        _historical_data_with_retry,
+        get_kite_client,
+        resolve_instrument_tokens,
+    )
+
+    requested = list(dict.fromkeys(symbols))
+    token_map, missing_instruments = resolve_instrument_tokens(requested, exchange="NSE")
+    kite = get_kite_client()
+    trading_day = datetime.fromisoformat(str(trade_date)).date()
+    range_start = datetime.combine(trading_day, dt_time(9, 15))
+    from_ts = range_start.strftime("%Y-%m-%d %H:%M:%S")
+    to_ts = (range_start + timedelta(minutes=max(1, int(or_minutes or 5)))).strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+
+    fetched = 0
+    errors = 0
+    for symbol in requested:
+        token = token_map.get(symbol)
+        if token is None:
+            continue
+        try:
+            raw_candles = _historical_data_with_retry(
+                kite,
+                token,
+                "5minute",
+                from_ts,
+                to_ts,
+                attempts=2,
+            )
+        except Exception as exc:
+            errors += 1
+            logger.warning(
+                "[%s] OR historical catch-up failed for %s on %s: %s",
+                session_id,
+                symbol,
+                trade_date,
+                exc,
+            )
+            continue
+        live_candles = _kite_history_to_live_candles(
+            symbol, raw_candles, trade_date=trade_date, or_minutes=or_minutes
+        )
+        if not live_candles:
+            continue
+        _merge_state_candles(runtime_state.for_symbol(symbol), live_candles)
+        fetched += 1
+
+    missing = len(requested) - fetched
+    logger.warning(
+        "[%s] OR historical catch-up complete trade_date=%s requested=%d fetched=%d "
+        "missing=%d missing_instruments=%d errors=%d",
+        session_id,
+        trade_date,
+        len(requested),
+        fetched,
+        missing,
+        len(missing_instruments),
+        errors,
+    )
+    return {"requested": len(requested), "fetched": fetched, "missing": missing, "errors": errors}
+
+
 @dataclass(slots=True)
 class LiveSessionDeps:
     session_loader: Callable[[str], Any] | None = None
@@ -128,6 +308,7 @@ class _LiveMultiContext:
     stage_b_applied: bool = False
     entries_disabled: bool = False
     entry_resume_symbols: list[str] | None = None
+    entry_universe_symbols: list[str] | None = None
     closed_bars: int = 0
     quote_events: int = 0
     final_status: str = "ACTIVE"
@@ -325,11 +506,22 @@ def _prefetch_setup_rows(
         if tc <= 0.0 or bc <= 0.0 or atr <= 0.0:
             invalid_symbols.append((symbol, tc, bc, atr))
             return None
+        prev_close = float(row[2]) if row[2] is not None else None
         or_close_5 = float(row[16]) if row[16] is not None else None
         direction = resolve_cpr_direction(or_close_5, tc, bc, fallback="NONE")
         if direction == "NONE" and or_close_5 is None:
             direction = str(row[21] or "NONE")
-        if direction == "NONE" and live_candles:
+        live_intraday: dict[str, Any] | None = None
+        db_or_high = float(row[13] or 0.0)
+        db_or_low = float(row[14] or 0.0)
+        db_open_915 = float(row[15] or 0.0)
+        if live_candles and (
+            direction == "NONE"
+            or db_or_high <= 0.0
+            or db_or_low <= 0.0
+            or db_open_915 <= 0.0
+            or or_close_5 is None
+        ):
             from engine.paper_setup_loader import _build_intraday_summary
 
             intraday = _build_intraday_summary(
@@ -337,16 +529,63 @@ def _prefetch_setup_rows(
                 or_minutes=candle_interval_minutes,
                 bar_end_offset=runtime_state.bar_end_offset,
             )
+            live_intraday = intraday
             live_or_close_5 = intraday.get("or_close_5")
             if live_or_close_5 is not None:
                 direction = resolve_cpr_direction(live_or_close_5, tc, bc, fallback="NONE")
                 or_close_5 = live_or_close_5
+        or_high_5 = db_or_high
+        or_low_5 = db_or_low
+        open_915_val = db_open_915
+        open_side = str(row[17] or "")
+        if live_intraday is not None:
+            from engine.cpr_atr_utils import (
+                calculate_gap_pct,
+                calculate_or_atr_ratio,
+                normalize_cpr_bounds,
+            )
+
+            or_high_5 = db_or_high or float(live_intraday.get("or_high_5") or 0.0)
+            or_low_5 = db_or_low or float(live_intraday.get("or_low_5") or 0.0)
+            open_915_val = db_open_915 or float(live_intraday.get("open_915") or 0.0)
+            if open_915_val > 0:
+                cpr_lower, cpr_upper = normalize_cpr_bounds(tc, bc)
+                if open_915_val < cpr_lower:
+                    open_side = "BELOW"
+                elif open_915_val > cpr_upper:
+                    open_side = "ABOVE"
+                else:
+                    open_side = "INSIDE"
+                open_to_cpr_atr = (
+                    abs(open_915_val - (cpr_lower if open_side == "BELOW" else cpr_upper)) / atr
+                    if open_side in {"BELOW", "ABOVE"}
+                    else 0.0
+                )
+                gap_abs_pct = (
+                    abs(calculate_gap_pct(open_915_val, prev_close))
+                    if prev_close is not None
+                    else None
+                )
+                or_atr_5 = (
+                    calculate_or_atr_ratio(or_high_5, or_low_5, atr)
+                    if or_high_5 > 0 and or_low_5 > 0
+                    else None
+                )
+            else:
+                open_to_cpr_atr = float(row[18]) if row[18] is not None else None
+                gap_abs_pct = float(row[19]) if row[19] is not None else None
+                or_atr_5 = float(row[20]) if row[20] is not None else None
+        else:
+            open_to_cpr_atr = float(row[18]) if row[18] is not None else None
+            gap_abs_pct = float(row[19]) if row[19] is not None else None
+            or_atr_5 = float(row[20]) if row[20] is not None else None
+        or_proxy, setup_source = _or_proxy_and_source(live_intraday)
         rvol_baseline: list[float | None] | None = None
         if row[25]:
             rvol_baseline = [float(v) if v is not None else None for v in row[25]]
         setup_row = {
             "trade_date": str(row[1] or trade_date),
-            "prev_day_close": float(row[2]) if row[2] is not None else None,
+            "prev_day_close": prev_close,
             "tc": tc,
             "bc": bc,
             "pivot": float(row[5] or 0.0),
@@ -357,20 +596,21 @@ def _prefetch_setup_rows(
             "atr": atr,
             "cpr_width_pct": float(row[11] or 0.0),
             "cpr_threshold": float(row[12] or 0.0),
-            "or_high_5": float(row[13] or 0.0),
-            "or_low_5": float(row[14] or 0.0),
-            "open_915": float(row[15] or 0.0),
+            "or_high_5": or_high_5,
+            "or_low_5": or_low_5,
+            "open_915": open_915_val,
             "or_close_5": or_close_5,
-            "open_side": str(row[17] or ""),
-            "open_to_cpr_atr": float(row[18]) if row[18] is not None else None,
-            "gap_abs_pct": float(row[19]) if row[19] is not None else None,
-            "or_atr_5": float(row[20]) if row[20] is not None else None,
+            "open_side": open_side,
+            "open_to_cpr_atr": open_to_cpr_atr,
+            "gap_abs_pct": gap_abs_pct,
+            "or_atr_5": or_atr_5,
             "direction": direction,
             "is_narrowing": bool(row[22]),
             "cpr_shift": str(row[23] or "OVERLAP"),
             "regime_move_pct": float(row[24]) if row[24] is not None else None,
             "rvol_baseline": rvol_baseline,
-            "setup_source": "market_day_state",
+            "or_proxy": or_proxy,
+            "setup_source": setup_source,
         }
         return setup_row
 
@@ -443,10 +683,33 @@ def _prefetch_setup_rows(
                 continue
             row = batch_rows.get(symbol)
             if row is None:
-                missing_symbols.append(symbol)
+                if not runtime_state.allow_live_setup_fallback:
+                    missing_symbols.append(symbol)
+                    continue
+                setup_row = load_setup_row(
+                    symbol,
+                    trade_date,
+                    live_candles=state.candles,
+                    or_minutes=candle_interval_minutes,
+                    allow_live_fallback=True,
+                    bar_end_offset=runtime_state.bar_end_offset,
+                    regime_index_symbol=regime_index_symbol,
+                    regime_snapshot_minutes=regime_snapshot_minutes,
+                )
+                if setup_row is None:
+                    missing_symbols.append(symbol)
+                    continue
+                if not runtime_state.allow_or_proxy_setup and setup_row_uses_or_proxy(setup_row):
+                    missing_symbols.append(symbol)
+                    continue
+                state.setup_row = _normalize_setup_row_direction(setup_row)
+                _log_setup_row_parity(symbol, trade_date, state.setup_row)
                 continue
             setup_row = _hydrate_setup_row(symbol=symbol, row=row, live_candles=state.candles)
             if setup_row is None:
+                continue
+            if not runtime_state.allow_or_proxy_setup and setup_row_uses_or_proxy(setup_row):
+                missing_symbols.append(symbol)
                 continue
             if row[24] is not None:
                 setup_row["regime_move_pct"] = float(row[24])
@@ -480,6 +743,9 @@ def _prefetch_setup_rows(
                 invalid_symbols.append((symbol, tc, bc, atr))
                 continue
             setup_row.setdefault("setup_source", "market_day_state")
+            if not runtime_state.allow_or_proxy_setup and setup_row_uses_or_proxy(setup_row):
+                missing_symbols.append(symbol)
+                continue
             state.setup_row = _normalize_setup_row_direction(setup_row)
             _log_setup_row_parity(symbol, trade_date, state.setup_row)
     if invalid_symbols:
@@ -534,8 +800,10 @@ async def _prepare_live_multi_context(
         force_paper_db_sync(get_paper_db())
 
     params = build_backtest_params(session)
+    real_order_router = build_real_order_router(spec.real_order_config)
     runtime_state = PaperRuntimeState(
         allow_live_setup_fallback=allow_live_setup_fallback,
+        allow_or_proxy_setup=real_order_router is None,
         bar_end_offset=timedelta(minutes=5)
         if getattr(ticker_adapter, "_local_feed", False)
         else None,
@@ -548,6 +816,25 @@ async def _prepare_live_multi_context(
         regime_index_symbol=str(strategy_params.get("regime_index_symbol") or ""),
         regime_snapshot_minutes=int(strategy_params.get("regime_snapshot_minutes") or 30),
     )
+    if real_order_router is not None and not getattr(ticker_adapter, "_local_feed", False):
+        catchup_symbols = _symbols_needing_true_or(runtime_state, active_symbols)
+        if catchup_symbols:
+            _catch_up_true_or_from_kite(
+                runtime_state=runtime_state,
+                symbols=catchup_symbols,
+                trade_date=trade_date,
+                or_minutes=candle_interval,
+                session_id=spec.session_id,
+            )
+            _clear_unresolved_setup_rows(runtime_state, catchup_symbols)
+            _prefetch_setup_rows(
+                runtime_state=runtime_state,
+                symbols=catchup_symbols,
+                trade_date=trade_date,
+                candle_interval_minutes=candle_interval,
+                regime_index_symbol=str(strategy_params.get("regime_index_symbol") or ""),
+                regime_snapshot_minutes=int(strategy_params.get("regime_snapshot_minutes") or 30),
+            )
     direction_readiness = _log_direction_readiness(
         session_id=spec.session_id,
         runtime_state=runtime_state,
@@ -571,7 +858,6 @@ async def _prepare_live_multi_context(
         tracker.mark_traded(closed_pos.symbol)
         runtime_state.for_symbol(closed_pos.symbol).position_closed_today = True
 
-    real_order_router = build_real_order_router(spec.real_order_config)
     if real_order_router is not None:
         logger.warning(
             "[%s] broker order routing enabled for multi-live mode=%s fixed_qty=%d",
@@ -614,6 +900,7 @@ async def _prepare_live_multi_context(
         builder=builder,
         notes=spec.notes,
         entry_resume_symbols=list(active_symbols),
+        entry_universe_symbols=list(active_symbols),
     )
 
 
@@ -699,6 +986,342 @@ async def _process_live_multi_bar(
     elif driver_result["triggered"]:
         ctx.final_status = "STOPPING"
         ctx.terminal_reason = "risk_control_triggered"
+
+    connected = bool(ticker_adapter is not None and getattr(ticker_adapter, "is_connected", True))
+    await _write_feed_state(
+        None,
+        session_id=ctx.session_id,
+        status="OK" if connected else "STALE",
+        last_event_ts=getattr(ticker_adapter, "last_tick_ts", None),
+        last_bar_ts=ctx.last_bar_ts,
+        last_price=ctx.last_price,
+        stale_reason=None if connected else "ticker_not_connected",
+        raw_state={
+            "connected": connected,
+            "active_symbols": len(ctx.active_symbols),
+            "closed_bars": ctx.closed_bars,
+        },
+    )
+
+
+async def _apply_live_multi_operator_controls(
+    *,
+    ctx: _LiveMultiContext,
+    ticker_adapter: Any,
+    use_websocket: bool,
+    now: datetime,
+) -> bool:
+    """Apply per-session operator controls for the multi-live dispatcher."""
+    stop_requested = False
+
+    signal_file = Path(".tmp_logs") / f"flatten_{ctx.session_id}.signal"
+    if signal_file.exists():
+        logger.info(
+            "[%s] Multi flatten signal detected — closing all positions and completing session",
+            ctx.session_id,
+        )
+        try:
+            signal_file.unlink()
+        except OSError:
+            pass
+        live_feed_state = _live_mark_feed_state(
+            session_id=ctx.session_id,
+            symbol_last_prices=ctx.symbol_last_prices,
+            ticker_adapter=ticker_adapter if use_websocket else None,
+            symbols=list(ctx.tracker._open.keys()) or ctx.active_symbols,
+        )
+        await flatten_session_positions(
+            ctx.session_id,
+            notes="manual_flatten_signal",
+            feed_state=live_feed_state,
+            real_order_router=ctx.real_order_router,
+        )
+        if _reconcile_live_session(
+            session_id=ctx.session_id,
+            reason="manual_flatten_signal",
+            alerts_enabled=True,
+        ):
+            ctx.final_status = "FAILED"
+            ctx.terminal_reason = "reconciliation_failed_after_manual_flatten"
+        else:
+            ctx.final_status = "COMPLETED"
+            ctx.terminal_reason = "manual_flatten_signal"
+        return True
+
+    cmd_dir = Path(".tmp_logs") / f"cmd_{ctx.session_id}"
+    if not cmd_dir.exists():
+        return False
+
+    def _command_sort_key(path: Path) -> tuple[int, str]:
+        try:
+            action = str((json.loads(path.read_text()) or {}).get("action") or "")
+        except Exception:
+            action = ""
+        return (0 if action == "cancel_pending_intents" else 1, path.name)
+
+    command_files = sorted(cmd_dir.glob("*.json"), key=_command_sort_key)
+    for cmd_file in command_files:
+        if _is_admin_command_stale(cmd_file, now):
+            logger.warning("[%s] Stale admin command dropped: %s", ctx.session_id, cmd_file.name)
+            try:
+                cmd_file.unlink()
+            except OSError:
+                logger.debug(
+                    "[%s] Failed to delete stale admin command %s",
+                    ctx.session_id,
+                    cmd_file,
+                    exc_info=True,
+                )
+            continue
+
+        command_processed = False
+        try:
+            cmd = json.loads(cmd_file.read_text())
+            action = cmd.get("action", "")
+            reason = cmd.get("reason", "admin_command")
+            requester = cmd.get("requester", "unknown")
+            logger.info(
+                "[%s] Multi admin command: action=%s symbols=%s requester=%s",
+                ctx.session_id,
+                action,
+                cmd.get("symbols"),
+                requester,
+            )
+
+            if action == "close_all":
+                live_feed_state = _live_mark_feed_state(
+                    session_id=ctx.session_id,
+                    symbol_last_prices=ctx.symbol_last_prices,
+                    ticker_adapter=ticker_adapter if use_websocket else None,
+                    symbols=list(ctx.tracker._open.keys()) or ctx.active_symbols,
+                )
+                await flatten_session_positions(
+                    ctx.session_id,
+                    notes=f"admin_{reason}_{requester}",
+                    feed_state=live_feed_state,
+                    real_order_router=ctx.real_order_router,
+                )
+                if _reconcile_live_session(
+                    session_id=ctx.session_id,
+                    reason=f"admin:{action}",
+                    alerts_enabled=True,
+                ):
+                    ctx.entries_disabled = True
+                    ctx.final_status = "FAILED"
+                    ctx.terminal_reason = "reconciliation_failed_after_admin_close_all"
+                else:
+                    ctx.final_status = "COMPLETED"
+                    ctx.terminal_reason = f"admin_{reason}"
+                stop_requested = True
+
+            elif action == "close_positions":
+                symbols = [str(symbol).upper() for symbol in (cmd.get("symbols") or [])]
+                if symbols:
+                    live_feed_state = _live_mark_feed_state(
+                        session_id=ctx.session_id,
+                        symbol_last_prices=ctx.symbol_last_prices,
+                        ticker_adapter=ticker_adapter if use_websocket else None,
+                        symbols=symbols,
+                    )
+                    close_result = await flatten_positions_subset(
+                        ctx.session_id,
+                        symbols,
+                        notes=f"admin_{reason}_{requester}",
+                        feed_state=live_feed_state,
+                        real_order_router=ctx.real_order_router,
+                    )
+                    for position in close_result.get("positions", []):
+                        symbol = str(position.get("symbol", ""))
+                        if symbol and ctx.tracker.has_open_position(symbol):
+                            position_obj = ctx.tracker.get_open_position(symbol)
+                            close_price = float(position.get("close_price", 0))
+                            quantity = float(
+                                getattr(position_obj, "current_qty", None)
+                                or getattr(position_obj, "quantity", 0)
+                                or 0
+                            )
+                            direction = str(getattr(position_obj, "direction", "LONG")).upper()
+                            entry_price = float(getattr(position_obj, "entry_price", 0) or 0)
+                            exit_value = (
+                                quantity * close_price
+                                if direction == "LONG"
+                                else quantity * (2 * entry_price - close_price)
+                            )
+                            ctx.tracker.record_close(symbol, exit_value)
+                    get_paper_db().force_sync()
+                    if _reconcile_live_session(
+                        session_id=ctx.session_id,
+                        reason=f"admin:{action}",
+                        alerts_enabled=True,
+                    ):
+                        ctx.entries_disabled = True
+                        monitor_symbols = _entry_disabled_symbols(
+                            tracker=ctx.tracker,
+                            active_symbols=ctx.active_symbols,
+                        )
+                        if monitor_symbols:
+                            ctx.active_symbols = monitor_symbols
+                            if use_websocket and ticker_adapter is not None:
+                                ticker_adapter.update_symbols(ctx.session_id, ctx.active_symbols)
+
+            elif action == "set_risk_budget":
+                portfolio_value = cmd.get("portfolio_value")
+                max_positions = cmd.get("max_positions")
+                max_position_pct = cmd.get("max_position_pct")
+                ctx.tracker.update_budget(
+                    portfolio_value=(
+                        float(portfolio_value) if portfolio_value is not None else None
+                    ),
+                    max_positions=(int(max_positions) if max_positions is not None else None),
+                    max_position_pct=(
+                        float(max_position_pct) if max_position_pct is not None else None
+                    ),
+                )
+                ctx.entries_disabled = False
+                open_notional = ctx.tracker.current_open_notional()
+                if ctx.tracker.initial_capital > 0 and open_notional >= ctx.tracker.initial_capital:
+                    ctx.entries_disabled = True
+                    monitor_symbols = _entry_disabled_symbols(
+                        tracker=ctx.tracker,
+                        active_symbols=ctx.active_symbols,
+                    )
+                    if monitor_symbols:
+                        ctx.active_symbols = monitor_symbols
+                        if use_websocket and ticker_adapter is not None:
+                            ticker_adapter.update_symbols(ctx.session_id, ctx.active_symbols)
+                logger.warning(
+                    "[%s] Multi risk budget updated by %s: portfolio_value=%.2f "
+                    "max_positions=%d max_position_pct=%.4f open_notional=%.2f "
+                    "cash_available=%.2f entries_disabled=%s",
+                    ctx.session_id,
+                    requester,
+                    ctx.tracker.initial_capital,
+                    ctx.tracker.max_positions,
+                    ctx.tracker.max_position_pct,
+                    open_notional,
+                    ctx.tracker.cash_available,
+                    ctx.entries_disabled,
+                )
+                try:
+                    get_paper_db().update_session(
+                        ctx.session_id,
+                        notes=(
+                            f"RISK_BUDGET_UPDATED portfolio_value="
+                            f"{ctx.tracker.initial_capital:.2f} max_positions="
+                            f"{ctx.tracker.max_positions} max_position_pct="
+                            f"{ctx.tracker.max_position_pct:.4f} reason={reason}"
+                        ),
+                    )
+                    get_paper_db().force_sync()
+                except Exception:
+                    logger.debug(
+                        "[%s] Failed to stamp multi risk budget update",
+                        ctx.session_id,
+                        exc_info=True,
+                    )
+
+            elif action == "pause_entries":
+                ctx.entries_disabled = True
+                monitor_symbols = _entry_disabled_symbols(
+                    tracker=ctx.tracker,
+                    active_symbols=ctx.active_symbols,
+                )
+                if monitor_symbols:
+                    ctx.active_symbols = monitor_symbols
+                    if use_websocket and ticker_adapter is not None:
+                        ticker_adapter.update_symbols(ctx.session_id, ctx.active_symbols)
+                logger.warning(
+                    "[%s] Multi entries paused by %s reason=%s open_positions=%d",
+                    ctx.session_id,
+                    requester,
+                    reason,
+                    ctx.tracker.open_count,
+                )
+                try:
+                    get_paper_db().update_session(
+                        ctx.session_id,
+                        notes=f"ENTRIES_PAUSED reason={reason} requester={requester}",
+                    )
+                    get_paper_db().force_sync()
+                except Exception:
+                    logger.debug(
+                        "[%s] Failed to stamp multi pause note",
+                        ctx.session_id,
+                        exc_info=True,
+                    )
+
+            elif action == "resume_entries":
+                ctx.entries_disabled = False
+                ctx.active_symbols = list(ctx.entry_resume_symbols or ctx.active_symbols)
+                if use_websocket and ticker_adapter is not None:
+                    ticker_adapter.update_symbols(ctx.session_id, ctx.active_symbols)
+                logger.warning(
+                    "[%s] Multi entries resumed by %s reason=%s symbols=%d original_universe=%d",
+                    ctx.session_id,
+                    requester,
+                    reason,
+                    len(ctx.active_symbols),
+                    len(ctx.entry_universe_symbols or []),
+                )
+                try:
+                    get_paper_db().update_session(
+                        ctx.session_id,
+                        notes=f"ENTRIES_RESUMED reason={reason} requester={requester}",
+                    )
+                    get_paper_db().force_sync()
+                except Exception:
+                    logger.debug(
+                        "[%s] Failed to stamp multi resume note",
+                        ctx.session_id,
+                        exc_info=True,
+                    )
+
+            elif action == "cancel_pending_intents":
+                cancelled = _cancel_pending_admin_commands(cmd_dir, cmd_file)
+                logger.warning(
+                    "[%s] Multi pending admin intents cancelled by %s reason=%s count=%d",
+                    ctx.session_id,
+                    requester,
+                    reason,
+                    cancelled,
+                )
+                try:
+                    get_paper_db().update_session(
+                        ctx.session_id,
+                        notes=(
+                            f"PENDING_INTENTS_CANCELLED count={cancelled} "
+                            f"reason={reason} requester={requester}"
+                        ),
+                    )
+                    get_paper_db().force_sync()
+                except Exception:
+                    logger.debug(
+                        "[%s] Failed to stamp multi cancel-pending note",
+                        ctx.session_id,
+                        exc_info=True,
+                    )
+
+            else:
+                logger.warning(
+                    "[%s] Unknown multi admin command action %r dropped: %s",
+                    ctx.session_id,
+                    action,
+                    cmd_file.name,
+                )
+
+            command_processed = True
+        except Exception:
+            logger.exception("[%s] Multi admin command failed: %s", ctx.session_id, cmd_file.name)
+        finally:
+            if command_processed:
+                try:
+                    cmd_file.unlink()
+                except OSError:
+                    pass
+        if stop_requested:
+            break
+
+    return stop_requested
 
 
 async def _finalize_live_session(
@@ -855,6 +1478,50 @@ async def run_live_multi_sessions(
         while max_cycles is None or cycles < max_cycles:
             cycles += 1
             now = datetime.now(IST)
+            active_contexts = [ctx for ctx in contexts if ctx.final_status == "ACTIVE"]
+            if not active_contexts:
+                break
+            if _should_use_global_flatten_signal():
+                logger.info("LIVE_MULTI_GLOBAL_FLATTEN sessions=%d", len(active_contexts))
+                for ctx in active_contexts:
+                    live_feed_state = _live_mark_feed_state(
+                        session_id=ctx.session_id,
+                        symbol_last_prices=ctx.symbol_last_prices,
+                        ticker_adapter=ticker_adapter if not local_feed else None,
+                        symbols=list(ctx.tracker._open.keys()) or ctx.active_symbols,
+                    )
+                    await flatten_session_positions(
+                        ctx.session_id,
+                        notes="global_flatten_signal",
+                        feed_state=live_feed_state,
+                        real_order_router=ctx.real_order_router,
+                    )
+                    if _reconcile_live_session(
+                        session_id=ctx.session_id,
+                        reason="global_flatten_signal",
+                        alerts_enabled=True,
+                    ):
+                        ctx.final_status = "FAILED"
+                        ctx.terminal_reason = "reconciliation_failed_after_global_flatten"
+                    else:
+                        ctx.final_status = "COMPLETED"
+                        ctx.terminal_reason = "global_flatten_signal"
+                try:
+                    _GLOBAL_FLATTEN_SIGNAL.unlink(missing_ok=True)
+                except OSError:
+                    logger.debug(
+                        "Failed to delete global flatten signal %s",
+                        _GLOBAL_FLATTEN_SIGNAL,
+                        exc_info=True,
+                    )
+                continue
+            for ctx in active_contexts:
+                await _apply_live_multi_operator_controls(
+                    ctx=ctx,
+                    ticker_adapter=ticker_adapter,
+                    use_websocket=not local_feed,
+                    now=now,
+                )
             active_contexts = [ctx for ctx in contexts if ctx.final_status == "ACTIVE"]
             if not active_contexts:
                 break
@@ -1085,6 +1752,7 @@ async def run_live_session(
 
     runtime_state = PaperRuntimeState(
         allow_live_setup_fallback=allow_live_setup_fallback,
+        allow_or_proxy_setup=real_order_router is None,
         bar_end_offset=timedelta(minutes=5)
         if getattr(ticker_adapter, "_local_feed", False)
         else None,
@@ -1098,6 +1766,27 @@ async def run_live_session(
             regime_index_symbol=str(strategy_params.get("regime_index_symbol") or ""),
             regime_snapshot_minutes=int(strategy_params.get("regime_snapshot_minutes") or 30),
         )
+        if real_order_router is not None and not getattr(ticker_adapter, "_local_feed", False):
+            catchup_symbols = _symbols_needing_true_or(runtime_state, active_symbols)
+            if catchup_symbols:
+                _catch_up_true_or_from_kite(
+                    runtime_state=runtime_state,
+                    symbols=catchup_symbols,
+                    trade_date=trade_date,
+                    or_minutes=candle_interval,
+                    session_id=session_id,
+                )
+                _clear_unresolved_setup_rows(runtime_state, catchup_symbols)
+                _prefetch_setup_rows(
+                    runtime_state=runtime_state,
+                    symbols=catchup_symbols,
+                    trade_date=trade_date,
+                    candle_interval_minutes=candle_interval,
+                    regime_index_symbol=str(strategy_params.get("regime_index_symbol") or ""),
+                    regime_snapshot_minutes=int(
+                        strategy_params.get("regime_snapshot_minutes") or 30
+                    ),
+                )
     direction_readiness = _log_direction_readiness(
         session_id=session_id,
         runtime_state=runtime_state,
@@ -1664,9 +2353,7 @@ async def run_live_session(
                         continue
                     _command_processed = False
                     try:
-                        import json as _json
-
-                        _cmd = _json.loads(_cmd_file.read_text())
+                        _cmd = json.loads(_cmd_file.read_text())
                         _action = _cmd.get("action", "")
                         _reason = _cmd.get("reason", "admin_command")
                         _requester = _cmd.get("requester", "unknown")
@@ -1889,6 +2576,13 @@ async def run_live_session(
                                     session_id,
                                     exc_info=True,
                                 )
+                        else:
+                            logger.warning(
+                                "[%s] Unknown admin command action %r dropped: %s",
+                                session_id,
+                                _action,
+                                _cmd_file.name,
+                            )
                         _command_processed = True
                     except Exception:
                         logger.exception(

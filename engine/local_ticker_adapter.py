@@ -7,12 +7,14 @@ directly from intraday_day_pack data — no synthetic ticks, no builder dependen
 from __future__ import annotations
 
 import logging
+import os
 import threading
+import time
 from datetime import date, datetime, timedelta
 from datetime import time as dt_time
 from typing import Any
 
-from db.duckdb import get_live_market_db
+from db.duckdb import _use_market_read_replica, get_dashboard_db, get_live_market_db
 from engine.cpr_atr_strategy import DayPack
 from engine.live_market_data import IST, ClosedCandle, FiveMinuteCandleBuilder
 
@@ -47,7 +49,7 @@ def _load_day_packs(
     """Load intraday_day_pack for one date, return {symbol: DayPack}."""
     # Use the explicit live market accessor so local live/replay validation is
     # pinned to the market source rather than the dashboard replica contract.
-    db = get_live_market_db()
+    db = get_dashboard_db() if _use_market_read_replica() else get_live_market_db()
     pack_time_mode = (
         "minute_arr" if _has_column(db, "intraday_day_pack", "minute_arr") else "time_arr"
     )
@@ -234,6 +236,9 @@ class LocalTickerAdapter:
 
     def drain_closed(self, session_id: str) -> list[ClosedCandle]:
         """Advance one session by one bar and return that session's candles."""
+        delay_sec = float(os.getenv("PIVOT_LOCAL_FEED_BAR_DELAY_SEC", "0") or "0")
+        if delay_sec > 0:
+            time.sleep(delay_sec)
         with self._lock:
             sym_set = self._session_symbols.get(session_id)
             if not sym_set:

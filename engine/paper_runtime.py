@@ -17,15 +17,11 @@ from engine.alert_dispatcher import AlertDispatcher, AlertType, get_alert_config
 from engine.bar_orchestrator import SessionPositionTracker
 from engine.cpr_atr_shared import (
     CompletedCandleDecision,
-    normalize_stop_loss,
     resolve_completed_candle_trade_step,
     scan_cpr_levels_entry,
     split_scale_out_quantity,
 )
 from engine.cpr_atr_strategy import DayPack
-from engine.cpr_atr_utils import (
-    calculate_position_size,
-)
 from engine.execution_safety import build_order_idempotency_key
 from engine.paper_admin import write_admin_command
 from engine.paper_alerts import (
@@ -51,6 +47,7 @@ from engine.paper_setup_loader import (
     load_setup_row,
     refresh_pending_setup_rows_for_bar,
     runtime_setup_status,
+    setup_row_uses_or_proxy,
 )
 from engine.paper_store import (
     _db,
@@ -119,18 +116,18 @@ def _has_flatten_eod_in_alert_log(session_id: str, *, trade_date: str | None = N
     except Exception:
         return False
     try:
-        pattern = f"%{session_id}%"
+        session_tag = f"Session: <code>{session_id}</code>"
         if trade_date:
             row = con.execute(
                 """
                 SELECT 1
                 FROM alert_log
                 WHERE alert_type='FLATTEN_EOD'
-                  AND (subject LIKE ? OR body LIKE ?)
+                  AND body LIKE ?
                   AND (subject LIKE ? OR body LIKE ?)
                 LIMIT 1
                 """,
-                [pattern, pattern, f"%{trade_date}%", f"%{trade_date}%"],
+                [f"%{session_tag}%", f"%{trade_date}%", f"%{trade_date}%"],
             ).fetchone()
         else:
             row = con.execute(
@@ -138,10 +135,10 @@ def _has_flatten_eod_in_alert_log(session_id: str, *, trade_date: str | None = N
                 SELECT 1
                 FROM alert_log
                 WHERE alert_type='FLATTEN_EOD'
-                  AND (subject LIKE ? OR body LIKE ?)
+                  AND body LIKE ?
                 LIMIT 1
                 """,
-                [pattern, pattern],
+                [f"%{session_tag}%"],
             ).fetchone()
         if not row:
             return False
@@ -944,69 +941,6 @@ async def enforce_session_risk_controls(
     }
 
 
-def _entry_candidate(
-    *,
-    direction: str,
-    candle: dict[str, Any],
-    sl_price: float,
-    target_price: float,
-    first_target_price: float | None = None,
-    scale_out_pct: float = 0.0,
-    atr: float,
-    params: BacktestParams,
-    entry_price: float | None = None,
-    capital_base: float | None = None,
-) -> dict[str, Any] | None:
-    # Use caller-supplied fill price (e.g. stop-order simulation) or fall back to close.
-    fill_price = entry_price if entry_price is not None else float(candle["close"])
-    target_for_rr = float(first_target_price or target_price)
-    normalized = normalize_stop_loss(
-        entry_price=fill_price,
-        sl_price=sl_price,
-        direction=direction,
-        atr=atr,
-        min_sl_atr_ratio=params.min_sl_atr_ratio,
-        max_sl_atr_ratio=params.max_sl_atr_ratio,
-    )
-    if normalized is None:
-        return None
-    sl_price, sl_distance = normalized
-    if direction == "LONG" and target_for_rr <= fill_price:
-        return None
-    if direction == "SHORT" and target_for_rr >= fill_price:
-        return None
-
-    capital_for_sizing = (
-        float(capital_base) if capital_base is not None else float(params.portfolio_value or 0.0)
-    )
-    risk_capital = (
-        float(capital_base)
-        if capital_base is not None and bool(params.risk_based_sizing)
-        else float(params.capital or 0.0)
-    )
-    position_size = calculate_position_size(risk_capital, params.risk_pct, sl_distance)
-    if not params.risk_based_sizing:
-        notional_cap = max(
-            1,
-            int((capital_for_sizing * params.max_position_pct) / max(1.0, fill_price)),
-        )
-        position_size = max(1, min(position_size, notional_cap))
-    rr_ratio = abs(target_for_rr - fill_price) / sl_distance if sl_distance > 0 else params.rr_ratio
-    return {
-        "direction": direction,
-        "entry_price": fill_price,
-        "entry_time": candle["time_str"],
-        "event_time": candle.get("bar_end"),
-        "sl_price": float(sl_price),
-        "target_price": float(target_price),
-        "first_target_price": float(first_target_price or target_price),
-        "scale_out_pct": float(scale_out_pct),
-        "sl_distance": float(sl_distance),
-        "position_size": int(position_size),
-        "rr_ratio": float(rr_ratio),
-    }
-
-
 async def _open_position_from_candidate(
     *,
     session: PaperSession,
@@ -1230,7 +1164,26 @@ async def _advance_open_position(
         }
 
     if decision.action == "PARTIAL" and real_order_router is not None and real_order_router.enabled:
-        raise RuntimeError("automated real-order routing does not support partial scale-out exits")
+        next_trail_state = _updated_trail_state(ts, trail_state, candle)
+        next_trail_state["candle_count"] = candle_count
+        logger.warning(
+            "Real-order partial scale-out not supported for %s in session %s; deferring to full close",
+            position.symbol,
+            position.session_id,
+        )
+        await update_position(
+            position.position_id,
+            stop_loss=float(ts.current_sl),
+            trail_state=next_trail_state,
+            current_qty=current_qty,
+            last_price=float(candle["close"]),
+        )
+        return {
+            "action": "HOLD",
+            "position_id": position.position_id,
+            "mark": float(candle["close"]),
+            "next_trail_state": next_trail_state,
+        }
 
     real_exit_meta: dict[str, Any] = {}
     if decision.action == "CLOSE" and real_order_router is not None and real_order_router.enabled:
@@ -1282,6 +1235,9 @@ async def _advance_open_position(
             last_price=float(candle["close"]),
             realized_pnl=realized,
         )
+        position.current_qty = remaining_qty
+        position.realized_pnl = realized
+        await _accumulate_session_pnl(position.session_id, realized - realized_so_far)
         logger.info(
             "Paper trade partial session_id=%s symbol=%s direction=%s first_exit=%.2f runner_exit=%.2f pnl=%.2f bars=%d",
             position.session_id,
@@ -1305,6 +1261,7 @@ async def _advance_open_position(
                 float(decision.fills[0][1]),
             ),
             "remaining_qty": remaining_qty,
+            "realized_pnl": realized,
             "next_trail_state": next_trail_state,
         }
 
@@ -1329,7 +1286,7 @@ async def _advance_open_position(
         closed_at=candle.get("bar_end") if isinstance(candle, dict) else None,
     )
     # Update session total_pnl so the dashboard shows live PnL during trading.
-    await _accumulate_session_pnl(position.session_id, realized)
+    await _accumulate_session_pnl(position.session_id, realized - realized_so_far)
     logger.info(
         "Paper trade close session_id=%s symbol=%s direction=%s time=%s reason=%s exit=%.2f pnl=%.2f bars=%d",
         position.session_id,
@@ -1404,7 +1361,8 @@ async def evaluate_candle(
             regime_snapshot_minutes=int(getattr(params, "regime_snapshot_minutes", 30) or 30),
         )
         if setup_row is not None:
-            state.setup_row = setup_row
+            if runtime_state.allow_or_proxy_setup or not setup_row_uses_or_proxy(setup_row):
+                state.setup_row = setup_row
         state.setup_refresh_bar_end = candle.bar_end
     setup_status = _live_setup_status(state.setup_row)
     if state.setup_row is None:
@@ -1630,6 +1588,7 @@ async def process_closed_candle(
                 str(candle.symbol),
                 float(advance.get("exit_value") or 0.0),
                 float(advance.get("remaining_qty") or 0.0),
+                float(advance["realized_pnl"]) if advance.get("realized_pnl") is not None else None,
             )
         return {
             "symbol": candle.symbol,

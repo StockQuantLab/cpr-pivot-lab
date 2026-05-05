@@ -1117,6 +1117,10 @@ def get_dashboard_db() -> MarketDB:
     return _dashboard_db
 
 
+def _use_market_read_replica() -> bool:
+    return str(os.getenv("PIVOT_MARKET_READ_REPLICA", "")).strip() == "1"
+
+
 def get_live_market_db() -> MarketDB:
     """Return a read-only MarketDB instance pinned to the source market DB.
 
@@ -1125,6 +1129,8 @@ def get_live_market_db() -> MarketDB:
     keeping the connection read-only.
     """
     global _live_market_db, _live_market_atexit_registered
+    if _use_market_read_replica():
+        return get_dashboard_db()
     if _db is not None:
         logger.info("Live market DB reusing existing source connection source=%s", _db.db_path)
         return _db

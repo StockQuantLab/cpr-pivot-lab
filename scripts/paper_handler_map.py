@@ -20,7 +20,9 @@ PAPER_TRADING_HANDLER_NAMES: tuple[str, ...] = (
     "_cmd_reconcile",
     "_cmd_broker_reconcile",
     "_cmd_broker_sync_orders",
+    "_cmd_broker_cancel_order",
     "_cmd_pilot_check",
+    "_cmd_real_readiness",
     "_cmd_real_pilot_plan",
     "_cmd_order",
     "_cmd_real_dry_run_order",
@@ -35,6 +37,7 @@ PAPER_TRADING_HANDLER_NAMES: tuple[str, ...] = (
     "_cmd_daily_replay",
     "_cmd_daily_sim",
     "_cmd_daily_live",
+    "_cmd_operator_drill",
 )
 
 

@@ -555,8 +555,8 @@ Single-date parity check for 2026-04-09 CPR_LEVELS_RISK_SHORT:
 Sub-rupee PnL deltas (BELLACASA ₹0.07, TRF ₹0.03) are from floating-point
 rounding in the cost model calculation paths — acceptable.
 
-Full baseline reruns are complete. The current daily-reset set is treated as the
-frozen reference; compound-risk remains under review.
+Full baseline reruns are complete. The current May 4 all-8 CPR family in
+`docs/PAPER_TRADING_RUNBOOK.md` is treated as the frozen reference.
 
 ### Step 7 (old): detailed validation specs (superseded by DONE above)
 
@@ -689,8 +689,8 @@ After all parity work is verified:
    (non-compound, daily-reset): same symbols, same entry times, same exit times,
    same prices, same quantities, same exit_reason, same gross_pnl, same total_costs,
    same profit_loss. DHARMAJ-type gaps must be resolved. (DONE — verified 2026-04-09)
-6. Daily-reset baseline reruns are frozen and documented; compound-risk rows are
-   still under review for exact old-vs-new reconciliation.
+6. Daily-reset and compound baseline reruns are frozen and documented in the
+   current all-8 CPR family.
 7. Terminal operations (flatten, archive) are idempotent across all modes.
 8. Adapter edge cases have explicit test coverage.
 9. Parity tests cover the CPR_LEVELS batch path (not just the old per-symbol path).

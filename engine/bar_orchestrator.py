@@ -195,7 +195,13 @@ class SessionPositionTracker:
         self._open[symbol] = tracked
         self.cash_available -= max(0.0, float(position_value or 0.0))
 
-    def record_partial(self, symbol: str, exit_value: float, remaining_qty: float) -> None:
+    def record_partial(
+        self,
+        symbol: str,
+        exit_value: float,
+        remaining_qty: float,
+        realized_pnl: float | None = None,
+    ) -> None:
         normalized = str(symbol)
         tracked = self._open.get(normalized)
         if tracked is None:
@@ -203,6 +209,8 @@ class SessionPositionTracker:
         tracked.current_qty = max(0.0, float(remaining_qty or 0.0))
         if tracked.raw_position is not None:
             tracked.raw_position.current_qty = tracked.current_qty
+            if realized_pnl is not None:
+                tracked.raw_position.realized_pnl = float(realized_pnl)
         self.cash_available += max(0.0, float(exit_value or 0.0))
 
     def update_trail_state(self, symbol: str, trail_state: dict[str, Any]) -> None:

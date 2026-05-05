@@ -31,6 +31,19 @@ class _FakeLiveAdapter:
         )
 
 
+def test_real_order_runtime_config_rejects_explicit_zero_cash_budget() -> None:
+    with pytest.raises(OrderSafetyError, match="cash budget must be positive"):
+        RealOrderRuntimeConfig.from_mapping(
+            {
+                "enabled": True,
+                "fixed_quantity": 1,
+                "max_positions": 1,
+                "cash_budget": 0,
+                "require_account_cash_check": False,
+            }
+        )
+
+
 @pytest.mark.asyncio
 async def test_real_order_router_places_fixed_quantity_market_entry(
     tmp_path, monkeypatch: pytest.MonkeyPatch
@@ -69,6 +82,45 @@ async def test_real_order_router_places_fixed_quantity_market_entry(
         payload = json.loads(str(orders[0].broker_payload))
         assert payload["tradingsymbol"] == "SBIN"
         assert payload["order_type"] == "MARKET"
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_real_order_router_can_size_entry_from_cash_budget(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = PaperDB(db_path=tmp_path / "paper.duckdb")
+    adapter = _FakeLiveAdapter()
+    monkeypatch.setattr("engine.real_order_runtime.get_paper_db", lambda: db)
+    try:
+        router = RealOrderRouter(
+            RealOrderRuntimeConfig(
+                enabled=True,
+                sizing_mode="CASH_BUDGET",
+                fixed_quantity=1,
+                max_positions=1,
+                cash_budget=10_000.0,
+                entry_order_type="LIMIT",
+                entry_max_slippage_pct=0.5,
+            ),
+            adapter=adapter,
+            account_available_cash=20_000.0,
+        )
+
+        meta = await router.place_entry(
+            session_id="paper-live-1",
+            symbol="ITC",
+            direction="LONG",
+            reference_price=311.5,
+            event_time="2026-05-06T09:20:00+05:30",
+        )
+
+        # LIMIT sizing uses the protected marketable limit price, not raw LTP.
+        assert meta["real_order_qty"] == 31
+        assert meta["real_sizing_mode"] == "CASH_BUDGET"
+        assert adapter.intents[0].quantity == 31
+        assert adapter.intents[0].price == pytest.approx(313.06)
     finally:
         db.close()
 
@@ -192,6 +244,21 @@ def test_real_order_router_rejects_budget_above_account_cash() -> None:
             ),
             adapter=_FakeLiveAdapter(),
             account_available_cash=100_000.0,
+        )
+
+
+def test_real_order_router_rejects_missing_required_account_cash() -> None:
+    with pytest.raises(OrderSafetyError, match="available_cash could not be fetched"):
+        RealOrderRouter(
+            RealOrderRuntimeConfig(
+                enabled=True,
+                fixed_quantity=1,
+                max_positions=1,
+                cash_budget=10_000.0,
+                require_account_cash_check=True,
+            ),
+            adapter=_FakeLiveAdapter(),
+            account_available_cash=None,
         )
 
 

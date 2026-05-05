@@ -39,6 +39,7 @@ class PaperRuntimeState:
     session_params_key: str | None = None
     session_params: BacktestParams | None = None
     allow_live_setup_fallback: bool = True
+    allow_or_proxy_setup: bool = True
     bar_end_offset: timedelta | None = None
     skipped_setup_rows: int = 0
     invalid_setup_rows: int = 0

@@ -24,6 +24,7 @@ from engine.broker_adapter import (
 @dataclass(frozen=True, slots=True)
 class RealOrderRuntimeConfig:
     enabled: bool = False
+    sizing_mode: str = "FIXED_QTY"
     fixed_quantity: int = 1
     max_positions: int = 1
     cash_budget: float = 10_000.0
@@ -39,16 +40,22 @@ class RealOrderRuntimeConfig:
     @classmethod
     def from_mapping(cls, raw: dict[str, Any] | None) -> RealOrderRuntimeConfig:
         data = dict(raw or {})
+        fixed_quantity = data.get("fixed_quantity", 1)
+        max_positions = data.get("max_positions", 1)
+        cash_budget = data.get("cash_budget", 10_000.0)
+        entry_slippage = data.get("entry_max_slippage_pct", 0.5)
+        exit_slippage = data.get("exit_max_slippage_pct", DEFAULT_EXIT_MAX_SLIPPAGE_PCT)
         return cls(
             enabled=bool(data.get("enabled", False)),
-            fixed_quantity=int(data.get("fixed_quantity") or 1),
-            max_positions=int(data.get("max_positions") or 1),
-            cash_budget=float(data.get("cash_budget") or 10_000.0),
+            sizing_mode=str(data.get("sizing_mode") or "FIXED_QTY").upper(),
+            fixed_quantity=int(fixed_quantity if fixed_quantity is not None else 1),
+            max_positions=int(max_positions if max_positions is not None else 1),
+            cash_budget=float(cash_budget if cash_budget is not None else 10_000.0),
             require_account_cash_check=bool(data.get("require_account_cash_check", True)),
             entry_order_type=str(data.get("entry_order_type") or "LIMIT").upper(),
-            entry_max_slippage_pct=float(data.get("entry_max_slippage_pct") or 0.5),
+            entry_max_slippage_pct=float(entry_slippage if entry_slippage is not None else 0.5),
             exit_max_slippage_pct=float(
-                data.get("exit_max_slippage_pct") or DEFAULT_EXIT_MAX_SLIPPAGE_PCT
+                exit_slippage if exit_slippage is not None else DEFAULT_EXIT_MAX_SLIPPAGE_PCT
             ),
             product=str(data.get("product") or "MIS").upper(),
             exchange=str(data.get("exchange") or "NSE").upper(),
@@ -57,6 +64,8 @@ class RealOrderRuntimeConfig:
         ).validate()
 
     def validate(self) -> RealOrderRuntimeConfig:
+        if self.sizing_mode not in {"FIXED_QTY", "CASH_BUDGET"}:
+            raise OrderSafetyError("real-order sizing mode must be FIXED_QTY or CASH_BUDGET")
         if self.fixed_quantity <= 0:
             raise OrderSafetyError("real-order fixed quantity must be positive")
         if self.max_positions <= 0:
@@ -81,9 +90,9 @@ class RealOrderRuntimeConfig:
 class RealOrderRouter:
     """Places guarded real broker orders for live-session paper events.
 
-    The router uses a fixed real quantity independent of paper sizing. This lets
-    paper strategy math continue unchanged while the real-money pilot starts at
-    one share and scales only after the Doppler caps and CLI quantity are raised.
+    The router keeps broker sizing independent of paper sizing. This lets paper
+    strategy math continue unchanged while the real-money pilot starts small and
+    only scales after the Doppler caps and CLI sizing mode are raised.
     """
 
     def __init__(
@@ -98,16 +107,16 @@ class RealOrderRouter:
         self._open_real_positions = 0
         self._used_cash_notional = 0.0
         self._open_notional_by_symbol: dict[str, float] = {}
-        if (
-            config.enabled
-            and config.require_account_cash_check
-            and account_available_cash is not None
-            and config.cash_budget > float(account_available_cash)
-        ):
-            raise OrderSafetyError(
-                f"real-order cash budget {config.cash_budget:.2f} exceeds available cash "
-                f"{float(account_available_cash):.2f}"
-            )
+        if config.enabled and config.require_account_cash_check and config.adapter_mode == "LIVE":
+            if account_available_cash is None:
+                raise OrderSafetyError(
+                    "real-order cash check required but available_cash could not be fetched"
+                )
+            if config.cash_budget > float(account_available_cash):
+                raise OrderSafetyError(
+                    f"real-order cash budget {config.cash_budget:.2f} exceeds available cash "
+                    f"{float(account_available_cash):.2f}"
+                )
 
     @property
     def enabled(self) -> bool:
@@ -166,17 +175,19 @@ class RealOrderRouter:
             role="entry",
             mode=str(result.get("mode") or self.adapter.mode),
             event_lag_ms=event_lag_ms,
+            quote_age_sec=0.0,
             intent_latency_ms=intent_latency_ms,
             broker_latency_ms=result.get("broker_latency_ms"),
             total_latency_ms=total_latency_ms,
         )
         return {
-            "real_order_qty": self.config.fixed_quantity,
+            "real_order_qty": intent.quantity,
             "real_entry_order_id": result.get("exchange_order_id"),
             "real_entry_order_type": intent.order_type,
             "real_entry_side": side,
             "real_entry_payload": result.get("payload"),
-            "real_remaining_qty": self.config.fixed_quantity,
+            "real_remaining_qty": intent.quantity,
+            "real_sizing_mode": self.config.sizing_mode,
             "real_entry_mode": result.get("mode") or self.adapter.mode,
             "real_entry_intent_latency_ms": round(intent_latency_ms, 3),
             "real_entry_broker_latency_ms": result.get("broker_latency_ms"),
@@ -232,6 +243,7 @@ class RealOrderRouter:
             role=role,
             mode=str(result.get("mode") or self.adapter.mode),
             event_lag_ms=event_lag_ms,
+            quote_age_sec=float(quote_age_sec),
             intent_latency_ms=intent_latency_ms,
             broker_latency_ms=result.get("broker_latency_ms"),
             total_latency_ms=total_latency_ms,
@@ -246,6 +258,7 @@ class RealOrderRouter:
             "real_exit_broker_latency_ms": result.get("broker_latency_ms"),
             "real_exit_total_latency_ms": round(total_latency_ms, 3),
             "real_exit_event_lag_ms": event_lag_ms,
+            "real_exit_quote_age_sec": round(float(quote_age_sec), 3),
         }
 
     def exit_quantity_for_position(self, position: Any) -> int:
@@ -276,11 +289,12 @@ class RealOrderRouter:
                 reference_price=reference_price,
                 max_slippage_pct=self.config.entry_max_slippage_pct,
             )
+        quantity = self._entry_quantity(reference_price=reference_price, price=price)
         return BrokerOrderIntent(
             session_id=session_id,
             symbol=symbol,
             side=side,
-            quantity=self.config.fixed_quantity,
+            quantity=quantity,
             role="entry",
             order_type=order_type,
             price=price,
@@ -292,6 +306,21 @@ class RealOrderRouter:
             exchange=self.config.exchange,
             event_time=event_time,
         )
+
+    def _entry_quantity(self, *, reference_price: float, price: float | None) -> int:
+        if self.config.sizing_mode == "FIXED_QTY":
+            return self.config.fixed_quantity
+        sizing_price = float(price if price is not None else reference_price)
+        if not math.isfinite(sizing_price) or sizing_price <= 0:
+            raise OrderSafetyError("cash-budget sizing requires a positive entry price")
+        remaining_budget = max(0.0, self.config.cash_budget - self._used_cash_notional)
+        quantity = math.floor(remaining_budget / sizing_price)
+        if quantity <= 0:
+            raise OrderSafetyError(
+                f"real-order cash budget {self.config.cash_budget:.2f} cannot buy one share "
+                f"at entry price {sizing_price:.2f}"
+            )
+        return int(quantity)
 
 
 def build_real_order_router(
@@ -399,6 +428,7 @@ def _log_order_latency(
     role: str,
     mode: str,
     event_lag_ms: float | None,
+    quote_age_sec: float | None,
     intent_latency_ms: float,
     broker_latency_ms: Any,
     total_latency_ms: float,
@@ -407,12 +437,13 @@ def _log_order_latency(
 
     logging.getLogger(__name__).info(
         "ORDER_LATENCY session_id=%s symbol=%s role=%s mode=%s "
-        "event_lag_ms=%s intent_ms=%.3f broker_ms=%s total_ms=%.3f",
+        "event_lag_ms=%s quote_age_sec=%s intent_ms=%.3f broker_ms=%s total_ms=%.3f",
         session_id,
         symbol.upper(),
         role,
         mode,
         "n/a" if event_lag_ms is None else f"{event_lag_ms:.3f}",
+        "n/a" if quote_age_sec is None else f"{float(quote_age_sec):.3f}",
         intent_latency_ms,
         "n/a" if broker_latency_ms is None else f"{float(broker_latency_ms):.3f}",
         total_latency_ms,

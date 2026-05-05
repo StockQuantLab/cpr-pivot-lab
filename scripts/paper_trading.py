@@ -7,9 +7,13 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
+import subprocess
+import sys
 import time
 from dataclasses import asdict
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
@@ -38,6 +42,7 @@ from engine.paper_runtime import (
 from scripts import data_quality as _data_quality
 from scripts.paper_archive import archive_completed_session
 from scripts.paper_broker_cli import (
+    _cmd_broker_cancel_order,
     _cmd_broker_reconcile,
     _cmd_broker_sync_orders,
     _cmd_close_position,
@@ -46,6 +51,7 @@ from scripts.paper_broker_cli import (
     _cmd_real_dry_run_order,
     _cmd_real_order,
     _cmd_real_pilot_plan,
+    _cmd_real_readiness,
     _load_json_list_arg,
 )
 from scripts.paper_cli_helpers import (
@@ -100,6 +106,7 @@ from scripts.paper_strategy_params import (
     PAPER_ALLOWED_STRATEGIES,
     PAPER_STANDARD_MATRIX,
     _assert_cpr_only_strategy,
+    _collect_strategy_cli_overrides,
     _paper_default_strategy,
     _parse_json,
     _prepare_paper_multi_strategy_params,
@@ -127,9 +134,11 @@ __all__ = [
 _BROKER_HANDLER_EXPORTS = (
     _cmd_broker_reconcile,
     _cmd_broker_sync_orders,
+    _cmd_broker_cancel_order,
     _cmd_close_position,
     _cmd_order,
     _cmd_pilot_check,
+    _cmd_real_readiness,
     _cmd_real_dry_run_order,
     _cmd_real_order,
     _cmd_real_pilot_plan,
@@ -404,6 +413,46 @@ def _select_paper_multi_variants(
             f"direction={requested_direction or 'BOTH'}."
         )
     return variants
+
+
+def _paper_session_id_prefix() -> str:
+    return str(os.getenv("PIVOT_PAPER_SESSION_ID_PREFIX", "") or "").strip()
+
+
+def _deep_merge_strategy_overrides(
+    base: dict[str, Any],
+    overrides: dict[str, Any],
+) -> dict[str, Any]:
+    merged = dict(base)
+    for key, value in overrides.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge_strategy_overrides(dict(merged[key]), value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _apply_multi_cli_strategy_overrides(
+    strategy: str,
+    strategy_params: dict[str, Any],
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    """Apply explicit multi-run overrides after canonical preset validation."""
+    overrides = _collect_strategy_cli_overrides(args, has_preset=True)
+    if not overrides:
+        return strategy_params
+    base = {
+        key: value
+        for key, value in strategy_params.items()
+        if key
+        not in {
+            "_canonical_preset",
+            "_strategy_config_fingerprint",
+            "_resolved_strategy_config",
+        }
+    }
+    merged = _deep_merge_strategy_overrides(base, overrides)
+    return _with_resolved_strategy_metadata(strategy, normalize_strategy_params(merged))
 
 
 def _enforce_live_readiness_gate(
@@ -1401,6 +1450,7 @@ async def _cmd_daily_live_multi(args: argparse.Namespace) -> None:
     variant_setup: list[tuple[str, str, dict[str, Any], list[str]]] = []
     for label, strategy, base_params in raw_variants:
         normalized_params = _prepare_paper_multi_strategy_params(label, strategy, base_params)
+        normalized_params = _apply_multi_cli_strategy_overrides(strategy, normalized_params, args)
         filtered = pre_filter_symbols_for_strategy(
             trade_date,
             all_symbols,
@@ -1419,7 +1469,10 @@ async def _cmd_daily_live_multi(args: argparse.Namespace) -> None:
         for label, strategy, normalized_params, filtered in variant_setup:
             if not filtered:
                 continue
-            session_id = f"{label}-{trade_date}{_workflow_session_suffix('live', feed_source)}"
+            session_id = (
+                f"{_paper_session_id_prefix()}{label}-{trade_date}"
+                f"{_workflow_session_suffix('live', feed_source)}"
+            )
             existing = await get_session(session_id)
             if existing is None:
                 direction = str(normalized_params.get("direction_filter", "BOTH") or "BOTH").upper()
@@ -1470,7 +1523,10 @@ async def _cmd_daily_live_multi(args: argparse.Namespace) -> None:
     skipped_payloads: list[dict[str, Any]] = []
     spec_labels: list[str] = []
     for label, strategy, normalized_params, filtered in variant_setup:
-        session_id = f"{label}-{trade_date}{_workflow_session_suffix('live', feed_source)}"
+        session_id = (
+            f"{_paper_session_id_prefix()}{label}-{trade_date}"
+            f"{_workflow_session_suffix('live', feed_source)}"
+        )
 
         if not filtered:
             skipped_payloads.append(
@@ -1553,6 +1609,105 @@ async def _cmd_daily_live_multi(args: argparse.Namespace) -> None:
         shared_ticker.close()
         if suppress_alerts:
             set_alerts_suppressed(False)
+
+
+async def _cmd_operator_drill(args: argparse.Namespace) -> None:
+    """Launch an isolated Kite WebSocket multi-live drill in a child process."""
+    if bool(getattr(args, "real_orders", False)) or bool(
+        getattr(args, "simulate_real_orders", False)
+    ):
+        raise SystemExit("operator-drill is paper-only; real/simulated real orders are disabled.")
+
+    trade_date = resolve_trade_date(args.trade_date)
+    run_id = str(getattr(args, "run_id", "") or "").strip() or (
+        f"operator-drill-{trade_date}-{datetime.now(IST).strftime('%H%M%S')}"
+    )
+    drill_root = Path(".tmp_logs") / "operator_drills" / run_id
+    drill_root.mkdir(parents=True, exist_ok=True)
+    paper_db_path = (drill_root / "paper.duckdb").resolve()
+    replica_dir = (drill_root / "paper_replica").resolve()
+    log_path = drill_root / "daily_live_multi.log"
+    stdout_path = drill_root / "daily_live_multi.stdout.json"
+
+    cmd = [
+        sys.executable,
+        "-m",
+        "scripts.paper_trading",
+        "daily-live",
+        "--multi",
+        "--strategy",
+        args.strategy,
+        "--trade-date",
+        trade_date,
+        "--feed-source",
+        "kite",
+        "--skip-coverage",
+        "--no-alerts",
+        "--poll-interval-sec",
+        str(args.poll_interval_sec),
+        "--candle-interval-minutes",
+        str(args.candle_interval_minutes),
+        "--max-cycles",
+        str(args.max_cycles),
+        "--notes",
+        f"OPERATOR_DRILL run_id={run_id}",
+    ]
+    for option, value in (
+        ("--or-minutes", getattr(args, "or_minutes", None)),
+        ("--entry-window-end", getattr(args, "entry_window_end", None)),
+        ("--time-exit", getattr(args, "time_exit", None)),
+        ("--cpr-entry-start", getattr(args, "cpr_entry_start", None)),
+    ):
+        if value is not None:
+            cmd.extend([option, str(value)])
+    if getattr(args, "symbols", None):
+        cmd.extend(["--symbols", args.symbols])
+    elif getattr(args, "universe_name", None):
+        cmd.extend(["--universe-name", args.universe_name])
+    else:
+        cmd.extend(["--symbols", "SBIN,RELIANCE"])
+
+    env = {
+        **os.environ,
+        "PIVOT_PAPER_DB_PATH": str(paper_db_path),
+        "PIVOT_PAPER_REPLICA_DIR": str(replica_dir),
+        "PIVOT_MARKET_READ_REPLICA": "1",
+        "PIVOT_PAPER_SESSION_ID_PREFIX": f"DRILL-{run_id}-",
+        "PYTHONUNBUFFERED": "1",
+    }
+    started_at = datetime.now(IST)
+    with log_path.open("w", encoding="utf-8") as log_file:
+        proc = subprocess.run(
+            cmd,
+            cwd=Path.cwd(),
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=log_file,
+            check=False,
+        )
+    stdout_path.write_text(proc.stdout, encoding="utf-8")
+    payload = {
+        "ok": proc.returncode == 0,
+        "returncode": proc.returncode,
+        "run_id": run_id,
+        "trade_date": trade_date,
+        "started_at": started_at.isoformat(),
+        "finished_at": datetime.now(IST).isoformat(),
+        "paper_db": str(paper_db_path),
+        "replica_dir": str(replica_dir),
+        "log": str(log_path),
+        "stdout": str(stdout_path),
+        "child_command": cmd,
+        "notes": (
+            "Isolated drill: same daily-live --multi Kite WebSocket code path, "
+            "temporary paper DB, namespaced session IDs, alerts disabled, "
+            "real orders disabled."
+        ),
+    }
+    print(json.dumps(payload, default=str, indent=2))
+    if proc.returncode != 0:
+        raise SystemExit(proc.returncode)
 
 
 async def _cmd_daily_replay_multi(args: argparse.Namespace) -> None:
@@ -2273,7 +2428,12 @@ def main() -> None:
     # Startup: cancel any stale sessions left from a previous crash. Skip commands
     # that are intentionally file-only or broker-read-only so they work while a
     # live paper session holds paper.duckdb.
-    startup_cleanup_skip_commands = {"send-command", "pilot-check", "real-pilot-plan"}
+    startup_cleanup_skip_commands = {
+        "send-command",
+        "pilot-check",
+        "real-pilot-plan",
+        "operator-drill",
+    }
     if getattr(args, "command", "") not in startup_cleanup_skip_commands:
         stale = _pdb().cleanup_stale_sessions()
         if stale:

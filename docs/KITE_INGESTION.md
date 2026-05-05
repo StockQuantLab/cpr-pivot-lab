@@ -324,8 +324,10 @@ doppler run -- uv run pivot-refresh \
 
 The final command must return `Ready YES`. Do not hand-run the individual steps unless you are
 debugging a failed stage.
-When redirected to a file, `pivot-refresh --eod-ingest` streams child command output directly, so
-the log should show Kite ingestion progress instead of staying silent until a stage exits.
+When redirected to a file, launch `pivot-refresh --eod-ingest` with `PYTHONUNBUFFERED=1`; otherwise
+Python stdout can block-buffer child output and make progress appear in large delayed bursts.
+The command streams child output directly, so an unbuffered log should show Kite ingestion progress
+instead of staying silent until a stage exits.
 The command is rerun-safe by default: daily and 5-minute ingestion pass `--skip-existing`, so
 already-covered parquet symbols are logged as skipped instead of fetched again. Use
 `--force-ingest` only when you intentionally want to refetch existing candles.

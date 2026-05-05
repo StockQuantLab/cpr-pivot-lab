@@ -283,3 +283,220 @@ async def test_cmd_flatten_both_queues_long_and_short(tmp_path, monkeypatch, cap
         payload = json.loads(Path(command["command_file"]).read_text())
         assert payload["action"] == "close_all"
         assert payload["reason"] == "risk_off"
+
+
+class _FakeMultiTracker:
+    def __init__(self) -> None:
+        self._open: dict[str, object] = {}
+        self.open_count = 0
+        self.initial_capital = 200_000.0
+        self.max_positions = 5
+        self.max_position_pct = 0.2
+        self.cash_available = 200_000.0
+
+    def update_budget(
+        self,
+        *,
+        portfolio_value: float | None = None,
+        max_positions: int | None = None,
+        max_position_pct: float | None = None,
+    ) -> None:
+        if portfolio_value is not None:
+            self.initial_capital = portfolio_value
+        if max_positions is not None:
+            self.max_positions = max_positions
+        if max_position_pct is not None:
+            self.max_position_pct = max_position_pct
+
+    def current_open_notional(self) -> float:
+        return 0.0
+
+
+class _FakeMultiPaperDb:
+    def __init__(self) -> None:
+        self.notes: list[str] = []
+        self.syncs = 0
+
+    def update_session(self, session_id: str, **kwargs):
+        assert session_id == "sess-multi"
+        self.notes.append(str(kwargs.get("notes") or ""))
+        return None
+
+    def force_sync(self) -> None:
+        self.syncs += 1
+
+
+class _FakeTicker:
+    def __init__(self) -> None:
+        self.updates: list[tuple[str, list[str]]] = []
+
+    def update_symbols(self, session_id: str, symbols: list[str]) -> None:
+        self.updates.append((session_id, list(symbols)))
+
+
+def _multi_ctx() -> SimpleNamespace:
+    return SimpleNamespace(
+        session_id="sess-multi",
+        active_symbols=["SBIN", "RELIANCE"],
+        entry_resume_symbols=["SBIN", "RELIANCE"],
+        entry_universe_symbols=["SBIN", "RELIANCE"],
+        entries_disabled=False,
+        tracker=_FakeMultiTracker(),
+        symbol_last_prices={"SBIN": 100.0},
+        real_order_router=None,
+        final_status="ACTIVE",
+        terminal_reason=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_live_multi_operator_controls_pause_resume_and_set_budget(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    import scripts.paper_live as paper_live
+
+    monkeypatch.chdir(tmp_path)
+    fake_db = _FakeMultiPaperDb()
+    monkeypatch.setattr(paper_live, "get_paper_db", lambda: fake_db)
+    ctx = _multi_ctx()
+    ticker = _FakeTicker()
+    cmd_dir = tmp_path / ".tmp_logs" / "cmd_sess-multi"
+    cmd_dir.mkdir(parents=True)
+
+    (cmd_dir / "001_pause.json").write_text(
+        json.dumps({"action": "pause_entries", "reason": "risk_off", "requester": "test"})
+    )
+    stopped = await paper_live._apply_live_multi_operator_controls(
+        ctx=ctx,
+        ticker_adapter=ticker,
+        use_websocket=True,
+        now=paper_live.datetime.now(paper_live.IST),
+    )
+    assert stopped is False
+    assert ctx.entries_disabled is True
+    assert not (cmd_dir / "001_pause.json").exists()
+    assert fake_db.notes[-1] == "ENTRIES_PAUSED reason=risk_off requester=test"
+
+    (cmd_dir / "002_budget.json").write_text(
+        json.dumps(
+            {
+                "action": "set_risk_budget",
+                "reason": "pilot_reduce",
+                "requester": "test",
+                "portfolio_value": 100_000,
+                "max_positions": 1,
+                "max_position_pct": 0.1,
+            }
+        )
+    )
+    stopped = await paper_live._apply_live_multi_operator_controls(
+        ctx=ctx,
+        ticker_adapter=ticker,
+        use_websocket=True,
+        now=paper_live.datetime.now(paper_live.IST),
+    )
+    assert stopped is False
+    assert ctx.tracker.initial_capital == 100_000
+    assert ctx.tracker.max_positions == 1
+    assert ctx.tracker.max_position_pct == 0.1
+
+    (cmd_dir / "003_resume.json").write_text(
+        json.dumps({"action": "resume_entries", "reason": "risk_on", "requester": "test"})
+    )
+    stopped = await paper_live._apply_live_multi_operator_controls(
+        ctx=ctx,
+        ticker_adapter=ticker,
+        use_websocket=True,
+        now=paper_live.datetime.now(paper_live.IST),
+    )
+    assert stopped is False
+    assert ctx.entries_disabled is False
+    assert ticker.updates[-1] == ("sess-multi", ["SBIN", "RELIANCE"])
+    assert fake_db.notes[-1] == "ENTRIES_RESUMED reason=risk_on requester=test"
+
+
+@pytest.mark.asyncio
+async def test_live_multi_operator_controls_cancel_pending(tmp_path, monkeypatch) -> None:
+    import scripts.paper_live as paper_live
+
+    monkeypatch.chdir(tmp_path)
+    fake_db = _FakeMultiPaperDb()
+    monkeypatch.setattr(paper_live, "get_paper_db", lambda: fake_db)
+    ctx = _multi_ctx()
+    cmd_dir = tmp_path / ".tmp_logs" / "cmd_sess-multi"
+    cmd_dir.mkdir(parents=True)
+    old_cmd = cmd_dir / "001_pause.json"
+    cancel_cmd = cmd_dir / "002_cancel.json"
+    old_cmd.write_text(json.dumps({"action": "pause_entries"}))
+    cancel_cmd.write_text(json.dumps({"action": "cancel_pending_intents", "requester": "test"}))
+
+    stopped = await paper_live._apply_live_multi_operator_controls(
+        ctx=ctx,
+        ticker_adapter=_FakeTicker(),
+        use_websocket=True,
+        now=paper_live.datetime.now(paper_live.IST),
+    )
+
+    assert stopped is False
+    assert not old_cmd.exists()
+    assert not cancel_cmd.exists()
+    assert fake_db.notes[-1].startswith("PENDING_INTENTS_CANCELLED count=1")
+
+
+@pytest.mark.asyncio
+async def test_live_multi_operator_controls_logs_unknown_action(
+    tmp_path, monkeypatch, caplog
+) -> None:
+    import scripts.paper_live as paper_live
+
+    monkeypatch.chdir(tmp_path)
+    ctx = _multi_ctx()
+    cmd_dir = tmp_path / ".tmp_logs" / "cmd_sess-multi"
+    cmd_dir.mkdir(parents=True)
+    cmd_file = cmd_dir / "001_typo.json"
+    cmd_file.write_text(json.dumps({"action": "restart_positions", "requester": "test"}))
+
+    with caplog.at_level("WARNING"):
+        stopped = await paper_live._apply_live_multi_operator_controls(
+            ctx=ctx,
+            ticker_adapter=_FakeTicker(),
+            use_websocket=True,
+            now=paper_live.datetime.now(paper_live.IST),
+        )
+
+    assert stopped is False
+    assert not cmd_file.exists()
+    assert "Unknown multi admin command action" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_live_multi_operator_controls_flatten_signal(tmp_path, monkeypatch) -> None:
+    import scripts.paper_live as paper_live
+
+    monkeypatch.chdir(tmp_path)
+    signal_dir = tmp_path / ".tmp_logs"
+    signal_dir.mkdir()
+    signal_file = signal_dir / "flatten_sess-multi.signal"
+    signal_file.write_text("1")
+    ctx = _multi_ctx()
+    flatten_calls: list[dict[str, object]] = []
+
+    async def fake_flatten_session_positions(*args, **kwargs):
+        flatten_calls.append({"args": args, "kwargs": kwargs})
+
+    monkeypatch.setattr(paper_live, "flatten_session_positions", fake_flatten_session_positions)
+    monkeypatch.setattr(paper_live, "_reconcile_live_session", lambda **kwargs: False)
+
+    stopped = await paper_live._apply_live_multi_operator_controls(
+        ctx=ctx,
+        ticker_adapter=_FakeTicker(),
+        use_websocket=True,
+        now=paper_live.datetime.now(paper_live.IST),
+    )
+
+    assert stopped is True
+    assert ctx.final_status == "COMPLETED"
+    assert ctx.terminal_reason == "manual_flatten_signal"
+    assert not signal_file.exists()
+    assert flatten_calls[0]["args"] == ("sess-multi",)

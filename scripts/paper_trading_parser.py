@@ -37,7 +37,9 @@ def build_paper_trading_parser(
     _cmd_reconcile = handlers["_cmd_reconcile"]
     _cmd_broker_reconcile = handlers["_cmd_broker_reconcile"]
     _cmd_broker_sync_orders = handlers["_cmd_broker_sync_orders"]
+    _cmd_broker_cancel_order = handlers["_cmd_broker_cancel_order"]
     _cmd_pilot_check = handlers["_cmd_pilot_check"]
+    _cmd_real_readiness = handlers["_cmd_real_readiness"]
     _cmd_real_pilot_plan = handlers["_cmd_real_pilot_plan"]
     _cmd_order = handlers["_cmd_order"]
     _cmd_real_dry_run_order = handlers["_cmd_real_dry_run_order"]
@@ -52,6 +54,7 @@ def build_paper_trading_parser(
     _cmd_daily_replay = handlers["_cmd_daily_replay"]
     _cmd_daily_sim = handlers["_cmd_daily_sim"]
     _cmd_daily_live = handlers["_cmd_daily_live"]
+    _cmd_operator_drill = handlers["_cmd_operator_drill"]
 
     parser = argparse.ArgumentParser(description="Paper trading session control")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -287,6 +290,15 @@ def build_paper_trading_parser(
             help=(
                 "Route daily-live paper entries/exits through the Zerodha REAL_DRY_RUN "
                 "adapter and record broker-intent latency without calling Kite place_order."
+            ),
+        )
+        sp.add_argument(
+            "--real-order-sizing-mode",
+            choices=["fixed-qty", "cash-budget"],
+            default="fixed-qty",
+            help=(
+                "Real entry sizing mode. fixed-qty uses --real-order-fixed-qty; "
+                "cash-budget buys as many shares as fit inside --real-order-cash-budget."
             ),
         )
         sp.add_argument(
@@ -557,6 +569,27 @@ def build_paper_trading_parser(
     )
     broker_sync.set_defaults(handler=_cmd_broker_sync_orders)
 
+    broker_cancel = sub.add_parser(
+        "broker-cancel-order",
+        help="Cancel a pending Kite order that has a matching local paper_orders row",
+    )
+    broker_cancel.add_argument("--session-id", required=True, help="Owning paper session")
+    broker_cancel.add_argument("--kite-order-id", required=True, help="Kite order_id to cancel")
+    broker_cancel.add_argument("--variety", default="regular", help="Kite order variety")
+    broker_cancel.add_argument("--parent-order-id", default=None, help="Optional parent order id")
+    broker_cancel.add_argument(
+        "--limit",
+        type=int,
+        default=500,
+        help="Recent local broker-order rows to search (default: 500)",
+    )
+    broker_cancel.add_argument(
+        "--confirm-cancel",
+        action="store_true",
+        help="Required extra confirmation for broker order cancellation",
+    )
+    broker_cancel.set_defaults(handler=_cmd_broker_cancel_order)
+
     pilot_check = sub.add_parser(
         "pilot-check",
         help="Validate real small-size pilot guardrails without enabling real orders",
@@ -582,6 +615,38 @@ def build_paper_trading_parser(
         help="Exit non-zero when guardrail findings exist",
     )
     pilot_check.set_defaults(handler=_cmd_pilot_check)
+
+    real_readiness = sub.add_parser(
+        "real-readiness",
+        help="Read-only preflight for real-order gates, Kite token, cash, and outbound IP",
+    )
+    real_readiness.add_argument("--symbol", default="ITC", help="Optional LTP symbol")
+    real_readiness.add_argument("--exchange", default="NSE", help="Exchange, default NSE")
+    real_readiness.add_argument("--quantity", type=int, default=1, help="Pilot quantity")
+    real_readiness.add_argument("--product", default="MIS", help="Pilot product")
+    real_readiness.add_argument("--order-type", default="LIMIT", help="Pilot order type")
+    real_readiness.add_argument(
+        "--expected-ip",
+        default=None,
+        help="Expected whitelisted outbound IP. Defaults to CPR_ZERODHA_EXPECTED_OUTBOUND_IP.",
+    )
+    real_readiness.add_argument(
+        "--skip-public-ip",
+        action="store_true",
+        help="Skip outbound public-IP lookup.",
+    )
+    real_readiness.add_argument(
+        "--ip-timeout-sec",
+        type=float,
+        default=4.0,
+        help="Timeout for public-IP lookup.",
+    )
+    real_readiness.add_argument(
+        "--strict",
+        action="store_true",
+        help="Exit non-zero when error findings exist.",
+    )
+    real_readiness.set_defaults(handler=_cmd_real_readiness)
 
     pilot_plan = sub.add_parser(
         "real-pilot-plan",
@@ -1021,6 +1086,25 @@ def build_paper_trading_parser(
         help="Market data source: 'kite' (live WebSocket) or 'local' (DuckDB replay).",
     )
     daily_live.set_defaults(handler=_cmd_daily_live)
+
+    operator_drill = sub.add_parser(
+        "operator-drill",
+        help="Run an isolated Kite WebSocket --multi live-runtime drill in a temporary paper DB",
+    )
+    _add_symbol_args(operator_drill)
+    _add_strategy_args(operator_drill)
+    _add_live_args(operator_drill)
+    operator_drill.add_argument(
+        "--trade-date",
+        default="today",
+        help="Trade date YYYY-MM-DD or today for the Kite WebSocket drill.",
+    )
+    operator_drill.add_argument(
+        "--run-id",
+        default=None,
+        help="Optional drill run id under .tmp_logs/operator_drills/.",
+    )
+    operator_drill.set_defaults(handler=_cmd_operator_drill)
 
     return parser
 

@@ -158,6 +158,27 @@ paper-only, but routes every paper entry/exit intent through the Zerodha `REAL_D
 adapter so broker-intent payloads and order latency are recorded without calling Kite
 `place_order`.
 
+**Isolated operator drill (safe during actual paper-live):**
+```bash
+doppler run -- uv run pivot-paper-trading operator-drill \
+  --trade-date today \
+  --symbols ITC,SBIN,RELIANCE \
+  --entry-window-end 15:05 \
+  --time-exit 15:10 \
+  --cpr-entry-start 14:45 \
+  --max-cycles 120
+```
+
+`operator-drill` launches a child `daily-live --multi --feed-source kite` process with
+`PIVOT_PAPER_DB_PATH` pointed at `.tmp_logs/operator_drills/<run_id>/paper.duckdb`. The dashboard
+and actual paper-live remain on `data/paper.duckdb`. Drill session IDs are prefixed with
+`DRILL-<run_id>-`, so admin command directories and flatten sentinel files cannot collide with the
+real live sessions. The child also sets `PIVOT_MARKET_READ_REPLICA=1` so setup reads use the market
+replica instead of competing with the active production `market.duckdb` connection. The drill is
+paper-only, alerts are disabled, and real/simulated real orders are rejected. Use explicit
+`--entry-window-end`, `--time-exit`, and `--cpr-entry-start` only when you need to test operator
+controls after the normal entry window; those overrides apply to the drill child only.
+
 **In-session safety drills after LONG/SHORT session IDs exist:**
 ```bash
 doppler run -- uv run pivot-paper-trading reconcile --session-id <LONG_SESSION_ID> --strict
@@ -194,6 +215,9 @@ Operational notes:
   available; they do not wait for the next 5-minute strategy candle.
 - `set_risk_budget` changes future entries only. Existing open positions keep normal exits unless
   you also send `close_positions` or `close_all`.
+- `daily-live --multi` polls the same per-session command directories and flatten sentinel files as
+  single-session live. LONG-only and SHORT-only controls are supported without killing the sibling
+  session.
 - Dashboard `/paper_ledger` exposes the same controls and refreshes active paper state every 3s.
 
 ### Universe policy (`canonical_full` → `full_YYYY_MM_DD`)
@@ -213,8 +237,8 @@ snapshot already matches canonical.
 
 | What ran | Universe saved | Use it for |
 |----------|---------------|-----------|
-| Pre-market `daily-prepare --trade-date 2026-04-27` (ran this morning) | `full_2026_04_27` | Live trading today; backtest parity for 2026-04-27 |
-| EOD `daily-prepare --trade-date 2026-04-28` (ran tonight) | `full_2026_04_28` | Live trading tomorrow; backtest parity for 2026-04-28 |
+| Pre-market `daily-prepare --trade-date <today>` | `full_<today>` | Live trading today; backtest parity for today's trade date |
+| EOD `daily-prepare --trade-date <next_trading_date>` | `full_<next_trading_date>` | Live trading next session; backtest parity for that trade date |
 
 **Why this naming, not the data-date?**
 The date you'd put in `--start`/`--end` for a parity backtest is always the trade date, and the
@@ -225,22 +249,22 @@ every time you build a backtest command — a constant source of off-by-one erro
 
 1. **Normal live trading tomorrow** — omit the universe flag entirely:
    ```bash
-   doppler run -- uv run pivot-paper-trading daily-live --multi --strategy CPR_LEVELS --trade-date 2026-04-28
+   doppler run -- uv run pivot-paper-trading daily-live --multi --strategy CPR_LEVELS --trade-date today
    ```
-   Auto-resolves to `full_2026_04_28`.
+   Auto-resolves to the dated `full_YYYY_MM_DD` universe for today's trade date.
 
 2. **Emergency mid-session relaunch (same day)** — pass today's trade date explicitly so the
    relaunch uses the identical symbol list as the original launch:
    ```bash
    doppler run -- uv run pivot-paper-trading daily-live --multi --strategy CPR_LEVELS \
-     --trade-date 2026-04-27 --universe-name full_2026_04_27
+     --trade-date <trade_date> --universe-name full_<YYYY_MM_DD>
    ```
 
 3. **Backtest parity check for today's paper session** — use today's universe, not tomorrow's:
    ```bash
    doppler run -- uv run pivot-backtest \
-     --universe-name full_2026_04_27 \
-     --start 2026-04-27 --end 2026-04-27 \
+     --universe-name full_<YYYY_MM_DD> \
+     --start <trade_date> --end <trade_date> \
      --preset CPR_LEVELS_RISK_SHORT --save
    ```
    The date in `--universe-name` always matches `--start`/`--end`.
@@ -307,10 +331,11 @@ execution rules; none of them is exempt from parity.
 - For CPR_LEVELS, a trade only opens when the effective reward/risk at entry meets `min_effective_rr` (default `2.0`).
   `rr_ratio` is the target multiple used by the trade model; it is not the entry gate.
 
-### Canonical 4 CPR Baselines (Backtest)
+### Canonical CPR Baselines (Backtest)
 
-Use these 4 presets as the canonical CPR baseline matrix. Keep every parameter fixed and only
-change the date window when extending baselines.
+Use these 4 presets as the canonical CPR strategy matrix. The saved canonical baseline family has
+8 rows because each preset is retained in daily-reset and compound modes. Keep every parameter
+fixed and only change the date window when extending baselines.
 
 | Variant | Preset | Legacy label meaning |
 |---------|--------|----------------------|
@@ -319,16 +344,21 @@ change the date window when extending baselines.
 | CPR LONG risk sizing | `CPR_LEVELS_RISK_LONG` | `cpr-levels-long-risksize-rvol1-atr0.5` |
 | CPR SHORT risk sizing | `CPR_LEVELS_RISK_SHORT` | `cpr-levels-short-risksize-rvoloff-atr0.5` |
 
-Canonical rerun commands (only change `--start`/`--end`):
+Canonical all-family rerun command:
 
 ```bash
-uv run pivot-backtest --all --universe-size 0 --yes-full-run --start 2025-01-01 --end 2026-04-24 --preset CPR_LEVELS_STANDARD_LONG  --save --quiet
-uv run pivot-backtest --all --universe-size 0 --yes-full-run --start 2025-01-01 --end 2026-04-24 --preset CPR_LEVELS_STANDARD_SHORT --save --quiet
-uv run pivot-backtest --all --universe-size 0 --yes-full-run --start 2025-01-01 --end 2026-04-24 --preset CPR_LEVELS_RISK_LONG      --save --quiet
-uv run pivot-backtest --all --universe-size 0 --yes-full-run --start 2025-01-01 --end 2026-04-24 --preset CPR_LEVELS_RISK_SHORT     --save --quiet
+doppler run -- uv run pivot-baselines --start 2025-01-01 --end 2026-05-04
 ```
 
-Reference sets (Apr 2026):
+For individual checks, use the dated universe explicitly and keep the preset unchanged:
+
+```bash
+doppler run -- uv run pivot-backtest --universe-name full_2026_04_30 --yes-full-run \
+  --start 2025-01-01 --end 2026-05-04 --preset CPR_LEVELS_RISK_LONG \
+  --save --quiet --progress-file .tmp_logs/bt_cpr_risk_long.jsonl
+```
+
+Reference sets:
 
 - **Pre-fix baselines (v1 — kept for history, do not use as new comparison target):**
 
@@ -514,7 +544,7 @@ Use the guarded single-command EOD path by default. It prevents skipped instrume
 out-of-order build/prepare steps:
 
 ```bash
-doppler run -- uv run pivot-refresh \
+PYTHONUNBUFFERED=1 doppler run -- uv run pivot-refresh \
   --eod-ingest \
   --date <today> \
   --trade-date <next_trading_date>
@@ -523,7 +553,7 @@ doppler run -- uv run pivot-refresh \
 For example, after close on 2026-04-29:
 
 ```bash
-doppler run -- uv run pivot-refresh \
+PYTHONUNBUFFERED=1 doppler run -- uv run pivot-refresh \
   --eod-ingest \
   --date 2026-04-29 \
   --trade-date 2026-04-30
@@ -535,6 +565,14 @@ daily-prepare → final `pivot-data-quality --date <next_trading_date>`. The fin
 Ingestion stages are rerun-safe by default: the wrapper passes `--skip-existing` to daily and
 5-minute Kite ingestion, so existing parquet is logged as skipped. Add `--force-ingest` only for
 an intentional refetch.
+
+`PYTHONUNBUFFERED=1` is required when redirecting EOD output to a log. Without it, Python stdout can
+block-buffer child output and make the pipeline look silent for several minutes before flushing a
+large burst. Monitor EOD progress from direct signals too: Kite checkpoint JSON files under
+`data/raw/kite/checkpoints/`, row counts in `market.duckdb` after build stages, and Windows
+`tasklist` memory/CPU for the active worker process. For the daily-prepare stage, a direct
+`backtest_universe` count for `full_<next_trading_date>` is cleaner than waiting for thousands of
+per-symbol readiness lines to flush.
 
 ### 1b. Pre-market setup and readiness check (8:30–9:10 AM)
 
@@ -558,6 +596,13 @@ doppler run -- uv run pivot-signal-alert --all-symbols --condition narrow-cpr
 Live uses the latest completed trading day's CPR/ATR inputs and resolves today's direction from
 the live 9:15 opening-range candle. `--allow-late-start-fallback` is no longer required for normal
 startup.
+If a Kite WebSocket session starts late, Kite does not replay earlier ticks or the 09:15-09:20
+opening-range candle. Real-order sessions therefore use a true-OR catch-up path: load DB setup,
+fetch the missing 09:15-09:20 candle from Kite historical `5minute` data for unresolved symbols,
+then hydrate setup again before entries are enabled. If this historical catch-up fails for a
+symbol, that symbol remains unresolved and cannot place real orders. Paper diagnostics may still
+use the explicit diagnostic OR proxy for continuity testing, but `daily-live --real-orders`
+refuses those proxy setup rows.
 If `market_day_state` or `strategy_day_state` rows exist for a live/current trade date while
 same-day `intraday_day_pack` is absent, `daily-prepare` / `pivot-data-quality --date today` now
 fail closed. Those rows are treated as accidental future-state data and must be cleaned instead of
@@ -701,8 +746,11 @@ doppler run -- uv run pivot-paper-trading daily-live \
 ```
 
 `--allow-late-start-fallback` is no longer required for normal startup. Live does not build or
-require future-date `market_day_state` rows; it derives setup from the previous completed trading
-day and resolves direction from the live 9:15 candle.
+require future-date `market_day_state` rows; it derives CPR/ATR setup from the previous completed
+trading day and resolves direction from the live 9:15 candle. If a Kite WebSocket session starts
+after the OR window, paper mode can continue with the diagnostic OR proxy when explicitly allowed,
+but real-order mode attempts true-OR catch-up from Kite historical `5minute` candles and blocks
+entries for symbols whose true OR still cannot be proven.
 
 Add `--no-alerts` only for silent validation runs. Add explicit CPR flags only when you are
 intentionally overriding the canonical preset.
@@ -1054,10 +1102,15 @@ Use when you need to close open positions immediately due to market conditions, 
 or end-of-day. While `daily-live` is still running, prefer the admin command queue wrappers below.
 They do not compete with the live process for the DuckDB writer lock.
 
+These controls work for both single-session `daily-live` and `daily-live --multi`. In `--multi`,
+each session polls its own `.tmp_logs/cmd_<session_id>/` queue and
+`.tmp_logs/flatten_<session_id>.signal`, so LONG-only or SHORT-only controls do not stop the
+sibling session.
+
 **Close specific symbols in one running session:**
 ```bash
 doppler run -- uv run pivot-paper-trading send-command \
-  --session-id CPR_LEVELS_LONG-2026-04-27-live-kite \
+  --session-id <LONG_SESSION_ID> \
   --action close_positions \
   --symbols SBIN,RELIANCE \
   --reason operator_close
@@ -1068,7 +1121,7 @@ The session keeps running after `close_positions`.
 **Flatten one running session:**
 ```bash
 doppler run -- uv run pivot-paper-trading send-command \
-  --session-id CPR_LEVELS_SHORT-2026-04-27-live-kite \
+  --session-id <SHORT_SESSION_ID> \
   --action close_all \
   --reason market_conditions
 ```
@@ -1085,7 +1138,7 @@ doppler run -- uv run pivot-paper-trading flatten-both \
 **Reduce budget for future entries only:**
 ```bash
 doppler run -- uv run pivot-paper-trading send-command \
-  --session-id CPR_LEVELS_SHORT-2026-04-27-live-kite \
+  --session-id <SHORT_SESSION_ID> \
   --action set_risk_budget \
   --portfolio-value 500000 \
   --max-positions 5 \
@@ -1100,7 +1153,7 @@ disabled until those positions close. To reduce current exposure immediately, al
 **Pause future entries while still monitoring open-position exits:**
 ```bash
 doppler run -- uv run pivot-paper-trading send-command \
-  --session-id CPR_LEVELS_LONG-2026-04-27-live-kite \
+  --session-id <LONG_SESSION_ID> \
   --action pause_entries \
   --reason market_regime_pause
 ```
@@ -1108,7 +1161,7 @@ doppler run -- uv run pivot-paper-trading send-command \
 **Resume future entries for the original session universe:**
 ```bash
 doppler run -- uv run pivot-paper-trading send-command \
-  --session-id CPR_LEVELS_LONG-2026-04-27-live-kite \
+  --session-id <LONG_SESSION_ID> \
   --action resume_entries \
   --reason market_regime_recovered
 ```
@@ -1116,14 +1169,14 @@ doppler run -- uv run pivot-paper-trading send-command \
 **Cancel unprocessed admin intents for one session:**
 ```bash
 doppler run -- uv run pivot-paper-trading send-command \
-  --session-id CPR_LEVELS_LONG-2026-04-27-live-kite \
+  --session-id <LONG_SESSION_ID> \
   --action cancel_pending_intents \
   --reason operator_reset_queue
 ```
 
 `cancel_pending_intents` deletes only command files that the live loop has not processed yet.
-It does not cancel already-filled paper exits or broker orders; real broker order cancellation
-belongs to the future broker-adapter phase.
+It does not cancel already-filled paper exits or broker orders. Use `broker-cancel-order` for a
+pending real Kite order that is already recorded in `paper_orders`.
 
 Flatten commands reconcile automatically inside the running live loop after positions are closed and
 alerts are queued. If reconciliation reports critical findings after `close_all` or sentinel flatten,
@@ -1132,7 +1185,7 @@ the session fails closed instead of being marked as cleanly completed.
 Use the standalone reconcile command when you want an explicit operator gate or diagnostic readout:
 ```bash
 doppler run -- uv run pivot-paper-trading reconcile \
-  --session-id CPR_LEVELS_SHORT-2026-04-27-live-kite \
+  --session-id <SHORT_SESSION_ID> \
   --strict
 ```
 
@@ -1141,12 +1194,12 @@ doppler run -- uv run pivot-paper-trading reconcile \
 **Real-broker dry-run payload check (no order placement):**
 ```bash
 doppler run -- uv run pivot-paper-trading real-dry-run-order \
-  --session-id CPR_LEVELS_LONG-2026-04-27-live-kite \
+  --session-id <LONG_SESSION_ID> \
   --symbol SBIN \
   --side BUY \
   --quantity 10 \
   --role entry \
-  --event-time 2026-04-27T09:20:00+05:30
+  --event-time <trade_date>T09:20:00+05:30
 ```
 
 This prints and records the Zerodha payload with `broker_mode=REAL_DRY_RUN`.
@@ -1175,6 +1228,25 @@ Default real-order safety posture:
 - every real order requires fresh `--reference-price` and `--reference-price-age-sec`
 - real placement also requires `--confirm-real-order`
 
+Pre-market real-order readiness check:
+
+```bash
+# Refresh KITE_ACCESS_TOKEN manually first with pivot-kite-token.
+# If you have just whitelisted today's public IP in Kite, pass it here or set
+# CPR_ZERODHA_EXPECTED_OUTBOUND_IP in Doppler.
+doppler run -- uv run pivot-paper-trading real-readiness \
+  --symbol ITC \
+  --quantity 1 \
+  --expected-ip <WHITELISTED_PUBLIC_IP> \
+  --strict
+```
+
+`real-readiness` is read-only. It checks the Kite token/profile call, available cash, ITC LTP,
+real-order Doppler gates, quantity/notional guardrails, and the machine's current outbound public
+IP. Kite does not expose a read API for the app IP whitelist, so the command can only compare the
+current outbound IP with the IP you say is whitelisted. If your ISP gives a dynamic IP, this check
+must be run each morning after token refresh and before any real-order pilot.
+
 No-placement planner for a one-symbol pilot:
 
 ```bash
@@ -1191,14 +1263,29 @@ optional SL order, and `broker-sync-orders` monitoring. It does **not** submit o
 not open `paper.duckdb`, so it can be run while paper-live is still holding the writer lock. The
 MARKET fallback command only works if Doppler allows `MARKET` in
 `CPR_ZERODHA_REAL_ALLOWED_ORDER_TYPES`. If the optional broker-side SL order is placed and the
-position is later sold manually, cancel the pending SL order in Kite first to avoid unintended
-exposure.
+position is later sold manually, cancel the pending SL order first to avoid unintended exposure.
+
+Broker cancel path for pending real orders:
+
+```bash
+doppler run -- uv run pivot-paper-trading broker-cancel-order \
+  --session-id manual-pilot-2026-05-05-itc \
+  --kite-order-id <KITE_ORDER_ID> \
+  --confirm-cancel
+
+doppler run -- uv run pivot-paper-trading broker-sync-orders \
+  --session-id manual-pilot-2026-05-05-itc
+```
+
+`broker-cancel-order` refuses to cancel arbitrary broker orders: the Kite order id must match a
+local `paper_orders.exchange_order_id` row for the supplied session. After cancellation, it updates
+the local order snapshot and forces the dashboard replica to publish.
 
 Example manual real LIMIT buy:
 
 ```bash
 doppler run -- uv run pivot-paper-trading real-order \
-  --session-id manual-pilot-2026-05-04 \
+  --session-id manual-pilot-<YYYY-MM-DD>-<symbol> \
   --symbol SBIN \
   --side BUY \
   --quantity 1 \
@@ -1237,7 +1324,9 @@ doppler run -- uv run pivot-paper-trading daily-live \
   --real-entry-order-type MARKET
 ```
 
-Safer first live strategy pilot after market-order connectivity is proven:
+Safer first live strategy pilot after market-order connectivity is proven. Use `fixed-qty` for the
+smallest canary, or `cash-budget` when the operator explicitly wants to allocate the full real-order
+cash budget to one open position:
 
 ```bash
 doppler run -- uv run pivot-paper-trading daily-live \
@@ -1253,17 +1342,43 @@ doppler run -- uv run pivot-paper-trading daily-live \
   --real-exit-max-slippage-pct 2
 ```
 
+Capital-budget one-position LONG canary:
+
+```bash
+doppler run -- uv run pivot-paper-trading daily-live \
+  --strategy CPR_LEVELS \
+  --preset CPR_LEVELS_RISK_LONG \
+  --trade-date today \
+  --real-orders \
+  --real-order-sizing-mode cash-budget \
+  --real-order-max-positions 1 \
+  --real-order-cash-budget 10000 \
+  --real-entry-order-type LIMIT \
+  --real-entry-max-slippage-pct 0.5 \
+  --real-exit-max-slippage-pct 2
+```
+
+For `cash-budget`, the router computes `floor(cash_budget / protected_entry_price)` at entry time.
+The protected entry price includes the entry slippage buffer for LIMIT orders, so the order stays
+inside the local cash-budget cap. Doppler `CPR_ZERODHA_REAL_MAX_QTY` must still be high enough for
+the computed quantity; otherwise the broker safety gate correctly rejects the order.
+
 Automated pilot behaviour:
 
 - paper-live is unchanged unless `--real-orders` is present
-- real quantity is fixed by `--real-order-fixed-qty`; it does not use paper position size
+- default real quantity is fixed by `--real-order-fixed-qty`; use
+  `--real-order-sizing-mode cash-budget` to size entries from `--real-order-cash-budget`
 - default max real-routed open positions is `1`
 - real entries are cash-budgeted: cumulative open real-order notional must stay within
   `--real-order-cash-budget`, and startup rejects the session if that budget exceeds Kite
   reported available equity cash
 - entries can be `LIMIT` or `MARKET`, but `MARKET` requires the Doppler order-type allow-list
 - exits, stop exits, admin close, global flatten, and EOD flatten use protected LIMIT orders
-- partial scale-out is blocked for real routing until it has a dedicated reconciliation path
+- partial scale-out is blocked at startup for real routing; the lower-level runtime also defers any
+  unexpected real-order `PARTIAL` decision to `HOLD` so the full position stays monitored
+- `daily-live --real-orders` refuses diagnostic OR-proxy setup rows; if the session starts late, it
+  first tries true opening-range catch-up from Kite historical `5minute` data and only allows entries
+  for symbols whose true OR/direction is resolved
 - every real order row is recorded in `paper_orders` with `broker_mode=LIVE` and the Kite order id
 
 **Real-order safety model:**
@@ -1289,15 +1404,21 @@ Default safety assumptions in code:
 - zero, negative, NaN, and infinite prices are rejected before payload generation
 - SL/SL-M require a trigger price
 - MARKET/SL-M require Zerodha `market_protection`
-- exit/close/flatten/emergency roles must use protected LIMIT with a fresh reference price
-- stale reference prices are rejected
+- exit/close roles must use protected LIMIT with a fresh reference price
+- emergency/manual flatten roles also use protected LIMIT and slippage bounds, but do not reject
+  solely because feed quote age is stale; this keeps emergency flatten usable during stale-feed
+  incidents
+- fill quality during stale-feed emergency flatten is not guaranteed: the LIMIT price is based on
+  the last known reference, which can be minutes old. Review `ORDER_LATENCY quote_age_sec` /
+  order logs after any stale-feed flatten to see how old the reference was.
+- stale reference prices are rejected for normal entries and normal exits
 - real order placement remains blocked if either the code gate or Doppler gate is off
 
 Example protected dry-run flatten payload:
 
 ```bash
 doppler run -- uv run pivot-paper-trading real-dry-run-order \
-  --session-id CPR_LEVELS_LONG-2026-04-27-live-kite \
+  --session-id <LONG_SESSION_ID> \
   --symbol SBIN \
   --side SELL \
   --quantity 250 \
@@ -1307,7 +1428,7 @@ doppler run -- uv run pivot-paper-trading real-dry-run-order \
   --reference-price 800 \
   --reference-price-age-sec 1 \
   --max-slippage-pct 2 \
-  --event-time 2026-04-27T10:30:00+05:30
+  --event-time <trade_date>T10:30:00+05:30
 ```
 
 Dashboard visibility:
@@ -1322,7 +1443,7 @@ Dashboard visibility:
 **Broker reconciliation check (read-only):**
 ```bash
 doppler run -- uv run pivot-paper-trading broker-reconcile \
-  --session-id CPR_LEVELS_LONG-2026-04-27-live-kite \
+  --session-id <LONG_SESSION_ID> \
   --broker-orders-json broker_orders.json \
   --broker-positions-json broker_positions.json \
   --strict

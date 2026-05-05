@@ -48,6 +48,12 @@ _PROTECTED_EXIT_ROLES = (
     "kill",
     "stop",
 )
+_EMERGENCY_FLATTEN_ROLE_TOKENS = ("flatten", "manual_flatten", "emergency", "kill")
+
+
+def _role_matches_any(role: str, tokens: tuple[str, ...]) -> bool:
+    normalized = role.strip().lower().replace("-", "_")
+    return any(token in normalized for token in tokens)
 
 
 @dataclass(frozen=True, slots=True)
@@ -473,8 +479,11 @@ def _floor_to_tick(value: float, tick_size: float) -> float:
 
 
 def _is_protected_exit_role(role: str) -> bool:
-    normalized = role.strip().lower().replace("-", "_")
-    return any(token in normalized for token in _PROTECTED_EXIT_ROLES)
+    return _role_matches_any(role, _PROTECTED_EXIT_ROLES)
+
+
+def _is_emergency_flatten_role(role: str) -> bool:
+    return _role_matches_any(role, _EMERGENCY_FLATTEN_ROLE_TOKENS)
 
 
 def _validate_protected_exit(intent: BrokerOrderIntent) -> None:
@@ -484,7 +493,10 @@ def _validate_protected_exit(intent: BrokerOrderIntent) -> None:
         raise OrderSafetyError("exit/flatten roles require a fresh reference_price")
     if intent.reference_price_age_sec is None:
         raise OrderSafetyError("exit/flatten roles require reference_price_age_sec")
-    if intent.reference_price_age_sec > DEFAULT_MAX_QUOTE_AGE_SEC:
+    if (
+        intent.reference_price_age_sec > DEFAULT_MAX_QUOTE_AGE_SEC
+        and not _is_emergency_flatten_role(intent.role)
+    ):
         raise OrderSafetyError(
             f"reference price is stale: {intent.reference_price_age_sec:.2f}s > "
             f"{DEFAULT_MAX_QUOTE_AGE_SEC:.2f}s"
@@ -544,7 +556,10 @@ def _validate_real_order_gate(
         raise OrderSafetyError("real orders require a fresh reference_price")
     if intent.reference_price_age_sec is None:
         raise OrderSafetyError("real orders require reference_price_age_sec")
-    if intent.reference_price_age_sec > DEFAULT_MAX_QUOTE_AGE_SEC:
+    if (
+        intent.reference_price_age_sec > DEFAULT_MAX_QUOTE_AGE_SEC
+        and not _is_emergency_flatten_role(intent.role)
+    ):
         raise OrderSafetyError(
             f"reference price is stale: {intent.reference_price_age_sec:.2f}s > "
             f"{DEFAULT_MAX_QUOTE_AGE_SEC:.2f}s"

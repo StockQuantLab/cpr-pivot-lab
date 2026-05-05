@@ -13,6 +13,7 @@ from __future__ import annotations
 import atexit
 import json
 import logging
+import os
 import re as _re
 import subprocess as _subprocess
 import threading
@@ -111,6 +112,20 @@ def _clear_deferred_sync_marker() -> None:
         DEFERRED_SYNC_MARKER.unlink(missing_ok=True)
     except Exception as exc:
         logger.debug("Failed to clear paper deferred-sync marker: %s", exc)
+
+
+def _active_paper_db_file() -> Path:
+    override = str(os.getenv("PIVOT_PAPER_DB_PATH", "") or "").strip()
+    return Path(override).expanduser().resolve() if override else PAPER_DUCKDB_FILE
+
+
+def _active_paper_replica_dir(db_path: Path) -> Path:
+    override = str(os.getenv("PIVOT_PAPER_REPLICA_DIR", "") or "").strip()
+    if override:
+        return Path(override).expanduser().resolve()
+    if db_path != PAPER_DUCKDB_FILE:
+        return db_path.parent / f"{db_path.stem}_replica"
+    return REPLICA_DIR
 
 
 def _recover_deferred_sync_if_needed(*, allow_live_db_open: bool = True) -> None:
@@ -2029,10 +2044,11 @@ def get_paper_db() -> PaperDB:
     if _paper_db is None:
         with _paper_db_lock:
             if _paper_db is None:
-                replica_dir = REPLICA_DIR
+                db_path = _active_paper_db_file()
+                replica_dir = _active_paper_replica_dir(db_path)
                 replica_dir.mkdir(parents=True, exist_ok=True)
-                sync = ReplicaSync(PAPER_DUCKDB_FILE, replica_dir, min_interval_sec=2.0)
-                _paper_db = PaperDB(replica_sync=sync)
+                sync = ReplicaSync(db_path, replica_dir, min_interval_sec=2.0)
+                _paper_db = PaperDB(db_path=db_path, replica_sync=sync)
                 if not _paper_db_atexit:
                     atexit.register(close_paper_db)
                     _paper_db_atexit = True
@@ -2046,17 +2062,19 @@ def get_dashboard_paper_db() -> PaperDB:
     open the live paper.duckdb directly.
     """
     global _dashboard_paper_db, _dashboard_paper_consumer, _dashboard_paper_atexit
-    REPLICA_DIR.mkdir(parents=True, exist_ok=True)
+    db_path = _active_paper_db_file()
+    replica_dir = _active_paper_replica_dir(db_path)
+    replica_dir.mkdir(parents=True, exist_ok=True)
     _recover_deferred_sync_if_needed(allow_live_db_open=False)
     if _dashboard_paper_consumer is None:
-        _dashboard_paper_consumer = ReplicaConsumer(REPLICA_DIR, PAPER_DUCKDB_FILE.stem)
+        _dashboard_paper_consumer = ReplicaConsumer(replica_dir, db_path.stem)
     replica_path = _dashboard_paper_consumer.get_replica_path()
     if _dashboard_paper_db is None:
         with _dashboard_paper_lock:
             if _dashboard_paper_db is None:
                 if replica_path is None:
                     raise RuntimeError(
-                        f"No paper replica found in {REPLICA_DIR}. "
+                        f"No paper replica found in {replica_dir}. "
                         "Run a paper trading session to create one."
                     )
                 _dashboard_paper_db = PaperDB(

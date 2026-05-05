@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-CPR Pivot Lab — AI Agent  (Phidata + GLM-4.7 via ZAI)
+CPR Pivot Lab — AI Agent  (Phidata + Ollama)
 
 Understands natural language queries about CPR-ATR strategy backtests,
 stock performance, parameter optimization, and data availability.
@@ -63,9 +63,9 @@ def _json_tool(func):
 SYSTEM_PROMPT = """You are the CPR Pivot Lab AI analyst — expert in CPR-ATR trading strategy for NSE stocks.
 
 Architecture:
-- Market data: Parquet files (51 NSE stocks, ~10 years, 5-min OHLCV) queried via DuckDB
-- PostgreSQL: live paper-session state, alerts, and this chat session storage
-- DuckDB: historical backtests and archived paper ledgers
+- Market data: Parquet files (2100+ NSE symbols, ~10 years, 5-min OHLCV) queried via DuckDB
+- PostgreSQL: agent chat sessions and signals only (paper trading state is in DuckDB)
+- DuckDB: historical backtests, archived paper ledgers, and live paper trading state
 
 You can:
 1. Run backtests: "Run SBIN backtest 2022-2024" or "Test all stocks 2023"

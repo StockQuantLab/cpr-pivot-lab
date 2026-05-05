@@ -11,6 +11,49 @@ from db.paper_db import PaperDB
 from scripts.paper_broker_cli import _maybe_complete_zero_fill_manual_pilot
 
 
+def test_get_paper_db_honors_temp_path_override(tmp_path: Path, monkeypatch) -> None:
+    paper_db_module.close_paper_db()
+    override = tmp_path / "drill" / "paper.duckdb"
+    monkeypatch.setenv("PIVOT_PAPER_DB_PATH", str(override))
+    try:
+        db = paper_db_module.get_paper_db()
+        assert db.db_path == override.resolve()
+        db.create_session(session_id="drill-session", status="ACTIVE")
+        assert override.exists()
+        assert (override.parent / "paper_replica").exists()
+    finally:
+        paper_db_module.close_paper_db()
+
+
+def test_paper_prepare_read_only_can_use_market_replica(monkeypatch) -> None:
+    import scripts.paper_prepare as paper_prepare
+
+    calls: list[str] = []
+    monkeypatch.setenv("PIVOT_MARKET_READ_REPLICA", "1")
+    monkeypatch.setattr(
+        paper_prepare, "get_dashboard_db", lambda: calls.append("replica") or object()
+    )
+    monkeypatch.setattr(paper_prepare, "get_db", lambda: calls.append("source") or object())
+
+    paper_prepare._open_runtime_db(read_only=True)
+    paper_prepare._open_runtime_db(read_only=False)
+
+    assert calls == ["replica", "source"]
+
+
+def test_live_market_db_can_use_replica_for_drill(monkeypatch) -> None:
+    from db import duckdb as duckdb_module
+
+    calls: list[str] = []
+    monkeypatch.setenv("PIVOT_MARKET_READ_REPLICA", "1")
+    monkeypatch.setattr(
+        duckdb_module, "get_dashboard_db", lambda: calls.append("replica") or object()
+    )
+
+    assert duckdb_module.get_live_market_db() is not None
+    assert calls == ["replica"]
+
+
 def test_cleanup_stale_sessions_only_cancels_stopping_rows(tmp_path: Path) -> None:
     db = PaperDB(db_path=tmp_path / "paper.duckdb")
     try:

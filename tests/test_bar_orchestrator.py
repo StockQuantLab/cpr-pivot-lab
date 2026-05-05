@@ -70,14 +70,16 @@ def test_session_position_tracker_partial_reduces_qty_and_credits_cash() -> None
         trail_state={},
         quantity=100.0,
         current_qty=100.0,
+        realized_pnl=0.0,
     )
 
     tracker.record_open(position, position_value=50_000.0)
-    tracker.record_partial("SBIN", exit_value=26_000.0, remaining_qty=50.0)
+    tracker.record_partial("SBIN", exit_value=26_000.0, remaining_qty=50.0, realized_pnl=950.0)
 
     assert tracker.cash_available == pytest.approx(76_000.0)
     assert tracker.current_open_notional() == pytest.approx(25_000.0)
     assert position.current_qty == pytest.approx(50.0)
+    assert position.realized_pnl == pytest.approx(950.0)
 
 
 def test_should_process_symbol_respects_window_status_and_open_positions() -> None:
