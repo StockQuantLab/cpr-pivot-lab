@@ -79,7 +79,7 @@ def test_baseline_registry_validates_eight_unique_variants(tmp_path: Path) -> No
     ]
     registry = {
         "name": "test",
-        "universe": "full_2026_04_30",
+        "universe": "full_2026_05_05",
         "variants": variants,
     }
     path = tmp_path / "registry.yaml"

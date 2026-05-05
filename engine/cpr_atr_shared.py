@@ -126,11 +126,11 @@ def find_first_close_idx(
     """Find the first candle whose close crosses the trigger in the given direction."""
     if direction == "LONG":
         for i in range(start_idx, end_idx + 1):
-            if closes[i] >= trigger:
+            if closes[i] > trigger:
                 return i
     else:
         for i in range(start_idx, end_idx + 1):
-            if closes[i] <= trigger:
+            if closes[i] < trigger:
                 return i
     return -1
 
@@ -235,10 +235,12 @@ def find_cpr_levels_entry(
     bc = float(setup_row["bc"])
     cpr_lower, cpr_upper = normalize_cpr_bounds(tc, bc)
     atr_buffer = params.atr_sl_buffer * atr
+    target_level = str(getattr(cpr_cfg, "target_level", "FIRST") or "FIRST").upper()
+    rr_gate_target_level = str(getattr(cpr_cfg, "rr_gate_target_level", "AUTO") or "AUTO").upper()
 
     if direction == "LONG":
         trigger = cpr_upper * (1.0 + params.buffer_pct)
-        if current_close < trigger:
+        if current_close <= trigger:
             _last_reject_reason.value = "TRIGGER_NOT_HIT"
             return None
         if (
@@ -249,14 +251,25 @@ def find_cpr_levels_entry(
             return None
         sl_price = cpr_lower - atr_buffer
         first_target_price = float(setup_row["r1"])
+        second_target_raw = setup_row.get("r2")
+        if second_target_raw is None and (
+            target_level == "SECOND"
+            or rr_gate_target_level == "SECOND"
+            or cpr_cfg.scale_out_pct > 0
+        ):
+            _last_reject_reason.value = "TARGET_BEHIND_ENTRY"
+            return None
+        second_target_price = (
+            float(second_target_raw) if second_target_raw is not None else first_target_price
+        )
         runner_target_price = (
-            float(setup_row["r2"])
-            if cpr_cfg.scale_out_pct > 0 and float(setup_row["r2"]) > first_target_price
+            second_target_price
+            if cpr_cfg.scale_out_pct > 0 and second_target_price > first_target_price
             else None
         )
     else:
         trigger = cpr_lower * (1.0 - params.buffer_pct)
-        if current_close > trigger:
+        if current_close >= trigger:
             _last_reject_reason.value = "TRIGGER_NOT_HIT"
             return None
         if (
@@ -267,14 +280,35 @@ def find_cpr_levels_entry(
             return None
         sl_price = cpr_upper + atr_buffer
         first_target_price = float(setup_row["s1"])
+        second_target_raw = setup_row.get("s2")
+        if second_target_raw is None and (
+            target_level == "SECOND"
+            or rr_gate_target_level == "SECOND"
+            or cpr_cfg.scale_out_pct > 0
+        ):
+            _last_reject_reason.value = "TARGET_BEHIND_ENTRY"
+            return None
+        second_target_price = (
+            float(second_target_raw) if second_target_raw is not None else first_target_price
+        )
         runner_target_price = (
-            float(setup_row["s2"])
-            if cpr_cfg.scale_out_pct > 0 and float(setup_row["s2"]) < first_target_price
+            second_target_price
+            if cpr_cfg.scale_out_pct > 0 and second_target_price < first_target_price
             else None
         )
 
     use_scale_out = runner_target_price is not None
-    target_price = runner_target_price if use_scale_out else first_target_price
+    if use_scale_out:
+        target_price = first_target_price
+    elif target_level == "SECOND":
+        target_price = second_target_price
+    else:
+        target_price = first_target_price
+    if rr_gate_target_level == "AUTO":
+        rr_gate_target_level = "FIRST" if use_scale_out else target_level
+    rr_gate_target_price = (
+        second_target_price if rr_gate_target_level == "SECOND" else first_target_price
+    )
 
     candle_open = float(day_pack.opens[current_idx])
     fill_price = max(trigger, candle_open) if direction == "LONG" else min(trigger, candle_open)
@@ -292,10 +326,10 @@ def find_cpr_levels_entry(
         return None
     normalized_sl_price, sl_distance = normalized_sl
 
-    if direction == "LONG" and target_price <= fill_price:
+    if direction == "LONG" and rr_gate_target_price <= fill_price:
         _last_reject_reason.value = "TARGET_BEHIND_ENTRY"
         return None
-    if direction == "SHORT" and target_price >= fill_price:
+    if direction == "SHORT" and rr_gate_target_price >= fill_price:
         _last_reject_reason.value = "TARGET_BEHIND_ENTRY"
         return None
 
@@ -304,7 +338,7 @@ def find_cpr_levels_entry(
     rvol = (entry_volume / avg_vol) if avg_vol and avg_vol > 0 else 0.0
 
     effective_rr = (
-        abs(target_price - fill_price) / sl_distance if sl_distance > 0 else params.rr_ratio
+        abs(rr_gate_target_price - fill_price) / sl_distance if sl_distance > 0 else params.rr_ratio
     )
     if effective_rr < cpr_cfg.min_effective_rr:
         _last_reject_reason.value = "MIN_EFFECTIVE_RR"

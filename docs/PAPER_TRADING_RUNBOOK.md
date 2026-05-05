@@ -347,14 +347,14 @@ fixed and only change the date window when extending baselines.
 Canonical all-family rerun command:
 
 ```bash
-doppler run -- uv run pivot-baselines --start 2025-01-01 --end 2026-05-04
+doppler run -- uv run pivot-baselines --start 2025-01-01 --end 2026-05-05
 ```
 
 For individual checks, use the dated universe explicitly and keep the preset unchanged:
 
 ```bash
-doppler run -- uv run pivot-backtest --universe-name full_2026_04_30 --yes-full-run \
-  --start 2025-01-01 --end 2026-05-04 --preset CPR_LEVELS_RISK_LONG \
+doppler run -- uv run pivot-backtest --universe-name full_2026_05_05 --yes-full-run \
+  --start 2025-01-01 --end 2026-05-05 --preset CPR_LEVELS_RISK_LONG \
   --save --quiet --progress-file .tmp_logs/bt_cpr_risk_long.jsonl
 ```
 
@@ -373,31 +373,31 @@ Reference sets:
 | Daily Reset Std SHORT | `1d6e5e93618e` | 2025-01-01 → 2026-04-09 | ₹1,041,450 |
 | Daily Reset Std LONG | `84a85d954f99` | 2025-01-01 → 2026-04-09 | ₹827,381 |
 
-**Current CPR baselines (2026-05-04 `full_2026_04_30` / 2038-symbol all-8 rerun through 2026-05-04):**
+**Current CPR baselines (2026-05-05 `full_2026_05_05` / 2038-symbol all-8 rerun through 2026-05-05):**
 
 SHORT presets now use `short_trail_atr_multiplier = 1.25`. LONG keeps `trail_atr_multiplier = 1.0`.
 Canonical sizing is now `max_positions=5`, `capital=200000`, `max_position_pct=0.2`.
 Daily-reset risk is the live-paper sizing reference.
-The May 4 extension is now the canonical comparison target for all eight CPR baselines:
+The May 5 extension is now the canonical comparison target for all eight CPR baselines:
 
 | Mode | Preset | Run ID | Start → End | P/L | Calmar |
 |------|--------|--------|-------------|-----|--------|
-| Daily Reset | `CPR_LEVELS_STANDARD_LONG` | `1089ce2684e3` | 2025-01-01 → 2026-05-04 | ₹1,728,353 | 207 |
-| Daily Reset | `CPR_LEVELS_STANDARD_SHORT` | `f9eacc07c317` | 2025-01-01 → 2026-05-04 | ₹1,602,288 | 88 |
-| Daily Reset | `CPR_LEVELS_RISK_LONG` | `785a0ae8bc76` | 2025-01-01 → 2026-05-04 | ₹1,721,793 | 209 |
-| Daily Reset | `CPR_LEVELS_RISK_SHORT` | `49488023a79d` | 2025-01-01 → 2026-05-04 | ₹1,619,565 | 94 |
-| Compound | `CPR_LEVELS_STANDARD_LONG` | `eb3c979cbae2` | 2025-01-01 → 2026-05-04 | ₹5,579,446 | 402 |
-| Compound | `CPR_LEVELS_STANDARD_SHORT` | `5e5d105ee842` | 2025-01-01 → 2026-05-04 | ₹4,926,210 | 172 |
-| Compound | `CPR_LEVELS_RISK_LONG` | `521c0fad74af` | 2025-01-01 → 2026-05-04 | ₹1,729,140 | 207 |
-| Compound | `CPR_LEVELS_RISK_SHORT` | `eeae3af65dd1` | 2025-01-01 → 2026-05-04 | ₹1,632,929 | 85 |
+| Daily Reset | `CPR_LEVELS_STANDARD_LONG` | `7d108d511ef8` | 2025-01-01 → 2026-05-05 | ₹1,736,192 | 207 |
+| Daily Reset | `CPR_LEVELS_STANDARD_SHORT` | `51c3605228d7` | 2025-01-01 → 2026-05-05 | ₹1,606,325 | 88 |
+| Daily Reset | `CPR_LEVELS_RISK_LONG` | `f9d8f3c689a9` | 2025-01-01 → 2026-05-05 | ₹1,729,632 | 209 |
+| Daily Reset | `CPR_LEVELS_RISK_SHORT` | `05cda5c2d526` | 2025-01-01 → 2026-05-05 | ₹1,623,602 | 94 |
+| Compound | `CPR_LEVELS_STANDARD_LONG` | `52abe32edd6c` | 2025-01-01 → 2026-05-05 | ₹5,640,976 | 404 |
+| Compound | `CPR_LEVELS_STANDARD_SHORT` | `1b3a33451ae7` | 2025-01-01 → 2026-05-05 | ₹4,945,029 | 172 |
+| Compound | `CPR_LEVELS_RISK_LONG` | `fdeb1465e168` | 2025-01-01 → 2026-05-05 | ₹1,737,000 | 208 |
+| Compound | `CPR_LEVELS_RISK_SHORT` | `5aeb65383761` | 2025-01-01 → 2026-05-05 | ₹1,636,958 | 85 |
 
-The 2026-05-04 promotion supersedes the prior 2026-04-30-ended comparison set, the
+The 2026-05-05 promotion supersedes the prior 2026-05-04-ended comparison set, the
 2026-05-03 comparison set, and the older deleted 2026-04-28 `u2029` baseline rows. The
 retired rows should not be used as comparison targets. The only added trading date versus the
-previous current set is 2026-05-04; 2026-05-01 was a market holiday and 2026-05-02/03 were
-weekend days.
-Use `full_2026_04_30` explicitly for reproducible reruns; it matched `canonical_full` at promotion
-time but the dated name is the durable reference.
+previous current set is 2026-05-05. Strict verification showed exact matching trade rows
+through 2026-05-04 and metric deltas equal only the 2026-05-05 trade rows.
+Use `full_2026_05_05` explicitly for reproducible reruns; it had the same 2038-symbol membership
+as `full_2026_04_30` at promotion time, but the dated name is the durable reference.
 
 When extending the v2 set to a later end date, rerun these same eight presets and
 compare the overlapping window only. The incremental window should be the only source

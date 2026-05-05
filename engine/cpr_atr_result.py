@@ -17,6 +17,27 @@ from engine.cpr_atr_models import BacktestParams, FunnelCounts, TradeResult
 logger = logging.getLogger(__name__)
 
 
+def _run_label_suffix(params: BacktestParams | None) -> str:
+    if params is None:
+        return ""
+    cpr_cfg = getattr(params, "cpr_levels", None)
+    if cpr_cfg is None:
+        return ""
+    suffixes: list[str] = []
+    scale_out_pct = float(getattr(cpr_cfg, "scale_out_pct", 0.0) or 0.0)
+    if scale_out_pct > 0.0:
+        suffixes.append(f"scaleout{scale_out_pct:g}")
+    target_level = str(getattr(cpr_cfg, "target_level", "FIRST") or "FIRST").upper()
+    if target_level != "FIRST":
+        suffixes.append(f"target-{target_level.lower()}")
+    rr_gate_target_level = str(getattr(cpr_cfg, "rr_gate_target_level", "AUTO") or "AUTO").upper()
+    if rr_gate_target_level not in {"AUTO", "FIRST"}:
+        suffixes.append(f"rrgate-{rr_gate_target_level.lower()}")
+    if not suffixes:
+        return ""
+    return " " + "-".join(suffixes)
+
+
 def _int_from_mapping(
     values: dict[str, object] | None,
     key: str,
@@ -462,12 +483,14 @@ class BacktestResult:
                 "compound" if self.params and self.params.compound_equity else "daily-reset"
             )
             sizing_label = "risk" if self.params and self.params.risk_based_sizing else "standard"
+            experiment_label = _run_label_suffix(self.params)
             target_db.store_run_metadata(
                 run_id=self.run_id,
                 strategy=strategy,
                 label=(
                     f"{strategy}"
                     f" {mode_label}-{sizing_label}"
+                    f"{experiment_label}"
                     f" | {run_context.get('start_date', '')}"
                     f" to {run_context.get('end_date', '')}"
                 ),

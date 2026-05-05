@@ -81,6 +81,8 @@ def make_param_signature(
         "cpr_hold_confirm": cpr_cfg.cpr_hold_confirm,
         "cpr_min_close_atr": cpr_cfg.cpr_min_close_atr,
         "scale_out_pct": cpr_cfg.scale_out_pct,
+        "target_level": cpr_cfg.target_level,
+        "rr_gate_target_level": cpr_cfg.rr_gate_target_level,
         "commission_model": params.commission_model,
         "slippage_bps": params.slippage_bps,
         "compound_equity": params.compound_equity,

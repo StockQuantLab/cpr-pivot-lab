@@ -656,6 +656,7 @@ def test_paper_trading_parser_supports_daily_commands() -> None:
     assert daily_live_args.regime_snapshot_minutes == 30
     assert daily_live_args.cpr_min_close_atr is None
     assert daily_live_args.cpr_scale_out_pct is None
+    assert daily_live_args.cpr_rr_gate_target is None
     assert daily_live_args.narrowing_filter is False
     assert daily_live_args.standard_sizing is False
     assert daily_live_args.risk_based_sizing is True
@@ -775,6 +776,8 @@ def test_paper_trading_parser_supports_feed_audit_pack_source() -> None:
             "0.35",
             "--cpr-scale-out-pct",
             "0.8",
+            "--cpr-rr-gate-target",
+            "second",
             "--narrowing-filter",
         ]
     )
@@ -786,6 +789,7 @@ def test_paper_trading_parser_supports_feed_audit_pack_source() -> None:
     assert tuned_live_args.regime_snapshot_minutes == 10
     assert tuned_live_args.cpr_min_close_atr == 0.35
     assert tuned_live_args.cpr_scale_out_pct == 0.8
+    assert tuned_live_args.cpr_rr_gate_target == "second"
     assert tuned_live_args.narrowing_filter is True
     assert tuned_live_args.standard_sizing is False
     assert tuned_live_args.risk_based_sizing is True

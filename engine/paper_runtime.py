@@ -967,7 +967,7 @@ async def _open_position_from_candidate(
         quantity=float(candidate["position_size"]),
         entry_price=float(candidate["entry_price"]),
         stop_loss=float(candidate["sl_price"]),
-        target_price=float(candidate["target_price"]),
+        target_price=float(candidate.get("runner_target_price") or candidate["target_price"]),
         trail_state={
             "entry_price": float(candidate["entry_price"]),
             "direction": candidate["direction"],
@@ -987,6 +987,11 @@ async def _open_position_from_candidate(
             "entry_time": candidate["entry_time"],
             "first_target_price": float(
                 candidate.get("first_target_price") or candidate["target_price"]
+            ),
+            "runner_target_price": (
+                float(candidate["runner_target_price"])
+                if candidate.get("runner_target_price") is not None
+                else None
             ),
             "scale_out_pct": float(candidate.get("scale_out_pct") or 0.0),
             "scaled_out": False,

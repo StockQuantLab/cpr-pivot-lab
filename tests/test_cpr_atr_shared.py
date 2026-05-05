@@ -61,6 +61,12 @@ def test_find_first_close_idx_respects_direction() -> None:
     assert find_first_close_idx(closes, 0, 3, direction="SHORT", trigger=99.5) == 0
 
 
+def test_find_first_close_idx_requires_exclusive_cross() -> None:
+    closes = [100.0, 100.01, 99.99]
+    assert find_first_close_idx(closes, 0, 2, direction="LONG", trigger=100.0) == 1
+    assert find_first_close_idx(closes, 0, 2, direction="SHORT", trigger=100.0) == 2
+
+
 def test_simulate_trade_lifecycle_long_hits_target() -> None:
     pack = DayPack(
         time_str=["09:20", "09:25", "09:30"],

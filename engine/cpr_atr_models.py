@@ -32,6 +32,8 @@ class CPRLevelsParams:
     cpr_hold_confirm: bool
     cpr_min_close_atr: float
     scale_out_pct: float = 0.0
+    target_level: str = "FIRST"
+    rr_gate_target_level: str = "AUTO"
     time_stop_bars: int = 0
     momentum_confirm: bool = False
 
@@ -114,6 +116,8 @@ class StrategyConfig:
             cpr_hold_confirm=False,
             cpr_min_close_atr=0.0,
             scale_out_pct=0.0,
+            target_level="FIRST",
+            rr_gate_target_level="AUTO",
         )
     )
     fbr_config: FBRParams = field(

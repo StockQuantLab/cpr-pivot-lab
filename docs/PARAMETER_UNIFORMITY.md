@@ -128,6 +128,8 @@ explicitly include the override. The assertion gate catches accidental omissions
 | `cpr_min_close_atr` | 0.0 | **0.5** | 0.5 | 0.5 | 0.5 | YES |
 | `momentum_confirm` | False | **True** | True | True | True | YES |
 | `scale_out_pct` | 0.0 | *(default)* | 0.0 | 0.0 | 0.0 | YES |
+| `target_level` | "FIRST" | *(default)* | "FIRST" | "FIRST" | "FIRST" | YES |
+| `rr_gate_target_level` | "AUTO" | *(default)* | "AUTO" | "AUTO" | "AUTO" | YES |
 | `cpr_entry_start` | "" | *(default)* | "" | "" | "" | YES |
 | `cpr_confirm_entry` | False | *(default)* | False | False | False | YES |
 | `cpr_hold_confirm` | False | *(default)* | False | False | False | YES |

@@ -493,7 +493,7 @@ Current interpretation:
   `docs/PAPER_TRADING_RUNBOOK.md`.
 - `compound-standard` scales with equity as expected.
 - `compound-risk` uses the shared current-equity allocator and is part of the approved
-  reference set. Treat any future drift as a regression against the current May 4 baseline
+  reference set. Treat any future drift as a regression against the current May 5 baseline
   family in `docs/PAPER_TRADING_RUNBOOK.md`.
 - Strategy tuning is still separate from parity work.
 
@@ -501,10 +501,10 @@ Current interpretation:
 
 | Run | Calmar | WR | PF | P/L |
 |---|---:|---:|---:|---:|
-| STD_LONG `1089ce2684e3` | 207 | 33.7% | 3.41 | ₹1.728M |
-| RISK_LONG `785a0ae8bc76` | 209 | 33.7% | 3.46 | ₹1.722M |
-| STD_SHORT `f9eacc07c317` | 88 | 30.0% | 2.57 | ₹1.602M |
-| RISK_SHORT `49488023a79d` | 94 | 30.3% | 2.61 | ₹1.620M |
+| STD_LONG `7d108d511ef8` | 207 | 33.6% | 3.40 | ₹1.736M |
+| RISK_LONG `f9d8f3c689a9` | 209 | 33.6% | 3.45 | ₹1.730M |
+| STD_SHORT `51c3605228d7` | 88 | 30.0% | 2.57 | ₹1.606M |
+| RISK_SHORT `05cda5c2d526` | 94 | 30.2% | 2.61 | ₹1.624M |
 
 #### What this means
 
@@ -522,7 +522,7 @@ Current interpretation:
 
 #### Pending validation
 
-- Keep the 2026-05-04 `full_2026_04_30` reference baseline fixed unless a future change is
+- Keep the 2026-05-05 `full_2026_05_05` reference baseline fixed unless a future change is
   explicitly intended to alter the reference behavior.
 - Use the current reference baseline set for any future regression checks.
 

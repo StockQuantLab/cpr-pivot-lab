@@ -30,7 +30,10 @@ When opening behavior is neither clearly above TC nor below BC, both strategies 
 - **cpr_confirm_entry (SHORT):** Trades fell from `2,823` → `468`, return `6.96%`. Filtered out too many good shorts.
 - **or_atr_min = 0.5 (SHORT):** Return moved from `112.32%` → `107.40%`. Not worth the trade count reduction.
 - **open_to_cpr_atr floor (SHORT):** `short_open_to_cpr_atr_min = 0.5` → `1,455` trades, `37.84%` return (`₹378K`, `PF 2.05`). The shared `cpr_min_close_atr = 0.5` default is the promoted version.
-- **80/20 CPR scale-out (R1→R2 / S1→S2):** `cpr_scale_out_pct = 0.8` moved LONG from `43.44%` → `43.07%` and SHORT from `128.08%` → `117.85%`. Opt-in only.
+- **CPR scale-out / R2-S2 target experiments:** rejected. Corrected 2026-05-05 tests showed
+  `scale_out_pct = 0.5` and `0.8`, full-position R2/S2 targets, and R2/S2 RR-gate variants all
+  underperformed canonical R1/S1 full exits. Keep `scale_out_pct = 0.0`, `target_level = FIRST`,
+  and `rr_gate_target_level = AUTO` unless starting a new explicit experiment.
 <!-- /REJECTED_VARIANTS -->
 
 - Keep the default CPR_LEVELS path on the 5-minute signal unless you are explicitly testing a new short-side filter.

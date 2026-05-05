@@ -207,6 +207,7 @@ class TestBacktestParams:
                 cpr_hold_confirm=True,
                 cpr_min_close_atr=0.1,
                 scale_out_pct=0.8,
+                target_level="SECOND",
             )
         )
         assert p.strategy == "FBR"
@@ -215,6 +216,7 @@ class TestBacktestParams:
         assert p.cpr_levels.cpr_hold_confirm is True
         assert p.cpr_levels.cpr_min_close_atr == 0.1
         assert p.cpr_levels.scale_out_pct == 0.8
+        assert p.cpr_levels.target_level == "SECOND"
         assert p.runtime_batch_size == 8
         assert p.regime_index_symbol == "NIFTY 500"
         assert p.regime_min_move_pct == 0.3
@@ -231,6 +233,7 @@ class TestBacktestParams:
                 cpr_hold_confirm=True,
                 cpr_min_close_atr=0.2,
                 scale_out_pct=0.75,
+                target_level="SECOND",
             ),
             fbr=FBRParams(
                 failure_window=10,
@@ -258,6 +261,7 @@ class TestBacktestParams:
         assert p.cpr_levels.cpr_hold_confirm is True
         assert p.cpr_levels.cpr_min_close_atr == 0.2
         assert p.cpr_levels.scale_out_pct == 0.75
+        assert p.cpr_levels.target_level == "SECOND"
         assert p.fbr.failure_window == 10
         assert p.fbr.fbr_min_or_atr == 0.7
         assert p.fbr.fbr_failure_depth == 0.4
@@ -290,6 +294,16 @@ class TestBacktestParams:
 
         assert cfg.direction_filter == "SHORT"
         assert cfg.skip_rvol_check is False
+
+    def test_cpr_scale_out_and_rr_gate_target_preset_overrides(self):
+        cfg = build_strategy_config_from_preset(
+            "CPR_LEVELS_RISK_LONG",
+            {"scale_out_pct": 0.5, "rr_gate_target_level": "SECOND"},
+        )
+
+        assert cfg.cpr_levels.scale_out_pct == 0.5
+        assert cfg.cpr_levels.target_level == "FIRST"
+        assert cfg.cpr_levels.rr_gate_target_level == "SECOND"
 
     def test_regime_gate_is_disabled_by_default(self):
         setup_row = {
@@ -400,6 +414,51 @@ class TestBacktestParams:
         """param_signature must change when params differ."""
         params_a = BacktestParams()
         params_b = BacktestParams(cpr_percentile=50.0)
+        bt_a = CPRATRBacktest(params_a, db=type("DB", (), {})())
+        bt_b = CPRATRBacktest(params_b, db=type("DB", (), {})())
+        sig_a = bt_a._make_param_signature(["SBIN"], "2023-01-01", "2023-01-31")
+        sig_b = bt_b._make_param_signature(["SBIN"], "2023-01-01", "2023-01-31")
+        assert sig_a != sig_b
+
+    def test_param_signature_changes_with_cpr_target_level(self):
+        """R1 and R2 target experiments must not share a param_signature."""
+        params_a = BacktestParams()
+        params_b = BacktestParams(
+            cpr_levels_config=CPRLevelsParams(
+                cpr_shift_filter="ALL",
+                min_effective_rr=2.0,
+                use_narrowing_filter=False,
+                cpr_entry_start="",
+                cpr_confirm_entry=False,
+                cpr_hold_confirm=False,
+                cpr_min_close_atr=0.0,
+                scale_out_pct=0.0,
+                target_level="SECOND",
+            )
+        )
+        bt_a = CPRATRBacktest(params_a, db=type("DB", (), {})())
+        bt_b = CPRATRBacktest(params_b, db=type("DB", (), {})())
+        sig_a = bt_a._make_param_signature(["SBIN"], "2023-01-01", "2023-01-31")
+        sig_b = bt_b._make_param_signature(["SBIN"], "2023-01-01", "2023-01-31")
+        assert sig_a != sig_b
+
+    def test_param_signature_changes_with_cpr_rr_gate_target_level(self):
+        """R1 and R2 RR-gate experiments must not share a param_signature."""
+        params_a = BacktestParams()
+        params_b = BacktestParams(
+            cpr_levels_config=CPRLevelsParams(
+                cpr_shift_filter="ALL",
+                min_effective_rr=2.0,
+                use_narrowing_filter=False,
+                cpr_entry_start="",
+                cpr_confirm_entry=False,
+                cpr_hold_confirm=False,
+                cpr_min_close_atr=0.0,
+                scale_out_pct=0.0,
+                target_level="FIRST",
+                rr_gate_target_level="SECOND",
+            )
+        )
         bt_a = CPRATRBacktest(params_a, db=type("DB", (), {})())
         bt_b = CPRATRBacktest(params_b, db=type("DB", (), {})())
         sig_a = bt_a._make_param_signature(["SBIN"], "2023-01-01", "2023-01-31")
@@ -975,6 +1034,79 @@ class TestBacktestResultMetrics:
         assert calls[0] == ("metadata", "PAPER")
         assert calls[1] == ("results", "PAPER")
         assert calls[2] == ("invalidate", "paper-1")
+
+    def test_save_to_db_labels_cpr_exit_experiments(self, monkeypatch):
+        df = pl.DataFrame(
+            {
+                "run_id": ["scale-r2"],
+                "symbol": ["SBIN"],
+                "trade_date": ["2023-06-15"],
+                "profit_loss": [1000.0],
+                "exit_reason": ["TARGET"],
+            }
+        )
+        params = BacktestParams(
+            risk_based_sizing=True,
+            cpr_levels_config=CPRLevelsParams(
+                cpr_shift_filter="ALL",
+                min_effective_rr=2.0,
+                use_narrowing_filter=True,
+                cpr_entry_start="",
+                cpr_confirm_entry=False,
+                cpr_hold_confirm=False,
+                cpr_min_close_atr=0.5,
+                scale_out_pct=0.5,
+                rr_gate_target_level="SECOND",
+            ),
+        )
+        res = BacktestResult(
+            run_id="scale-r2",
+            params=params,
+            _loaded_df=df,
+            run_context={"start_date": "2023-01-01", "end_date": "2023-12-31"},
+        )
+
+        labels: list[str] = []
+
+        class _FakeCon:
+            def execute(self, *args, **kwargs):
+                return None
+
+            def register(self, *args, **kwargs):
+                return None
+
+            def unregister(self, *args, **kwargs):
+                return None
+
+        class _FakeDB:
+            con = _FakeCon()
+
+            def store_run_metadata(self, **kwargs):
+                labels.append(kwargs["label"])
+
+            def store_backtest_results(
+                self,
+                results_df,
+                execution_mode: str | None = None,
+                transactional: bool = True,
+            ):
+                return results_df.height
+
+        monkeypatch.setattr("engine.cpr_atr_strategy.get_db", lambda: _FakeDB())
+        monkeypatch.setitem(
+            sys.modules,
+            "web.state",
+            type(
+                "_FakeWebStateModule",
+                (),
+                {"invalidate_run_cache": staticmethod(lambda run_id=None: None)},
+            )(),
+        )
+
+        assert res.save_to_db() == 1
+        assert labels == [
+            "CPR_LEVELS daily-reset-risk scaleout0.5-rrgate-second | 2023-01-01 to 2023-12-31"
+        ]
 
     def test_summary_includes_time_of_day_breakdown(self):
         df = pl.DataFrame(
@@ -1579,6 +1711,224 @@ class TestPortfolioExecutionOverlay:
         assert candidate["entry_idx"] == 1
         assert candidate["entry_time"] == "09:25"
         assert candidate["entry_price"] == pytest.approx(106.1)
+
+    def test_scan_cpr_levels_entry_requires_close_beyond_trigger(self):
+        params = BacktestParams(
+            min_price=50.0,
+            skip_rvol_check=True,
+            cpr_levels_config=CPRLevelsParams(
+                cpr_shift_filter="ALL",
+                min_effective_rr=2.0,
+                use_narrowing_filter=False,
+                cpr_entry_start="",
+                cpr_confirm_entry=False,
+                cpr_hold_confirm=False,
+                cpr_min_close_atr=0.0,
+                scale_out_pct=0.0,
+            ),
+        )
+        setup_row = {
+            "direction": "LONG",
+            "atr": 2.0,
+            "cpr_width_pct": 0.1,
+            "cpr_threshold": 33.0,
+            "high_915": 101.0,
+            "low_915": 99.0,
+            "open_915": 100.0,
+            "tc": 100.0,
+            "bc": 99.0,
+            "r1": 110.0,
+            "s1": 95.0,
+            "prev_day_close": 99.5,
+            "is_narrowing": True,
+            "open_to_cpr_atr": 0.0,
+        }
+        day_pack = DayPack(
+            time_str=["09:20", "09:25"],
+            opens=[100.0, 100.2],
+            highs=[100.2, 100.4],
+            lows=[99.8, 100.1],
+            closes=[100.0, 100.2],
+            volumes=[1000.0, 1000.0],
+            rvol_baseline=[1000.0, 1000.0],
+        )
+
+        candidate = scan_cpr_levels_entry(
+            day_pack=day_pack,
+            setup_row=setup_row,
+            params=params,
+            scan_start_idx=0,
+            scan_end_idx=1,
+        )
+
+        assert candidate is not None
+        assert candidate["entry_idx"] == 1
+
+    def test_scale_out_min_effective_rr_uses_first_target_not_runner_target(self):
+        params = BacktestParams(
+            min_price=50.0,
+            skip_rvol_check=True,
+            cpr_levels_config=CPRLevelsParams(
+                cpr_shift_filter="ALL",
+                min_effective_rr=2.0,
+                use_narrowing_filter=False,
+                cpr_entry_start="",
+                cpr_confirm_entry=False,
+                cpr_hold_confirm=False,
+                cpr_min_close_atr=0.0,
+                scale_out_pct=0.5,
+            ),
+        )
+        setup_row = {
+            "direction": "LONG",
+            "atr": 2.0,
+            "cpr_width_pct": 0.1,
+            "cpr_threshold": 33.0,
+            "high_915": 101.0,
+            "low_915": 99.0,
+            "open_915": 100.0,
+            "tc": 100.0,
+            "bc": 99.0,
+            "r1": 103.0,
+            "r2": 112.0,
+            "s1": 95.0,
+            "prev_day_close": 99.5,
+            "is_narrowing": True,
+            "open_to_cpr_atr": 0.0,
+        }
+        day_pack = DayPack(
+            time_str=["09:20"],
+            opens=[101.0],
+            highs=[101.5],
+            lows=[100.5],
+            closes=[101.0],
+            volumes=[1000.0],
+            rvol_baseline=[1000.0],
+        )
+
+        candidate = scan_cpr_levels_entry(
+            day_pack=day_pack,
+            setup_row=setup_row,
+            params=params,
+            scan_start_idx=0,
+            scan_end_idx=0,
+        )
+
+        assert candidate is None
+
+    def test_scale_out_can_require_min_effective_rr_against_runner_target(self):
+        params = BacktestParams(
+            min_price=50.0,
+            skip_rvol_check=True,
+            cpr_levels_config=CPRLevelsParams(
+                cpr_shift_filter="ALL",
+                min_effective_rr=2.0,
+                use_narrowing_filter=False,
+                cpr_entry_start="",
+                cpr_confirm_entry=False,
+                cpr_hold_confirm=False,
+                cpr_min_close_atr=0.0,
+                scale_out_pct=0.5,
+                rr_gate_target_level="SECOND",
+            ),
+        )
+        setup_row = {
+            "direction": "LONG",
+            "atr": 2.0,
+            "cpr_width_pct": 0.1,
+            "cpr_threshold": 33.0,
+            "high_915": 101.0,
+            "low_915": 99.0,
+            "open_915": 100.0,
+            "tc": 100.0,
+            "bc": 99.0,
+            "r1": 103.0,
+            "r2": 112.0,
+            "s1": 95.0,
+            "prev_day_close": 99.5,
+            "is_narrowing": True,
+            "open_to_cpr_atr": 0.0,
+        }
+        day_pack = DayPack(
+            time_str=["09:20"],
+            opens=[101.0],
+            highs=[101.5],
+            lows=[100.5],
+            closes=[101.0],
+            volumes=[1000.0],
+            rvol_baseline=[1000.0],
+        )
+
+        candidate = scan_cpr_levels_entry(
+            day_pack=day_pack,
+            setup_row=setup_row,
+            params=params,
+            scan_start_idx=0,
+            scan_end_idx=0,
+        )
+
+        assert candidate is not None
+        assert candidate["target_price"] == pytest.approx(103.0)
+        assert candidate["first_target_price"] == pytest.approx(103.0)
+        assert candidate["runner_target_price"] == pytest.approx(112.0)
+        assert candidate["scale_out_pct"] == 0.5
+
+    def test_second_target_level_uses_full_position_r2_target_and_rr_gate(self):
+        params = BacktestParams(
+            min_price=50.0,
+            skip_rvol_check=True,
+            cpr_levels_config=CPRLevelsParams(
+                cpr_shift_filter="ALL",
+                min_effective_rr=2.0,
+                use_narrowing_filter=False,
+                cpr_entry_start="",
+                cpr_confirm_entry=False,
+                cpr_hold_confirm=False,
+                cpr_min_close_atr=0.0,
+                scale_out_pct=0.0,
+                target_level="SECOND",
+            ),
+        )
+        setup_row = {
+            "direction": "LONG",
+            "atr": 2.0,
+            "cpr_width_pct": 0.1,
+            "cpr_threshold": 33.0,
+            "high_915": 101.0,
+            "low_915": 99.0,
+            "open_915": 100.0,
+            "tc": 100.0,
+            "bc": 99.0,
+            "r1": 103.0,
+            "r2": 112.0,
+            "s1": 95.0,
+            "prev_day_close": 99.5,
+            "is_narrowing": True,
+            "open_to_cpr_atr": 0.0,
+        }
+        day_pack = DayPack(
+            time_str=["09:20"],
+            opens=[101.0],
+            highs=[101.5],
+            lows=[100.5],
+            closes=[101.0],
+            volumes=[1000.0],
+            rvol_baseline=[1000.0],
+        )
+
+        candidate = scan_cpr_levels_entry(
+            day_pack=day_pack,
+            setup_row=setup_row,
+            params=params,
+            scan_start_idx=0,
+            scan_end_idx=0,
+        )
+
+        assert candidate is not None
+        assert candidate["target_price"] == pytest.approx(112.0)
+        assert candidate["first_target_price"] == pytest.approx(103.0)
+        assert candidate["runner_target_price"] is None
+        assert candidate["scale_out_pct"] == 0.0
 
 
 class TestRunMetricsMaterialization:

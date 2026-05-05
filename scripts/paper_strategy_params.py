@@ -344,6 +344,14 @@ def _collect_strategy_cli_overrides(
     if scale_out_pct is not None:
         overrides.setdefault("cpr_levels_config", {})
         overrides["cpr_levels_config"]["scale_out_pct"] = float(scale_out_pct)
+    target_level = getattr(args, "cpr_target_level", None)
+    if target_level:
+        overrides.setdefault("cpr_levels_config", {})
+        overrides["cpr_levels_config"]["target_level"] = str(target_level).upper()
+    rr_gate_target = getattr(args, "cpr_rr_gate_target", None)
+    if rr_gate_target:
+        overrides.setdefault("cpr_levels_config", {})
+        overrides["cpr_levels_config"]["rr_gate_target_level"] = str(rr_gate_target).upper()
     if getattr(args, "narrowing_filter", False):
         overrides["narrowing_filter"] = True
     or_minutes = getattr(args, "or_minutes", None)

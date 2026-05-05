@@ -166,9 +166,19 @@ def build_strategy_config_from_overrides(
     cpr_overrides = dict(overrides.get("cpr_levels_config") or {})
     fbr_overrides = dict(overrides.get("fbr_config") or {})
 
-    for _cpr_field in ("cpr_min_close_atr", "time_stop_bars", "momentum_confirm"):
+    for _cpr_field in (
+        "cpr_min_close_atr",
+        "target_level",
+        "rr_gate_target_level",
+        "time_stop_bars",
+        "momentum_confirm",
+    ):
         if _cpr_field in overrides and _cpr_field not in cpr_overrides:
             cpr_overrides[_cpr_field] = overrides[_cpr_field]
+    if "cpr_target_level" in overrides and "target_level" not in cpr_overrides:
+        cpr_overrides["target_level"] = overrides["cpr_target_level"]
+    if "cpr_rr_gate_target" in overrides and "rr_gate_target_level" not in cpr_overrides:
+        cpr_overrides["rr_gate_target_level"] = overrides["cpr_rr_gate_target"]
     if "cpr_scale_out_pct" in overrides and "scale_out_pct" not in cpr_overrides:
         cpr_overrides["scale_out_pct"] = overrides["cpr_scale_out_pct"]
     if "scale_out_pct" in overrides and "scale_out_pct" not in cpr_overrides:

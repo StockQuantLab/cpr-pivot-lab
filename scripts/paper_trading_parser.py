@@ -204,6 +204,24 @@ def build_paper_trading_parser(
             help="CPR_LEVELS: fraction of position to exit at R1/S1 before the runner.",
         )
         sp.add_argument(
+            "--cpr-target-level",
+            choices=["first", "second"],
+            default=None,
+            help=(
+                "CPR_LEVELS: full-position target when scale-out is disabled. "
+                "'first' uses R1/S1; 'second' uses R2/S2."
+            ),
+        )
+        sp.add_argument(
+            "--cpr-rr-gate-target",
+            choices=["first", "second"],
+            default=None,
+            help=(
+                "CPR_LEVELS: target level used only for min_effective_rr entry quality gate. "
+                "'first' gates against R1/S1; 'second' gates against R2/S2."
+            ),
+        )
+        sp.add_argument(
             "--narrowing-filter",
             action="store_true",
             help="Enable the canonical CPR narrowing filter.",

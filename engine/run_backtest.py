@@ -688,6 +688,25 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--cpr-target-level",
+        choices=["first", "second"],
+        default="first",
+        help=(
+            "CPR_LEVELS: full-position target when scale-out is disabled. "
+            "'first' uses R1/S1; 'second' uses R2/S2."
+        ),
+    )
+    parser.add_argument(
+        "--cpr-rr-gate-target",
+        choices=["first", "second"],
+        default=None,
+        help=(
+            "CPR_LEVELS: target level used only for min_effective_rr entry quality gate. "
+            "Default is automatic: scale-out gates against R1/S1, full-position target "
+            "experiments gate against their selected target. 'second' gates against R2/S2."
+        ),
+    )
+    parser.add_argument(
         "--short-open-to-cpr-atr-min",
         type=float,
         default=0.0,
@@ -717,6 +736,8 @@ def _run_with_lock(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
         parser.error("--cpr-min-close-atr must be >= 0.0")
     if args.cpr_scale_out_pct < 0.0 or args.cpr_scale_out_pct >= 1.0:
         parser.error("--cpr-scale-out-pct must be in the range [0.0, 1.0)")
+    if args.cpr_scale_out_pct > 0.0 and args.cpr_target_level != "first":
+        parser.error("--cpr-target-level second cannot be combined with --cpr-scale-out-pct")
     if args.short_open_to_cpr_atr_min < 0.0:
         parser.error("--short-open-to-cpr-atr-min must be >= 0.0")
     if args.runtime_batch_size < 1:
@@ -935,6 +956,8 @@ def _run_with_lock(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
             "cpr_hold_confirm": args.cpr_hold_confirm,
             "cpr_min_close_atr": args.cpr_min_close_atr,
             "scale_out_pct": args.cpr_scale_out_pct,
+            "target_level": args.cpr_target_level.upper(),
+            "rr_gate_target_level": (args.cpr_rr_gate_target or "auto").upper(),
             "time_stop_bars": args.time_stop_bars,
             "momentum_confirm": args.momentum_confirm,
         },
@@ -1004,6 +1027,12 @@ def _run_with_lock(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
             preset_cli_overrides["max_sl_atr_ratio"] = args.max_sl_atr_ratio
         if args.time_stop_bars > 0:
             preset_cli_overrides["time_stop_bars"] = args.time_stop_bars
+        if args.cpr_scale_out_pct > 0.0:
+            preset_cli_overrides["scale_out_pct"] = args.cpr_scale_out_pct
+        if args.cpr_target_level != "first":
+            preset_cli_overrides["target_level"] = args.cpr_target_level.upper()
+        if args.cpr_rr_gate_target is not None:
+            preset_cli_overrides["rr_gate_target_level"] = args.cpr_rr_gate_target.upper()
         if args.momentum_confirm:
             preset_cli_overrides["momentum_confirm"] = True
         params = build_strategy_config_from_preset(args.preset, preset_cli_overrides)

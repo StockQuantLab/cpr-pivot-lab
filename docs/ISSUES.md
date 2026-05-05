@@ -7,6 +7,150 @@ Supersedes: `docs/PARITY_INCIDENT_LOG.md` (contents migrated below).
 
 ---
 
+## 2026-05-05 — FIXED: BUG: CPR scale-out partial target used R2/S2 instead of R1/S1
+
+**Status:** FIXED
+**Severity:** High
+
+### Symptom
+
+Corrected CPR scale-out experiments showed `scale_out_pct=0.5` and `scale_out_pct=0.8` producing
+nearly identical results. That is impossible if 50% vs 80% of the position is actually being exited
+at R1/S1.
+
+### Root Cause
+
+`scan_cpr_levels_entry()` selected `target_price = runner_target_price` whenever scale-out was
+enabled. The trade lifecycle treats `target_price` as the first partial-exit target and
+`runner_target_price` as the final runner target, so scale-out trades were effectively exiting the
+partial leg at R2/S2 instead of R1/S1. Changing `scale_out_pct` only affected rounding in rare rows.
+
+### Fix
+
+`engine/cpr_atr_shared.py` now keeps `target_price` at R1/S1 when scale-out is enabled and stores
+R2/S2 only in `runner_target_price`. A separate `rr_gate_target_level` was added so experiments can
+test the entry quality gate against R2/S2 without changing the actual exit path. Backtest and
+paper/replay parsers now expose this as `--cpr-rr-gate-target first|second`.
+
+Regression coverage:
+`tests/test_strategy.py::TestPortfolioExecutionOverlay::test_scale_out_min_effective_rr_uses_first_target_not_runner_target`,
+`tests/test_strategy.py::TestPortfolioExecutionOverlay::test_scale_out_can_require_min_effective_rr_against_runner_target`,
+and parser/signature/label tests around `rr_gate_target_level`.
+
+### Experiment Results
+
+Invalid scale-out runs `888f27180e57`, `6104ef8a3793`, and `4793f0a9d6b6` were deleted.
+Corrected daily-reset RISK experiments on `full_2026_05_05` produced:
+
+| Variant | Run ID | P/L Delta vs Canonical | PF | Calmar | Verdict |
+|---|---|---:|---:|---:|---|
+| LONG 50% at R1 + runner R2 | `8a672ed94922` | -Rs 144,678 | 3.36 | 196.77 | Worse |
+| SHORT 50% at S1 + runner S2 | `739d0cdb0cfa` | -Rs 2,878 | 2.72 | 96.82 | Near-flat |
+| LONG 80% at R1 + runner R2 | `f1837dc278f7` | -Rs 254,359 | 3.20 | 181.59 | Worse |
+| SHORT 80% at S1 + runner S2 | `e32f101d5d40` | -Rs 34,385 | 2.68 | 94.31 | Worse |
+| LONG 50% scale-out, RR gate R2 | `a4e339791464` | -Rs 478,318 | 2.41 | 102.09 | Worse |
+| SHORT 50% scale-out, RR gate S2 | `13146f14bef6` | -Rs 274,573 | 2.20 | 53.25 | Worse |
+| LONG 80% scale-out, RR gate R2 | `927e5f2a8249` | -Rs 486,689 | 2.40 | 123.80 | Worse |
+| SHORT 80% scale-out, RR gate S2 | `d66e2f0b29fa` | -Rs 282,298 | 2.19 | 58.03 | Worse |
+| LONG full position to R2 | `e83951a885f5` | -Rs 325,464 | 2.45 | 88.39 | Worse |
+| SHORT full position to S2 | `72fd277d1525` | -Rs 318,968 | 2.08 | 34.34 | Worse |
+
+Interpretation: corrected scale-out increases win rate modestly, but it gives up too much target
+profit on LONG and does not materially improve SHORT. R2/S2-based quality gating improves win rate
+but damages P/L, PF, and Calmar. Keep canonical full exit at R1/S1 for now.
+
+All corrected experiment rows above were deleted after review so the dashboard and registry retain
+only canonical baselines. CPR defaults remain `scale_out_pct=0.0`, `target_level=FIRST`, and
+`rr_gate_target_level=AUTO`; do not enable scale-out, full R2/S2 targets, or R2/S2 RR gating in
+backtest, paper replay, paper live, or real-routed live unless starting a fresh opt-in experiment.
+
+### Related
+
+Canonical controls: `f9d8f3c689a9` (RISK_LONG daily-reset), `05cda5c2d526`
+(RISK_SHORT daily-reset).
+
+---
+
+## 2026-05-05 — FIXED: BUG: CPR experiment runs were indistinguishable in dashboard labels
+
+**Status:** FIXED
+**Severity:** Low
+
+### Symptom
+
+The four corrected CPR exit experiments existed in `run_metadata`, `run_metrics`, and the dashboard
+replica, but the dashboard appeared to show fewer distinct runs because all four were labeled only
+as `CPR_LEVELS daily-reset-risk | 2025-01-01 to 2026-05-05`.
+
+### Root Cause
+
+`BacktestResult.save_to_db()` generated labels from strategy, reset mode, sizing mode, and date
+window only. It did not include non-canonical CPR exit settings such as `scale_out_pct` or
+`target_level`. The parameter signature also included `scale_out_pct` but not `target_level`, so
+R1/S1 and full-position R2/S2 target experiments were not fully separated in the signature.
+
+### Fix
+
+`engine/cpr_atr_result.py` now appends label suffixes for non-default CPR exit settings, for example
+`scaleout0.5`, `target-second`, and `rrgate-second`. `engine/cpr_backtest_helpers.py` now includes
+`target_level` and `rr_gate_target_level` in the deterministic parameter signature. Experiment rows
+were relabeled in `run_metadata` and `run_metrics`, then the backtest replica was force-synced.
+
+Regression coverage:
+`tests/test_strategy.py::TestBacktestResultMetrics::test_save_to_db_labels_cpr_exit_experiments`
+and `tests/test_strategy.py::TestBacktestParams::test_param_signature_changes_with_cpr_target_level`.
+
+### Related
+
+Deleted experiment runs: `8a672ed94922`, `739d0cdb0cfa`, `f1837dc278f7`, `e32f101d5d40`,
+`a4e339791464`, `13146f14bef6`, `927e5f2a8249`, `d66e2f0b29fa`, `e83951a885f5`,
+`72fd277d1525`.
+
+---
+
+## 2026-05-05 — FIXED: BUG: preset backtest ignored CPR scale-out CLI override
+
+**Status:** FIXED
+**Severity:** Medium
+
+### Symptom
+
+Initial CPR scale-out experiments using `pivot-backtest --preset ... --cpr-scale-out-pct 0.5`
+matched canonical results exactly. That was suspicious because scale-out should alter exit
+management whenever R1/S1 is reached.
+
+### Root Cause
+
+The non-preset `strategy_overrides` path included `scale_out_pct`, but the preset path only
+forwarded selected non-default overrides and omitted `--cpr-scale-out-pct`. Preset-based
+experiments silently ran with the preset's default `scale_out_pct=0.0`.
+
+### Fix
+
+`engine/run_backtest.py` now forwards non-zero `--cpr-scale-out-pct` into preset overrides.
+It also adds `--cpr-target-level first|second` so full-position R2/S2 target experiments can
+be run explicitly without confusing them with scale-out behavior. Paper/replay argument parsing
+and strategy-param resolution now understand the same target-level field.
+
+Regression coverage:
+`tests/test_strategy.py::TestBacktestParams::test_cpr_scale_out_and_rr_gate_target_preset_overrides`,
+`tests/test_strategy.py::TestPortfolioExecutionOverlay::test_second_target_level_uses_full_position_r2_target_and_rr_gate`,
+and CLI/parser coverage in `tests/test_cli.py` / `tests/test_paper_trading_cli.py`.
+
+### Experiment Results
+
+Invalid exact-match scale-out runs `676f9ad4bae2` and `820255bfa089` were deleted. A follow-up
+scale-out lifecycle bug was later found, so the first corrected scale-out result set was also
+invalidated and deleted. See the 2026-05-05 scale-out partial-target issue above for the final
+corrected experiment table.
+
+### Related
+
+Canonical controls: `f9d8f3c689a9` (RISK_LONG daily-reset), `05cda5c2d526`
+(RISK_SHORT daily-reset).
+
+---
+
 ## 2026-05-05 — FIXED: OPS: EOD log monitoring was delayed by buffered non-TTY stdout
 
 **Status:** FIXED
@@ -265,7 +409,9 @@ dedupe to match the exact rendered session tag in the alert body (`Session:
 ### Objective
 
 Complete the remaining live-readiness items that were deferred while the 2026-05-05 paper-live
-session and the first ITC real-order round-trip were in progress.
+session and the first ITC real-order round-trip were in progress. Code support exists for the
+checks below; the remaining work is live validation during the next market session with a fresh
+Kite token and current whitelisted outbound IP.
 
 ### Pending Work
 
@@ -7185,9 +7331,9 @@ checks still run. Regression coverage:
 
 ---
 
-## 2026-05-03 — OPEN: STRATEGY: min_effective_rr gate evaluated against runner target (R2/S2), not first target (R1/S1)
+## 2026-05-03 — FIXED: STRATEGY: min_effective_rr gate evaluated against runner target (R2/S2), not first target (R1/S1)
 
-**Status:** OPEN
+**Status:** FIXED
 **Severity:** High
 
 ### Symptom
@@ -7209,6 +7355,21 @@ Trade quality is overstated when scale-out is active. Trades that do not meet th
 ### Location
 
 `engine/cpr_atr_shared.py:277`, `306-310`
+
+### Fix
+
+Fixed 2026-05-05. The `min_effective_rr` and target-behind-entry gates now evaluate against
+the first target (`R1` / `S1`) even when `scale_out_pct > 0`; the runner target remains the
+trade lifecycle target only after the entry has passed the first-target quality gate.
+
+Regression coverage:
+`tests/test_strategy.py::TestPortfolioExecutionOverlay::test_scale_out_min_effective_rr_uses_first_target_not_runner_target`.
+
+Validation 2026-05-05: daily-reset risk baseline spot-checks after the strategy-fix batch:
+`RISK_LONG` rerun `7fa2d899fe78` matched canonical `f9d8f3c689a9` exactly (0 trade delta,
+0 P/L delta, exact row-set match). `RISK_SHORT` rerun `3eeff6cc74d2` changed because the
+SHORT trailing-stop fix below changes exit management; this RR-gate fix does not affect
+canonical `scale_out_pct=0` runs directly.
 
 ---
 
@@ -7983,9 +8144,9 @@ and `tests/test_paper_runtime.py::test_format_risk_alert_ignores_invalid_trade_d
 
 ---
 
-## 2026-05-03 — OPEN: STRATEGY: CPR entry boundary allows equality (close == trigger) when exclusive crossing intended
+## 2026-05-03 — FIXED: STRATEGY: CPR entry boundary allows equality (close == trigger) when exclusive crossing intended
 
-**Status:** OPEN
+**Status:** FIXED
 **Severity:** Medium
 
 ### Symptom
@@ -8012,6 +8173,20 @@ Marginal entries at the exact trigger boundary may have lower follow-through pro
 ### Location
 
 `engine/cpr_atr_shared.py:239`, `258`
+
+### Fix
+
+Fixed 2026-05-05. CPR trigger checks now require a strict close beyond the trigger:
+LONG uses `current_close > trigger`, SHORT uses `current_close < trigger`. The shared
+`find_first_close_idx()` helper now uses the same exclusive crossing semantics.
+
+Regression coverage:
+`tests/test_strategy.py::TestPortfolioExecutionOverlay::test_scan_cpr_levels_entry_requires_close_beyond_trigger`
+and `tests/test_cpr_atr_shared.py::test_find_first_close_idx_requires_exclusive_cross`.
+
+Validation 2026-05-05: daily-reset `RISK_LONG` had an exact row-set match after this fix, so
+no equality-boundary LONG trades were present in the current canonical window. The SHORT rerun
+delta is attributable to the trailing-stop fix below.
 
 ---
 
@@ -8383,9 +8558,9 @@ that analytics schema is separate cleanup, not a Monday live blocker. Regression
 
 ---
 
-## 2026-05-03 — OPEN: STRATEGY: SHORT trailing stop skips SL tightening on BREAKEVEN-to-TRAIL transition
+## 2026-05-03 — WON'T FIX: STRATEGY: SHORT trailing stop skips SL tightening on BREAKEVEN-to-TRAIL transition
 
-**Status:** OPEN
+**Status:** WON'T FIX for canonical CPR as of 2026-05-05
 **Severity:** Medium
 
 ### Symptom
@@ -8411,7 +8586,7 @@ The comment says "Same deferred-SL logic as LONG" but the SL update is missing e
 
 If price reverses sharply on the target-reaching bar, the SHORT position is not protected by the trailing stop for one bar. The SL remains at breakeven (entry price) instead of tightening to `lowest_since_entry + ATR`.
 
-### Fix Direction
+### Rejected Fix Direction
 
 Add SL tightening to the SHORT transition, mirroring LONG:
 ```python
@@ -8422,6 +8597,28 @@ self.phase = "TRAIL"
 ### Location
 
 `engine/cpr_atr_utils.py:144-146`
+
+### Decision
+
+Rejected 2026-05-05 after baseline validation. The mirror-LONG implementation worked
+mechanically, but materially regressed the daily-reset `RISK_SHORT` baseline. Keep the existing
+deferred SHORT trailing behavior for canonical CPR unless a future explicit strategy experiment
+accepts the lower-return tradeoff.
+
+Regression coverage remains on the current deferred behavior:
+`tests/test_cpr_utils.py::TestTrailingStop::test_short_intraday_low_triggers_trail_after_breakeven`
+and `tests/test_cpr_utils.py::TestTrailingStop::test_short_same_bar_multi_transition_protect_to_trail`.
+
+Validation 2026-05-05: daily-reset `RISK_SHORT` rerun `3eeff6cc74d2` versus canonical
+`05cda5c2d526` produced `+2` trades and `-₹60,462.70` P/L delta. Exit mix shifted as expected
+from the rejected fix: `TARGET` decreased `753 → 358`, `TRAILING_SL` increased `15 → 408`,
+and PF moved `2.61 → 2.55`. Do not promote or reintroduce this behavior without a new
+operator-approved experiment.
+
+Post-revert confirmation 2026-05-05: daily-reset `RISK_SHORT` rerun `83bac0a64e06` matched
+canonical `05cda5c2d526` exactly: `0` trade delta, `₹0.00` P/L delta, and exact row-set match.
+Temporary validation runs `7fa2d899fe78`, `3eeff6cc74d2`, and `83bac0a64e06` were deleted
+after comparison.
 
 ---
 

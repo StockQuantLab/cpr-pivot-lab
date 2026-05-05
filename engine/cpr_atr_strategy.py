@@ -1488,7 +1488,12 @@ class CPRATRBacktest:
         if direction == "LONG":
             trigger = cpr_upper * (1.0 + p.buffer_pct)
             sl_price = cpr_lower - atr_buffer
-            target_price = float(setup_row["r1"])
+            target_price = (
+                float(setup_row["r2"])
+                if str(getattr(cpr_cfg, "target_level", "FIRST") or "FIRST").upper() == "SECOND"
+                and cpr_cfg.scale_out_pct <= 0
+                else float(setup_row["r1"])
+            )
             runner_target_price = (
                 float(setup_row["r2"])
                 if cpr_cfg.scale_out_pct > 0 and float(setup_row["r2"]) > target_price
@@ -1497,7 +1502,12 @@ class CPRATRBacktest:
         else:
             trigger = cpr_lower * (1.0 - p.buffer_pct)
             sl_price = cpr_upper + atr_buffer
-            target_price = float(setup_row["s1"])
+            target_price = (
+                float(setup_row["s2"])
+                if str(getattr(cpr_cfg, "target_level", "FIRST") or "FIRST").upper() == "SECOND"
+                and cpr_cfg.scale_out_pct <= 0
+                else float(setup_row["s1"])
+            )
             runner_target_price = (
                 float(setup_row["s2"])
                 if cpr_cfg.scale_out_pct > 0 and float(setup_row["s2"]) < target_price

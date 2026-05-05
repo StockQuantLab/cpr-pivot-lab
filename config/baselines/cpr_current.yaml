@@ -1,48 +1,48 @@
 name: cpr_current
-description: Active CPR baseline registry promoted on 2026-05-04 after extending the all-8 rerun through the 2026-05-04 trading day.
-universe: full_2026_04_30
+description: Active CPR baseline registry promoted on 2026-05-05 after extending the all-8 rerun through the 2026-05-05 trading day.
+universe: full_2026_05_05
 symbol_count: 2038
 start_date: 2025-01-01
-end_date: 2026-05-04
-promoted_date: 2026-05-04
+end_date: 2026-05-05
+promoted_date: 2026-05-05
 variants:
   - label: daily_reset_standard_long
     preset: CPR_LEVELS_STANDARD_LONG
     direction: LONG
     compound_equity: false
-    run_id: 1089ce2684e3
+    run_id: 7d108d511ef8
   - label: daily_reset_standard_short
     preset: CPR_LEVELS_STANDARD_SHORT
     direction: SHORT
     compound_equity: false
-    run_id: f9eacc07c317
+    run_id: 51c3605228d7
   - label: daily_reset_risk_long
     preset: CPR_LEVELS_RISK_LONG
     direction: LONG
     compound_equity: false
-    run_id: 785a0ae8bc76
+    run_id: f9d8f3c689a9
   - label: daily_reset_risk_short
     preset: CPR_LEVELS_RISK_SHORT
     direction: SHORT
     compound_equity: false
-    run_id: 49488023a79d
+    run_id: 05cda5c2d526
   - label: compound_standard_long
     preset: CPR_LEVELS_STANDARD_LONG
     direction: LONG
     compound_equity: true
-    run_id: eb3c979cbae2
+    run_id: 52abe32edd6c
   - label: compound_standard_short
     preset: CPR_LEVELS_STANDARD_SHORT
     direction: SHORT
     compound_equity: true
-    run_id: 5e5d105ee842
+    run_id: 1b3a33451ae7
   - label: compound_risk_long
     preset: CPR_LEVELS_RISK_LONG
     direction: LONG
     compound_equity: true
-    run_id: 521c0fad74af
+    run_id: fdeb1465e168
   - label: compound_risk_short
     preset: CPR_LEVELS_RISK_SHORT
     direction: SHORT
     compound_equity: true
-    run_id: eeae3af65dd1
+    run_id: 5aeb65383761
