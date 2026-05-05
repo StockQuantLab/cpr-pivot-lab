@@ -184,6 +184,11 @@ def test_paper_trading_parser_supports_daily_commands() -> None:
     assert daily_prepare_args.all_symbols is False
     assert daily_prepare_args.universe_name is None
     assert daily_prepare_args.snapshot_universe_name is None
+    assert daily_prepare_args.allow_rerun is False
+    daily_prepare_rerun_args = parser.parse_args(
+        ["daily-prepare", "--trade-date", "2024-01-01", "--allow-rerun"]
+    )
+    assert daily_prepare_rerun_args.allow_rerun is True
 
     universes_args = parser.parse_args(["universes", "--name", "full_2026_04_24"])
     assert universes_args.command == "universes"
@@ -989,6 +994,48 @@ async def test_cmd_daily_prepare_auto_snapshots_all_symbols(
         ("dq", "2024-01-01"),
         ("print", "2024-01-01"),
     ]
+
+
+@pytest.mark.asyncio
+async def test_cmd_daily_prepare_same_day_guard_blocks_accidental_ready_rerun(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import scripts.paper_trading as pt
+
+    monkeypatch.setattr(pt, "_today_ist", lambda: "2024-01-01")
+    monkeypatch.setattr(pt, "resolve_trade_date", lambda value: value)
+    monkeypatch.setattr(pt, "_load_saved_universe_for_guard", lambda _name: ["RELIANCE", "SBIN"])
+    monkeypatch.setattr(
+        pt._data_quality,
+        "build_trade_date_readiness_report",
+        lambda trade_date: {"trade_date": trade_date, "ready": True},
+    )
+    monkeypatch.setattr(
+        pt,
+        "ensure_canonical_universe",
+        lambda trade_date=None: pytest.fail("guard should stop before canonical writes"),
+    )
+    monkeypatch.setattr(
+        pt,
+        "prepare_runtime_for_daily_paper",
+        lambda **kwargs: pytest.fail("guard should stop before daily-prepare validation"),
+    )
+
+    await _cmd_daily_prepare(
+        SimpleNamespace(
+            trade_date="2024-01-01",
+            symbols=None,
+            universe_name=None,
+            all_symbols=True,
+            snapshot_universe_name=None,
+            allow_rerun=False,
+        )
+    )
+
+    output = capsys.readouterr().out
+    assert "daily-prepare already completed for 2024-01-01" in output
+    assert "same_day_daily_prepare_already_ready" in output
 
 
 @pytest.mark.asyncio

@@ -545,8 +545,80 @@ def _last_available_trade_date(db) -> str:
     raise RuntimeError("No source trade dates found in v_5min or v_daily")
 
 
+def _today_ist() -> str:
+    return datetime.now(IST).date().isoformat()
+
+
+def _guard_completed_same_day_daily_prepare(
+    *,
+    args: argparse.Namespace,
+    trade_date: str,
+    snapshot_universe_name: str,
+) -> bool:
+    """Stop accidental same-day daily-prepare reruns after EOD already prepared live."""
+
+    if bool(getattr(args, "allow_rerun", False)):
+        return False
+    if trade_date != _today_ist():
+        return False
+    if not bool(getattr(args, "all_symbols", False)):
+        return False
+    if _parse_symbols_arg(getattr(args, "symbols", None)):
+        return False
+    if str(getattr(args, "universe_name", "") or "").strip():
+        return False
+    if not snapshot_universe_name:
+        return False
+
+    existing_symbols = _load_saved_universe_for_guard(snapshot_universe_name)
+    if not existing_symbols:
+        return False
+
+    readiness = _data_quality.build_trade_date_readiness_report(trade_date)  # type: ignore[attr-defined]
+    if not readiness.get("ready", False):
+        return False
+
+    print(
+        f"daily-prepare already completed for {trade_date}: "
+        f"universe '{snapshot_universe_name}' exists with {len(existing_symbols)} symbols "
+        "and data-quality readiness is Ready YES.",
+        flush=True,
+    )
+    print(
+        "Guard: not rerunning daily-prepare for the same live date. "
+        "Use 'pivot-data-quality --date today', 'pivot-paper-trading status', "
+        "and 'pivot-lock-status --json' for status checks. "
+        "Use --allow-rerun only for an explicit recovery drill.",
+        flush=True,
+    )
+    print(
+        json.dumps(
+            {
+                "trade_date": trade_date,
+                "snapshot_universe_name": snapshot_universe_name,
+                "snapshot_universe_count": len(existing_symbols),
+                "dq_ready": True,
+                "guard": "same_day_daily_prepare_already_ready",
+            },
+            default=str,
+            indent=2,
+        )
+    )
+    return True
+
+
 async def _cmd_daily_prepare(args: argparse.Namespace) -> None:
     trade_date = resolve_trade_date(args.trade_date)
+    snapshot_universe_name = str(getattr(args, "snapshot_universe_name", "") or "").strip()
+    if not snapshot_universe_name and bool(getattr(args, "all_symbols", False)):
+        snapshot_universe_name = f"full_{trade_date.replace('-', '_')}"
+    if _guard_completed_same_day_daily_prepare(
+        args=args,
+        trade_date=trade_date,
+        snapshot_universe_name=snapshot_universe_name,
+    ):
+        return
+
     canonical_symbols: list[str] = []
     canonical_created = False
     if (
@@ -564,9 +636,6 @@ async def _cmd_daily_prepare(args: argparse.Namespace) -> None:
                 flush=True,
             )
     symbols = _resolve_cli_symbols(build_parser(), args, read_only=True)
-    snapshot_universe_name = str(getattr(args, "snapshot_universe_name", "") or "").strip()
-    if not snapshot_universe_name and bool(getattr(args, "all_symbols", False)):
-        snapshot_universe_name = f"full_{trade_date.replace('-', '_')}"
     if snapshot_universe_name:
         existing_symbols = _load_saved_universe_for_guard(snapshot_universe_name)
         refresh_snapshot = bool(getattr(args, "refresh_universe_snapshot", False))

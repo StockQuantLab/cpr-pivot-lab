@@ -33,8 +33,12 @@ PYTHONUNBUFFERED=1 doppler run -- uv run pivot-paper-trading daily-live \
   elapsed time, log sizes, log tails, and Windows memory counters when available.
 - `PYTHONUNBUFFERED=1` is required for real-time log visibility when using the direct command.
 - Pre-market (8:30–9:10 AM): `daily-prepare --trade-date today --all-symbols` must pass
-  before live starts. If EOD was not completed, run `pivot-refresh --since <prev_trading_date>
-  --prepare-paper --trade-date today` and wait for it to complete.
+  once before live starts. If yesterday's EOD pipeline already ran it and today's dated
+  universe is ready, do not rerun it for status; use `pivot-data-quality --date today`,
+  `pivot-paper-trading status`, and `pivot-lock-status --json` instead. The CLI guards
+  same-day ready reruns and requires `--allow-rerun` for an explicit recovery drill.
+  If EOD was not completed, run `pivot-refresh --since <prev_trading_date> --prepare-paper
+  --trade-date today` and wait for it to complete.
 - `pivot-data-quality --date today` must print `Ready YES` before live starts. In pre-market
   mode this checks today's saved universe against the previous completed trading day's
   `v_daily`, `v_5min`, `atr_intraday`, and `cpr_thresholds` data; it does not require today's
@@ -74,7 +78,8 @@ you explicitly launch `daily-live --real-orders` and all Doppler real-order gate
 
 **Pre-market gate:**
 ```bash
-doppler run -- uv run pivot-eod-status --date <previous_trading_date> --trade-date today
+# If yesterday's EOD already completed, skip daily-prepare and use the status checks below.
+# If EOD did not complete or today's full_YYYY_MM_DD snapshot is missing, run daily-prepare once.
 doppler run -- uv run pivot-paper-trading daily-prepare --trade-date today --all-symbols
 doppler run -- uv run pivot-data-quality --date today
 doppler run -- uv run python scripts/test_kite_websocket.py
@@ -90,6 +95,11 @@ Required result:
 - `status` shows no unexpected active sessions before launch.
 - `universes` includes today's `full_YYYY_MM_DD` snapshot.
 - `pivot-lock-status` shows no live writer PID before startup.
+
+Do not use `pivot-eod-status` as the same-day live-readiness authority after the EOD pipeline
+has already completed. The live startup gate is `pivot-data-quality --date today`; `eod-status`
+is stricter about same-day `or_daily` / `virgin_cpr_flags` rows that are not required before
+the 09:15 live opening-range candle exists.
 
 **After market open status-only commands:**
 ```bash

@@ -824,6 +824,14 @@ def build_paper_trading_parser(
             "from canonical_full. Normal reruns refuse mismatched overwrites."
         ),
     )
+    daily_prepare.add_argument(
+        "--allow-rerun",
+        action="store_true",
+        help=(
+            "Allow an explicit same-day daily-prepare rerun after the dated universe already "
+            "exists and data-quality readiness is green. Use only for recovery drills."
+        ),
+    )
     _add_symbol_args(daily_prepare)
     daily_prepare.set_defaults(handler=_cmd_daily_prepare)
 

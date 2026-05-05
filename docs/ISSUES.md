@@ -7,6 +7,42 @@ Supersedes: `docs/PARITY_INCIDENT_LOG.md` (contents migrated below).
 
 ---
 
+## 2026-05-05 — FIXED: OPS: same-day daily-prepare rerun caused readiness confusion
+
+**Status:** FIXED
+**Severity:** Medium
+
+### Symptom
+
+During pre-market live-readiness confirmation for 2026-05-05, `daily-prepare --trade-date today
+--all-symbols` was rerun even though yesterday's EOD pipeline had already prepared
+`full_2026_05_05`. The rerun did not corrupt data, but it produced a large readiness payload and
+created operator confusion about whether live setup had been repeated or damaged.
+
+### Root Cause
+
+The runbook mixed one-time pre-market preparation with same-day status checks. The CLI was
+validate-only and refused mismatched snapshot overwrites, but it still allowed a same-day
+`daily-prepare` rerun when the dated universe already existed and `pivot-data-quality` was green.
+
+### Fix
+
+`pivot-paper-trading daily-prepare` now guards accidental same-day reruns: when today's
+`full_YYYY_MM_DD` universe already exists and data-quality readiness is `Ready YES`, the command
+stops before canonical-universe writes, snapshot handling, and full preparation output. It prints
+a concise guard message directing operators to use `pivot-data-quality --date today`,
+`pivot-paper-trading status`, and `pivot-lock-status --json`. `--allow-rerun` is available only
+for explicit recovery drills.
+
+The runbook now distinguishes one-time `daily-prepare` from status-only checks and notes that
+`pivot-eod-status` is not the same-day live-readiness authority after EOD has already completed.
+
+### Related
+
+2026-05-05 live-paper readiness check, `full_2026_05_05`, same-day setup-only mode.
+
+---
+
 ## 2026-05-04 — OPEN: PARITY: Kite feed-audit replay does not reproduce actual live session
 
 **Status:** OPEN
