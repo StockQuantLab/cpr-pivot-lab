@@ -429,9 +429,7 @@ async def test_live_multi_operator_controls_pause_resume_and_set_budget(
 
 
 @pytest.mark.asyncio
-async def test_live_multi_operator_controls_cancel_pending(
-    tmp_path, monkeypatch, caplog
-) -> None:
+async def test_live_multi_operator_controls_cancel_pending(tmp_path, monkeypatch, caplog) -> None:
     import scripts.paper_live as paper_live
 
     monkeypatch.chdir(tmp_path)

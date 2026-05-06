@@ -353,26 +353,28 @@ def test_paper_daily_summary_excludes_diagnostic_paper_runs(tmp_path) -> None:
         db.store_backtest_results(
             pl.concat(
                 [
-                    _trade_frame("CPR_LEVELS_LONG-2026-05-04-live-kite", "2026-05-04")
-                    .with_columns(
+                    _trade_frame("CPR_LEVELS_LONG-2026-05-04-live-kite", "2026-05-04").with_columns(
                         pl.lit("PAPER").alias("execution_mode"),
                         pl.lit("LONG").alias("direction"),
                         pl.lit(24753.32).alias("profit_loss"),
                     ),
-                    _trade_frame("compare-kite-audit-long-2026-05-04-v2", "2026-05-04")
-                    .with_columns(
+                    _trade_frame(
+                        "compare-kite-audit-long-2026-05-04-v2", "2026-05-04"
+                    ).with_columns(
                         pl.lit("PAPER").alias("execution_mode"),
                         pl.lit("LONG").alias("direction"),
                         pl.lit(21218.73).alias("profit_loss"),
                     ),
-                    _trade_frame("CPR_LEVELS_SHORT-2026-05-04-live-kite", "2026-05-04")
-                    .with_columns(
+                    _trade_frame(
+                        "CPR_LEVELS_SHORT-2026-05-04-live-kite", "2026-05-04"
+                    ).with_columns(
                         pl.lit("PAPER").alias("execution_mode"),
                         pl.lit("SHORT").alias("direction"),
                         pl.lit(-3737.70).alias("profit_loss"),
                     ),
-                    _trade_frame("compare-kite-audit-short-2026-05-04-v2", "2026-05-04")
-                    .with_columns(
+                    _trade_frame(
+                        "compare-kite-audit-short-2026-05-04-v2", "2026-05-04"
+                    ).with_columns(
                         pl.lit("PAPER").alias("execution_mode"),
                         pl.lit("SHORT").alias("direction"),
                         pl.lit(-746.85).alias("profit_loss"),

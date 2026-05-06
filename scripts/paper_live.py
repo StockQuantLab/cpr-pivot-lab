@@ -936,9 +936,7 @@ async def _prepare_live_multi_context(
     runtime_state = PaperRuntimeState(
         allow_live_setup_fallback=allow_live_setup_fallback,
         allow_or_proxy_setup=_allow_or_proxy_setup_for_adapter(ticker_adapter),
-        bar_end_offset=timedelta(minutes=5)
-        if _is_local_feed_adapter(ticker_adapter)
-        else None,
+        bar_end_offset=timedelta(minutes=5) if _is_local_feed_adapter(ticker_adapter) else None,
     )
     _prefetch_setup_rows(
         runtime_state=runtime_state,
@@ -1902,9 +1900,7 @@ async def run_live_session(
     runtime_state = PaperRuntimeState(
         allow_live_setup_fallback=allow_live_setup_fallback,
         allow_or_proxy_setup=_allow_or_proxy_setup_for_adapter(ticker_adapter),
-        bar_end_offset=timedelta(minutes=5)
-        if _is_local_feed_adapter(ticker_adapter)
-        else None,
+        bar_end_offset=timedelta(minutes=5) if _is_local_feed_adapter(ticker_adapter) else None,
     )
     if deps is None:
         _prefetch_setup_rows(

@@ -1018,9 +1018,7 @@ class DuckDBRuntimeBuilderMixin:
                 date.fromisoformat(since_date_iso) - timedelta(days=calc_lookback_days)
             ).isoformat()
         window_filter_sql = _date_window_clause("date::DATE", calc_since_date_iso, until_date_iso)
-        insert_window_filter_sql = _date_window_clause(
-            "trade_date", since_date_iso, until_date_iso
-        )
+        insert_window_filter_sql = _date_window_clause("trade_date", since_date_iso, until_date_iso)
         # _date_window_clause embeds dates as SQL literals (no ? placeholders),
         # so window_params is always empty — the filtering is in window_filter_sql.
         window_params: list[object] = []

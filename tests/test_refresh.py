@@ -153,7 +153,17 @@ def test_eod_ingest_runs_strict_order(monkeypatch) -> None:
         "--resume",
         "--skip-existing",
     ]
-    runtime_tables = ["cpr", "atr", "thresholds", "or", "state", "strategy", "pack", "virgin", "meta"]
+    runtime_tables = [
+        "cpr",
+        "atr",
+        "thresholds",
+        "or",
+        "state",
+        "strategy",
+        "pack",
+        "virgin",
+        "meta",
+    ]
     for index, table in enumerate(runtime_tables, start=3):
         assert captured[index][3:] == [
             "--table",

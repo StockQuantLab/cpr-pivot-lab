@@ -541,7 +541,11 @@ def _print_window_report(start_date: str, end_date: str) -> None:
     print(f"\nWindow checks ({start_date} -> {end_date}; read-only, registry not mutated):")
     for item in checks:
         label, sql = item[0], item[1]
-        params = [end_date, start_date, end_date] if len(item) > 2 and item[2] == "date_gap" else [start_date, end_date]
+        params = (
+            [end_date, start_date, end_date]
+            if len(item) > 2 and item[2] == "date_gap"
+            else [start_date, end_date]
+        )
         count = con.execute(sql, params).fetchone()[0]
         print(f"  {label:<20} {int(count):>10,}")
 
@@ -609,8 +613,7 @@ def _baseline_window_count_and_samples(
             params,
         ).fetchall()
         samples = [
-            {"symbol": str(symbol), "trade_date": str(trade_date)}
-            for symbol, trade_date in rows
+            {"symbol": str(symbol), "trade_date": str(trade_date)} for symbol, trade_date in rows
         ]
     return source_count, missing_count, samples
 
@@ -670,8 +673,7 @@ def _baseline_window_pack_rvol_count_and_samples(
         except Exception:
             rows = []
         samples = [
-            {"symbol": str(symbol), "trade_date": str(trade_date)}
-            for symbol, trade_date in rows
+            {"symbol": str(symbol), "trade_date": str(trade_date)} for symbol, trade_date in rows
         ]
     return checked_count, failing_count, samples
 

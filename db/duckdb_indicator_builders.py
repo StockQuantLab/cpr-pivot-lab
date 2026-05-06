@@ -250,9 +250,7 @@ class DuckDBIndicatorBuilderMixin:
                 self.con.execute("DELETE FROM cpr_daily WHERE " + " AND ".join(delete_parts))
                 self.con.execute("INSERT INTO cpr_daily SELECT * FROM tmp_cpr_daily_refresh")
             else:
-                self.con.execute(
-                    "CREATE TABLE cpr_daily AS SELECT * FROM tmp_cpr_daily_refresh"
-                )
+                self.con.execute("CREATE TABLE cpr_daily AS SELECT * FROM tmp_cpr_daily_refresh")
             self.con.execute("DROP TABLE tmp_cpr_daily_refresh")
             n = self.con.execute("SELECT COUNT(*) FROM cpr_daily").fetchone()[0]
             scope = f"symbols={len(target_symbols)}"

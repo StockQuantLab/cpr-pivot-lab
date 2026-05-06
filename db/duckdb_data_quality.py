@@ -29,7 +29,9 @@ SPECIAL_TRADING_SESSION_WINDOWS: dict[str, tuple[str, str]] = {
 }
 
 
-def timestamp_invalid_condition_sql(*, column: str = "candle_time", date_column: str = "date") -> str:
+def timestamp_invalid_condition_sql(
+    *, column: str = "candle_time", date_column: str = "date"
+) -> str:
     """Return SQL that flags candles outside configured valid NSE session windows."""
     special_clauses = []
     for trading_date, (start_time, end_time) in SPECIAL_TRADING_SESSION_WINDOWS.items():
@@ -467,8 +469,7 @@ class MarketDataQualityMixin:
             severities={"PACK_RVOL_ALL_NULL": "CRITICAL"},
             detail_fns={
                 "PACK_RVOL_ALL_NULL": lambda c, d: (
-                    f"{c} pack days with all-null RVOL baseline despite prior context "
-                    f"(first: {d})"
+                    f"{c} pack days with all-null RVOL baseline despite prior context (first: {d})"
                 )
             },
         )

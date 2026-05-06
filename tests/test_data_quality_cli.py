@@ -245,9 +245,7 @@ def test_baseline_window_atr_source_excludes_zero_volume_index_days(monkeypatch)
 
     assert report["checks"][0]["source_symbol_days"] == 1
     assert report["checks"][0]["missing_symbol_days"] == 1
-    assert report["checks"][0]["samples"] == [
-        {"symbol": "SBIN", "trade_date": "2026-05-06"}
-    ]
+    assert report["checks"][0]["samples"] == [{"symbol": "SBIN", "trade_date": "2026-05-06"}]
 
 
 def test_comprehensive_dq_scan_registers_all_null_pack_rvol():
