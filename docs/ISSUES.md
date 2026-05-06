@@ -7,6 +7,1288 @@ Supersedes: `docs/PARITY_INCIDENT_LOG.md` (contents migrated below).
 
 ---
 
+## 2026-05-06 — FIXED: DATA: full canonical baseline window had stale pack coverage/RVOL rows
+
+**Status:** FIXED
+**Severity:** High
+
+### Symptom
+
+The canonical baseline-window gate for `2025-01-01 -> 2026-05-06` failed after the May-only repair:
+
+- `intraday_day_pack`: `6,807` missing symbol-days
+- `PACK_RVOL_ALL_NULL`: `1,188` failing symbol-days
+
+Most RVOL failures were at the start of the baseline window, indicating the pack rows were built
+without enough pre-window RVOL lookback context.
+
+### Root Cause
+
+Older pack rows in the canonical baseline slice predated the incremental RVOL lookback fix and were
+not repaired by the May-only targeted rebuild. The baseline-window gate correctly caught that the
+full baseline slice was still not promotable.
+
+### Fix
+
+Rebuilt `intraday_day_pack` for `canonical_full` from `2025-01-01`, with the repaired builder reading
+from `2024-11-17` for RVOL lookback and inserting from `2025-01-01`.
+
+### Related
+
+Verification:
+
+```bash
+doppler run -- uv run pivot-data-quality --baseline-window \
+  --universe-name canonical_full \
+  --start 2025-01-01 \
+  --end 2026-05-06 \
+  --limit 20
+```
+
+Result: `PASS`
+
+- `intraday_day_pack`: `587,052` source days, `0` missing
+- `atr_intraday`: `584,220` source days, `0` missing
+- `market_day_state`: `586,500` buildable days, `0` missing
+- `strategy_day_state`: `586,500` buildable days, `0` missing
+- `cpr_daily`: `645,973` source days, `0` missing
+- `cpr_thresholds`: `645,973` source days, `0` missing
+- `PACK_RVOL_ALL_NULL`: `586,579` checked days, `0` failing
+
+---
+
+## 2026-05-06 — FIXED: DATA: baseline-window gate failed on mixed real pack gaps and zero-volume index ATR rows
+
+**Status:** FIXED
+**Severity:** Medium
+
+### Symptom
+
+After the RVOL repair, the short baseline-window gate still failed for `2026-04-29 -> 2026-05-06`:
+
+- `intraday_day_pack`: 45 missing symbol-days
+- `atr_intraday`: 3 missing symbol-days (`NIFTY 50`, `NIFTY 100`, `NIFTY 500` on 2026-05-06)
+
+### Root Cause
+
+The pack rows were real repair targets: affected symbols had regular 5-minute candles, daily rows,
+and runtime state, but the targeted pack rebuild initially skipped because the pack coverage guard
+checked broad date-level coverage instead of exact symbol-date coverage.
+
+The remaining ATR rows were zero-volume NIFTY index reference rows. They should not block CPR equity
+baseline promotion as tradeable ATR source days.
+
+### Fix
+
+Rebuilt the affected 25-symbol pack scope from `2026-04-29` with `--force`, restoring pack coverage
+to zero missing rows for the verified window.
+
+`scripts/data_quality.py --baseline-window` now treats ATR source days as buildable only when they
+have enough true-range candles and positive intraday volume, excluding zero-volume index rows from
+blocking ATR coverage.
+
+`db/duckdb_runtime_builders.py` no longer applies the broad pack date-coverage skip to
+symbol-scoped incremental pack rebuilds. Targeted repair commands can now actually repair sparse
+symbol gaps without requiring `--force`.
+
+### Related
+
+Verification:
+
+- `doppler run -- uv run pivot-data-quality --baseline-window --universe-name canonical_full --start 2026-04-29 --end 2026-05-06 --limit 20` -> `PASS`
+- `uv run pytest tests/test_data_quality_cli.py tests/test_intraday_day_pack_incremental.py -q` -> `22 passed`
+- `uv run ruff check db/duckdb_runtime_builders.py scripts/data_quality.py tests/test_data_quality_cli.py` -> clean
+
+---
+
+## 2026-05-06 — FIXED: DATA: DQ did not catch all-null pack RVOL baselines
+
+**Status:** FIXED
+**Severity:** High
+
+### Symptom
+
+The incremental `intraday_day_pack` RVOL regression was not caught by existing DQ/readiness checks.
+Runtime rows existed for the affected symbol/date pairs, so coverage checks passed even though
+`rvol_baseline_arr` was all-null for 2026-04-29, 2026-04-30, 2026-05-04, and 2026-05-05.
+
+### Root Cause
+
+DQ was coverage-oriented: it checked whether required rows existed and whether raw OHLC/timestamp
+data was structurally valid. It did not validate semantic quality of derived pack arrays, specifically
+whether RVOL baselines had usable prior-day context.
+
+### Fix
+
+`scripts/data_quality.py` now checks `intraday_day_pack.rvol_baseline_arr` for all-null/empty arrays
+when the same symbol has prior pack history in the previous 45 calendar days. The check is included in:
+
+- `pivot-data-quality --date ...` readiness;
+- `pivot-data-quality --baseline-window ...` promotion gates;
+- bounded window reports via `--window-start/--window-end`.
+
+Regression coverage: `tests/test_data_quality_cli.py`.
+
+---
+
+## 2026-05-06 — FIXED: OPS: cleanly completed runtime locks left stale lock metadata
+
+**Status:** FIXED
+**Severity:** Low
+
+### Symptom
+
+After EOD recovery completed, `pivot-lock-status --json` still showed
+`.tmp_logs/runtime-writer.lock` as stale for a dead PID even though the OS file lock had been
+released and no writer was active.
+
+### Root Cause
+
+`engine.command_lock.acquire_command_lock()` wrote `.lock.info` metadata on acquisition but did not
+remove that sidecar on normal release. The lock file itself is harmless, but stale sidecar metadata
+made a clean exit look like a stale writer.
+
+### Fix
+
+Normal lock release now removes the `.lock.info` sidecar after unlocking. Abnormal process exits
+still leave metadata behind, which is useful for stale-lock diagnostics.
+
+---
+
+## 2026-05-06 — FIXED: OPS: EOD build_runtime can terminate with Windows exit code -1
+
+**Status:** FIXED
+**Severity:** High
+
+### Symptom
+
+During `pivot-refresh --eod-ingest --date 2026-05-06 --trade-date 2026-05-07`, stage 4
+(`build_runtime`) terminated twice with exit code `4294967295` (`-1` on Windows) and no Python
+traceback:
+
+- first run: after `virgin_cpr_flags refreshed`
+- resume run: during ATR batch 9
+
+Both crashes left stale runtime-writer locks for dead PIDs. The EOD pipeline was recovered by
+running ATR as an isolated lower-pressure table build, then resuming from `build_next_day_cpr`.
+
+### Root Cause
+
+Not fully confirmed. The crash occurs outside normal Python exception handling while a long-lived
+monolithic `build_all()` process is running multiple DuckDB-heavy refreshes. This is likely process
+termination from native DuckDB/Windows resource pressure rather than a handled Python error.
+
+### Current Recovery
+
+If this repeats:
+
+```bash
+doppler run -- uv run pivot-build --table atr \
+  --refresh-since <eod_date> \
+  --batch-size 64 \
+  --duckdb-threads 4 \
+  --duckdb-max-memory 8GB
+
+doppler run -- uv run pivot-refresh --eod-ingest \
+  --date <eod_date> \
+  --trade-date <next_trade_date> \
+  --start-from-stage build_next_day_cpr
+```
+
+### Fix
+
+`pivot-refresh --eod-ingest` now runs `build_runtime` as table-isolated substages:
+`cpr`, `atr`, `thresholds`, `or`, `state`, `strategy`, `pack`, `virgin`, and `meta`.
+Each substage is a separate `pivot-build --table ... --refresh-since ...` process with deferred
+replica sync. A native crash now fails only the current table command and can be resumed/retried at
+the failed table without discarding successful previous stages.
+
+Regression coverage: `tests/test_refresh.py`.
+
+---
+
+## 2026-05-06 — FIXED: OPS: EOD pivot-build stages repeatedly forced market replica sync
+
+**Status:** FIXED
+**Severity:** Medium
+
+### Symptom
+
+Tonight's EOD next-day table stages inserted the required rows quickly, but each table-scoped
+`pivot-build` command then spent several extra minutes before returning. The long pause happened
+after the `... refreshed` line and before the command's final `Completed in ...` line.
+
+### Root Cause
+
+Runtime table builders call `_publish_replica(force=True)` after each table refresh. In EOD this is
+wasteful because `pivot-refresh` already runs a dedicated `sync_replica --verify --trade-date ...`
+stage after all next-day tables are built.
+
+### Fix
+
+`scripts/build_tables.py` now supports:
+
+- `--defer-replica-sync` to suppress per-table replica publication while an orchestrator is building;
+- `--skip-status` to skip the final broad row-count/status summary.
+
+`scripts/refresh.py` passes both flags for all EOD `pivot-build` stages. The pipeline still publishes
+and verifies the market replica once at the existing `sync_replica` stage.
+
+### Expected Impact
+
+Routine EOD should avoid repeated market replica copies/verifications, especially across
+`build_next_day_cpr`, `build_next_day_thresholds`, `build_next_day_state`, and
+`build_next_day_strategy`.
+
+---
+
+## 2026-05-06 — FIXED: DATA: incremental intraday_day_pack lost RVOL lookback context
+
+**Status:** FIXED
+**Severity:** High
+
+### Symptom
+
+`intraday_day_pack` incremental refresh read only rows inside the target refresh window before
+calculating `rvol_baseline_arr`. For a one-day EOD refresh, the rolling baseline could be calculated
+from only the current day, leaving no prior-day volume context for the new pack row.
+
+### Root Cause
+
+The pack SQL applied `date >= <refresh_date>` inside the same CTE that computed:
+
+```sql
+AVG(volume) OVER (
+  PARTITION BY symbol, time
+  ORDER BY date
+  ROWS BETWEEN <lookback> PRECEDING AND 1 PRECEDING
+)
+```
+
+SQL applies the `WHERE` filter before the window function, so the previous trading days needed for
+RVOL were excluded.
+
+### Fix
+
+Incremental pack builds now use two windows:
+
+- a calculation window that starts before the refresh date to include enough prior days for RVOL;
+- an insert window that writes only the requested refresh date/range.
+
+This preserves correctness while avoiding a full-history pack scan.
+
+Regression coverage:
+`tests/test_intraday_day_pack_incremental.py::test_incremental_pack_uses_prior_days_for_rvol_baseline`.
+
+---
+
+## 2026-05-06 — FIXED: DATA: DQ timestamp rule treated special sessions as critical invalid rows
+
+**Status:** FIXED
+**Severity:** Medium
+
+### Symptom
+
+The all-history DQ registry showed `TIMESTAMP_INVALID` as `CRITICAL` for `1,563` symbols even though
+the offending rows clustered on known evening/extended trading sessions such as Muhurat trading
+dates.
+
+### Root Cause
+
+The DQ scan hard-coded the regular NSE session window `09:15 -> 15:30` for every date. It did not
+allow special sessions such as Muhurat trading (`2015-11-11`, `2016-10-30`, `2017-10-19`,
+`2018-11-07`, `2019-10-27`, `2020-11-14`, `2021-11-04`, `2022-10-24`, `2023-11-12`,
+`2024-11-01`) or the `2021-02-24` extended session after the market halt.
+
+### Fix
+
+`db/duckdb_data_quality.py` now centralizes the valid timestamp predicate with a
+special-session allowlist. `scripts/data_quality.py` uses the same predicate for bounded window
+reports. Full DQ refresh now reports `TIMESTAMP_INVALID = 0`.
+
+### Related
+
+Verification:
+
+- `uv run pytest tests/test_data_quality_cli.py -q` -> `17 passed`
+- `uv run ruff check scripts/data_quality.py tests/test_data_quality_cli.py` -> clean
+- `doppler run -- uv run pivot-data-quality --refresh --full --limit 10` -> `TIMESTAMP_INVALID 0`
+
+---
+
+## 2026-05-06 — FIXED: DATA: bounded full DQ scans forced slow all-history registry refresh
+
+**Status:** FIXED
+**Severity:** Medium
+
+### Symptom
+
+`pivot-data-quality --refresh --full` took about `623s` because it scans every historical 5-minute
+parquet row and mutates the all-history `data_quality_issues` registry. Operators only need fast
+bounded diagnostics for the active baseline/live window most days.
+
+### Root Cause
+
+The CLI accepted `--window-start/--window-end`, but `--refresh --full` always executed the global
+comprehensive scan before printing the bounded window report.
+
+### Fix
+
+`pivot-data-quality --refresh --full --window-start <D1> --window-end <D2>` now runs a read-only
+bounded full-window report and does not mutate the all-history registry. The bounded report includes
+OHLC, zero-price, timestamp, extreme-candle, duplicate-candle, zero-volume-day, and date-gap checks.
+
+### Related
+
+Verification:
+
+```bash
+uv run pivot-data-quality --refresh --full \
+  --window-start 2025-01-01 \
+  --window-end 2026-05-05 \
+  --limit 5
+```
+
+Returned current-window counts without global registry mutation:
+`OHLC=0`, `ZERO_PRICE=0`, `TIMESTAMP_INVALID=0`, `EXTREME_CANDLE=2`,
+`DUPLICATE_CANDLE=0`, `ZERO_VOLUME_DAY=538`, `DATE_GAP=289`.
+
+---
+
+## 2026-05-06 — MONITORING: DATA: two Kite-sourced extreme 9:15 candles remain in canonical window
+
+**Status:** MONITORING
+**Severity:** Low
+
+### Symptom
+
+After repairing out-of-session timestamp rows, the canonical data window
+`2025-01-01 -> 2026-05-05` still has two raw `EXTREME_CANDLE` warnings:
+
+- `STALLION` on `2025-01-23 09:15`, range `50.01%`, volume `0`;
+- `MBEL` on `2025-08-06 09:15`, range `74.03%`, volume `0`.
+
+### Root Cause
+
+Targeted Kite re-ingestion returned the same candles, so these are broker-source historical rows,
+not local merge artifacts. They are in-session candles, so pruning by session time would be wrong.
+
+### Fix
+
+Do not overwrite with guessed values. Keep as warning/monitoring data until a better independent
+source is available. Baseline runtime coverage remains clean.
+
+### Related
+
+Targeted commands:
+`pivot-kite-ingest --date 2025-01-23 --symbols STALLION --5min` and
+`pivot-kite-ingest --date 2025-08-06 --symbols MBEL --5min`.
+
+---
+
+## 2026-05-06 — FIXED: DATA: out-of-session 5-minute candles contaminated 2025 raw parquet
+
+**Status:** FIXED
+**Severity:** High
+
+### Symptom
+
+The canonical baseline window had `24,203` `TIMESTAMP_INVALID` raw 5-minute candles:
+
+- `360ONE`: `12,102` rows from `2025-04-01` to `2025-12-31`, times `15:35 -> 20:55`;
+- `3IINFOLTD`: `12,101` rows from `2025-04-01` to `2025-12-31`, times `15:35 -> 20:55`.
+
+### Root Cause
+
+The 2025 parquet files for those symbols contained after-hours rows. This can affect ATR because
+`atr_intraday` builds from the last available 5-minute candles in `v_5min`.
+
+### Fix
+
+Added guarded repair mode:
+
+```bash
+pivot-hygiene --repair-invalid-5min-session \
+  --symbols 360ONE,3IINFOLTD \
+  --start 2025-04-01 \
+  --end 2025-12-31 \
+  --apply
+```
+
+The command backs up original parquet files under `.tmp_logs/data_repair/` and removes only candles
+outside `09:15 -> 15:30` for the requested symbols/date window. Repaired files:
+
+- `360ONE 2025`: `18,624 -> 6,522` rows;
+- `3IINFOLTD 2025`: `18,623 -> 6,522` rows.
+
+Then targeted runtime rebuild refreshed only affected symbols:
+
+```bash
+pivot-build --refresh-since 2025-01-23 --symbols 360ONE,3IINFOLTD,MBEL,STALLION
+```
+
+Final canonical-window raw checks: `TIMESTAMP_INVALID=0`, `OHLC_VIOLATION=0`, `ZERO_PRICE=0`.
+
+### Related
+
+Regression coverage: `tests/test_data_hygiene.py`.
+
+---
+
+## 2026-05-06 — FIXED: DATA: targeted CPR refresh failed on duplicate unique key
+
+**Status:** FIXED
+**Severity:** Medium
+
+### Symptom
+
+Targeted runtime rebuild after data repair failed:
+
+`Duplicate key "symbol: STALLION, trade_date: 2025-01-24" violates unique constraint`
+
+### Root Cause
+
+`build_cpr_table(symbols=..., since_date=...)` deleted and reinserted rows inside one transaction.
+DuckDB could still reject reinserting the same unique `(symbol, trade_date)` key during that
+transaction.
+
+### Fix
+
+`db/duckdb_indicator_builders.py` now materializes targeted CPR refresh rows into a temp table,
+validates no duplicate `(symbol, trade_date)` rows, then deletes and inserts from the temp table.
+The targeted rebuild completed after this change.
+
+### Related
+
+Verification: `uv run pytest tests/test_data_quality_cli.py tests/test_data_hygiene.py -q` ->
+`28 passed`; targeted `pivot-build --refresh-since 2025-01-23 --symbols 360ONE,3IINFOLTD,MBEL,STALLION`
+completed in `452.3s`.
+
+---
+
+## 2026-05-06 — FIXED: DATA: read-only data-quality reports opened writer DB
+
+**Status:** FIXED
+**Severity:** Medium
+
+### Symptom
+
+`pivot-data-quality --window-start ... --window-end ...` and baseline-window checks could fail while
+dashboard/readers were open because the CLI opened the writer `market.duckdb` connection even for
+read-only reports.
+
+### Root Cause
+
+`scripts/data_quality.py::main()` always called `get_db()` for issue listing after read-only window
+reports.
+
+### Fix
+
+Read-only data-quality report/listing paths now use `get_live_market_db()`. Writer access remains
+limited to `--refresh`.
+
+### Related
+
+Regression coverage: `tests/test_data_quality_cli.py`.
+
+---
+
+## 2026-05-06 — MONITORING: LIVE: Revisit real-fill target/SL offset vs absolute CPR levels
+
+**Status:** MONITORING
+**Severity:** Low
+
+### Symptom
+
+Real-routed orders can fill at a slightly different price than the model/candle entry price. The
+current implementation shifts stop-loss and target by the fill-price offset so the accepted trade's
+rupee risk/reward remains intact.
+
+Example: model entry `100`, model SL `95`, model target `110`, real fill `101` becomes SL `96` and
+target `111` instead of keeping the absolute CPR target at `110`.
+
+### Root Cause
+
+This is an intentional live-execution design choice, not a defect. It preserves position sizing and
+planned RR when broker fills differ from the model price, but the target/SL may no longer equal the
+absolute CPR R1/S1 or R2/S2 level.
+
+### Fix
+
+Keep current offset behavior for the initial real-order pilot. Revisit after enough real fill data
+is collected by comparing:
+
+- offset mode: preserve planned rupee risk/reward from actual fill;
+- absolute CPR mode: keep target/SL pinned to CPR levels and accept changed actual RR.
+
+Decision should be based on observed fill slippage and post-fill outcome data, not theory alone.
+
+### Related
+
+Documented in `docs/REAL_ORDER_LIVE_FLOW.md`. Revisit after multiple real-order pilot days have
+latency/fill data.
+
+---
+
+## 2026-05-06 — FIXED: PERF: full-universe late-start OR catch-up duplicated Kite calls per direction
+
+**Status:** FIXED
+**Severity:** Medium
+
+### Symptom
+
+An isolated full-universe Kite `operator-drill` started late at 11:31 IST with
+`--entry-window-end 11:45 --time-exit 11:50` proved the late-start historical OR path is correct,
+but slow in `--multi`.
+
+Observed log evidence from `late-start-kite-20260506-1129`:
+
+- LONG OR catch-up: `requested=820 fetched=781 missing=39 missing_instruments=9 errors=0`,
+  completed at 11:36:44;
+- SHORT OR catch-up repeated the same 820-symbol historical fetch and completed at 11:41:54;
+- both sessions then reached live bar processing, opened/closed one isolated paper LONG trade, and
+  exited cleanly.
+
+### Root Cause
+
+`run_live_multi_sessions()` prepared each `_LiveMultiContext` independently. LONG and SHORT share
+the same CPR Stage A symbol set for this strategy, but each context called Kite historical OR
+catch-up separately before the shared WebSocket loop could start.
+
+### Fix
+
+`scripts/paper_live.py` now creates a per-multi-run shared OR cache for Kite live sessions.
+`_catch_up_true_or_from_kite()` stores fetched/missing 09:15 OR historical results by symbol, and
+the second context reuses those candles instead of calling Kite again.
+
+Regression coverage:
+`tests/test_paper_live_polling.py::test_catch_up_true_or_from_kite_reuses_shared_or_cache`.
+
+### Related
+
+Isolated drill:
+`.tmp_logs/operator_drills/late-start-kite-20260506-1129/daily_live_multi.log`.
+
+---
+
+## 2026-05-06 — FIXED: UI: paper daily summary included diagnostic compare runs
+
+**Status:** FIXED
+**Severity:** High
+
+### Symptom
+
+The `/paper_ledger` Daily Summary tab showed 2026-05-04 LONG P/L as `₹45,972`, while the actual
+archived live Kite LONG session `CPR_LEVELS_LONG-2026-05-04-live-kite` showed `₹24,753`.
+
+### Root Cause
+
+`BacktestDB.get_paper_daily_summary()` aggregated every `backtest_results` row with
+`execution_mode='PAPER'` except `TMP_%` runs. That included diagnostic compare runs such as
+`compare-kite-audit-long-2026-05-04-v2` and `compare-kite-audit-short-2026-05-04-v2`, so the
+dashboard mixed actual live Kite sessions with audit/replay diagnostics.
+
+### Fix
+
+`db/backtest_db.py::get_paper_daily_summary()` now restricts the dashboard daily summary to actual
+archived Kite live paper sessions: `run_id LIKE '%-live-kite'`.
+
+Regression coverage:
+`tests/test_backtest_replica_migration.py::test_paper_daily_summary_excludes_diagnostic_paper_runs`.
+
+### Related
+
+2026-05-04 corrected dashboard row: LONG `17 / ₹24,753.32`, SHORT `15 / -₹3,737.70`, total
+`32 / ₹21,015.62`.
+
+---
+
+## 2026-05-06 — FIXED: LIVE: Kite paper live did not use historical OR catch-up like real live
+
+**Status:** FIXED
+**Severity:** High
+
+### Symptom
+
+After a late start, paper live and real/sim-real live could resolve CPR opening-range context through
+different paths. Real-order sessions fetched the true 09:15-09:20 Kite historical candle before
+allowing entries, while plain Kite paper live could still rely on the late-start OR proxy path.
+
+### Root Cause
+
+`scripts/paper_live.py` only ran `_catch_up_true_or_from_kite()` when `real_order_router is not None`.
+For normal paper-live Kite sessions, `PaperRuntimeState.allow_or_proxy_setup` also remained `True`,
+so the setup loader could synthesize OR from the first post-start candle.
+
+### Fix
+
+Kite live setup now uses one shared catch-up helper for paper, simulated-real, and real-order
+sessions. Any Kite adapter disallows OR proxy setup and attempts true historical OR catch-up for
+unresolved/proxy setup rows. Local-feed diagnostics keep proxy fallback behavior.
+
+Regression coverage:
+`tests/test_paper_live_polling.py::test_kite_adapter_disallows_or_proxy_setup` and
+`tests/test_paper_live_polling.py::test_kite_true_or_catchup_runs_for_plain_paper_live`.
+
+### Related
+
+Late-start OR tests on 2026-05-06; 2-symbol Kite drill proved historical OR resolution at 10:15,
+while full-universe validation still needs a run that remains alive through the next 5-minute bar.
+
+---
+
+## 2026-05-06 — FIXED: LIVE: daily-live reused terminal failed Kite session IDs
+
+**Status:** FIXED
+**Severity:** Critical
+
+### Symptom
+
+A late-start paper-live test launched at 09:53 IST reused the existing canonical session IDs
+`CPR_LEVELS_LONG-2026-05-06-live-kite` and `CPR_LEVELS_SHORT-2026-05-06-live-kite`, even though
+both sessions were already terminal/failed from the earlier operator-drill close-all incident.
+
+The dashboard then showed impossible active-session state, including stale realized P&L and
+absurd unrealized P&L values such as `+₹6,064,643` on LONG and `-₹1,664,738` on SHORT. This was
+paper-only contamination, not real broker exposure, but it is operationally dangerous because
+an operator could make decisions from invalid active-session state.
+
+### Root Cause
+
+`scripts/paper_trading.py::_ensure_daily_session()` reused any existing live session after
+parameter-drift checks. It did not reject terminal statuses for normal `daily-live` launches.
+
+This allowed a fresh `daily-live --multi --trade-date today` test to reuse `FAILED` Kite live
+sessions for the same deterministic daily session IDs.
+
+### Fix
+
+`_ensure_daily_session()` now refuses to reuse terminal live statuses:
+`COMPLETED`, `FAILED`, `CANCELLED`, `STOPPING`, and `STOPPED`.
+
+`PLANNING`, `ACTIVE`, and `PAUSED` remain reusable live states and still go through the existing
+execution sizing and strategy fingerprint drift checks. Local-feed live diagnostics keep their
+fresh fallback session-id behavior for terminal collisions.
+
+Added regression coverage in `tests/test_paper_trading_workflow.py` for:
+
+- refusing terminal Kite live session reuse;
+- preserving local-feed fallback behavior;
+- allowing non-terminal live states.
+
+The contaminated 2026-05-06 sessions were manually terminal-stamped `FAILED` with note
+`contaminated_late_start_reused_failed_session_terminal_stamp_20260506`, and
+`pivot-paper-trading status` returned no active sessions afterward.
+
+### Related
+
+Supervisor log `.tmp_logs/supervisor/cpr_20260506_late_or.stderr.log`; launch at
+2026-05-06 09:53:53 IST.
+
+---
+
+## 2026-05-06 — FIXED: LIVE: Protective SL order id was treated as protection before broker acceptance
+
+**Status:** FIXED
+**Severity:** Critical
+
+### Symptom
+
+During the 2026-05-06 ITC one-share SL-M pilot, Kite returned an order id for a protective
+SELL `SL-M`, but broker-sync later reconciled the order as `REJECTED`:
+
+`16448 : Difference between limit price and trigger price is beyond permissible range`
+
+The strategy real-order router previously treated a returned protective order id as sufficient
+protection. A broker/RMS rejection after submission could therefore leave a filled entry open
+without a broker-native stop.
+
+### Root Cause
+
+`engine/real_order_runtime.py::place_entry()` waited for entry fill confirmation, placed the
+protective `SL-M`, then immediately returned `real_protection_status="PLACED"` without polling
+the broker orderbook for `TRIGGER PENDING`.
+
+### Fix
+
+`engine/real_order_runtime.py` now calls `_await_order_acceptance()` after placing a protective
+stop. The entry is considered protected only when Kite reports an accepted pending status such
+as `TRIGGER PENDING`. If the protective order is `REJECTED`, `CANCELLED`, immediately filled,
+or not accepted before timeout, the router treats that as protective-SL failure and attempts
+the existing immediate rollback flatten.
+
+Added regression coverage in `tests/test_real_order_runtime.py` for post-submit protective
+SL rejection.
+
+### Related
+
+Manual pilot `manual-pilot-2026-05-06-itc-slm`; rejected wide SL-M order `260506150301406`;
+accepted/cancelled tighter SL-M order `260506150305188`.
+
+---
+
+## 2026-05-06 — FIXED: LIVE: Zerodha SL-M protective order strips market_protection before API call
+
+**Status:** FIXED
+**Severity:** Critical
+
+### Symptom
+
+During the 2026-05-06 manual real-order ITC pilot, the real BUY succeeded and filled, but both
+attempts to place a protective SELL `SL-M` were rejected by Kite:
+
+`Market orders without market protection are not allowed via API. Please set market protection or use a Limit order.`
+
+The second attempt passed `--market-protection 5` through the CLI, but Kite still rejected it.
+
+### Root Cause
+
+`BrokerOrderIntent.zerodha_payload()` correctly includes `market_protection` for `MARKET` and
+`SL-M` orders, but `engine/broker_adapter.py::_call_kite_place_order()` removes that field before
+calling `kite_client.place_order()`:
+
+`kwargs = {key: value for key, value in payload.items() if key != "market_protection"}`
+
+That made every real API `SL-M` payload reach Kite without market protection.
+
+### Fix
+
+`engine/broker_adapter.py::_call_kite_place_order()` now uses KiteConnect's lower-level `_post`
+path when the payload contains `market_protection`, because the installed public
+`place_order()` signature does not expose that parameter. Stop-loss roles using `SL`/`SL-M`
+are also allowed through the protected-exit validator when they include a trigger and fresh
+reference price.
+
+Added regression coverage in `tests/test_broker_adapter.py` proving `SL-M` submits
+`market_protection` and manual stop-loss roles can use `SL-M`.
+
+Live verification:
+
+- BUY 1 ITC filled: Kite `260506150284056`, average price `₹311.40`
+- SELL `SL-M` with `market_protection=1`: Kite `260506150305188`, broker status
+  `TRIGGER PENDING`
+- Cancelled accepted SL-M: Kite `260506150305188`, broker status `CANCELLED`
+- Final SELL 1 ITC filled: Kite `260506150320553`, average price `₹311.60`
+- Zerodha positions confirmed net ITC quantity `0`
+
+### Related
+
+Manual pilots `manual-pilot-2026-05-06-itc` and `manual-pilot-2026-05-06-itc-slm`.
+
+---
+
+## 2026-05-06 — FIXED: LIVE: Rejected real-order intent blocks immediate retry with same role
+
+**Status:** FIXED
+**Severity:** High
+
+### Symptom
+
+After the first protective `SL-M` attempt was rejected by Kite before an exchange order id was
+stored, retrying the same `manual_protective_sl` role failed locally with:
+
+`real-order intent already exists without broker order id; manual broker reconciliation required before retry`
+
+The operator had to retry using a different role name while the real position was live.
+
+### Root Cause
+
+The duplicate-intent guard correctly prevents resubmitting an ambiguous pending intent with no
+`exchange_order_id`, but broker/API validation rejections are terminal and should not require a
+new role for a corrected retry. The failed intent row is not being classified as safely terminal
+for retry.
+
+### Fix
+
+`db/paper_db.py` now has `update_order_broker_rejection()` and `prepare_order_broker_retry()`.
+`engine/broker_adapter.py::record_real_order()` marks pre-dispatch broker/API failures as
+terminal `REJECTED`, and allows retry of the same idempotency key only when there is positive
+evidence that no broker order id exists. Ambiguous pending rows without a broker id still block
+duplicate submission and require manual reconciliation.
+
+Added regression coverage in `tests/test_broker_adapter.py`.
+
+### Related
+
+Observed during manual pilot `manual-pilot-2026-05-06-itc` after Kite rejected the SL-M payload.
+
+---
+
+## 2026-05-06 — FIXED: LIVE: Simulated-real admin close_all double-counts exit fills
+
+**Status:** FIXED
+**Severity:** Critical
+
+### Symptom
+
+During the 2026-05-06 live-paper drill run
+`CPR_LEVELS_LONG-2026-05-06-live-kite` / `CPR_LEVELS_SHORT-2026-05-06-live-kite`,
+operator `close_all` flattened the paper positions, sent EOD summaries, then raised
+`SESSION_ERROR ... reconciliation_critical`.
+
+Reconciliation findings showed `EXIT_OVERFILLED` for every open position:
+`Position ... qty=1 but exit fills total 2`.
+
+### Root Cause
+
+In `--simulate-real-orders` / `REAL_DRY_RUN` mode, admin flatten records both:
+
+- a simulated broker exit fill row (`broker_mode='REAL_DRY_RUN'`, `position_id=<pos>`,
+  `fill_qty=1`), and
+- a normal paper flatten `MARKET` exit row for the same `position_id`, also `fill_qty=1`.
+
+The reconciliation layer correctly sums exit fills by `position_id` and reports two filled exits
+against a one-share local position.
+
+### Fix
+
+`engine/paper_runtime.py` now treats the broker/simulated-broker exit row as the canonical filled
+exit when `real_order_router.place_exit()` succeeds. `flatten_session_positions()` and
+`flatten_positions_subset()` no longer append an additional local `MARKET FILLED` paper exit for
+the same `position_id` in the real-routed path.
+
+Regression coverage: `tests/test_paper_runtime.py::test_flatten_session_positions_does_not_append_duplicate_fill_for_real_exit`.
+
+Live validation still needed in the next `--simulate-real-orders` drill: run `close_all`, then
+`reconcile`, and confirm no `EXIT_OVERFILLED` findings.
+
+### Related
+
+Observed at 2026-05-06 09:21 IST after operator drill `close_all`. Affects
+`CPR_LEVELS_LONG-2026-05-06-live-kite` and `CPR_LEVELS_SHORT-2026-05-06-live-kite`.
+
+---
+
+## 2026-05-06 — FIXED: LIVE: cancel_pending_intents logs FileNotFoundError after cancelling commands
+
+**Status:** FIXED
+**Severity:** Medium
+
+### Symptom
+
+The 2026-05-06 operator drill for `cancel_pending_intents` functionally cancelled two pending
+commands per session, but the same polling pass then logged `FileNotFoundError` for the just-deleted
+`pause_entries` and `resume_entries` files.
+
+### Root Cause
+
+`_apply_live_multi_operator_controls()` builds a sorted list of command files at the start of the
+poll. `cancel_pending_intents` deletes the other files, but the loop continues iterating over the
+stale in-memory `command_files` list and attempts to read those deleted paths.
+
+### Fix
+
+`scripts/paper_live.py` now prioritizes `cancel_pending_intents`, skips missing command paths before
+reading, and exits the current command poll after cancellation so stale in-memory file paths are not
+processed. The same guard was added to the single-session command loop.
+
+Regression coverage: `tests/test_paper_admin_commands.py::test_live_multi_operator_controls_cancel_pending`.
+
+### Related
+
+Observed in `.tmp_logs/supervisor/cpr_20260506_drill.stderr.log` at 09:20 IST.
+
+---
+
+## 2026-05-06 — FIXED: LIVE: --multi feed state remains CONNECTING until first closed bar
+
+**Status:** FIXED
+**Severity:** Medium
+
+### Symptom
+
+The dashboard showed feed status `CONNECTING` after the WebSocket had connected. Logs showed
+`KiteTicker connected` at 09:16:25 and the 09:20 ticker health showed `connected=True`,
+`last_tick_age=0s`, `coverage=99%`, but `paper_feed_state` stayed `CONNECTING` before the first
+closed-bar dispatch.
+
+### Root Cause
+
+In `run_live_multi_sessions()`, the startup path writes `paper_feed_state.status='CONNECTING'`.
+The main loop updates tick counters while the current 5-minute bucket is still open, but it
+`continue`s before writing an `OK` feed state unless a closed candle batch is dispatched.
+
+### Fix
+
+`scripts/paper_live.py` now writes a one-time lightweight `OK` feed-state heartbeat per multi
+session as soon as WebSocket ticks are observed, before the first closed candle is dispatched. The
+heartbeat records `last_event_ts`, active-symbol count, quote event count, and
+`pre_bar_heartbeat=true`.
+
+Regression coverage: `tests/test_paper_admin_commands.py::test_mark_multi_feed_ok_from_ticks_writes_pre_bar_heartbeat`.
+
+### Related
+
+Observed on 2026-05-06 before the 09:20 bar. Similar operator symptom was seen on 2026-05-05.
+
+---
+
+## 2026-05-06 — FIXED: LIVE: Reconciliation-critical close_all leaves sessions STOPPING
+
+**Status:** FIXED
+**Severity:** High
+
+### Symptom
+
+After admin `close_all`, both 2026-05-06 paper drill sessions had all positions closed and EOD
+summaries sent, but `pivot-paper-trading status` still reported active sessions with
+`status='STOPPING'` and `ended_at=NULL`.
+
+### Root Cause
+
+The admin close path marks the in-memory multi context failed when reconciliation reports critical
+findings, but the persisted session is left in `STOPPING` after finalization. This keeps the
+session visible as active even though all positions are already closed.
+
+### Fix
+
+`scripts/paper_live.py::_finalize_live_multi_context()` now persists terminal `FAILED` status when
+the in-memory multi context has failed, clears stale-feed state, force-syncs the paper replica, and
+continues the normal failed-session archive path. This prevents reconciliation-critical admin close
+from leaving the dashboard/status API in `STOPPING`.
+
+Regression coverage: `tests/test_paper_admin_commands.py::test_finalize_live_multi_context_persists_failed_status`.
+
+### Related
+
+Observed on `CPR_LEVELS_LONG-2026-05-06-live-kite` and
+`CPR_LEVELS_SHORT-2026-05-06-live-kite`.
+
+---
+
+## 2026-05-06 — FIXED: LIVE: Follow-up hardening for C1-C5 and H1-H2 real-order safety fixes
+
+**Status:** FIXED
+**Severity:** Critical
+
+### Symptom
+
+Post-fix review found several remaining gaps in the first C1-C5/H1-H2 safety patch:
+
+- C1 still opened the local position with strategy quantity instead of broker-confirmed filled
+  quantity;
+- C2 left a real entry unprotected if protective SL-M placement failed after entry fill;
+- C3 kept exposure reserved on failed exits, but did not make the failure loud enough for operator
+  intervention;
+- C5 could retry a `PENDING_DISPATCH` row with no saved `exchange_order_id`;
+- H1 per-order risk checks used an arbitrary last bar close instead of a current open-position mark;
+- H2 single-session live lock release still depended on cleanup reaching the manual `__exit__()` call.
+
+A follow-up debugger pass also found two remaining deployment blockers: real-routed paper state and
+broker SL still used model stop/target levels after a broker fill at a different price, and an
+explicit broker zero-fill response could create or mask a zero-quantity local position. A final
+Zerodha-focused pass moved the zero-fill rejection into the real-order router before exposure
+counters are incremented.
+
+### Root Cause
+
+The first patch correctly introduced the broker intent/fill/protection lifecycle, but it did not
+fully propagate broker fill metadata into local paper state and did not harden all exception paths.
+The pending-intent recovery path only deduped rows that already had a broker order id, which still
+left a crash window between broker placement and local id persistence.
+
+### Fix
+
+Applied follow-up hardening:
+
+- `engine/paper_runtime.py` now opens real-routed local positions with `real_filled_qty` and
+  `real_entry_fill_price`, while normal paper mode keeps using the strategy quantity and candle
+  entry price;
+- `engine/paper_runtime.py` now recalculates local stop, first target, and runner target from the
+  confirmed broker fill price while preserving the model risk/reward distances; explicit zero
+  broker fill quantity raises and no position is opened;
+- `engine/real_order_runtime.py` registers exposure immediately after entry fill, attempts an
+  emergency protected flatten if protective SL-M placement fails, releases exposure only after that
+  rollback fill, recalculates the broker SL-M trigger from the confirmed entry fill price, and logs
+  critical operator-action messages on rollback/exit confirmation failures;
+- `engine/real_order_runtime.py` now rejects zero broker fill quantity before registering any real
+  exposure counter or placing a protective SL;
+- `engine/broker_adapter.py` now treats an existing pending live intent without broker id as a
+  reconciliation blocker instead of submitting another order; it first attempts exact single-match
+  broker orderbook recovery by matching the stored Zerodha payload, and blocks for manual
+  reconciliation if no unique match exists;
+- `engine/paper_session_driver.py` now builds risk-control marks from current open-position symbol
+  prices instead of depending on the final symbol in the bar group;
+- `scripts/paper_live.py` now releases the per-session live lock in a `finally` after alert
+  dispatcher shutdown, and adapter teardown failures no longer skip lock release.
+
+### Related
+
+Regression tests added for broker-fill quantity propagation, fill-price stop/target adjustment,
+zero-fill rejection before exposure registration, protective-SL failure rollback, unfilled exit
+exposure retention, pending-intent duplicate prevention/recovery, 0-match and ambiguous-match
+recovery blocking, and risk mark selection.
+
+---
+
+## 2026-05-05 — FIXED: LIVE: C1 real entry opens local position before broker fill confirmation
+
+**Status:** FIXED
+**Severity:** Critical
+
+### Symptom
+
+In strategy-routed real-order mode, an entry order can return `PLACED` from Kite while the local
+paper runtime immediately opens a position and writes a local paper entry as `FILLED`. If the
+broker order later rejects, remains open, or partially fills, the local system can believe it owns
+the full strategy quantity while the broker account owns a different quantity or no position.
+
+### Root Cause
+
+`engine/paper_runtime.py::_open_position_from_candidate()` calls
+`RealOrderRouter.place_entry()` and then immediately calls `open_position()` with
+`candidate["position_size"]`. `engine/broker_adapter.py::ZerodhaBrokerAdapter.place_order()`
+returns broker status `PLACED`; it does not imply exchange execution. The real-order metadata
+records `real_remaining_qty=intent.quantity`, not the actual filled quantity.
+
+### Fix
+
+Implemented a broker-backed entry confirmation step for real routing:
+
+- create a durable entry intent before broker dispatch;
+- wait for Kite order history / simulated-real snapshot confirmation before returning from
+  `RealOrderRouter.place_entry()`;
+- open the local paper position only after `place_entry()` returns confirmed fill metadata;
+- mark rejected/cancelled/partial entries explicitly and do not emit downstream exits for phantom
+  quantity.
+
+`REAL_DRY_RUN` now exercises the same intent -> fill-confirmation path with deterministic simulated
+fills, so paper live can rehearse the real-order lifecycle without placing broker orders.
+
+### Related
+
+Safe design decision: entry fill confirmation first, broker-native protection next, local `OPEN`
+state only after broker reality is known.
+
+---
+
+## 2026-05-05 — FIXED: LIVE: C2 strategy-routed real entries do not place broker-native stop loss
+
+**Status:** FIXED
+**Severity:** Critical
+
+### Symptom
+
+After a real strategy entry is placed, no broker-side stop-loss order is placed for the filled
+quantity. The only stop-loss protection is the Python live loop watching five-minute bars. If the
+process crashes, the feed drops, Windows sleeps, or network connectivity fails after entry, the real
+position can remain naked at the broker.
+
+### Root Cause
+
+`engine/real_order_runtime.py::RealOrderRouter.place_entry()` accepts only symbol, direction,
+reference price, and event time. It does not accept the strategy stop price and does not place an
+SL-M or other protective child/exit order after entry execution. The strategy already computes the
+stop in `candidate["sl_price"]`, but the real-order router does not use it.
+
+### Fix
+
+After C1 fill confirmation, `RealOrderRouter.place_entry()` immediately places a broker-native
+opposite-side `SL-M` protective order for the actual filled quantity. Current MIS CPR flow:
+
+- place entry;
+- confirm filled quantity;
+- place an opposite-side SL-M order with market protection at the confirmed-fill stop price
+  (`candidate["sl_price"]` shifted by the entry fill slippage, preserving the original stop
+  distance);
+- return/store `real_protective_sl_order_id`, `real_protective_sl_trigger_price`, and
+  `real_protection_status` in the paper position trail state.
+
+Do not place the protective order before fill confirmation, because entry rejection or partial fill
+can otherwise create over-hedged or reverse exposure.
+
+### Related
+
+OCO GTT is not the default fix for current intraday MIS routing. It may be explored later for CNC
+LONG exits, but it is not a replacement for broker-native protection plus fill sync in MIS.
+
+---
+
+## 2026-05-05 — FIXED: LIVE: C3 real exit releases slot and cash counters on submission, not fill
+
+**Status:** FIXED
+**Severity:** Critical
+
+### Symptom
+
+When a real exit order is submitted, the runtime immediately releases the real open-position slot
+and cash/notional budget before broker fill confirmation. If the exit remains open, rejects, or only
+partially fills, the system can open new real trades while the old broker position is still live,
+creating doubled exposure.
+
+### Root Cause
+
+`engine/real_order_runtime.py::RealOrderRouter.place_exit()` calls `record_real_order()` and then
+immediately decrements `_open_real_positions`, removes `_open_notional_by_symbol`, and reduces
+`_used_cash_notional`. `engine/paper_runtime.py::_advance_open_position()` then proceeds with the
+paper close path based on the candle decision, not the broker fill result.
+
+### Fix
+
+Moved real slot/cash release behind broker terminal fill confirmation:
+
+- real exit submitted => `RealOrderRouter.place_exit()` waits for broker/simulated fill;
+- release quantity/cash only after confirmed complete fill;
+- rejected, cancelled, timeout, or partial exit raises and prevents the local paper close path from
+  marking the position flat;
+- reconcile rejected/cancelled/partial exits before allowing new entries that consume the same
+  exposure budget.
+
+### Related
+
+This is part of the same broker state-machine work as C1/C2.
+
+---
+
+## 2026-05-05 — FIXED: LIVE: C4 real emergency flatten can use synthetic or stale fallback prices
+
+**Status:** FIXED
+**Severity:** Critical
+
+### Symptom
+
+Emergency/manual flatten can build a synthetic feed state using cached LTP, `position.last_price`,
+or even `entry_price`, then mark the local position closed after submitting a real exit. During
+feed failure or stale-market conditions, the operator may believe the book is flat while the broker
+exit is unfilled or priced from an unusable reference.
+
+### Root Cause
+
+`scripts/paper_live_helpers.py::live_mark_feed_state()` stamps `last_event_ts=datetime.now(IST)`
+even when `get_last_ltp()` returns a cached value with no real tick timestamp. In
+`engine/paper_runtime.py::flatten_session_positions()`, `_close_price_for_position()` falls back to
+`position.last_price` and then `entry_price`, and the function appends a local `FILLED` flatten and
+closes the local position after dispatching the broker exit.
+
+The older stale-quote-age blocker was fixed separately; this remaining issue is about quote
+provenance, synthetic freshness, and local close-before-broker-confirmation.
+
+### Fix
+
+For real-order flatten:
+
+- `KiteTickerAdapter.get_last_ltp_with_ts()` now exposes timestamped LTP;
+- `live_mark_feed_state()` carries the actual latest tick timestamp and no longer fabricates
+  freshness with wall-clock `now`;
+- real flatten/close requires a live mark and timestamped quote;
+- prefer a fresh broker quote or an explicit emergency order policy when the feed is stale;
+- keep the local position open until `RealOrderRouter.place_exit()` confirms broker/simulated fill;
+- fail loud with operator action required if no acceptable real mark/order path exists.
+
+### Related
+
+Related but distinct fixed entry: `2026-05-05 — FIXED: LIVE: real-order emergency flatten can be blocked by stale quote age`.
+
+---
+
+## 2026-05-05 — FIXED: LIVE: C5 real entry idempotency is not anchored by a durable pre-dispatch intent
+
+**Status:** FIXED
+**Severity:** Critical
+
+### Symptom
+
+A retry or restart around real entry dispatch can submit the same live signal more than once if the
+first broker call succeeds but the local durable order/intent record is not written or recovered
+before retry. This can create duplicate real orders for the same session, symbol, and signal bar.
+
+### Root Cause
+
+`engine/cpr_atr_shared.py::scan_cpr_levels_entry()` sets candidate `event_time` from
+`getattr(day_pack, "bar_end", None)`, but `_build_day_pack()` does not set `bar_end`. The common
+bar-group driver currently passes deterministic candle `bar_end` as the fallback, so this is not
+always wall-clock nondeterminism. The larger safety gap is that real broker dispatch is not guarded
+by a durable pre-dispatch intent with a unique key for `(session_id, symbol, side, role,
+signal_candle_bar_end)`.
+
+### Fix
+
+Persisted a deterministic real-order intent before calling Kite:
+
+- `_open_position_from_candidate()` pins missing candidate `event_time` to the signal candle
+  `bar_end` supplied by the shared bar driver;
+- create a unique intent key for session, symbol, side, role, and signal candle;
+- `record_real_order()` inserts a `PENDING_DISPATCH` order row before broker placement, recovers a
+  pending row only when exactly one Kite orderbook snapshot matches the stored Zerodha payload, and
+  otherwise blocks the retry for manual reconciliation instead of submitting a second broker order;
+- only open local paper position state after the broker/simulated entry fill and protective SL
+  placement steps complete.
+
+### Related
+
+This should be implemented with C1 rather than as a standalone string-key patch.
+
+---
+
+## 2026-05-05 — FIXED: RISK: H1 bar-level loss and drawdown controls run after new entries
+
+**Status:** FIXED
+**Severity:** High
+
+### Symptom
+
+The live bar driver can select and execute new entries for a bar before evaluating the session
+daily-loss and drawdown gates for that same bar. If the session is already past a stop-trading
+threshold, one more bar of new trades can still be opened.
+
+### Root Cause
+
+`engine/paper_session_driver.py::process_closed_bar_group()` runs the exit loop, then evaluates
+entry candidates, selects entries, and executes them. `check_bar_risk_controls()` runs later near
+the end of the bar-group flow.
+
+### Fix
+
+Moved risk controls earlier in the bar flow:
+
+- after processing exits and marks, run the session risk gate before entry candidate selection;
+- skip entry scan/execution when the gate triggers;
+- keep the existing post-entry check as a second pass for risk changes that occur later in the bar
+  flow.
+
+### Related
+
+Existing risk-control fixes addressed unrealized PnL and malformed `flatten_time`; this entry is
+about ordering of the gate inside the bar driver.
+
+---
+
+## 2026-05-05 — FIXED: LIVE: H2 no per-session process lock or lease for daily-live ownership
+
+**Status:** FIXED
+**Severity:** High
+
+### Symptom
+
+An accidental double-launch, supervisor restart race, or stale active process can allow two live
+processes to operate on the same `session_id`. Both can process bars and submit duplicate entries or
+exits against the same logical session.
+
+### Root Cause
+
+`scripts/paper_live.py::run_live_session()` and the multi-session startup path allow sessions that
+are already `ACTIVE` or `PAUSED` to continue. There is no per-session exclusive process lock with
+PID liveness, and no DB compare-and-swap lease that proves only one process owns a session before
+entering the live loop.
+
+### Fix
+
+Added session ownership before live loop startup:
+
+- acquire a per-session `.tmp_logs/paper-session-<session_id>.lock` command lock with PID metadata;
+- reject startup if a live owner PID is still running;
+- rely on the existing command-lock PID/liveness diagnostics and OS lock release on process exit;
+- apply the same per-session lock to both single-session `daily-live` and `--multi` contexts.
+
+Dashboard-visible DB lease fields were not added in this patch; the file lock prevents duplicate
+live-loop ownership, while dashboard owner display remains optional follow-up.
+
+### Related
+
+This should apply to both single-session `daily-live` and `--multi` contexts.
+
+---
+
 ## 2026-05-05 — FIXED: BUG: CPR scale-out partial target used R2/S2 instead of R1/S1
 
 **Status:** FIXED
@@ -2221,9 +3503,9 @@ print('Replica synced — safe to start daily-live')
 
 ---
 
-## 2026-04-29 — DQ GAP: EOD readiness does not validate full baseline-window runtime coverage
+## 2026-04-29 — FIXED: DQ GAP: EOD readiness does not validate full baseline-window runtime coverage
 
-**Status:** OPEN
+**Status:** FIXED — `pivot-data-quality --baseline-window`
 **Severity:** Medium — live readiness can pass while historical baseline reruns still have runtime-table gaps
 
 ### Symptom
@@ -2244,9 +3526,9 @@ Current `pivot-data-quality --date <trade_date>` is a live-readiness gate. It va
 tomorrow's operational readiness and sparse symbol/day gaps, but it does not validate historical
 baseline-window completeness for a named universe.
 
-### Required Fix
+### Fix
 
-Add a baseline preflight mode, for example:
+Added a read-only baseline preflight mode:
 
 ```bash
 pivot-data-quality --baseline-window \
@@ -2255,8 +3537,17 @@ pivot-data-quality --baseline-window \
   --end <current_date>
 ```
 
-The gate must fail when runtime tables are missing rows for `(symbol, date)` pairs where source
-parquet (`v_5min` / `v_daily`) exists. This should run before any canonical baseline rerun.
+The gate fails when runtime tables are missing rows for `(symbol, date)` pairs where source
+parquet (`v_5min` / `v_daily`) exists. It checks `intraday_day_pack`, `atr_intraday`,
+`market_day_state`, `strategy_day_state`, `cpr_daily`, and `cpr_thresholds` before canonical
+baseline reruns.
+
+### Verification
+
+- `uv run pytest tests/test_data_quality_cli.py -q` -> `15 passed`
+- `uv run ruff check scripts/data_quality.py tests/test_data_quality_cli.py` -> clean
+- `uv run pivot-data-quality --baseline-window --universe-name canonical_full --start 2025-01-01 --end 2026-05-05 --limit 10` initially failed before sparse-history classification, proving the gate caught unclassified historical gaps.
+- After classifying first-day/no-prior-context CPR gaps and ultra-sparse ATR days as non-buildable source days, `uv run pivot-data-quality --baseline-window --universe-name canonical_full --start 2025-01-01 --end 2026-05-05 --limit 20` -> `PASS`.
 
 ---
 
@@ -7234,9 +8525,9 @@ exact-date `market_day_state` rows.
 
 ---
 
-## 2026-04-30 — DATA GAP FOLLOW-UP: historical CPR/ATR/state sparse gaps remain after pack repair
+## 2026-04-30 — FIXED: DATA GAP FOLLOW-UP: historical CPR/ATR/state sparse gaps remain after pack repair
 
-**Status:** OPEN — deferred; not blocking 2026-04-30 live paper
+**Status:** FIXED — classified expected sparse-history gaps; baseline-window gate passes
 **Severity:** Medium — baseline-window completeness follow-up
 
 ### Symptom
@@ -7247,22 +8538,43 @@ derived CPR/ATR/state tables for sparse symbol-days.
 
 ### Current Verified State
 
-- `intraday_day_pack` is repaired for the baseline window `2025-01-01` → `2026-04-29`.
+Verified on 2026-05-06 with:
+
+```bash
+uv run pivot-data-quality --baseline-window \
+  --universe-name canonical_full \
+  --start 2025-01-01 \
+  --end 2026-05-05 \
+  --limit 10
+```
+
+- `intraday_day_pack` is repaired for the baseline window `2025-01-01` -> `2026-05-05`.
 - Missing pack rows where source 5-minute data exists: `0`.
-- Duplicate pack `(symbol, trade_date)` rows: `0`.
-- No future `2026-04-30+` runtime rows were created.
-- Remaining derived-table gaps where source 5-minute data exists:
-  - `atr_intraday`: `573` symbol-days across `491` symbols.
-  - `cpr_daily`: `170` symbol-days across `166` symbols.
-  - `market_day_state`: `552` symbol-days across `448` symbols.
-  - `strategy_day_state`: `552` symbol-days across `448` symbols.
+- `cpr_daily` / `cpr_thresholds` are complete for buildable daily source days.
+- `market_day_state` / `strategy_day_state` are complete for days with required pack + CPR +
+  threshold + usable prior ATR prerequisites.
+- `atr_intraday` is complete for source 5-minute days that have enough candles for ATR and a prior
+  usable ATR source day.
+- Final baseline-window gate:
+  - `intraday_day_pack`: `585,061` source days, `0` missing.
+  - `atr_intraday`: `582,781` buildable source days, `0` missing.
+  - `market_day_state`: `584,509` buildable source days, `0` missing.
+  - `strategy_day_state`: `584,509` buildable source days, `0` missing.
+  - `cpr_daily`: `643,982` buildable source days, `0` missing.
+  - `cpr_thresholds`: `643,982` buildable source days, `0` missing.
 
-### Follow-Up
+### Fix
 
-Investigate whether the remaining derived-table gaps are expected sparse symbol-days
-(suspended/no daily candle/no ATR lookback) or repairable runtime gaps. Do this before final
-baseline promotion, but do not rerun broad Kite ingestion unless raw parquet coverage is proven
-missing.
+`scripts/data_quality.py --baseline-window` now distinguishes raw source rows from buildable
+runtime source days:
+
+- CPR/threshold rows require a prior daily source row.
+- ATR rows require the current day to have enough true-range candles and a prior usable ATR source
+  day.
+- State rows require pack + CPR + threshold + prior usable ATR prerequisites.
+
+No Kite re-ingest was needed: raw parquet and pack coverage were already sufficient. The fix was
+classification of expected sparse-history and sparse-intraday days, not data rewriting.
 
 ---
 

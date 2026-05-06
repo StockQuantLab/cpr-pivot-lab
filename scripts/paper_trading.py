@@ -280,7 +280,8 @@ async def _ensure_daily_session(
         mode == "live"
         and str((requested_params or {}).get("feed_source", "") or "").lower() == "local"
     )
-    if local_feed_live and terminal_status in {"COMPLETED", "CANCELLED", "STOPPING"}:
+    terminal_live_statuses = {"COMPLETED", "FAILED", "CANCELLED", "STOPPING", "STOPPED"}
+    if local_feed_live and terminal_status in terminal_live_statuses:
         fallback_session_id = f"{requested_session_id}-{uuid4().hex[:6]}"
         logger.warning(
             "paper session_id %s already exists (status=%s); creating fresh local live session %s",
@@ -302,6 +303,13 @@ async def _ensure_daily_session(
         )
 
     if mode == "live":
+        if terminal_status in terminal_live_statuses:
+            raise SystemExit(
+                f"Existing live session {requested_session_id} is terminal "
+                f"(status={terminal_status}); refusing to reuse it. "
+                "Use an explicit resume/recovery command for failed sessions, or start with a "
+                "new custom session id for tests."
+            )
         session_execution_diffs: list[str] = []
         for key, requested_value in execution_kwargs.items():
             existing_value = getattr(session, key, None)
@@ -1664,6 +1672,8 @@ async def _cmd_operator_drill(args: argparse.Namespace) -> None:
         cmd.extend(["--symbols", args.symbols])
     elif getattr(args, "universe_name", None):
         cmd.extend(["--universe-name", args.universe_name])
+    elif bool(getattr(args, "full_universe", False)):
+        pass
     else:
         cmd.extend(["--symbols", "SBIN,RELIANCE"])
 

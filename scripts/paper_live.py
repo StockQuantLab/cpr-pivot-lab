@@ -8,6 +8,7 @@ import json
 import logging
 import os
 from collections.abc import Awaitable, Callable
+from contextlib import ExitStack
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
 from datetime import time as dt_time
@@ -20,6 +21,7 @@ from db.duckdb import get_live_market_db
 from db.paper_db import get_paper_db
 from engine import paper_session_driver as paper_session_driver
 from engine.bar_orchestrator import SessionPositionTracker
+from engine.command_lock import acquire_command_lock
 from engine.cpr_atr_shared import regime_snapshot_close_col
 from engine.kite_ticker_adapter import KiteTickerAdapter
 from engine.live_market_data import (
@@ -88,6 +90,13 @@ _ORIGINAL_LOAD_SETUP_ROW = load_setup_row
 _WEBSOCKET_RECONNECT_ALERT_ATTEMPTS = 3
 _WEBSOCKET_RECOVERY_AFTER_SEC = 20.0
 _WEBSOCKET_RECOVERY_COOLDOWN_SEC = 30.0
+
+
+def _session_lock_name(session_id: str) -> str:
+    safe = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in str(session_id))
+    return f"paper-session-{safe[:120]}"
+
+
 _FEED_AUDIT_CLEANUP_INTERVAL_SEC = 30 * 60
 try:
     _FEED_STALE_ALERT_COOLDOWN_SEC = float(os.getenv("PIVOT_FEED_STALE_ALERT_COOLDOWN_SEC", "900"))
@@ -174,6 +183,16 @@ def _symbols_needing_true_or(runtime_state: PaperRuntimeState, symbols: list[str
     return needed
 
 
+def _is_local_feed_adapter(ticker_adapter: Any) -> bool:
+    return bool(getattr(ticker_adapter, "_local_feed", False))
+
+
+def _allow_or_proxy_setup_for_adapter(ticker_adapter: Any) -> bool:
+    # Kite live must not synthesize OR from the first post-start bar. Local-feed
+    # diagnostics may still use the proxy fallback for continuity tests.
+    return _is_local_feed_adapter(ticker_adapter)
+
+
 def _clear_unresolved_setup_rows(runtime_state: PaperRuntimeState, symbols: list[str]) -> None:
     for symbol in symbols:
         state = runtime_state.symbols.get(symbol)
@@ -197,6 +216,7 @@ def _catch_up_true_or_from_kite(
     trade_date: str,
     or_minutes: int,
     session_id: str,
+    shared_or_cache: dict[str, list[dict[str, Any]]] | None = None,
 ) -> dict[str, int]:
     if not symbols:
         return {"requested": 0, "fetched": 0, "missing": 0, "errors": 0}
@@ -225,10 +245,19 @@ def _catch_up_true_or_from_kite(
     )
 
     fetched = 0
+    cached = 0
     errors = 0
     for symbol in requested:
+        if shared_or_cache is not None and symbol in shared_or_cache:
+            live_candles = list(shared_or_cache.get(symbol) or [])
+            if live_candles:
+                _merge_state_candles(runtime_state.for_symbol(symbol), live_candles)
+                cached += 1
+            continue
         token = token_map.get(symbol)
         if token is None:
+            if shared_or_cache is not None:
+                shared_or_cache[symbol] = []
             continue
         try:
             raw_candles = _historical_data_with_retry(
@@ -248,28 +277,91 @@ def _catch_up_true_or_from_kite(
                 trade_date,
                 exc,
             )
+            if shared_or_cache is not None:
+                shared_or_cache[symbol] = []
             continue
         live_candles = _kite_history_to_live_candles(
             symbol, raw_candles, trade_date=trade_date, or_minutes=or_minutes
         )
+        if shared_or_cache is not None:
+            shared_or_cache[symbol] = list(live_candles)
         if not live_candles:
             continue
         _merge_state_candles(runtime_state.for_symbol(symbol), live_candles)
         fetched += 1
 
-    missing = len(requested) - fetched
+    missing = len(requested) - fetched - cached
     logger.warning(
         "[%s] OR historical catch-up complete trade_date=%s requested=%d fetched=%d "
-        "missing=%d missing_instruments=%d errors=%d",
+        "cached=%d missing=%d missing_instruments=%d errors=%d",
         session_id,
         trade_date,
         len(requested),
         fetched,
+        cached,
         missing,
         len(missing_instruments),
         errors,
     )
-    return {"requested": len(requested), "fetched": fetched, "missing": missing, "errors": errors}
+    return {
+        "requested": len(requested),
+        "fetched": fetched + cached,
+        "missing": missing,
+        "errors": errors,
+    }
+
+
+def _catch_up_kite_true_or_if_needed(
+    *,
+    runtime_state: PaperRuntimeState,
+    active_symbols: list[str],
+    trade_date: str,
+    candle_interval: int,
+    session_id: str,
+    ticker_adapter: Any,
+    strategy_params: dict[str, Any],
+    shared_or_cache: dict[str, list[dict[str, Any]]] | None = None,
+) -> dict[str, int] | None:
+    if _is_local_feed_adapter(ticker_adapter):
+        return None
+
+    catchup_symbols = _symbols_needing_true_or(runtime_state, active_symbols)
+    if not catchup_symbols:
+        return {"requested": 0, "fetched": 0, "missing": 0, "errors": 0}
+
+    try:
+        result = _catch_up_true_or_from_kite(
+            runtime_state=runtime_state,
+            symbols=catchup_symbols,
+            trade_date=trade_date,
+            or_minutes=candle_interval,
+            session_id=session_id,
+            shared_or_cache=shared_or_cache,
+        )
+    except Exception as exc:
+        logger.warning(
+            "[%s] OR historical catch-up unavailable for %d symbols on %s: %s",
+            session_id,
+            len(catchup_symbols),
+            trade_date,
+            exc,
+        )
+        result = {
+            "requested": len(catchup_symbols),
+            "fetched": 0,
+            "missing": len(catchup_symbols),
+            "errors": len(catchup_symbols),
+        }
+    _clear_unresolved_setup_rows(runtime_state, catchup_symbols)
+    _prefetch_setup_rows(
+        runtime_state=runtime_state,
+        symbols=catchup_symbols,
+        trade_date=trade_date,
+        candle_interval_minutes=candle_interval,
+        regime_index_symbol=str(strategy_params.get("regime_index_symbol") or ""),
+        regime_snapshot_minutes=int(strategy_params.get("regime_snapshot_minutes") or 30),
+    )
+    return result
 
 
 @dataclass(slots=True)
@@ -316,6 +408,7 @@ class _LiveMultiContext:
     last_bar_ts: datetime | None = None
     last_snapshot_ts: datetime | None = None
     last_price: float | None = None
+    feed_ready_marked: bool = False
 
 
 def _cleanup_feed_audit_if_needed(
@@ -426,6 +519,44 @@ async def _write_feed_state(deps: LiveSessionDeps | None = None, **kwargs) -> An
     if deps and deps.feed_writer is not None:
         return await _maybe_await(deps.feed_writer(**kwargs))
     return get_paper_db().upsert_feed_state(**kwargs)
+
+
+async def _mark_multi_feed_ok_from_ticks(
+    ctx: _LiveMultiContext,
+    ticker_adapter: Any,
+) -> None:
+    """Publish a lightweight feed heartbeat before the first closed candle arrives."""
+    if ctx.feed_ready_marked:
+        return
+    last_tick_ts = getattr(ticker_adapter, "last_tick_ts", None)
+    if last_tick_ts is None:
+        return
+    await _write_feed_state(
+        None,
+        session_id=ctx.session_id,
+        status="OK",
+        last_event_ts=last_tick_ts,
+        last_bar_ts=ctx.last_bar_ts,
+        last_price=ctx.last_price,
+        stale_reason=None,
+        raw_state={
+            "connected": bool(getattr(ticker_adapter, "is_connected", False)),
+            "active_symbols": len(ctx.active_symbols),
+            "closed_bars": ctx.closed_bars,
+            "quote_events": ctx.quote_events,
+            "pre_bar_heartbeat": True,
+            "transport": "websocket",
+        },
+    )
+    ctx.feed_ready_marked = True
+
+
+def _admin_command_sort_key(path: Path) -> tuple[int, str]:
+    try:
+        action = str((json.loads(path.read_text()) or {}).get("action") or "")
+    except Exception:
+        action = ""
+    return (0 if action == "cancel_pending_intents" else 1, path.name)
 
 
 def _resolve_trade_date(session: Any) -> str:
@@ -775,6 +906,7 @@ async def _prepare_live_multi_context(
     ticker_adapter: Any,
     candle_interval: int,
     allow_live_setup_fallback: bool,
+    shared_or_cache: dict[str, list[dict[str, Any]]] | None = None,
 ) -> _LiveMultiContext:
     session = await _load_session(spec.session_id)
     if session is None:
@@ -803,9 +935,9 @@ async def _prepare_live_multi_context(
     real_order_router = build_real_order_router(spec.real_order_config)
     runtime_state = PaperRuntimeState(
         allow_live_setup_fallback=allow_live_setup_fallback,
-        allow_or_proxy_setup=real_order_router is None,
+        allow_or_proxy_setup=_allow_or_proxy_setup_for_adapter(ticker_adapter),
         bar_end_offset=timedelta(minutes=5)
-        if getattr(ticker_adapter, "_local_feed", False)
+        if _is_local_feed_adapter(ticker_adapter)
         else None,
     )
     _prefetch_setup_rows(
@@ -816,25 +948,16 @@ async def _prepare_live_multi_context(
         regime_index_symbol=str(strategy_params.get("regime_index_symbol") or ""),
         regime_snapshot_minutes=int(strategy_params.get("regime_snapshot_minutes") or 30),
     )
-    if real_order_router is not None and not getattr(ticker_adapter, "_local_feed", False):
-        catchup_symbols = _symbols_needing_true_or(runtime_state, active_symbols)
-        if catchup_symbols:
-            _catch_up_true_or_from_kite(
-                runtime_state=runtime_state,
-                symbols=catchup_symbols,
-                trade_date=trade_date,
-                or_minutes=candle_interval,
-                session_id=spec.session_id,
-            )
-            _clear_unresolved_setup_rows(runtime_state, catchup_symbols)
-            _prefetch_setup_rows(
-                runtime_state=runtime_state,
-                symbols=catchup_symbols,
-                trade_date=trade_date,
-                candle_interval_minutes=candle_interval,
-                regime_index_symbol=str(strategy_params.get("regime_index_symbol") or ""),
-                regime_snapshot_minutes=int(strategy_params.get("regime_snapshot_minutes") or 30),
-            )
+    _catch_up_kite_true_or_if_needed(
+        runtime_state=runtime_state,
+        active_symbols=active_symbols,
+        trade_date=trade_date,
+        candle_interval=candle_interval,
+        session_id=spec.session_id,
+        ticker_adapter=ticker_adapter,
+        strategy_params=strategy_params,
+        shared_or_cache=shared_or_cache,
+    )
     direction_readiness = _log_direction_readiness(
         session_id=spec.session_id,
         runtime_state=runtime_state,
@@ -1052,15 +1175,10 @@ async def _apply_live_multi_operator_controls(
     if not cmd_dir.exists():
         return False
 
-    def _command_sort_key(path: Path) -> tuple[int, str]:
-        try:
-            action = str((json.loads(path.read_text()) or {}).get("action") or "")
-        except Exception:
-            action = ""
-        return (0 if action == "cancel_pending_intents" else 1, path.name)
-
-    command_files = sorted(cmd_dir.glob("*.json"), key=_command_sort_key)
+    command_files = sorted(cmd_dir.glob("*.json"), key=_admin_command_sort_key)
     for cmd_file in command_files:
+        if not cmd_file.exists():
+            continue
         if _is_admin_command_stale(cmd_file, now):
             logger.warning("[%s] Stale admin command dropped: %s", ctx.session_id, cmd_file.name)
             try:
@@ -1300,6 +1418,7 @@ async def _apply_live_multi_operator_controls(
                         ctx.session_id,
                         exc_info=True,
                     )
+                stop_requested = False
 
             else:
                 logger.warning(
@@ -1318,6 +1437,8 @@ async def _apply_live_multi_operator_controls(
                     cmd_file.unlink()
                 except OSError:
                     pass
+        if command_processed and action == "cancel_pending_intents":
+            break
         if stop_requested:
             break
 
@@ -1397,6 +1518,19 @@ async def _finalize_live_multi_context(
         logger.exception("[%s] Multi final session completion failed", ctx.session_id)
         ctx.final_status = "FAILED"
         ctx.terminal_reason = "session_finalize_failed"
+    if ctx.final_status == "FAILED":
+        try:
+            await _update_session(
+                ctx.session_id,
+                None,
+                status="FAILED",
+                latest_candle_ts=ctx.last_bar_ts,
+                clear_stale_feed_at=True,
+                notes=ctx.terminal_reason or ctx.notes or "multi_session_failed",
+            )
+            get_paper_db().force_sync()
+        except Exception:
+            logger.exception("[%s] Multi failed-status stamp failed", ctx.session_id)
     final_session = await _load_session(ctx.session_id)
     if final_session is not None and getattr(final_session, "status", None):
         loaded_status = str(final_session.status)
@@ -1460,6 +1594,15 @@ async def run_live_multi_sessions(
     transport = "local" if local_feed else "websocket"
     feed_source = "local" if local_feed else "kite"
     contexts: list[_LiveMultiContext] = []
+    lock_stack = ExitStack()
+    shared_or_cache: dict[str, list[dict[str, Any]]] | None = {} if not local_feed else None
+    for spec in specs:
+        lock_stack.enter_context(
+            acquire_command_lock(
+                _session_lock_name(spec.session_id),
+                detail=f"paper live session {spec.session_id}",
+            )
+        )
     register_session_start()
     _start_alert_dispatcher()
     try:
@@ -1470,6 +1613,7 @@ async def run_live_multi_sessions(
                     ticker_adapter=ticker_adapter,
                     candle_interval=candle_interval,
                     allow_live_setup_fallback=allow_live_setup_fallback,
+                    shared_or_cache=shared_or_cache,
                 )
             )
         last_ticker_tick_count = ticker_adapter.tick_count if ticker_adapter is not None else 0
@@ -1531,6 +1675,8 @@ async def run_live_multi_sessions(
                 for ctx in active_contexts:
                     ctx.quote_events += tick_delta
                     ctx.last_snapshot_ts = ticker_adapter.last_tick_ts
+                    if not local_feed:
+                        await _mark_multi_feed_ok_from_ticks(ctx, ticker_adapter)
             last_ticker_tick_count = current_ticks
             session_candles: dict[str, list[ClosedCandle]] = {}
             if local_feed:
@@ -1613,20 +1759,23 @@ async def run_live_multi_sessions(
                         )
             await asyncio.sleep(0)
     finally:
-        results = []
-        for ctx in contexts:
-            try:
-                ticker_adapter.unregister_session(ctx.session_id)
-            except Exception:
-                logger.debug("[%s] Multi unregister failed", ctx.session_id, exc_info=True)
-            results.append(
-                await _finalize_live_multi_context(
-                    ctx=ctx,
-                    ticker_adapter=ticker_adapter,
-                    complete_on_exit=complete_on_exit,
+        try:
+            results = []
+            for ctx in contexts:
+                try:
+                    ticker_adapter.unregister_session(ctx.session_id)
+                except Exception:
+                    logger.debug("[%s] Multi unregister failed", ctx.session_id, exc_info=True)
+                results.append(
+                    await _finalize_live_multi_context(
+                        ctx=ctx,
+                        ticker_adapter=ticker_adapter,
+                        complete_on_exit=complete_on_exit,
+                    )
                 )
-            )
-        await maybe_shutdown_alert_dispatcher()
+            await maybe_shutdown_alert_dispatcher()
+        finally:
+            lock_stack.close()
     return results
 
 
@@ -1752,9 +1901,9 @@ async def run_live_session(
 
     runtime_state = PaperRuntimeState(
         allow_live_setup_fallback=allow_live_setup_fallback,
-        allow_or_proxy_setup=real_order_router is None,
+        allow_or_proxy_setup=_allow_or_proxy_setup_for_adapter(ticker_adapter),
         bar_end_offset=timedelta(minutes=5)
-        if getattr(ticker_adapter, "_local_feed", False)
+        if _is_local_feed_adapter(ticker_adapter)
         else None,
     )
     if deps is None:
@@ -1766,27 +1915,16 @@ async def run_live_session(
             regime_index_symbol=str(strategy_params.get("regime_index_symbol") or ""),
             regime_snapshot_minutes=int(strategy_params.get("regime_snapshot_minutes") or 30),
         )
-        if real_order_router is not None and not getattr(ticker_adapter, "_local_feed", False):
-            catchup_symbols = _symbols_needing_true_or(runtime_state, active_symbols)
-            if catchup_symbols:
-                _catch_up_true_or_from_kite(
-                    runtime_state=runtime_state,
-                    symbols=catchup_symbols,
-                    trade_date=trade_date,
-                    or_minutes=candle_interval,
-                    session_id=session_id,
-                )
-                _clear_unresolved_setup_rows(runtime_state, catchup_symbols)
-                _prefetch_setup_rows(
-                    runtime_state=runtime_state,
-                    symbols=catchup_symbols,
-                    trade_date=trade_date,
-                    candle_interval_minutes=candle_interval,
-                    regime_index_symbol=str(strategy_params.get("regime_index_symbol") or ""),
-                    regime_snapshot_minutes=int(
-                        strategy_params.get("regime_snapshot_minutes") or 30
-                    ),
-                )
+        _catch_up_kite_true_or_if_needed(
+            runtime_state=runtime_state,
+            active_symbols=active_symbols,
+            trade_date=trade_date,
+            candle_interval=candle_interval,
+            session_id=session_id,
+            ticker_adapter=ticker_adapter,
+            strategy_params=strategy_params,
+            shared_or_cache=None,
+        )
     direction_readiness = _log_direction_readiness(
         session_id=session_id,
         runtime_state=runtime_state,
@@ -1902,6 +2040,11 @@ async def run_live_session(
     audit_feed_source = "kite"
     audit_transport = "websocket" if use_websocket else "rest"
 
+    session_lock_ctx = acquire_command_lock(
+        _session_lock_name(session_id),
+        detail=f"paper live session {session_id}",
+    )
+    session_lock_ctx.__enter__()
     try:
         print(
             f"[live] {session_id} started - strategy={strategy} symbols={len(active_symbols)}"
@@ -2334,7 +2477,9 @@ async def run_live_session(
             # Admin command queue: dashboard / agent / operator drop JSON files here.
             _cmd_dir = Path(".tmp_logs") / f"cmd_{session_id}"
             if _cmd_dir.exists():
-                for _cmd_file in sorted(_cmd_dir.glob("*.json")):
+                for _cmd_file in sorted(_cmd_dir.glob("*.json"), key=_admin_command_sort_key):
+                    if not _cmd_file.exists():
+                        continue
                     if _is_admin_command_stale(_cmd_file, now):
                         logger.warning(
                             "[%s] Stale admin command dropped: %s",
@@ -2594,6 +2739,8 @@ async def run_live_session(
                                 _cmd_file.unlink()
                             except OSError:
                                 pass
+                    if _command_processed and _action == "cancel_pending_intents":
+                        break
                 if stop_requested:
                     break
 
@@ -2809,9 +2956,12 @@ async def run_live_session(
 
         # Adapter teardown — always runs even if flush raised.
         if use_websocket and ticker_adapter is not None:
-            ticker_adapter.unregister_session(session_id)
-            if local_ticker_created:
-                ticker_adapter.close()
+            try:
+                ticker_adapter.unregister_session(session_id)
+                if local_ticker_created:
+                    ticker_adapter.close()
+            except Exception:
+                logger.exception("[%s] Adapter teardown failed", session_id)
 
         # Position flatten — always runs.
         if final_status in {"COMPLETED", "NO_ACTIVE_SYMBOLS", "NO_TRADES_ENTRY_WINDOW_CLOSED"}:
@@ -2874,7 +3024,10 @@ async def run_live_session(
                     tracker.open_count,
                 )
 
-        await maybe_shutdown_alert_dispatcher()
+        try:
+            await maybe_shutdown_alert_dispatcher()
+        finally:
+            session_lock_ctx.__exit__(None, None, None)
 
     # Fix 3: stamp STALE/FAILED into the DB now so the session is never left looking
     # "ACTIVE" after the loop exits.  complete_session() below only writes COMPLETED

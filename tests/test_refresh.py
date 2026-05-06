@@ -127,14 +127,14 @@ def test_eod_ingest_runs_strict_order(monkeypatch) -> None:
         "scripts.kite_ingest",  # 0: refresh_instruments
         "scripts.kite_ingest",  # 1: ingest_daily
         "scripts.kite_ingest",  # 2: ingest_5min
-        "scripts.build_tables",  # 3: build_runtime
-        "scripts.build_tables",  # 4: build_next_day_cpr
-        "scripts.build_tables",  # 5: build_next_day_thresholds
-        "scripts.build_tables",  # 6: build_next_day_state
-        "scripts.build_tables",  # 7: build_next_day_strategy
-        "scripts.sync_replica",  # 8: sync_replica
-        "scripts.paper_trading",  # 9: daily_prepare
-        "scripts.data_quality",  # 10: data_quality
+        *(["scripts.build_tables"] * 9),  # 3-11: table-isolated build_runtime
+        "scripts.build_tables",  # 12: build_next_day_cpr
+        "scripts.build_tables",  # 13: build_next_day_thresholds
+        "scripts.build_tables",  # 14: build_next_day_state
+        "scripts.build_tables",  # 15: build_next_day_strategy
+        "scripts.sync_replica",  # 16: sync_replica
+        "scripts.paper_trading",  # 17: daily_prepare
+        "scripts.data_quality",  # 18: data_quality
     ]
     assert captured[0][3:] == ["--refresh-instruments", "--exchange", "NSE"]
     assert captured[1][3:] == [
@@ -153,47 +153,66 @@ def test_eod_ingest_runs_strict_order(monkeypatch) -> None:
         "--resume",
         "--skip-existing",
     ]
-    assert captured[3][3:] == ["--refresh-since", "2026-04-29", "--batch-size", "128"]
-    assert captured[4][3:] == [
+    runtime_tables = ["cpr", "atr", "thresholds", "or", "state", "strategy", "pack", "virgin", "meta"]
+    for index, table in enumerate(runtime_tables, start=3):
+        assert captured[index][3:] == [
+            "--table",
+            table,
+            "--refresh-since",
+            "2026-04-29",
+            "--batch-size",
+            "128",
+            "--skip-status",
+            "--defer-replica-sync",
+        ]
+    assert captured[12][3:] == [
         "--table",
         "cpr",
         "--refresh-date",
         "2026-04-30",
         "--batch-size",
         "128",
+        "--skip-status",
+        "--defer-replica-sync",
     ]
-    assert captured[5][3:] == [
+    assert captured[13][3:] == [
         "--table",
         "thresholds",
         "--refresh-date",
         "2026-04-30",
         "--batch-size",
         "128",
+        "--skip-status",
+        "--defer-replica-sync",
     ]
-    assert captured[6][3:] == [
+    assert captured[14][3:] == [
         "--table",
         "state",
         "--refresh-date",
         "2026-04-30",
         "--batch-size",
         "128",
+        "--skip-status",
+        "--defer-replica-sync",
     ]
-    assert captured[7][3:] == [
+    assert captured[15][3:] == [
         "--table",
         "strategy",
         "--refresh-date",
         "2026-04-30",
         "--batch-size",
         "128",
+        "--skip-status",
+        "--defer-replica-sync",
     ]
-    assert captured[8][3:] == ["--verify", "--trade-date", "2026-04-30"]
-    assert captured[9][3:] == [
+    assert captured[16][3:] == ["--verify", "--trade-date", "2026-04-30"]
+    assert captured[17][3:] == [
         "daily-prepare",
         "--trade-date",
         "2026-04-30",
         "--all-symbols",
     ]
-    assert captured[10][3:] == ["--date", "2026-04-30"]
+    assert captured[18][3:] == ["--date", "2026-04-30"]
 
 
 def test_eod_ingest_logs_stage_names(monkeypatch, capsys) -> None:

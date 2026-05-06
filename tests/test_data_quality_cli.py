@@ -1,9 +1,367 @@
 from __future__ import annotations
 
 import sys
+from datetime import datetime
+
+import duckdb
 
 import scripts.data_quality as data_quality
+from db.duckdb_data_quality import MarketDataQualityMixin, timestamp_invalid_condition_sql
 from scripts.paper_prepare import resolve_trade_date
+
+
+def test_timestamp_invalid_condition_allows_configured_special_sessions():
+    con = duckdb.connect(":memory:")
+    try:
+        con.execute("""
+            CREATE TABLE candles(date DATE, candle_time TIMESTAMP)
+        """)
+        con.execute("""
+            INSERT INTO candles VALUES
+                (DATE '2024-11-01', TIMESTAMP '2024-11-01 18:15:00'),
+                (DATE '2024-11-01', TIMESTAMP '2024-11-01 20:00:00'),
+                (DATE '2025-01-02', TIMESTAMP '2025-01-02 09:10:00'),
+                (DATE '2025-01-02', TIMESTAMP '2025-01-02 09:15:00')
+        """)
+        rows = con.execute(
+            f"""
+            SELECT candle_time
+            FROM candles
+            WHERE {timestamp_invalid_condition_sql()}
+            ORDER BY candle_time
+            """
+        ).fetchall()
+    finally:
+        con.close()
+
+    assert rows == [
+        (datetime(2024, 11, 1, 20, 0),),
+        (datetime(2025, 1, 2, 9, 10),),
+    ]
+
+
+def test_baseline_window_report_fails_on_missing_runtime_rows(monkeypatch):
+    class _FakeResult:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def fetchone(self):
+            return self._rows[0]
+
+        def fetchall(self):
+            return self._rows
+
+    class _FakeCon:
+        def execute(self, sql, params=None):
+            assert params == ["2025-01-01", "2026-05-05", "MAMATA", "SBIN"]
+            if "missing_symbol_days" in sql:
+                return _FakeResult([(200, 2)])
+            if "SELECT src.symbol" in sql:
+                return _FakeResult([("MAMATA", "2025-01-01"), ("SBIN", "2025-01-02")])
+            raise AssertionError(f"Unexpected SQL: {sql}")
+
+    class _FakeDb:
+        def __init__(self):
+            self.con = _FakeCon()
+
+        def get_universe_symbols(self, name):
+            assert name == "canonical_full"
+            return ["SBIN", "MAMATA"]
+
+    monkeypatch.setattr(
+        data_quality,
+        "_BASELINE_WINDOW_CHECKS",
+        (("intraday_day_pack", "v_5min", "date"),),
+    )
+
+    report = data_quality.build_baseline_window_report(
+        universe_name="canonical_full",
+        start_date="2025-01-01",
+        end_date="2026-05-05",
+        db=_FakeDb(),
+    )
+
+    assert report["ready"] is False
+    assert report["symbol_count"] == 2
+    assert report["checks"][0]["source_symbol_days"] == 200
+    assert report["checks"][0]["missing_symbol_days"] == 2
+    assert report["checks"][0]["samples"][0] == {
+        "symbol": "MAMATA",
+        "trade_date": "2025-01-01",
+    }
+
+
+def test_pack_rvol_all_null_symbols_requires_prior_pack_context():
+    con = duckdb.connect(":memory:")
+    try:
+        con.execute("""
+            CREATE TABLE intraday_day_pack(
+                symbol VARCHAR,
+                trade_date DATE,
+                rvol_baseline_arr DOUBLE[]
+            )
+        """)
+        con.execute("""
+            INSERT INTO intraday_day_pack VALUES
+                ('SBIN', DATE '2026-05-05', [100.0]),
+                ('SBIN', DATE '2026-05-06', [NULL, NULL]),
+                ('TCS', DATE '2026-05-05', [50.0]),
+                ('TCS', DATE '2026-05-06', [50.0, NULL]),
+                ('NEWLIST', DATE '2026-05-06', [NULL, NULL])
+        """)
+
+        class _Db:
+            pass
+
+        db = _Db()
+        db.con = con
+        symbols = data_quality._pack_rvol_all_null_symbols(
+            db,
+            symbols=["SBIN", "TCS", "NEWLIST"],
+            pack_date="2026-05-06",
+        )
+    finally:
+        con.close()
+
+    assert symbols == ["SBIN"]
+
+
+def test_baseline_window_report_fails_on_all_null_pack_rvol(monkeypatch):
+    con = duckdb.connect(":memory:")
+    try:
+        con.execute("""
+            CREATE TABLE intraday_day_pack(
+                symbol VARCHAR,
+                trade_date DATE,
+                rvol_baseline_arr DOUBLE[]
+            )
+        """)
+        con.execute("""
+            INSERT INTO intraday_day_pack VALUES
+                ('SBIN', DATE '2026-05-05', [100.0]),
+                ('SBIN', DATE '2026-05-06', [NULL, NULL]),
+                ('TCS', DATE '2026-05-05', [50.0]),
+                ('TCS', DATE '2026-05-06', [50.0, NULL])
+        """)
+
+        class _Db:
+            def __init__(self):
+                self.con = con
+
+            def get_universe_symbols(self, name):
+                assert name == "canonical_full"
+                return ["SBIN", "TCS"]
+
+        monkeypatch.setattr(data_quality, "_BASELINE_WINDOW_CHECKS", ())
+
+        report = data_quality.build_baseline_window_report(
+            universe_name="canonical_full",
+            start_date="2026-05-05",
+            end_date="2026-05-06",
+            db=_Db(),
+        )
+    finally:
+        con.close()
+
+    assert report["ready"] is False
+    assert report["quality_checks"][0]["issue_code"] == "PACK_RVOL_ALL_NULL"
+    assert report["quality_checks"][0]["failing_symbol_days"] == 1
+    assert report["quality_checks"][0]["samples"] == [
+        {"symbol": "SBIN", "trade_date": "2026-05-06"}
+    ]
+
+
+def test_baseline_window_atr_source_excludes_zero_volume_index_days(monkeypatch):
+    con = duckdb.connect(":memory:")
+    try:
+        con.execute("""
+            CREATE TABLE v_5min(
+                symbol VARCHAR,
+                date DATE,
+                true_range DOUBLE,
+                volume BIGINT
+            )
+        """)
+        con.execute("""
+            CREATE TABLE atr_intraday(
+                symbol VARCHAR,
+                trade_date DATE,
+                prev_date DATE,
+                atr DOUBLE
+            )
+        """)
+        con.executemany(
+            "INSERT INTO v_5min VALUES (?, ?, ?, ?)",
+            [
+                ("SBIN", "2026-05-05", 10.0, 100),
+                ("SBIN", "2026-05-05", 11.0, 100),
+                ("SBIN", "2026-05-05", 12.0, 100),
+                ("SBIN", "2026-05-05", 13.0, 100),
+                ("SBIN", "2026-05-05", 14.0, 100),
+                ("SBIN", "2026-05-05", 15.0, 100),
+                ("SBIN", "2026-05-06", 10.0, 100),
+                ("SBIN", "2026-05-06", 11.0, 100),
+                ("SBIN", "2026-05-06", 12.0, 100),
+                ("SBIN", "2026-05-06", 13.0, 100),
+                ("SBIN", "2026-05-06", 14.0, 100),
+                ("SBIN", "2026-05-06", 15.0, 100),
+                ("NIFTY 50", "2026-05-05", 10.0, 0),
+                ("NIFTY 50", "2026-05-05", 11.0, 0),
+                ("NIFTY 50", "2026-05-05", 12.0, 0),
+                ("NIFTY 50", "2026-05-05", 13.0, 0),
+                ("NIFTY 50", "2026-05-05", 14.0, 0),
+                ("NIFTY 50", "2026-05-05", 15.0, 0),
+                ("NIFTY 50", "2026-05-06", 10.0, 0),
+                ("NIFTY 50", "2026-05-06", 11.0, 0),
+                ("NIFTY 50", "2026-05-06", 12.0, 0),
+                ("NIFTY 50", "2026-05-06", 13.0, 0),
+                ("NIFTY 50", "2026-05-06", 14.0, 0),
+                ("NIFTY 50", "2026-05-06", 15.0, 0),
+            ],
+        )
+
+        class _Db:
+            def __init__(self):
+                self.con = con
+
+            def get_universe_symbols(self, name):
+                assert name == "canonical_full"
+                return ["SBIN", "NIFTY 50"]
+
+        monkeypatch.setattr(
+            data_quality,
+            "_BASELINE_WINDOW_CHECKS",
+            (("atr_intraday", "v_5min", "date"),),
+        )
+
+        report = data_quality.build_baseline_window_report(
+            universe_name="canonical_full",
+            start_date="2026-05-05",
+            end_date="2026-05-06",
+            db=_Db(),
+        )
+    finally:
+        con.close()
+
+    assert report["checks"][0]["source_symbol_days"] == 1
+    assert report["checks"][0]["missing_symbol_days"] == 1
+    assert report["checks"][0]["samples"] == [
+        {"symbol": "SBIN", "trade_date": "2026-05-06"}
+    ]
+
+
+def test_comprehensive_dq_scan_registers_all_null_pack_rvol():
+    class _Db(MarketDataQualityMixin):
+        def __init__(self):
+            self.con = duckdb.connect(":memory:")
+            self.read_only = False
+            self._has_5min = True
+            self._has_daily = True
+            self._parquet_dir = None
+            self._sync = None
+            self.publish_count = 0
+
+        def _begin_replica_batch(self) -> None:
+            pass
+
+        def _end_replica_batch(self) -> None:
+            pass
+
+        def _publish_replica(self, *, force: bool = False) -> None:
+            self.publish_count += int(force)
+
+        def _table_exists(self, table: str) -> bool:
+            row = self.con.execute(
+                """
+                SELECT COUNT(*)
+                FROM information_schema.tables
+                WHERE table_name = ?
+                """,
+                [table],
+            ).fetchone()
+            return bool(row and row[0])
+
+    db = _Db()
+    try:
+        db.con.execute("""
+            CREATE TABLE v_5min(
+                symbol VARCHAR,
+                date DATE,
+                candle_time TIMESTAMP,
+                open DOUBLE,
+                high DOUBLE,
+                low DOUBLE,
+                close DOUBLE,
+                volume BIGINT
+            )
+        """)
+        db.con.execute("""
+            CREATE TABLE intraday_day_pack(
+                symbol VARCHAR,
+                trade_date DATE,
+                rvol_baseline_arr DOUBLE[]
+            )
+        """)
+        db.con.execute("""
+            INSERT INTO intraday_day_pack VALUES
+                ('SBIN', DATE '2026-05-05', [100.0]),
+                ('SBIN', DATE '2026-05-06', [NULL, NULL]),
+                ('TCS', DATE '2026-05-05', [50.0]),
+                ('TCS', DATE '2026-05-06', [50.0, NULL])
+        """)
+
+        summary = db.run_comprehensive_dq_scan()
+        rows = db.get_data_quality_issues(issue_code="PACK_RVOL_ALL_NULL")
+    finally:
+        db.con.close()
+
+    assert summary["PACK_RVOL_ALL_NULL"] == 1
+    assert rows[0]["symbol"] == "SBIN"
+    assert rows[0]["severity"] == "CRITICAL"
+
+
+def test_baseline_window_cli_returns_nonzero_when_not_ready(monkeypatch, capsys):
+    monkeypatch.setattr(
+        data_quality,
+        "build_baseline_window_report",
+        lambda **_: {
+            "ready": False,
+            "universe_name": "canonical_full",
+            "symbol_count": 2,
+            "start_date": "2025-01-01",
+            "end_date": "2026-05-05",
+            "checks": [
+                {
+                    "target_table": "intraday_day_pack",
+                    "source_table": "v_5min",
+                    "source_symbol_days": 200,
+                    "missing_symbol_days": 1,
+                    "samples": [{"symbol": "MAMATA", "trade_date": "2025-01-01"}],
+                }
+            ],
+        },
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "pivot-data-quality",
+            "--baseline-window",
+            "--universe-name",
+            "canonical_full",
+            "--start",
+            "2025-01-01",
+            "--end",
+            "2026-05-05",
+        ],
+    )
+
+    assert data_quality.main() == 1
+
+    out = capsys.readouterr().out
+    assert "Baseline-window runtime coverage: FAIL" in out
+    assert "intraday_day_pack" in out
+    assert "MAMATA:2025-01-01" in out
 
 
 def test_windowed_dq_report_prints_registry_and_window_counts(monkeypatch, capsys):
@@ -34,6 +392,18 @@ def test_windowed_dq_report_prints_registry_and_window_counts(monkeypatch, capsy
                 return _FakeResult([(5,)])
             if "(high - low) / open > 0.5" in sql and "COUNT(*)" in sql:
                 return _FakeResult([(6,)])
+            if "dup_candles" in sql:
+                assert params == ["2025-01-01", "2026-03-27"]
+                return _FakeResult([(7,)])
+            if "day_vol = 0" in sql:
+                assert params == ["2025-01-01", "2026-03-27"]
+                return _FakeResult([(8,)])
+            if "gap_days > 7" in sql:
+                assert params == ["2026-03-27", "2025-01-01", "2026-03-27"]
+                return _FakeResult([(9,)])
+            if "FROM intraday_day_pack p" in sql and "rvol_baseline_arr" in sql:
+                assert params == ["2025-01-01", "2026-03-27"]
+                return _FakeResult([(10,)])
             raise AssertionError(f"Unexpected SQL: {sql}")
 
     class _FakeDb:
@@ -53,7 +423,7 @@ def test_windowed_dq_report_prints_registry_and_window_counts(monkeypatch, capsy
                 }
             ]
 
-    monkeypatch.setattr(data_quality, "get_db", lambda: _FakeDb())
+    monkeypatch.setattr(data_quality, "get_live_market_db", lambda: _FakeDb())
     monkeypatch.setattr(
         "sys.argv",
         [
@@ -70,11 +440,60 @@ def test_windowed_dq_report_prints_registry_and_window_counts(monkeypatch, capsy
     data_quality.main()
 
     out = capsys.readouterr().out
-    assert "Active DQ issues (2025-01-01 -> 2026-03-27)" in out
-    assert "Window checks (2025-01-01 -> 2026-03-27)" in out
+    assert "Active DQ issues (registry-wide; not window-scoped)" in out
+    assert "Window checks (2025-01-01 -> 2026-03-27; read-only, registry not mutated)" in out
     assert "OHLC_VIOLATION" in out
     assert "ZERO_PRICE" in out
+    assert "DUPLICATE_CANDLE" in out
+    assert "ZERO_VOLUME_DAY" in out
+    assert "DATE_GAP" in out
+    assert "PACK_RVOL_ALL_NULL" in out
     assert "SBIN" in out
+
+
+def test_windowed_refresh_full_is_read_only(monkeypatch, capsys):
+    class _FakeResult:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def fetchone(self):
+            return self._rows[0]
+
+        def fetchall(self):
+            return self._rows
+
+    class _FakeCon:
+        def execute(self, sql, params=None):
+            if "FROM data_quality_issues" in sql:
+                return _FakeResult([])
+            return _FakeResult([(0,)])
+
+    class _FakeDb:
+        con = _FakeCon()
+
+    monkeypatch.setattr(data_quality, "get_live_market_db", lambda: _FakeDb())
+    monkeypatch.setattr(
+        data_quality,
+        "get_db",
+        lambda: (_ for _ in ()).throw(AssertionError("must not open writer db")),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "pivot-data-quality",
+            "--refresh",
+            "--full",
+            "--window-start",
+            "2025-01-01",
+            "--window-end",
+            "2026-03-27",
+        ],
+    )
+
+    assert data_quality.main() == 0
+    out = capsys.readouterr().out
+    assert "read-only and does not mutate" in out
 
 
 def test_trade_date_dq_report_flags_freshness_and_runtime_gaps(monkeypatch, capsys):

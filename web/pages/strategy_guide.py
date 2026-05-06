@@ -113,11 +113,11 @@ _GUIDE_CSS = """
     border-radius: 2px;
 }
 .strategy-toc-title {
-    font-family: var(--font-mono);
+    font-family: var(--font-ui);
     font-size: 0.65rem;
     font-weight: 600;
     text-transform: uppercase;
-    letter-spacing: 0.12em;
+    letter-spacing: var(--ls-label, 0.08em);
     color: var(--theme-text-secondary);
     margin-bottom: 12px;
     padding-left: 12px;
@@ -136,7 +136,7 @@ _GUIDE_CSS = """
     padding: 7px 12px;
     text-decoration: none;
     color: var(--theme-text-secondary);
-    font-family: var(--font-mono);
+    font-family: var(--font-ui);
     font-size: 0.75rem;
     line-height: 1.4;
     border-left: 2px solid transparent;
@@ -179,11 +179,11 @@ _GUIDE_CSS = """
     border-radius: 4px;
 }
 .strategy-toc-mobile-title {
-    font-family: var(--font-mono);
+    font-family: var(--font-ui);
     font-size: 0.65rem;
     font-weight: 600;
     text-transform: uppercase;
-    letter-spacing: 0.12em;
+    letter-spacing: var(--ls-label, 0.08em);
     color: var(--theme-text-secondary);
     margin-bottom: 8px;
 }
@@ -256,7 +256,7 @@ _GUIDE_CSS = """
     font-weight: 600;
     letter-spacing: 0.03em;
     color: #fff;
-    font-family: var(--font-mono);
+    font-family: var(--font-ui);
 }
 .strat-badge.cpr-levels {
     background: var(--strat-cpr, #2563eb);
@@ -271,7 +271,7 @@ _GUIDE_CSS = """
     display: none;
 }
 .guide-section .nicegui-markdown h3 {
-    font-size: 1rem;
+    font-size: 1.1rem;
     font-weight: 600;
     color: var(--theme-text-primary);
     margin: 1.5rem 0 0.75rem;
@@ -279,7 +279,7 @@ _GUIDE_CSS = """
     border-bottom: 1px solid var(--theme-surface-border);
 }
 .guide-section .nicegui-markdown h4 {
-    font-size: 0.92rem;
+    font-size: 0.95rem;
     font-weight: 600;
     color: var(--theme-text-secondary);
     margin: 1.25rem 0 0.5rem;
@@ -289,6 +289,10 @@ _GUIDE_CSS = """
 }
 .guide-section .nicegui-markdown p:last-child {
     margin-bottom: 0;
+}
+.guide-section .nicegui-markdown p {
+    line-height: 1.7;
+    max-width: 65ch;
 }
 
 /* ── Section nav (prev/next) ───────────────────────────────────────── */
@@ -301,7 +305,7 @@ _GUIDE_CSS = """
     border-top: 1px solid var(--theme-surface-border);
 }
 .section-nav a {
-    font-family: var(--font-mono);
+    font-family: var(--font-ui);
     font-size: 0.75rem;
     color: var(--theme-text-secondary);
     text-decoration: none;
@@ -334,10 +338,10 @@ _GUIDE_CSS = """
     text-align: left;
     padding: 8px 12px;
     border: 1px solid var(--theme-surface-border);
-    font-family: var(--font-mono);
+    font-family: var(--font-ui);
     font-size: 0.75rem;
     text-transform: uppercase;
-    letter-spacing: 0.05em;
+    letter-spacing: var(--ls-label, 0.08em);
     white-space: nowrap;
 }
 .guide-section .nicegui-markdown td {

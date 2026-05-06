@@ -346,6 +346,62 @@ def test_replica_force_sync_publishes_snapshot(tmp_path) -> None:
     assert rows.height == 1
 
 
+def test_paper_daily_summary_excludes_diagnostic_paper_runs(tmp_path) -> None:
+    db = BacktestDB(db_path=tmp_path / "paper-daily-summary.duckdb")
+    try:
+        db.ensure_backtest_table()
+        db.store_backtest_results(
+            pl.concat(
+                [
+                    _trade_frame("CPR_LEVELS_LONG-2026-05-04-live-kite", "2026-05-04")
+                    .with_columns(
+                        pl.lit("PAPER").alias("execution_mode"),
+                        pl.lit("LONG").alias("direction"),
+                        pl.lit(24753.32).alias("profit_loss"),
+                    ),
+                    _trade_frame("compare-kite-audit-long-2026-05-04-v2", "2026-05-04")
+                    .with_columns(
+                        pl.lit("PAPER").alias("execution_mode"),
+                        pl.lit("LONG").alias("direction"),
+                        pl.lit(21218.73).alias("profit_loss"),
+                    ),
+                    _trade_frame("CPR_LEVELS_SHORT-2026-05-04-live-kite", "2026-05-04")
+                    .with_columns(
+                        pl.lit("PAPER").alias("execution_mode"),
+                        pl.lit("SHORT").alias("direction"),
+                        pl.lit(-3737.70).alias("profit_loss"),
+                    ),
+                    _trade_frame("compare-kite-audit-short-2026-05-04-v2", "2026-05-04")
+                    .with_columns(
+                        pl.lit("PAPER").alias("execution_mode"),
+                        pl.lit("SHORT").alias("direction"),
+                        pl.lit(-746.85).alias("profit_loss"),
+                    ),
+                ],
+                how="vertical",
+            )
+        )
+
+        rows = db.get_paper_daily_summary()
+    finally:
+        db.close()
+
+    assert rows == [
+        (
+            datetime(2026, 5, 4).date(),
+            1,
+            1,
+            24753.32,
+            1,
+            0,
+            -3737.7,
+            2,
+            1,
+            21015.62,
+        )
+    ]
+
+
 def test_replica_replace_retries_transient_permission_error(tmp_path, monkeypatch) -> None:
     sync = ReplicaSync(tmp_path / "retry.duckdb", tmp_path / "retry-replica")
     source = tmp_path / "pointer.tmp"

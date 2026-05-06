@@ -325,6 +325,10 @@ class _FakeMultiPaperDb:
     def force_sync(self) -> None:
         self.syncs += 1
 
+    def get_feed_state(self, session_id: str):
+        assert session_id == "sess-multi"
+        return None
+
 
 class _FakeTicker:
     def __init__(self) -> None:
@@ -346,6 +350,14 @@ def _multi_ctx() -> SimpleNamespace:
         real_order_router=None,
         final_status="ACTIVE",
         terminal_reason=None,
+        strategy="CPR_LEVELS",
+        notes=None,
+        quote_events=0,
+        closed_bars=0,
+        last_snapshot_ts=None,
+        last_bar_ts=None,
+        last_price=None,
+        feed_ready_marked=False,
     )
 
 
@@ -417,7 +429,9 @@ async def test_live_multi_operator_controls_pause_resume_and_set_budget(
 
 
 @pytest.mark.asyncio
-async def test_live_multi_operator_controls_cancel_pending(tmp_path, monkeypatch) -> None:
+async def test_live_multi_operator_controls_cancel_pending(
+    tmp_path, monkeypatch, caplog
+) -> None:
     import scripts.paper_live as paper_live
 
     monkeypatch.chdir(tmp_path)
@@ -431,17 +445,19 @@ async def test_live_multi_operator_controls_cancel_pending(tmp_path, monkeypatch
     old_cmd.write_text(json.dumps({"action": "pause_entries"}))
     cancel_cmd.write_text(json.dumps({"action": "cancel_pending_intents", "requester": "test"}))
 
-    stopped = await paper_live._apply_live_multi_operator_controls(
-        ctx=ctx,
-        ticker_adapter=_FakeTicker(),
-        use_websocket=True,
-        now=paper_live.datetime.now(paper_live.IST),
-    )
+    with caplog.at_level("ERROR"):
+        stopped = await paper_live._apply_live_multi_operator_controls(
+            ctx=ctx,
+            ticker_adapter=_FakeTicker(),
+            use_websocket=True,
+            now=paper_live.datetime.now(paper_live.IST),
+        )
 
     assert stopped is False
     assert not old_cmd.exists()
     assert not cancel_cmd.exists()
     assert fake_db.notes[-1].startswith("PENDING_INTENTS_CANCELLED count=1")
+    assert "Multi admin command failed" not in caplog.text
 
 
 @pytest.mark.asyncio
@@ -500,3 +516,80 @@ async def test_live_multi_operator_controls_flatten_signal(tmp_path, monkeypatch
     assert ctx.terminal_reason == "manual_flatten_signal"
     assert not signal_file.exists()
     assert flatten_calls[0]["args"] == ("sess-multi",)
+
+
+@pytest.mark.asyncio
+async def test_mark_multi_feed_ok_from_ticks_writes_pre_bar_heartbeat(monkeypatch) -> None:
+    import scripts.paper_live as paper_live
+
+    ctx = _multi_ctx()
+    tick_ts = paper_live.datetime(2026, 5, 6, 9, 16, tzinfo=paper_live.IST)
+    ticker = SimpleNamespace(last_tick_ts=tick_ts, is_connected=True)
+    writes: list[dict[str, object]] = []
+
+    async def fake_write_feed_state(_deps=None, **kwargs):
+        writes.append(kwargs)
+        return SimpleNamespace(**kwargs)
+
+    monkeypatch.setattr(paper_live, "_write_feed_state", fake_write_feed_state)
+
+    await paper_live._mark_multi_feed_ok_from_ticks(ctx, ticker)
+    await paper_live._mark_multi_feed_ok_from_ticks(ctx, ticker)
+
+    assert len(writes) == 1
+    assert writes[0]["session_id"] == "sess-multi"
+    assert writes[0]["status"] == "OK"
+    assert writes[0]["last_event_ts"] == tick_ts
+    assert writes[0]["raw_state"]["pre_bar_heartbeat"] is True
+    assert ctx.feed_ready_marked is True
+
+
+@pytest.mark.asyncio
+async def test_finalize_live_multi_context_persists_failed_status(monkeypatch) -> None:
+    import scripts.paper_live as paper_live
+
+    ctx = _multi_ctx()
+    ctx.final_status = "FAILED"
+    ctx.terminal_reason = "reconciliation_failed_after_admin_close_all"
+    session = SimpleNamespace(status="STOPPING")
+    updates: list[dict[str, object]] = []
+    complete_calls: list[dict[str, object]] = []
+
+    async def fake_complete_session(**kwargs):
+        complete_calls.append(kwargs)
+        return None
+
+    async def fake_update_session(session_id: str, deps=None, **kwargs):
+        assert session_id == "sess-multi"
+        updates.append(kwargs)
+        if "status" in kwargs:
+            session.status = kwargs["status"]
+        return session
+
+    async def fake_load_session(session_id: str):
+        assert session_id == "sess-multi"
+        return session
+
+    fake_db = _FakeMultiPaperDb()
+    monkeypatch.setattr(paper_live.paper_session_driver, "complete_session", fake_complete_session)
+    monkeypatch.setattr(paper_live, "_update_session", fake_update_session)
+    monkeypatch.setattr(paper_live, "_load_session", fake_load_session)
+    monkeypatch.setattr(paper_live, "get_paper_db", lambda: fake_db)
+    monkeypatch.setattr(
+        paper_live,
+        "archive_completed_session",
+        lambda session_id, paper_db: {"session_id": session_id, "archived": True},
+    )
+
+    result = await paper_live._finalize_live_multi_context(
+        ctx=ctx,
+        ticker_adapter=_FakeTicker(),
+        complete_on_exit=False,
+    )
+
+    assert complete_calls[0]["complete_on_exit"] is False
+    assert updates[-1]["status"] == "FAILED"
+    assert updates[-1]["notes"] == "reconciliation_failed_after_admin_close_all"
+    assert session.status == "FAILED"
+    assert result["final_status"] == "FAILED"
+    assert result["archive"] == {"session_id": "sess-multi", "archived": True}

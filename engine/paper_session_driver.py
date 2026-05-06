@@ -61,6 +61,26 @@ async def _maybe_await(value: Any) -> Any:
     return value
 
 
+def _risk_mark_context(
+    *,
+    tracker: SessionPositionTracker,
+    symbol_last_prices: dict[str, float],
+    bar_candles_sorted: list[Any],
+    fallback_last_price: float | None,
+) -> tuple[datetime, float | None]:
+    """Choose a current risk mark without depending on arbitrary last symbol order."""
+    as_of = max(candle.bar_end for candle in bar_candles_sorted)
+    for symbol in sorted(tracker._open):
+        if symbol in symbol_last_prices:
+            return as_of, float(symbol_last_prices[symbol])
+    if fallback_last_price is not None:
+        return as_of, float(fallback_last_price)
+    for candle in reversed(bar_candles_sorted):
+        if candle.symbol in symbol_last_prices:
+            return as_of, float(symbol_last_prices[candle.symbol])
+    return as_of, float(bar_candles_sorted[-1].close) if bar_candles_sorted else None
+
+
 def _signal_audit_base(
     *,
     session_id: str,
@@ -281,9 +301,29 @@ async def process_closed_bar_group(
     # Yield after exit loop so any CLOSE alerts fire before we scan entries.
     await asyncio.sleep(0)
 
+    triggered = False
+    if bar_candles_sorted:
+        risk_as_of, risk_last_price = _risk_mark_context(
+            tracker=tracker,
+            symbol_last_prices=symbol_last_prices,
+            bar_candles_sorted=bar_candles_sorted,
+            fallback_last_price=last_price,
+        )
+        if await check_bar_risk_controls(
+            session=session,
+            session_id=session_id,
+            as_of=risk_as_of,
+            symbol_last_prices=symbol_last_prices,
+            last_price=risk_last_price,
+            enforce_risk_controls=enforce_risk_controls,
+            build_feed_state=build_feed_state,
+            real_order_router=real_order_router,
+        ):
+            triggered = True
+
     # Step 2: evaluate entry candidates for this bar.
     entry_candidates: list[dict[str, Any]] = []
-    for _i, candle in enumerate(bar_candles_sorted):
+    for _i, candle in enumerate([] if triggered else bar_candles_sorted):
         if tracker.has_open_position(candle.symbol):
             signal_audit_rows.append(
                 {
@@ -376,6 +416,24 @@ async def process_closed_bar_group(
         )
     for selected in selected_entries:
         candidate = dict(selected.get("candidate") or {})
+        risk_as_of, risk_last_price = _risk_mark_context(
+            tracker=tracker,
+            symbol_last_prices=symbol_last_prices,
+            bar_candles_sorted=bar_candles_sorted,
+            fallback_last_price=last_price,
+        )
+        if await check_bar_risk_controls(
+            session=session,
+            session_id=session_id,
+            as_of=risk_as_of,
+            symbol_last_prices=symbol_last_prices,
+            last_price=risk_last_price,
+            enforce_risk_controls=enforce_risk_controls,
+            build_feed_state=build_feed_state,
+            real_order_router=real_order_router,
+        ):
+            triggered = True
+            break
         selected_rank = next(
             (
                 idx
@@ -466,22 +524,6 @@ async def process_closed_bar_group(
     ]
     if update_symbols_cb is not None and reduced_symbols != active_symbols:
         update_symbols_cb(reduced_symbols)
-
-    triggered = False
-    if bar_candles_sorted:
-        last_bar_ts = bar_candles_sorted[-1].bar_end
-        current_bar_close = float(bar_candles_sorted[-1].close)
-        if await check_bar_risk_controls(
-            session=session,
-            session_id=session_id,
-            as_of=last_bar_ts,
-            symbol_last_prices=symbol_last_prices,
-            last_price=current_bar_close,
-            enforce_risk_controls=enforce_risk_controls,
-            build_feed_state=build_feed_state,
-            real_order_router=real_order_router,
-        ):
-            triggered = True
 
     should_complete = bar_time >= entry_window_end and not tracker.open_symbols()
     if should_complete and update_symbols_cb is not None:

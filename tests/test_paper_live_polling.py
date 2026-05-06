@@ -9,6 +9,8 @@ import pytest
 from engine.paper_runtime import PaperRuntimeState
 from scripts.paper_live import (
     _GLOBAL_FLATTEN_SIGNAL,
+    _allow_or_proxy_setup_for_adapter,
+    _catch_up_kite_true_or_if_needed,
     _catch_up_true_or_from_kite,
     _cleanup_feed_audit_if_needed,
     _entry_disabled_symbols,
@@ -324,6 +326,59 @@ def test_catch_up_true_or_from_kite_merges_historical_or_candle(
     assert state.candles[0]["bar_end"].strftime("%H:%M") == "09:20"
 
 
+def test_catch_up_true_or_from_kite_reuses_shared_or_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first_state = PaperRuntimeState(allow_or_proxy_setup=False)
+    second_state = PaperRuntimeState(allow_or_proxy_setup=False)
+    calls: list[int] = []
+
+    monkeypatch.setattr(
+        "engine.kite_ingestion.resolve_instrument_tokens",
+        lambda symbols, exchange="NSE": ({"SBIN": 123}, []),
+    )
+    monkeypatch.setattr("engine.kite_ingestion.get_kite_client", lambda: object())
+
+    def fake_historical(*args, **kwargs):
+        calls.append(1)
+        return [
+            {
+                "date": datetime(2024, 1, 1, 9, 15),
+                "open": 100.0,
+                "high": 103.0,
+                "low": 99.5,
+                "close": 102.0,
+                "volume": 1000,
+            }
+        ]
+
+    monkeypatch.setattr("engine.kite_ingestion._historical_data_with_retry", fake_historical)
+    shared_or_cache: dict[str, list[dict[str, object]]] = {}
+
+    first = _catch_up_true_or_from_kite(
+        runtime_state=first_state,
+        symbols=["SBIN"],
+        trade_date="2024-01-01",
+        or_minutes=5,
+        session_id="sess-long",
+        shared_or_cache=shared_or_cache,
+    )
+    second = _catch_up_true_or_from_kite(
+        runtime_state=second_state,
+        symbols=["SBIN"],
+        trade_date="2024-01-01",
+        or_minutes=5,
+        session_id="sess-short",
+        shared_or_cache=shared_or_cache,
+    )
+
+    assert first == {"requested": 1, "fetched": 1, "missing": 0, "errors": 0}
+    assert second == {"requested": 1, "fetched": 1, "missing": 0, "errors": 0}
+    assert len(calls) == 1
+    assert first_state.for_symbol("SBIN").candles[0]["close"] == pytest.approx(102.0)
+    assert second_state.for_symbol("SBIN").candles[0]["close"] == pytest.approx(102.0)
+
+
 def test_prefetch_batch_path_fills_missing_or_from_caught_up_candle(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -453,3 +508,68 @@ def test_prefetch_batch_path_falls_back_to_live_setup_when_market_row_missing(
     )
 
     assert runtime_state.for_symbol("SBIN").setup_row["direction"] == "LONG"
+
+
+def test_kite_adapter_disallows_or_proxy_setup() -> None:
+    assert _allow_or_proxy_setup_for_adapter(SimpleNamespace()) is False
+    assert _allow_or_proxy_setup_for_adapter(SimpleNamespace(_local_feed=True)) is True
+
+
+def test_kite_true_or_catchup_runs_for_plain_paper_live(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import scripts.paper_live as paper_live
+
+    runtime_state = PaperRuntimeState(allow_live_setup_fallback=True, allow_or_proxy_setup=False)
+    runtime_state.for_symbol("SBIN").setup_row = {
+        "direction_pending": True,
+        "open_915": 0.0,
+        "or_high_5": 0.0,
+        "or_low_5": 0.0,
+        "or_close_5": None,
+    }
+    calls: dict[str, object] = {}
+
+    def fake_catchup(**kwargs):
+        calls["catchup"] = kwargs
+        runtime_state.for_symbol("SBIN").candles = [
+            {
+                "bar_end": datetime(2024, 1, 1, 9, 20),
+                "open": 100.0,
+                "high": 103.0,
+                "low": 99.5,
+                "close": 102.0,
+                "volume": 1000.0,
+            }
+        ]
+        return {"requested": 1, "fetched": 1, "missing": 0, "errors": 0}
+
+    def fake_prefetch(**kwargs):
+        calls["prefetch"] = kwargs
+        runtime_state.for_symbol("SBIN").setup_row = {
+            "direction": "LONG",
+            "direction_pending": False,
+            "open_915": 100.0,
+            "or_high_5": 103.0,
+            "or_low_5": 99.5,
+            "or_close_5": 102.0,
+            "or_proxy": False,
+        }
+
+    monkeypatch.setattr(paper_live, "_catch_up_true_or_from_kite", fake_catchup)
+    monkeypatch.setattr(paper_live, "_prefetch_setup_rows", fake_prefetch)
+
+    result = _catch_up_kite_true_or_if_needed(
+        runtime_state=runtime_state,
+        active_symbols=["SBIN"],
+        trade_date="2024-01-01",
+        candle_interval=5,
+        session_id="plain-paper-live",
+        ticker_adapter=SimpleNamespace(),
+        strategy_params={},
+    )
+
+    assert result == {"requested": 1, "fetched": 1, "missing": 0, "errors": 0}
+    assert calls["catchup"]["session_id"] == "plain-paper-live"
+    assert calls["prefetch"]["symbols"] == ["SBIN"]
+    assert runtime_state.for_symbol("SBIN").setup_row["or_proxy"] is False

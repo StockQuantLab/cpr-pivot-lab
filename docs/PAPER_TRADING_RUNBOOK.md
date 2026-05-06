@@ -347,14 +347,14 @@ fixed and only change the date window when extending baselines.
 Canonical all-family rerun command:
 
 ```bash
-doppler run -- uv run pivot-baselines --start 2025-01-01 --end 2026-05-05
+doppler run -- uv run pivot-baselines --start 2025-01-01 --end 2026-05-06
 ```
 
 For individual checks, use the dated universe explicitly and keep the preset unchanged:
 
 ```bash
-doppler run -- uv run pivot-backtest --universe-name full_2026_05_05 --yes-full-run \
-  --start 2025-01-01 --end 2026-05-05 --preset CPR_LEVELS_RISK_LONG \
+doppler run -- uv run pivot-backtest --universe-name full_2026_05_06 --yes-full-run \
+  --start 2025-01-01 --end 2026-05-06 --preset CPR_LEVELS_RISK_LONG \
   --save --quiet --progress-file .tmp_logs/bt_cpr_risk_long.jsonl
 ```
 
@@ -373,31 +373,30 @@ Reference sets:
 | Daily Reset Std SHORT | `1d6e5e93618e` | 2025-01-01 → 2026-04-09 | ₹1,041,450 |
 | Daily Reset Std LONG | `84a85d954f99` | 2025-01-01 → 2026-04-09 | ₹827,381 |
 
-**Current CPR baselines (2026-05-05 `full_2026_05_05` / 2038-symbol all-8 rerun through 2026-05-05):**
+**Current CPR baselines (2026-05-06 `full_2026_05_06` / 2038-symbol all-8 rerun through 2026-05-06):**
 
 SHORT presets now use `short_trail_atr_multiplier = 1.25`. LONG keeps `trail_atr_multiplier = 1.0`.
 Canonical sizing is now `max_positions=5`, `capital=200000`, `max_position_pct=0.2`.
 Daily-reset risk is the live-paper sizing reference.
-The May 5 extension is now the canonical comparison target for all eight CPR baselines:
+The May 6 repaired-data rerun is now the canonical comparison target for all eight CPR baselines:
 
 | Mode | Preset | Run ID | Start → End | P/L | Calmar |
 |------|--------|--------|-------------|-----|--------|
-| Daily Reset | `CPR_LEVELS_STANDARD_LONG` | `7d108d511ef8` | 2025-01-01 → 2026-05-05 | ₹1,736,192 | 207 |
-| Daily Reset | `CPR_LEVELS_STANDARD_SHORT` | `51c3605228d7` | 2025-01-01 → 2026-05-05 | ₹1,606,325 | 88 |
-| Daily Reset | `CPR_LEVELS_RISK_LONG` | `f9d8f3c689a9` | 2025-01-01 → 2026-05-05 | ₹1,729,632 | 209 |
-| Daily Reset | `CPR_LEVELS_RISK_SHORT` | `05cda5c2d526` | 2025-01-01 → 2026-05-05 | ₹1,623,602 | 94 |
-| Compound | `CPR_LEVELS_STANDARD_LONG` | `52abe32edd6c` | 2025-01-01 → 2026-05-05 | ₹5,640,976 | 404 |
-| Compound | `CPR_LEVELS_STANDARD_SHORT` | `1b3a33451ae7` | 2025-01-01 → 2026-05-05 | ₹4,945,029 | 172 |
-| Compound | `CPR_LEVELS_RISK_LONG` | `fdeb1465e168` | 2025-01-01 → 2026-05-05 | ₹1,737,000 | 208 |
-| Compound | `CPR_LEVELS_RISK_SHORT` | `5aeb65383761` | 2025-01-01 → 2026-05-05 | ₹1,636,958 | 85 |
+| Daily Reset | `CPR_LEVELS_STANDARD_LONG` | `d9bfe51d2d49` | 2025-01-01 → 2026-05-06 | ₹1,723,950 | 204 |
+| Daily Reset | `CPR_LEVELS_STANDARD_SHORT` | `05fd7c6f7184` | 2025-01-01 → 2026-05-06 | ₹1,614,615 | 88 |
+| Daily Reset | `CPR_LEVELS_RISK_LONG` | `dccce0e0ada6` | 2025-01-01 → 2026-05-06 | ₹1,717,560 | 207 |
+| Daily Reset | `CPR_LEVELS_RISK_SHORT` | `f6e520155aa7` | 2025-01-01 → 2026-05-06 | ₹1,631,892 | 94 |
+| Compound | `CPR_LEVELS_STANDARD_LONG` | `90f35eff2b60` | 2025-01-01 → 2026-05-06 | ₹5,468,602 | 393 |
+| Compound | `CPR_LEVELS_STANDARD_SHORT` | `bad839f6c921` | 2025-01-01 → 2026-05-06 | ₹5,003,566 | 173 |
+| Compound | `CPR_LEVELS_RISK_LONG` | `367caeefea75` | 2025-01-01 → 2026-05-06 | ₹1,725,265 | 205 |
+| Compound | `CPR_LEVELS_RISK_SHORT` | `99987700277a` | 2025-01-01 → 2026-05-06 | ₹1,645,245 | 85 |
 
-The 2026-05-05 promotion supersedes the prior 2026-05-04-ended comparison set, the
-2026-05-03 comparison set, and the older deleted 2026-04-28 `u2029` baseline rows. The
-retired rows should not be used as comparison targets. The only added trading date versus the
-previous current set is 2026-05-05. Strict verification showed exact matching trade rows
-through 2026-05-04 and metric deltas equal only the 2026-05-05 trade rows.
-Use `full_2026_05_05` explicitly for reproducible reruns; it had the same 2038-symbol membership
-as `full_2026_04_30` at promotion time, but the dated name is the durable reference.
+The 2026-05-06 promotion supersedes the prior 2026-05-05 comparison set, the
+2026-05-04-ended comparison set, the 2026-05-03 comparison set, and the older deleted
+2026-04-28 `u2029` baseline rows. The retired rows should not be used as comparison targets.
+This promotion is a corrected-data reset after full-window `intraday_day_pack` RVOL baseline
+repair; LONG deltas before 2026-05-06 are expected because LONG uses the RVOL gate.
+Use `full_2026_05_06` explicitly for reproducible reruns; the dated name is the durable reference.
 
 When extending the v2 set to a later end date, rerun these same eight presets and
 compare the overlapping window only. The incremental window should be the only source
@@ -1301,6 +1300,10 @@ This calls Kite `place_order` only after all gates pass and records the broker p
 `paper_orders` with `broker_mode=LIVE`.
 
 **Automated real-order CPR pilot path:**
+
+For a plain-English walkthrough of the full broker lifecycle, including LONG and SHORT examples,
+entry fill confirmation, broker-native SL-M placement, exits, duplicate retries, and failure
+scenarios, read [REAL_ORDER_LIVE_FLOW.md](REAL_ORDER_LIVE_FLOW.md).
 
 Normal `daily-live` remains paper-only. Automated Zerodha routing starts only when the command
 includes `--real-orders` and the same Doppler gates above are enabled. The pilot intentionally

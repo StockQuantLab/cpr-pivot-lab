@@ -12,6 +12,71 @@ from db.duckdb_validation import validate_symbols as _validate_symbols
 
 logger = logging.getLogger(__name__)
 
+SPECIAL_TRADING_SESSION_WINDOWS: dict[str, tuple[str, str]] = {
+    # Muhurat/evening sessions.
+    "2015-11-11": ("17:30", "18:45"),
+    "2016-10-30": ("18:30", "19:25"),
+    "2017-10-19": ("18:30", "19:25"),
+    "2018-11-07": ("17:30", "18:25"),
+    "2019-10-27": ("18:15", "19:10"),
+    "2020-11-14": ("18:15", "19:10"),
+    "2021-11-04": ("18:15", "19:10"),
+    "2022-10-24": ("18:15", "19:10"),
+    "2023-11-12": ("18:15", "19:10"),
+    "2024-11-01": ("18:00", "18:55"),
+    # NSE extended trading session after the 2021-02-24 market halt.
+    "2021-02-24": ("15:35", "16:55"),
+}
+
+
+def timestamp_invalid_condition_sql(*, column: str = "candle_time", date_column: str = "date") -> str:
+    """Return SQL that flags candles outside configured valid NSE session windows."""
+    special_clauses = []
+    for trading_date, (start_time, end_time) in SPECIAL_TRADING_SESSION_WINDOWS.items():
+        special_clauses.append(
+            f"({date_column}::DATE = DATE '{trading_date}' "
+            f"AND CAST({column} AS TIME) BETWEEN TIME '{start_time}:00' "
+            f"AND TIME '{end_time}:00')"
+        )
+    special_sql = " OR ".join(special_clauses) or "FALSE"
+    return f"""
+        (
+            HOUR({column}) < 9
+            OR HOUR({column}) > 15
+            OR (HOUR({column}) = 9 AND MINUTE({column}) < 15)
+            OR (HOUR({column}) = 15 AND MINUTE({column}) > 30)
+        )
+        AND NOT ({special_sql})
+    """
+
+
+def pack_rvol_all_null_condition_sql(alias: str = "p") -> str:
+    """Return SQL that detects empty/all-null pack RVOL arrays."""
+    return f"""
+        (
+            {alias}.rvol_baseline_arr IS NULL
+            OR len({alias}.rvol_baseline_arr) = 0
+            OR NOT EXISTS (
+                SELECT 1
+                FROM UNNEST({alias}.rvol_baseline_arr) AS rvol_item(value)
+                WHERE rvol_item.value IS NOT NULL
+            )
+        )
+    """
+
+
+def pack_rvol_has_prior_context_condition_sql(alias: str = "p") -> str:
+    """Return SQL that verifies prior pack history exists for the same symbol."""
+    return f"""
+        EXISTS (
+            SELECT 1
+            FROM intraday_day_pack prev_pack
+            WHERE prev_pack.symbol = {alias}.symbol
+              AND prev_pack.trade_date < {alias}.trade_date
+              AND prev_pack.trade_date >= {alias}.trade_date - INTERVAL 45 DAY
+        )
+    """
+
 
 class MarketDataQualityMixin:
     """Mixin for market data-quality tables and scan workflows."""
@@ -213,7 +278,8 @@ class MarketDataQualityMixin:
 
         print("  Pass 1/2: scanning candles for OHLC/null/zero/timestamp/extreme...", flush=True)
         try:
-            pass1_rows = self.con.execute("""
+            timestamp_invalid_condition = timestamp_invalid_condition_sql()
+            pass1_rows = self.con.execute(f"""
                 SELECT
                     symbol,
                     SUM(CASE WHEN high < low
@@ -238,15 +304,9 @@ class MarketDataQualityMixin:
                          THEN 1 ELSE 0 END) AS zero_cnt,
                     MIN(CASE WHEN open = 0 OR close = 0 OR high = 0
                          THEN date END)::VARCHAR AS zero_first,
-                    SUM(CASE WHEN HOUR(candle_time) < 9
-                                  OR HOUR(candle_time) > 15
-                                  OR (HOUR(candle_time) = 9  AND MINUTE(candle_time) < 15)
-                                  OR (HOUR(candle_time) = 15 AND MINUTE(candle_time) > 30)
+                    SUM(CASE WHEN {timestamp_invalid_condition}
                          THEN 1 ELSE 0 END) AS ts_cnt,
-                    MIN(CASE WHEN HOUR(candle_time) < 9
-                                  OR HOUR(candle_time) > 15
-                                  OR (HOUR(candle_time) = 9  AND MINUTE(candle_time) < 15)
-                                  OR (HOUR(candle_time) = 15 AND MINUTE(candle_time) > 30)
+                    MIN(CASE WHEN {timestamp_invalid_condition}
                          THEN candle_time END)::VARCHAR AS ts_example,
                     SUM(CASE WHEN open > 0 AND (high - low) / open > 0.5
                          THEN 1 ELSE 0 END) AS extreme_cnt,
@@ -296,13 +356,13 @@ class MarketDataQualityMixin:
                 "NULL_PRICE": lambda c, d: f"{c} candles with null OHLC (first: {d})",
                 "ZERO_PRICE": lambda c, d: f"{c} candles with zero open/close/high (first: {d})",
                 "TIMESTAMP_INVALID": lambda c, ex: (
-                    f"{c} candles outside 09:15-15:30 IST (e.g. {ex})"
+                    f"{c} candles outside configured NSE session windows (e.g. {ex})"
                 ),
                 "EXTREME_CANDLE": lambda c, mx: f"{c} candles with range >50% of open (max: {mx}%)",
             },
         )
 
-        print("  Pass 2/2: scanning for duplicates/date-gaps/zero-volume...", flush=True)
+        print("  Pass 2/3: scanning for duplicates/date-gaps/zero-volume...", flush=True)
         try:
             pass2_rows = self.con.execute("""
                 WITH day_stats AS (
@@ -383,6 +443,36 @@ class MarketDataQualityMixin:
             },
         )
 
+        print("  Pass 3/3: scanning derived pack RVOL baselines...", flush=True)
+        try:
+            if self._table_exists("intraday_day_pack"):
+                pack_rvol_rows = self.con.execute(f"""
+                    SELECT
+                        p.symbol,
+                        COUNT(*) AS affected_days,
+                        MIN(p.trade_date)::VARCHAR AS first_trade_date
+                    FROM intraday_day_pack p
+                    WHERE {pack_rvol_has_prior_context_condition_sql("p")}
+                      AND {pack_rvol_all_null_condition_sql("p")}
+                    GROUP BY p.symbol
+                """).fetchall()
+            else:
+                pack_rvol_rows = []
+        except Exception as exc:
+            logger.warning("DQ pass-3 pack RVOL scan failed: %s", exc)
+            pack_rvol_rows = []
+
+        _upsert_batch(
+            {"PACK_RVOL_ALL_NULL": pack_rvol_rows},
+            severities={"PACK_RVOL_ALL_NULL": "CRITICAL"},
+            detail_fns={
+                "PACK_RVOL_ALL_NULL": lambda c, d: (
+                    f"{c} pack days with all-null RVOL baseline despite prior context "
+                    f"(first: {d})"
+                )
+            },
+        )
+
         active_row = self.con.execute(
             "SELECT COUNT(*) FROM data_quality_issues WHERE is_active = TRUE"
         ).fetchone()
@@ -391,7 +481,7 @@ class MarketDataQualityMixin:
 
         total_affected = sum(v for k, v in summary.items() if k != "total_active_issues")
         logger.info(
-            "DQ scan complete: 2 passes, %d issue types, %d affected symbols, %d active total",
+            "DQ scan complete: 3 passes, %d issue types, %d affected symbols, %d active total",
             len(summary) - 1,
             total_affected,
             active_total,
@@ -442,7 +532,8 @@ class MarketDataQualityMixin:
         issue_code: str | None = None,
     ) -> list[dict[str, object]]:
         """Return data quality issue rows for reporting/debugging."""
-        self.ensure_data_quality_table()
+        if not self.read_only:
+            self.ensure_data_quality_table()
         where_parts: list[str] = []
         params: list[object] = []
         if active_only:
@@ -452,17 +543,22 @@ class MarketDataQualityMixin:
             params.append(issue_code)
 
         where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
-        rows = self.con.execute(
-            f"""
-            SELECT symbol, issue_code, severity, details, is_active, first_seen, last_seen
-            FROM data_quality_issues
-            {where_sql}
-            ORDER BY
-                CASE severity WHEN 'CRITICAL' THEN 0 WHEN 'WARNING' THEN 1 ELSE 2 END,
-                issue_code, symbol
-            """,
-            params,
-        ).fetchall()
+        try:
+            rows = self.con.execute(
+                f"""
+                SELECT symbol, issue_code, severity, details, is_active, first_seen, last_seen
+                FROM data_quality_issues
+                {where_sql}
+                ORDER BY
+                    CASE severity WHEN 'CRITICAL' THEN 0 WHEN 'WARNING' THEN 1 ELSE 2 END,
+                    issue_code, symbol
+                """,
+                params,
+            ).fetchall()
+        except Exception:
+            if self.read_only:
+                return []
+            raise
         return [
             {
                 "symbol": r[0],

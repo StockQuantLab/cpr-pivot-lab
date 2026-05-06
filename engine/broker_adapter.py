@@ -49,6 +49,7 @@ _PROTECTED_EXIT_ROLES = (
     "stop",
 )
 _EMERGENCY_FLATTEN_ROLE_TOKENS = ("flatten", "manual_flatten", "emergency", "kill")
+_STOP_LOSS_ROLE_TOKENS = ("stop", "stop_loss", "protective_sl", "sl_hit", "slm")
 
 
 def _role_matches_any(role: str, tokens: tuple[str, ...]) -> bool:
@@ -265,6 +266,9 @@ class BrokerAdapter(Protocol):
     async def place_order(self, intent: BrokerOrderIntent) -> BrokerExecutionResult:
         """Place or simulate one order intent."""
 
+    async def cancel_order(self, *, order_id: str, variety: str = "regular") -> str:
+        """Cancel one broker order."""
+
     async def fetch_order_snapshots(self) -> list[BrokerOrderSnapshot]:
         """Read broker order snapshots."""
 
@@ -285,6 +289,9 @@ class PaperBrokerAdapter:
             idempotency_key=intent.idempotency_key(),
             exchange_order_id=None,
         )
+
+    async def cancel_order(self, *, order_id: str, variety: str = "regular") -> str:
+        return str(order_id)
 
     async def fetch_order_snapshots(self) -> list[BrokerOrderSnapshot]:
         return []
@@ -361,6 +368,24 @@ class ZerodhaBrokerAdapter:
         orders = self._kite_client.orders()
         return [BrokerOrderSnapshot.from_mapping(dict(order)) for order in orders or []]
 
+    async def cancel_order(self, *, order_id: str, variety: str = "regular") -> str:
+        if self.mode == "REAL_DRY_RUN":
+            return str(order_id)
+        if not self._allow_real_orders:
+            raise RealOrderPlacementDisabledError(
+                "Real Zerodha order cancellation is disabled. Use REAL_DRY_RUN."
+            )
+        if self._kite_client is None or not callable(
+            getattr(self._kite_client, "cancel_order", None)
+        ):
+            raise RealOrderPlacementDisabledError("A Kite client with cancel_order is required.")
+        return str(
+            self._kite_client.cancel_order(
+                variety=str(variety or "regular"),
+                order_id=str(order_id),
+            )
+        )
+
     async def fetch_position_snapshots(self) -> list[BrokerPositionSnapshot]:
         if self._kite_client is None:
             return []
@@ -425,29 +450,123 @@ async def record_real_order(
     intent: BrokerOrderIntent,
     adapter: ZerodhaBrokerAdapter,
 ) -> dict[str, Any]:
-    result = await adapter.place_order(intent)
-    payload_json = json.dumps(result.payload, sort_keys=True, separators=(",", ":"))
-    normalized = intent.normalized()
-    order_id = paper_db.append_order_event(
-        session_id=normalized.session_id,
-        position_id=normalized.position_id,
-        signal_id=normalized.signal_id,
-        symbol=normalized.symbol,
-        side=normalized.side,
-        order_type=normalized.order_type,
-        requested_qty=normalized.quantity,
-        request_price=normalized.price,
-        fill_price=None,
-        fill_qty=0,
-        status="PENDING",
-        requested_at=datetime.now(UTC),
-        exchange_order_id=result.exchange_order_id,
-        idempotency_key=result.idempotency_key,
-        notes=result.mode,
-        broker_mode=result.mode,
-        broker_payload=payload_json,
-        broker_latency_ms=result.latency_ms,
+    safe_intent = intent.validate_for_broker()
+    normalized = safe_intent.normalized()
+    idempotency_key = normalized.idempotency_key()
+    existing = (
+        paper_db.get_order_by_idempotency_key(idempotency_key)
+        if hasattr(paper_db, "get_order_by_idempotency_key")
+        else None
     )
+    if existing is not None and existing.exchange_order_id:
+        payload = {}
+        if existing.broker_payload:
+            try:
+                payload = json.loads(str(existing.broker_payload))
+            except json.JSONDecodeError:
+                payload = {}
+        return {
+            "order_id": existing.order_id,
+            "broker": "zerodha",
+            "mode": existing.broker_mode or adapter.mode,
+            "status": existing.status,
+            "idempotency_key": idempotency_key,
+            "exchange_order_id": existing.exchange_order_id,
+            "broker_latency_ms": existing.broker_latency_ms,
+            "payload": payload,
+            "recovered_existing": True,
+        }
+
+    payload_json = json.dumps(safe_intent.zerodha_payload(), sort_keys=True, separators=(",", ":"))
+    if existing is not None:
+        payload = {}
+        if existing.broker_payload:
+            try:
+                payload = json.loads(str(existing.broker_payload))
+            except json.JSONDecodeError:
+                payload = {}
+        existing_status = str(existing.status or "").upper()
+        if (
+            adapter.mode != "REAL_DRY_RUN"
+            and existing.exchange_order_id is None
+            and existing_status in {"REJECTED", "CANCELLED"}
+        ):
+            if hasattr(paper_db, "prepare_order_broker_retry"):
+                paper_db.prepare_order_broker_retry(
+                    existing.order_id,
+                    broker_mode=adapter.mode,
+                    broker_payload=payload_json,
+                )
+        else:
+            recovered_snapshot = await _recover_pending_submission(
+                paper_db=paper_db,
+                order_id=existing.order_id,
+                adapter=adapter,
+                payload=payload or safe_intent.zerodha_payload(),
+            )
+            if recovered_snapshot is not None:
+                return {
+                    "order_id": existing.order_id,
+                    "broker": "zerodha",
+                    "mode": existing.broker_mode or adapter.mode,
+                    "status": recovered_snapshot.status,
+                    "idempotency_key": idempotency_key,
+                    "exchange_order_id": recovered_snapshot.order_id,
+                    "broker_latency_ms": existing.broker_latency_ms,
+                    "payload": recovered_snapshot.broker_payload,
+                    "recovered_existing": True,
+                }
+            if adapter.mode != "REAL_DRY_RUN":
+                raise OrderSafetyError(
+                    "real-order intent already exists without broker order id; "
+                    "manual broker reconciliation required before retry"
+                )
+
+    order_id = (
+        existing.order_id
+        if existing is not None
+        else paper_db.append_order_event(
+            session_id=normalized.session_id,
+            position_id=normalized.position_id,
+            signal_id=normalized.signal_id,
+            symbol=normalized.symbol,
+            side=normalized.side,
+            order_type=normalized.order_type,
+            requested_qty=normalized.quantity,
+            request_price=normalized.price,
+            fill_price=None,
+            fill_qty=0,
+            status="PENDING",
+            requested_at=datetime.now(UTC),
+            exchange_order_id=None,
+            idempotency_key=idempotency_key,
+            notes="PENDING_DISPATCH",
+            broker_mode=adapter.mode,
+            broker_payload=payload_json,
+            broker_latency_ms=None,
+        )
+    )
+    try:
+        result = await adapter.place_order(safe_intent)
+    except Exception as exc:
+        if hasattr(paper_db, "update_order_broker_rejection"):
+            paper_db.update_order_broker_rejection(
+                order_id,
+                broker_mode=adapter.mode,
+                broker_payload=payload_json,
+                broker_status_message=str(exc),
+            )
+        raise
+    payload_json = json.dumps(result.payload, sort_keys=True, separators=(",", ":"))
+    if hasattr(paper_db, "update_order_broker_submission"):
+        paper_db.update_order_broker_submission(
+            order_id,
+            exchange_order_id=result.exchange_order_id,
+            broker_mode=result.mode,
+            broker_payload=payload_json,
+            broker_latency_ms=result.latency_ms,
+            notes=result.mode,
+        )
     return {
         "order_id": order_id,
         "broker": result.broker,
@@ -458,6 +577,64 @@ async def record_real_order(
         "broker_latency_ms": result.latency_ms,
         "payload": result.payload,
     }
+
+
+async def _recover_pending_submission(
+    *,
+    paper_db: Any,
+    order_id: str,
+    adapter: ZerodhaBrokerAdapter,
+    payload: dict[str, Any],
+) -> BrokerOrderSnapshot | None:
+    """Recover a broker order for a pre-dispatch row whose exchange id was not saved."""
+    try:
+        snapshots = await adapter.fetch_order_snapshots()
+    except Exception:
+        return None
+    matches = [snapshot for snapshot in snapshots if _snapshot_matches_payload(snapshot, payload)]
+    if len(matches) != 1:
+        return None
+    for snapshot in matches:
+        broker_payload = json.dumps(
+            snapshot.broker_payload,
+            default=str,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        if hasattr(paper_db, "update_order_broker_submission"):
+            paper_db.update_order_broker_submission(
+                order_id,
+                exchange_order_id=snapshot.order_id,
+                broker_mode=adapter.mode,
+                broker_payload=broker_payload,
+                broker_latency_ms=None,
+                notes="RECOVERED_PENDING_DISPATCH",
+            )
+        if hasattr(paper_db, "update_order_from_broker_snapshot"):
+            paper_db.update_order_from_broker_snapshot(snapshot.order_id, snapshot.broker_payload)
+        return snapshot
+    return None
+
+
+def _snapshot_matches_payload(snapshot: BrokerOrderSnapshot, payload: dict[str, Any]) -> bool:
+    tag = str(payload.get("tag") or "").strip()
+    if tag and str(snapshot.tag or "").strip() != tag:
+        return False
+    if str(snapshot.symbol or "").upper() != str(payload.get("tradingsymbol") or "").upper():
+        return False
+    if str(snapshot.side or "").upper() != str(payload.get("transaction_type") or "").upper():
+        return False
+    if int(float(snapshot.quantity or 0)) != int(float(payload.get("quantity") or 0)):
+        return False
+    raw = snapshot.broker_payload or {}
+    for snap_key, payload_key in (
+        ("product", "product"),
+        ("exchange", "exchange"),
+        ("order_type", "order_type"),
+    ):
+        if str(raw.get(snap_key) or "").upper() != str(payload.get(payload_key) or "").upper():
+            return False
+    return True
 
 
 def _default_zerodha_tag(session_id: str, role: str) -> str:
@@ -486,7 +663,26 @@ def _is_emergency_flatten_role(role: str) -> bool:
     return _role_matches_any(role, _EMERGENCY_FLATTEN_ROLE_TOKENS)
 
 
+def _is_stop_loss_role(role: str) -> bool:
+    return _role_matches_any(role, _STOP_LOSS_ROLE_TOKENS)
+
+
 def _validate_protected_exit(intent: BrokerOrderIntent) -> None:
+    if intent.order_type in {"SL", "SL-M"} and _is_stop_loss_role(intent.role):
+        if intent.trigger_price is None:
+            raise OrderSafetyError("stop-loss orders require trigger_price")
+        if intent.order_type == "SL" and intent.price is None:
+            raise OrderSafetyError("SL stop-loss orders require price")
+        if intent.reference_price is None:
+            raise OrderSafetyError("stop-loss orders require a fresh reference_price")
+        if intent.reference_price_age_sec is None:
+            raise OrderSafetyError("stop-loss orders require reference_price_age_sec")
+        if intent.reference_price_age_sec > DEFAULT_MAX_QUOTE_AGE_SEC:
+            raise OrderSafetyError(
+                f"reference price is stale: {intent.reference_price_age_sec:.2f}s > "
+                f"{DEFAULT_MAX_QUOTE_AGE_SEC:.2f}s"
+            )
+        return
     if intent.order_type != "LIMIT":
         raise OrderSafetyError("exit/flatten roles must use protected LIMIT orders")
     if intent.reference_price is None:
@@ -589,10 +785,17 @@ def _estimated_order_price(intent: BrokerOrderIntent) -> float:
 
 
 def _call_kite_place_order(kite_client: Any, payload: dict[str, Any]) -> str:
-    # pykiteconnect v4 place_order has explicit keyword parameters and does not
-    # accept market_protection in the documented signature.
-    kwargs = {key: value for key, value in payload.items() if key != "market_protection"}
-    return kite_client.place_order(**kwargs)
+    if "market_protection" not in payload or not hasattr(kite_client, "_post"):
+        return kite_client.place_order(**payload)
+    params = dict(payload)
+    variety = str(params.pop("variety"))
+    params = {key: value for key, value in params.items() if value is not None}
+    response = kite_client._post(
+        "order.place",
+        url_args={"variety": variety},
+        params=params,
+    )
+    return str(response["order_id"])
 
 
 def _env_flag(name: str) -> bool:

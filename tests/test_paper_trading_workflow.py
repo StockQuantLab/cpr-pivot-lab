@@ -725,7 +725,7 @@ async def test_ensure_daily_session_reuses_existing_live_session(
     )
     existing = SimpleNamespace(
         session_id="paper-live-1",
-        status="FAILED",
+        status="ACTIVE",
         strategy="CPR_LEVELS",
         strategy_params=requested_params,
     )
@@ -946,6 +946,85 @@ async def test_ensure_daily_session_creates_fallback_for_local_live_terminal_col
     assert session.session_id == "paper-live-local-1-123456"
     assert calls and calls[0]["session_id"] == "paper-live-local-1-123456"
     assert calls[0]["status"] == "ACTIVE"
+
+
+@pytest.mark.parametrize("status", ["FAILED", "COMPLETED", "CANCELLED", "STOPPING", "STOPPED"])
+@pytest.mark.asyncio
+async def test_ensure_daily_session_rejects_kite_live_terminal_collision(
+    monkeypatch: pytest.MonkeyPatch,
+    status: str,
+) -> None:
+    import scripts.paper_trading as pt
+
+    existing = SimpleNamespace(session_id="paper-live-kite-1", status=status)
+
+    async def fake_get_session(session_id: str):
+        assert session_id == "paper-live-kite-1"
+        return existing
+
+    async def fake_create_paper_session(**_kwargs):
+        raise AssertionError("terminal Kite live session must not be recreated or reused")
+
+    monkeypatch.setattr(pt, "get_session", fake_get_session)
+    monkeypatch.setattr(pt, "create_paper_session", fake_create_paper_session)
+
+    with pytest.raises(SystemExit, match="refusing to reuse"):
+        await pt._ensure_daily_session(
+            session_id="paper-live-kite-1",
+            trade_date="2026-05-06",
+            strategy="CPR_LEVELS",
+            symbols=["SBIN"],
+            strategy_params={"direction_filter": "LONG", "feed_source": "kite"},
+            notes="late test",
+            mode="live",
+        )
+
+
+@pytest.mark.parametrize("status", ["PLANNING", "ACTIVE", "PAUSED"])
+@pytest.mark.asyncio
+async def test_ensure_daily_session_allows_non_terminal_live_collision(
+    monkeypatch: pytest.MonkeyPatch,
+    status: str,
+) -> None:
+    import scripts.paper_trading as pt
+
+    requested_params = pt._with_resolved_strategy_metadata(
+        "CPR_LEVELS",
+        {"direction_filter": "LONG", "feed_source": "kite"},
+    )
+    existing = SimpleNamespace(
+        session_id="paper-live-kite-1",
+        status=status,
+        strategy="CPR_LEVELS",
+        strategy_params=requested_params,
+        portfolio_value=1000000.0,
+        max_daily_loss_pct=0.03,
+        max_drawdown_pct=0.1,
+        max_positions=5,
+        max_position_pct=0.2,
+    )
+
+    async def fake_get_session(session_id: str):
+        assert session_id == "paper-live-kite-1"
+        return existing
+
+    async def fake_create_paper_session(**_kwargs):
+        raise AssertionError("non-terminal live session should be reused")
+
+    monkeypatch.setattr(pt, "get_session", fake_get_session)
+    monkeypatch.setattr(pt, "create_paper_session", fake_create_paper_session)
+
+    session = await pt._ensure_daily_session(
+        session_id="paper-live-kite-1",
+        trade_date="2026-05-06",
+        strategy="CPR_LEVELS",
+        symbols=["SBIN"],
+        strategy_params={"direction_filter": "LONG", "feed_source": "kite"},
+        notes="late test",
+        mode="live",
+    )
+
+    assert session is existing
 
 
 @pytest.mark.asyncio

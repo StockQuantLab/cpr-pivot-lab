@@ -11,6 +11,7 @@ and policy documents belong under `docs/`.
 - [../README.md](../README.md) - project overview, setup, and common commands
 - [../STRATEGY.md](../STRATEGY.md) - canonical strategy specification and parameter policy
 - [PAPER_TRADING_RUNBOOK.md](PAPER_TRADING_RUNBOOK.md) - paper replay/live operator workflow
+- [REAL_ORDER_LIVE_FLOW.md](REAL_ORDER_LIVE_FLOW.md) - plain-English actual live broker order lifecycle
 - [SETUP.md](SETUP.md) - setup, command profile, and remote dashboard access
 
 ## Operations

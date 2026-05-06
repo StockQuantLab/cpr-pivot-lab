@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import math
 import time
 from dataclasses import dataclass
@@ -20,6 +22,8 @@ from engine.broker_adapter import (
     record_real_order,
 )
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass(frozen=True, slots=True)
 class RealOrderRuntimeConfig:
@@ -36,6 +40,9 @@ class RealOrderRuntimeConfig:
     exchange: str = "NSE"
     adapter_mode: str = "LIVE"
     shadow: bool = False
+    fill_wait_timeout_sec: float = 8.0
+    fill_poll_sec: float = 0.5
+    protective_sl_market_protection_pct: float = DEFAULT_MARKET_PROTECTION_PCT
 
     @classmethod
     def from_mapping(cls, raw: dict[str, Any] | None) -> RealOrderRuntimeConfig:
@@ -61,6 +68,12 @@ class RealOrderRuntimeConfig:
             exchange=str(data.get("exchange") or "NSE").upper(),
             adapter_mode=str(data.get("adapter_mode") or "LIVE").upper(),
             shadow=bool(data.get("shadow", False)),
+            fill_wait_timeout_sec=float(data.get("fill_wait_timeout_sec", 8.0) or 8.0),
+            fill_poll_sec=float(data.get("fill_poll_sec", 0.5) or 0.5),
+            protective_sl_market_protection_pct=float(
+                data.get("protective_sl_market_protection_pct", DEFAULT_MARKET_PROTECTION_PCT)
+                or DEFAULT_MARKET_PROTECTION_PCT
+            ),
         ).validate()
 
     def validate(self) -> RealOrderRuntimeConfig:
@@ -84,6 +97,15 @@ class RealOrderRuntimeConfig:
             raise OrderSafetyError("automated CPR real-order pilot supports NSE only")
         if self.adapter_mode not in {"LIVE", "REAL_DRY_RUN"}:
             raise OrderSafetyError("real-order adapter mode must be LIVE or REAL_DRY_RUN")
+        if not math.isfinite(self.fill_wait_timeout_sec) or self.fill_wait_timeout_sec < 0:
+            raise OrderSafetyError("fill wait timeout must be non-negative")
+        if not math.isfinite(self.fill_poll_sec) or self.fill_poll_sec <= 0:
+            raise OrderSafetyError("fill poll interval must be positive")
+        if (
+            not math.isfinite(self.protective_sl_market_protection_pct)
+            or self.protective_sl_market_protection_pct <= 0
+        ):
+            raise OrderSafetyError("protective SL market protection must be positive")
         return self
 
 
@@ -129,10 +151,13 @@ class RealOrderRouter:
         symbol: str,
         direction: str,
         reference_price: float,
+        stop_loss: float | None,
         event_time: datetime | str | None,
     ) -> dict[str, Any]:
         if not self.enabled:
             return {}
+        if stop_loss is None or not math.isfinite(float(stop_loss)) or float(stop_loss) <= 0:
+            raise OrderSafetyError("real entry requires a positive strategy stop_loss")
         started = time.perf_counter()
         event_lag_ms = _event_lag_ms(event_time)
         if not self.config.shadow and self._open_real_positions >= self.config.max_positions:
@@ -163,12 +188,88 @@ class RealOrderRouter:
             intent=intent,
             adapter=self.adapter,
         )
-        total_latency_ms = (time.perf_counter() - started) * 1000.0
-        self._open_real_positions += 1
-        self._used_cash_notional += entry_notional
-        self._open_notional_by_symbol[symbol.upper()] = (
-            self._open_notional_by_symbol.get(symbol.upper(), 0.0) + entry_notional
+        fill = await self._await_order_fill(
+            exchange_order_id=str(result.get("exchange_order_id") or ""),
+            intent=intent,
+            fallback_price=reference_price,
         )
+        filled_qty = int(fill["filled_qty"])
+        fill_price = float(fill["fill_price"])
+        if filled_qty <= 0:
+            raise OrderSafetyError(
+                "broker returned zero fill quantity; no real exposure registered"
+            )
+        protective_stop_loss = _stop_loss_from_actual_fill(
+            direction=direction,
+            model_entry_price=reference_price,
+            model_stop_loss=float(stop_loss),
+            actual_fill_price=fill_price,
+        )
+        filled_notional = filled_qty * fill_price
+        self._register_real_exposure(symbol=symbol, notional=filled_notional)
+        try:
+            protective_result = await self._place_protective_stop(
+                session_id=session_id,
+                symbol=symbol,
+                direction=direction,
+                quantity=filled_qty,
+                stop_loss=protective_stop_loss,
+                event_time=event_time,
+            )
+            await self._await_order_acceptance(
+                exchange_order_id=str(protective_result.get("exchange_order_id") or ""),
+                accepted_statuses={"TRIGGER PENDING", "OPEN", "PENDING"},
+                expected_quantity=filled_qty,
+                fallback_status="TRIGGER PENDING",
+            )
+        except Exception as exc:
+            logger.critical(
+                "Protective SL placement failed after real entry fill session=%s symbol=%s "
+                "entry_order_id=%s qty=%s fill_price=%.2f; attempting immediate flatten",
+                session_id,
+                symbol,
+                result.get("exchange_order_id"),
+                filled_qty,
+                fill_price,
+                exc_info=True,
+            )
+            rollback_error: Exception | None = None
+            try:
+                await self._flatten_unprotected_entry(
+                    session_id=session_id,
+                    symbol=symbol,
+                    direction=direction,
+                    quantity=filled_qty,
+                    reference_price=fill_price,
+                    event_time=event_time,
+                )
+                self._release_real_exposure(symbol=symbol)
+                logger.critical(
+                    "Unprotected real entry flattened after protective SL failure "
+                    "session=%s symbol=%s qty=%s",
+                    session_id,
+                    symbol,
+                    filled_qty,
+                )
+            except Exception as flatten_exc:  # pragma: no cover - exercised by live broker failure
+                rollback_error = flatten_exc
+                logger.critical(
+                    "Unprotected real entry could not be flattened session=%s symbol=%s qty=%s; "
+                    "manual broker intervention required",
+                    session_id,
+                    symbol,
+                    filled_qty,
+                    exc_info=True,
+                )
+            if rollback_error is not None:
+                raise OrderSafetyError(
+                    "protective SL placement failed after entry fill and rollback flatten failed; "
+                    "manual broker intervention required"
+                ) from exc
+            raise OrderSafetyError(
+                "protective SL placement failed after entry fill; entry was flattened"
+            ) from exc
+        total_latency_ms = (time.perf_counter() - started) * 1000.0
         _log_order_latency(
             session_id=session_id,
             symbol=symbol,
@@ -182,11 +283,17 @@ class RealOrderRouter:
         )
         return {
             "real_order_qty": intent.quantity,
+            "real_filled_qty": filled_qty,
+            "real_entry_fill_price": fill_price,
             "real_entry_order_id": result.get("exchange_order_id"),
             "real_entry_order_type": intent.order_type,
             "real_entry_side": side,
             "real_entry_payload": result.get("payload"),
-            "real_remaining_qty": intent.quantity,
+            "real_remaining_qty": filled_qty,
+            "real_protective_sl_order_id": protective_result.get("exchange_order_id"),
+            "real_model_stop_loss": float(stop_loss),
+            "real_protective_sl_trigger_price": protective_stop_loss,
+            "real_protection_status": "PLACED",
             "real_sizing_mode": self.config.sizing_mode,
             "real_entry_mode": result.get("mode") or self.adapter.mode,
             "real_entry_intent_latency_ms": round(intent_latency_ms, 3),
@@ -207,12 +314,59 @@ class RealOrderRouter:
         role: str,
         event_time: datetime | str | None,
         quote_age_sec: float = 0.0,
+        protective_order_id: str | None = None,
     ) -> dict[str, Any]:
         if not self.enabled or quantity <= 0:
             return {}
         started = time.perf_counter()
         event_lag_ms = _event_lag_ms(event_time)
         side = "SELL" if direction.upper() == "LONG" else "BUY"
+        if protective_order_id:
+            if "SL_HIT" in role.upper():
+                try:
+                    fill = await self._await_order_fill(
+                        exchange_order_id=protective_order_id,
+                        intent=None,
+                        fallback_price=reference_price,
+                        expected_quantity=int(quantity),
+                    )
+                except Exception:
+                    logger.critical(
+                        "Protective SL fill confirmation failed session=%s symbol=%s "
+                        "order_id=%s qty=%s; keeping exposure reserved",
+                        session_id,
+                        symbol,
+                        protective_order_id,
+                        quantity,
+                        exc_info=True,
+                    )
+                    raise
+                self._release_real_exposure(symbol=symbol)
+                total_latency_ms = (time.perf_counter() - started) * 1000.0
+                _log_order_latency(
+                    session_id=session_id,
+                    symbol=symbol,
+                    role=role,
+                    mode=self.adapter.mode,
+                    event_lag_ms=event_lag_ms,
+                    quote_age_sec=float(quote_age_sec),
+                    intent_latency_ms=0.0,
+                    broker_latency_ms=None,
+                    total_latency_ms=total_latency_ms,
+                )
+                return {
+                    "real_exit_order_id": protective_order_id,
+                    "real_exit_order_type": "SL-M",
+                    "real_exit_side": side,
+                    "real_exit_mode": self.adapter.mode,
+                    "real_exit_via": "protective_sl",
+                    "real_exit_filled_qty": int(fill["filled_qty"]),
+                    "real_exit_fill_price": float(fill["fill_price"]),
+                    "real_exit_total_latency_ms": round(total_latency_ms, 3),
+                    "real_exit_event_lag_ms": event_lag_ms,
+                    "real_exit_quote_age_sec": round(float(quote_age_sec), 3),
+                }
+            await self.cancel_protective_order(protective_order_id)
         intent = build_protected_flatten_intent(
             session_id=session_id,
             symbol=symbol,
@@ -233,10 +387,26 @@ class RealOrderRouter:
             intent=intent,
             adapter=self.adapter,
         )
+        try:
+            fill = await self._await_order_fill(
+                exchange_order_id=str(result.get("exchange_order_id") or ""),
+                intent=intent,
+                fallback_price=reference_price,
+            )
+        except Exception:
+            logger.critical(
+                "Real exit fill confirmation failed session=%s symbol=%s order_id=%s "
+                "role=%s qty=%s; keeping exposure reserved",
+                session_id,
+                symbol,
+                result.get("exchange_order_id"),
+                role,
+                quantity,
+                exc_info=True,
+            )
+            raise
         total_latency_ms = (time.perf_counter() - started) * 1000.0
-        self._open_real_positions = max(0, self._open_real_positions - 1)
-        released = self._open_notional_by_symbol.pop(symbol.upper(), 0.0)
-        self._used_cash_notional = max(0.0, self._used_cash_notional - released)
+        self._release_real_exposure(symbol=symbol)
         _log_order_latency(
             session_id=session_id,
             symbol=symbol,
@@ -253,6 +423,8 @@ class RealOrderRouter:
             "real_exit_order_type": intent.order_type,
             "real_exit_side": side,
             "real_exit_payload": result.get("payload"),
+            "real_exit_filled_qty": int(fill["filled_qty"]),
+            "real_exit_fill_price": float(fill["fill_price"]),
             "real_exit_mode": result.get("mode") or self.adapter.mode,
             "real_exit_intent_latency_ms": round(intent_latency_ms, 3),
             "real_exit_broker_latency_ms": result.get("broker_latency_ms"),
@@ -260,6 +432,21 @@ class RealOrderRouter:
             "real_exit_event_lag_ms": event_lag_ms,
             "real_exit_quote_age_sec": round(float(quote_age_sec), 3),
         }
+
+    async def cancel_protective_order(self, order_id: str | None) -> str | None:
+        oid = str(order_id or "").strip()
+        if not oid:
+            return None
+        cancelled_id = await self.adapter.cancel_order(order_id=oid, variety="regular")
+        get_paper_db().update_order_from_broker_snapshot(
+            oid,
+            {
+                "status": "CANCELLED",
+                "filled_quantity": 0,
+                "average_price": 0,
+            },
+        )
+        return cancelled_id
 
     def exit_quantity_for_position(self, position: Any) -> int:
         if not self.enabled:
@@ -306,6 +493,218 @@ class RealOrderRouter:
             exchange=self.config.exchange,
             event_time=event_time,
         )
+
+    async def _place_protective_stop(
+        self,
+        *,
+        session_id: str,
+        symbol: str,
+        direction: str,
+        quantity: int,
+        stop_loss: float,
+        event_time: datetime | str | None,
+    ) -> dict[str, Any]:
+        side = "SELL" if direction.upper() == "LONG" else "BUY"
+        intent = BrokerOrderIntent(
+            session_id=session_id,
+            symbol=symbol,
+            side=side,
+            quantity=int(quantity),
+            role="protective_sl",
+            order_type="SL-M",
+            trigger_price=float(stop_loss),
+            reference_price=float(stop_loss),
+            reference_price_age_sec=0.0,
+            market_protection=self.config.protective_sl_market_protection_pct,
+            product=self.config.product,
+            exchange=self.config.exchange,
+            event_time=_event_time_value(event_time),
+        )
+        return await record_real_order(
+            paper_db=get_paper_db(),
+            intent=intent,
+            adapter=self.adapter,
+        )
+
+    async def _flatten_unprotected_entry(
+        self,
+        *,
+        session_id: str,
+        symbol: str,
+        direction: str,
+        quantity: int,
+        reference_price: float,
+        event_time: datetime | str | None,
+    ) -> dict[str, Any]:
+        side = "SELL" if direction.upper() == "LONG" else "BUY"
+        intent = build_protected_flatten_intent(
+            session_id=session_id,
+            symbol=symbol,
+            side=side,
+            quantity=int(quantity),
+            latest_price=float(reference_price),
+            quote_age_sec=0.0,
+            role="emergency_flatten:entry_protection_failed",
+            product=self.config.product,
+            exchange=self.config.exchange,
+            max_slippage_pct=self.config.exit_max_slippage_pct,
+            event_time=_event_time_value(event_time),
+        )
+        result = await record_real_order(
+            paper_db=get_paper_db(),
+            intent=intent,
+            adapter=self.adapter,
+        )
+        fill = await self._await_order_fill(
+            exchange_order_id=str(result.get("exchange_order_id") or ""),
+            intent=intent,
+            fallback_price=reference_price,
+        )
+        return {**result, **fill}
+
+    async def _await_order_fill(
+        self,
+        *,
+        exchange_order_id: str,
+        intent: BrokerOrderIntent | None,
+        fallback_price: float,
+        expected_quantity: int | None = None,
+    ) -> dict[str, Any]:
+        expected_qty = int(expected_quantity or (intent.quantity if intent is not None else 0))
+        if self.config.shadow or self.adapter.mode == "REAL_DRY_RUN":
+            if exchange_order_id:
+                get_paper_db().update_order_from_broker_snapshot(
+                    exchange_order_id,
+                    {
+                        "status": "COMPLETE",
+                        "filled_quantity": expected_qty,
+                        "average_price": float(
+                            (
+                                intent.price
+                                if intent is not None and intent.price is not None
+                                else None
+                            )
+                            or fallback_price
+                        ),
+                        "exchange_timestamp": datetime.now().isoformat(),
+                    },
+                )
+            return {
+                "filled_qty": expected_qty,
+                "fill_price": float(
+                    (intent.price if intent is not None and intent.price is not None else None)
+                    or fallback_price
+                ),
+                "status": "COMPLETE",
+            }
+
+        if not exchange_order_id:
+            raise OrderSafetyError("broker order id missing; cannot confirm fill")
+        deadline = time.monotonic() + float(self.config.fill_wait_timeout_sec)
+        last_snapshot: Any = None
+        while True:
+            snapshots = await self.adapter.fetch_order_snapshots()
+            for snapshot in snapshots:
+                if str(snapshot.order_id) != str(exchange_order_id):
+                    continue
+                last_snapshot = snapshot
+                if hasattr(get_paper_db(), "update_order_from_broker_snapshot"):
+                    get_paper_db().update_order_from_broker_snapshot(
+                        exchange_order_id, snapshot.broker_payload
+                    )
+                status = str(snapshot.status or "").upper()
+                filled_qty = int(float(snapshot.filled_quantity or 0))
+                if status == "COMPLETE" and filled_qty >= expected_qty:
+                    return {
+                        "filled_qty": filled_qty,
+                        "fill_price": float(snapshot.average_price or fallback_price),
+                        "status": status,
+                    }
+                if status in {"REJECTED", "CANCELLED"}:
+                    raise OrderSafetyError(
+                        f"broker order {exchange_order_id} ended {status} before fill"
+                    )
+            if time.monotonic() >= deadline:
+                break
+            await asyncio.sleep(float(self.config.fill_poll_sec))
+
+        if last_snapshot is not None and float(last_snapshot.filled_quantity or 0) > 0:
+            filled_qty = int(float(last_snapshot.filled_quantity or 0))
+            raise OrderSafetyError(
+                f"broker order {exchange_order_id} partially filled {filled_qty}/{expected_qty}; "
+                "manual reconciliation required"
+            )
+        raise OrderSafetyError(f"broker order {exchange_order_id} did not fill before timeout")
+
+    async def _await_order_acceptance(
+        self,
+        *,
+        exchange_order_id: str,
+        accepted_statuses: set[str],
+        expected_quantity: int,
+        fallback_status: str,
+    ) -> dict[str, Any]:
+        accepted = {str(status or "").upper() for status in accepted_statuses}
+        if self.config.shadow or self.adapter.mode == "REAL_DRY_RUN":
+            if exchange_order_id:
+                get_paper_db().update_order_from_broker_snapshot(
+                    exchange_order_id,
+                    {
+                        "status": fallback_status,
+                        "filled_quantity": 0,
+                        "average_price": 0.0,
+                        "exchange_timestamp": datetime.now().isoformat(),
+                    },
+                )
+            return {"status": fallback_status, "filled_qty": 0}
+
+        if not exchange_order_id:
+            raise OrderSafetyError("broker order id missing; cannot confirm protective order")
+        deadline = time.monotonic() + float(self.config.fill_wait_timeout_sec)
+        last_status = ""
+        while True:
+            snapshots = await self.adapter.fetch_order_snapshots()
+            for snapshot in snapshots:
+                if str(snapshot.order_id) != str(exchange_order_id):
+                    continue
+                if hasattr(get_paper_db(), "update_order_from_broker_snapshot"):
+                    get_paper_db().update_order_from_broker_snapshot(
+                        exchange_order_id, snapshot.broker_payload
+                    )
+                status = str(snapshot.status or "").upper()
+                last_status = status
+                filled_qty = int(float(snapshot.filled_quantity or 0))
+                if status in accepted:
+                    return {"status": status, "filled_qty": filled_qty}
+                if status in {"REJECTED", "CANCELLED"}:
+                    raise OrderSafetyError(
+                        f"broker protective order {exchange_order_id} ended {status}"
+                    )
+                if status == "COMPLETE":
+                    raise OrderSafetyError(
+                        f"broker protective order {exchange_order_id} filled immediately "
+                        f"{filled_qty}/{expected_quantity}; manual reconciliation required"
+                    )
+            if time.monotonic() >= deadline:
+                break
+            await asyncio.sleep(float(self.config.fill_poll_sec))
+
+        detail = f" last_status={last_status}" if last_status else ""
+        raise OrderSafetyError(
+            f"broker protective order {exchange_order_id} was not accepted before timeout{detail}"
+        )
+
+    def _release_real_exposure(self, *, symbol: str) -> None:
+        self._open_real_positions = max(0, self._open_real_positions - 1)
+        released = self._open_notional_by_symbol.pop(symbol.upper(), 0.0)
+        self._used_cash_notional = max(0.0, self._used_cash_notional - released)
+
+    def _register_real_exposure(self, *, symbol: str, notional: float) -> None:
+        self._open_real_positions += 1
+        self._used_cash_notional += float(notional)
+        self._open_notional_by_symbol[symbol.upper()] = self._open_notional_by_symbol.get(
+            symbol.upper(), 0.0
+        ) + float(notional)
 
     def _entry_quantity(self, *, reference_price: float, price: float | None) -> int:
         if self.config.sizing_mode == "FIXED_QTY":
@@ -384,6 +783,27 @@ def _marketable_limit_price(
         raw = reference_price * (1.0 - max_slippage_pct / 100.0)
         return round(math.floor(raw / tick_size) * tick_size, 4)
     raise OrderSafetyError("entry side must be BUY or SELL")
+
+
+def _stop_loss_from_actual_fill(
+    *,
+    direction: str,
+    model_entry_price: float,
+    model_stop_loss: float,
+    actual_fill_price: float,
+) -> float:
+    stop_distance = abs(float(model_entry_price) - float(model_stop_loss))
+    if not math.isfinite(stop_distance) or stop_distance <= 0:
+        raise OrderSafetyError("real entry stop distance must be positive")
+    if direction.upper() == "LONG":
+        adjusted = float(actual_fill_price) - stop_distance
+    elif direction.upper() == "SHORT":
+        adjusted = float(actual_fill_price) + stop_distance
+    else:
+        raise OrderSafetyError("entry direction must be LONG or SHORT")
+    if not math.isfinite(adjusted) or adjusted <= 0:
+        raise OrderSafetyError("adjusted protective stop loss is not positive")
+    return round(adjusted, 4)
 
 
 def _intent_notional(intent: BrokerOrderIntent) -> float:

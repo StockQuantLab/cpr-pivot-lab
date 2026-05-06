@@ -1122,6 +1122,14 @@ def build_paper_trading_parser(
         default=None,
         help="Optional drill run id under .tmp_logs/operator_drills/.",
     )
+    operator_drill.add_argument(
+        "--full-universe",
+        action="store_true",
+        help=(
+            "Use the dated saved universe in the isolated drill. Default drill scope is "
+            "SBIN,RELIANCE unless --symbols or --universe-name is provided."
+        ),
+    )
     operator_drill.set_defaults(handler=_cmd_operator_drill)
 
     return parser

@@ -365,7 +365,9 @@ async def test_replay_session_stops_later_dates_when_risk_triggers(
         leave_active=False,
     )
 
-    assert [dt.date() for dt in processed_candles] == [datetime(2024, 1, 2).date()]
+    # Risk controls run before entry evaluation now, so a triggered gate can stop
+    # replay before scanning the candle for new entries.
+    assert processed_candles == []
     assert len(risk_calls) == 1
     assert archived == []
     assert result["completed"] is False

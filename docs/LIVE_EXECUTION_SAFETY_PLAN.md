@@ -1,5 +1,9 @@
 # Live Execution Safety Plan
 
+Current actual-live broker lifecycle documentation lives in
+[REAL_ORDER_LIVE_FLOW.md](REAL_ORDER_LIVE_FLOW.md). This file is the historical safety rollout
+plan; use it for design context, not as the current operator command source.
+
 Scope: build and validate the remaining real-trading safety controls in paper mode first. Real Zerodha order placement stays disabled until the paper safety layer has passed live-session tests.
 
 ## Readiness Position

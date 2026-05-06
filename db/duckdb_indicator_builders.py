@@ -227,24 +227,33 @@ class DuckDBIndicatorBuilderMixin:
         """
 
         if target_symbols is not None:
-            self.con.execute("BEGIN TRANSACTION")
-            try:
-                if table_exists:
-                    delete_parts = [f"symbol IN ({_sql_symbol_list(target_symbols)})"]
-                    if since_date_iso:
-                        delete_parts.append(f"trade_date >= '{since_date_iso}'::DATE")
-                    if until_date_iso:
-                        delete_parts.append(f"trade_date <= '{until_date_iso}'::DATE")
-                    self.con.execute("DELETE FROM cpr_daily WHERE " + " AND ".join(delete_parts))
-                self.con.execute(
-                    f"INSERT INTO cpr_daily {insert_sql}"
-                    if table_exists
-                    else f"CREATE TABLE cpr_daily AS {insert_sql}"
+            self.con.execute("DROP TABLE IF EXISTS tmp_cpr_daily_refresh")
+            self.con.execute(f"CREATE TEMP TABLE tmp_cpr_daily_refresh AS {insert_sql}")
+            duplicate = self.con.execute("""
+                SELECT symbol, trade_date, COUNT(*) AS n
+                FROM tmp_cpr_daily_refresh
+                GROUP BY symbol, trade_date
+                HAVING COUNT(*) > 1
+                LIMIT 1
+            """).fetchone()
+            if duplicate:
+                raise RuntimeError(
+                    "cpr_daily targeted refresh produced duplicate row "
+                    f"symbol={duplicate[0]} trade_date={duplicate[1]} count={duplicate[2]}"
                 )
-                self.con.execute("COMMIT")
-            except Exception:
-                self.con.execute("ROLLBACK")
-                raise
+            if table_exists:
+                delete_parts = [f"symbol IN ({_sql_symbol_list(target_symbols)})"]
+                if since_date_iso:
+                    delete_parts.append(f"trade_date >= '{since_date_iso}'::DATE")
+                if until_date_iso:
+                    delete_parts.append(f"trade_date <= '{until_date_iso}'::DATE")
+                self.con.execute("DELETE FROM cpr_daily WHERE " + " AND ".join(delete_parts))
+                self.con.execute("INSERT INTO cpr_daily SELECT * FROM tmp_cpr_daily_refresh")
+            else:
+                self.con.execute(
+                    "CREATE TABLE cpr_daily AS SELECT * FROM tmp_cpr_daily_refresh"
+                )
+            self.con.execute("DROP TABLE tmp_cpr_daily_refresh")
             n = self.con.execute("SELECT COUNT(*) FROM cpr_daily").fetchone()[0]
             scope = f"symbols={len(target_symbols)}"
             if since_date_iso:

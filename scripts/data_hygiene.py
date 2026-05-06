@@ -7,18 +7,29 @@ import json
 import logging
 import shutil
 import time
-from datetime import UTC, datetime
+from dataclasses import dataclass
+from datetime import UTC, date, datetime
+from datetime import time as dt_time
 from pathlib import Path
+
+import polars as pl
 
 from engine.cli_setup import configure_windows_stdio
 from engine.command_lock import command_lock
-from engine.kite_ingestion import get_kite_paths, tradeable_symbols
+from engine.kite_ingestion import (
+    PARQUET_5MIN_SCHEMA,
+    _write_parquet_atomically,
+    get_kite_paths,
+    tradeable_symbols,
+)
 
 logger = logging.getLogger(__name__)
 
 MIN_TRADEABLE_SYMBOLS = 1000
 MIN_HISTORY_DAYS = 252  # < 1 year of trading days → SHORT_HISTORY
 MIN_AVG_TURNOVER = 5_000_000  # ₹50 lakh avg 9:15 candle turnover → ILLIQUID
+NSE_SESSION_START = dt_time(9, 15)
+NSE_SESSION_END = dt_time(15, 30)
 
 TABLES_TO_PURGE = [
     "cpr_daily",
@@ -31,6 +42,17 @@ TABLES_TO_PURGE = [
     "virgin_cpr_flags",
     "data_quality_issues",
 ]
+
+
+@dataclass(frozen=True)
+class InvalidSessionRepairResult:
+    symbol: str
+    year: int
+    path: Path
+    invalid_rows: int
+    rows_before: int
+    rows_after: int
+    backup_path: Path | None = None
 
 
 def detect_dead_symbols() -> set[str]:
@@ -315,6 +337,119 @@ def check_stale() -> None:
     print("View in dashboard: /data_quality")
 
 
+def _parse_csv_symbols(raw: str | None) -> list[str]:
+    symbols = [part.strip().upper() for part in str(raw or "").split(",") if part.strip()]
+    return sorted(set(symbols))
+
+
+def _parse_iso_date(raw: str | None, *, arg_name: str) -> date:
+    if not raw:
+        raise SystemExit(f"{arg_name} is required.")
+    try:
+        return date.fromisoformat(raw)
+    except ValueError as exc:
+        raise SystemExit(f"{arg_name} must be YYYY-MM-DD, got {raw!r}.") from exc
+
+
+def _repair_invalid_5min_file(
+    *,
+    path: Path,
+    symbol: str,
+    year: int,
+    start_date: date,
+    end_date: date,
+    apply: bool,
+    backup_root: Path,
+) -> InvalidSessionRepairResult | None:
+    df = pl.read_parquet(path)
+    if df.is_empty():
+        return None
+    candle_date = pl.col("date").cast(pl.Date)
+    candle_time = pl.col("candle_time").dt.time()
+    in_window = candle_date.is_between(start_date, end_date)
+    outside_session = (candle_time < NSE_SESSION_START) | (candle_time > NSE_SESSION_END)
+    invalid_mask = in_window & outside_session
+    invalid_rows = df.filter(invalid_mask).height
+    if invalid_rows <= 0:
+        return None
+
+    cleaned = df.filter(~invalid_mask)
+    backup_path: Path | None = None
+    if apply:
+        backup_path = backup_root / "5min" / symbol / f"{year}.parquet"
+        backup_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(path, backup_path)
+        _write_parquet_atomically(cleaned, path, schema=PARQUET_5MIN_SCHEMA)
+
+    return InvalidSessionRepairResult(
+        symbol=symbol,
+        year=year,
+        path=path,
+        invalid_rows=invalid_rows,
+        rows_before=df.height,
+        rows_after=cleaned.height,
+        backup_path=backup_path,
+    )
+
+
+def repair_invalid_5min_session_rows(
+    *,
+    symbols: list[str],
+    start_date: date,
+    end_date: date,
+    apply: bool,
+) -> list[InvalidSessionRepairResult]:
+    """Remove 5-minute candles outside regular NSE session for targeted symbols/dates."""
+    if not symbols:
+        raise SystemExit("--symbols is required for --repair-invalid-5min-session.")
+    if end_date < start_date:
+        raise SystemExit("--end must be on or after --start.")
+
+    paths = get_kite_paths()
+    ts = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+    backup_root = Path(".tmp_logs") / "data_repair" / f"invalid_5min_session_{ts}"
+    years = range(start_date.year, end_date.year + 1)
+    results: list[InvalidSessionRepairResult] = []
+    for symbol in symbols:
+        for year in years:
+            path = paths.parquet_root / "5min" / symbol / f"{year}.parquet"
+            if not path.exists():
+                continue
+            result = _repair_invalid_5min_file(
+                path=path,
+                symbol=symbol,
+                year=year,
+                start_date=start_date,
+                end_date=end_date,
+                apply=apply,
+                backup_root=backup_root,
+            )
+            if result is not None:
+                results.append(result)
+
+    action = "Repaired" if apply else "Would repair"
+    print(
+        f"{action} invalid 5-min session rows for {len(symbols)} symbols "
+        f"from {start_date.isoformat()} to {end_date.isoformat()}:"
+    )
+    if not results:
+        print("  No invalid rows found.")
+        return []
+
+    total_invalid = 0
+    for result in results:
+        total_invalid += result.invalid_rows
+        backup = f" backup={result.backup_path}" if result.backup_path else ""
+        print(
+            f"  {result.symbol} {result.year}: invalid={result.invalid_rows:,} "
+            f"rows {result.rows_before:,}->{result.rows_after:,}{backup}"
+        )
+    print(f"  Total invalid rows: {total_invalid:,}")
+    if not apply:
+        print("Run again with --apply to write repaired parquet files.")
+    return results
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Detect and purge dead (delisted) symbols from parquet and DuckDB"
@@ -328,11 +463,20 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Flag short-history and illiquid symbols in data_quality_issues",
     )
+    group.add_argument(
+        "--repair-invalid-5min-session",
+        action="store_true",
+        help="Remove targeted 5-min candles outside 09:15-15:30 from parquet files.",
+    )
     parser.add_argument(
         "--confirm",
         action="store_true",
         help="Required with --purge to confirm deletion",
     )
+    parser.add_argument("--symbols", default=None, help="Comma-separated symbols for repair mode")
+    parser.add_argument("--start", default=None, help="Repair start date YYYY-MM-DD")
+    parser.add_argument("--end", default=None, help="Repair end date YYYY-MM-DD")
+    parser.add_argument("--apply", action="store_true", help="Apply repair mode changes")
     return parser
 
 
@@ -346,6 +490,17 @@ def main() -> int:
 
     if args.check_stale:
         check_stale()
+        elapsed = time.time() - start
+        print(f"\nTotal time: {elapsed:.1f}s")
+        return 0
+
+    if args.repair_invalid_5min_session:
+        repair_invalid_5min_session_rows(
+            symbols=_parse_csv_symbols(args.symbols),
+            start_date=_parse_iso_date(args.start, arg_name="--start"),
+            end_date=_parse_iso_date(args.end, arg_name="--end"),
+            apply=bool(args.apply),
+        )
         elapsed = time.time() - start
         print(f"\nTotal time: {elapsed:.1f}s")
         return 0

@@ -42,6 +42,18 @@ _EOD_STAGE_DESCRIPTIONS = {
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 IST = ZoneInfo("Asia/Kolkata")
+type StageCommand = list[str] | list[list[str]]
+_EOD_RUNTIME_BUILD_TABLES = [
+    "cpr",
+    "atr",
+    "thresholds",
+    "or",
+    "state",
+    "strategy",
+    "pack",
+    "virgin",
+    "meta",
+]
 
 
 def _detect_refresh_since() -> str | None:
@@ -85,34 +97,83 @@ def _run_stage(
     index: int,
     total: int,
     name: str,
-    cmd: list[str],
+    cmd: StageCommand,
     dry_run: bool,
 ) -> None:
     description = _EOD_STAGE_DESCRIPTIONS.get(name, name)
     print(f"\n[{index}/{total}] START {name}: {description}", flush=True)
     started_at = dt.datetime.now(IST)
-    code = _run(cmd, dry_run=dry_run, timeout=None)
+    commands: list[list[str]]
+    if cmd and isinstance(cmd[0], list):
+        commands = cmd  # type: ignore[assignment]
+    else:
+        commands = [cmd]  # type: ignore[list-item]
+    for sub_index, sub_cmd in enumerate(commands, start=1):
+        if len(commands) > 1:
+            print(f"[{index}/{total}] {name} substage {sub_index}/{len(commands)}", flush=True)
+        code = _run(sub_cmd, dry_run=dry_run, timeout=None)
+        if code != 0:
+            elapsed = (dt.datetime.now(IST) - started_at).total_seconds()
+            print(
+                f"[{index}/{total}] FAILED {name}: exit_code={code} elapsed={elapsed:.1f}s",
+                flush=True,
+            )
+            raise SystemExit(code)
     elapsed = (dt.datetime.now(IST) - started_at).total_seconds()
-    if code != 0:
-        print(
-            f"[{index}/{total}] FAILED {name}: exit_code={code} elapsed={elapsed:.1f}s", flush=True
-        )
-        raise SystemExit(code)
     print(f"[{index}/{total}] DONE {name}: elapsed={elapsed:.1f}s", flush=True)
 
 
-def _build_table_cmd(*, table: str, trade_date: str, batch_size: int) -> list[str]:
-    return [
+def _build_table_cmd(
+    *,
+    table: str,
+    trade_date: str | None = None,
+    since: str | None = None,
+    batch_size: int,
+    skip_status: bool = False,
+    defer_replica_sync: bool = False,
+) -> list[str]:
+    cmd = [
         sys.executable,
         "-m",
         "scripts.build_tables",
         "--table",
         table,
-        "--refresh-date",
-        trade_date,
-        "--batch-size",
-        str(batch_size),
     ]
+    if trade_date is not None:
+        cmd.extend(
+            [
+                "--refresh-date",
+                trade_date,
+            ]
+        )
+    elif since is not None:
+        cmd.extend(
+            [
+                "--refresh-since",
+                since,
+            ]
+        )
+    cmd.extend(
+        [
+            "--batch-size",
+            str(batch_size),
+        ]
+    )
+    if skip_status:
+        cmd.append("--skip-status")
+    if defer_replica_sync:
+        cmd.append("--defer-replica-sync")
+    return cmd
+
+
+def _build_next_day_table_cmd(*, table: str, trade_date: str, batch_size: int) -> list[str]:
+    return _build_table_cmd(
+        table=table,
+        trade_date=trade_date,
+        batch_size=batch_size,
+        skip_status=True,
+        defer_replica_sync=True,
+    )
 
 
 def _sync_replica_cmd(*, trade_date: str) -> list[str]:
@@ -181,8 +242,14 @@ def _refresh_instruments_cmd() -> list[str]:
     ]
 
 
-def _build_cmd(*, since: str, batch_size: int) -> list[str]:
-    return [
+def _build_cmd(
+    *,
+    since: str,
+    batch_size: int,
+    skip_status: bool = False,
+    defer_replica_sync: bool = False,
+) -> list[str]:
+    cmd = [
         sys.executable,
         "-m",
         "scripts.build_tables",
@@ -190,6 +257,25 @@ def _build_cmd(*, since: str, batch_size: int) -> list[str]:
         since,
         "--batch-size",
         str(batch_size),
+    ]
+    if skip_status:
+        cmd.append("--skip-status")
+    if defer_replica_sync:
+        cmd.append("--defer-replica-sync")
+    return cmd
+
+
+def _build_runtime_cmds(*, since: str, batch_size: int) -> list[list[str]]:
+    """Return table-isolated runtime refresh commands for robust EOD builds."""
+    return [
+        _build_table_cmd(
+            table=table,
+            since=since,
+            batch_size=batch_size,
+            skip_status=True,
+            defer_replica_sync=True,
+        )
+        for table in _EOD_RUNTIME_BUILD_TABLES
     ]
 
 
@@ -237,22 +323,26 @@ def _run_eod_ingestion(
                 skip_existing=skip_existing,
             ),
         ),
-        ("build_runtime", _build_cmd(since=ingest_date, batch_size=batch_size)),
+        ("build_runtime", _build_runtime_cmds(since=ingest_date, batch_size=batch_size)),
         (
             "build_next_day_cpr",
-            _build_table_cmd(table="cpr", trade_date=trade_date, batch_size=batch_size),
+            _build_next_day_table_cmd(table="cpr", trade_date=trade_date, batch_size=batch_size),
         ),
         (
             "build_next_day_thresholds",
-            _build_table_cmd(table="thresholds", trade_date=trade_date, batch_size=batch_size),
+            _build_next_day_table_cmd(
+                table="thresholds", trade_date=trade_date, batch_size=batch_size
+            ),
         ),
         (
             "build_next_day_state",
-            _build_table_cmd(table="state", trade_date=trade_date, batch_size=batch_size),
+            _build_next_day_table_cmd(table="state", trade_date=trade_date, batch_size=batch_size),
         ),
         (
             "build_next_day_strategy",
-            _build_table_cmd(table="strategy", trade_date=trade_date, batch_size=batch_size),
+            _build_next_day_table_cmd(
+                table="strategy", trade_date=trade_date, batch_size=batch_size
+            ),
         ),
         ("sync_replica", _sync_replica_cmd(trade_date=trade_date)),
         ("daily_prepare", _daily_prepare_cmd(trade_date=trade_date)),

@@ -20,6 +20,7 @@ class BrokerOrderSnapshot:
     side: str
     quantity: float
     filled_quantity: float = 0.0
+    average_price: float | None = None
     status: str = "UNKNOWN"
     tag: str | None = None
     broker_payload: dict[str, Any] = field(default_factory=dict)
@@ -38,6 +39,9 @@ class BrokerOrderSnapshot:
             quantity=float(data.get("quantity") or data.get("requested_qty") or 0.0),
             filled_quantity=float(
                 data.get("filled_quantity") or data.get("filled_qty") or data.get("fill_qty") or 0.0
+            ),
+            average_price=(
+                float(data["average_price"]) if data.get("average_price") is not None else None
             ),
             status=str(data.get("status") or "UNKNOWN").upper(),
             tag=data.get("tag"),

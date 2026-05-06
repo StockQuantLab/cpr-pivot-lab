@@ -6,6 +6,7 @@ import asyncio
 import inspect
 import json
 import logging
+import math
 import threading
 from collections.abc import Callable
 from datetime import datetime
@@ -15,6 +16,7 @@ from zoneinfo import ZoneInfo
 from db.paper_db import FeedState, PaperPosition, PaperSession
 from engine.alert_dispatcher import AlertDispatcher, AlertType, get_alert_config
 from engine.bar_orchestrator import SessionPositionTracker
+from engine.broker_adapter import OrderSafetyError
 from engine.cpr_atr_shared import (
     CompletedCandleDecision,
     resolve_completed_candle_trade_step,
@@ -561,13 +563,13 @@ def _build_symbol_price_map(feed_state: FeedState | None) -> dict[str, float]:
 def _feed_quote_age_sec(feed_state: FeedState | None, now: datetime) -> float:
     last_event_ts = getattr(feed_state, "last_event_ts", None)
     if not isinstance(last_event_ts, datetime):
-        return 0.0
+        return math.inf
     if last_event_ts.tzinfo is None and now.tzinfo is not None:
         last_event_ts = last_event_ts.replace(tzinfo=now.tzinfo)
     try:
         return max(0.0, (now - last_event_ts.astimezone(now.tzinfo)).total_seconds())
     except Exception:
-        return 0.0
+        return math.inf
 
 
 def _close_price_for_position(position: PaperPosition, price_map: dict[str, float]) -> float:
@@ -643,6 +645,15 @@ async def flatten_session_positions(
         side = "SELL" if str(position.direction).upper() == "LONG" else "BUY"
         real_exit_meta: dict[str, Any] = {}
         if real_order_router is not None and real_order_router.enabled:
+            if position.symbol not in price_map:
+                raise RuntimeError(
+                    f"real flatten requires a live mark for {position.symbol}; no fresh price found"
+                )
+            quote_age_sec = _feed_quote_age_sec(feed_state, now_ist)
+            if not math.isfinite(float(quote_age_sec)):
+                raise RuntimeError(
+                    f"real flatten requires a timestamped quote for {position.symbol}"
+                )
             real_qty = real_order_router.exit_quantity_for_position(position)
             real_exit_meta = await real_order_router.place_exit(
                 session_id=session_id,
@@ -651,30 +662,35 @@ async def flatten_session_positions(
                 position_id=position.position_id,
                 quantity=real_qty,
                 reference_price=close_price,
-                quote_age_sec=_feed_quote_age_sec(feed_state, now_ist),
+                quote_age_sec=quote_age_sec,
                 role=f"manual_flatten:{notes or 'paper flatten'}",
                 event_time=now_ist,
+                protective_order_id=str(
+                    (position.trail_state or {}).get("real_protective_sl_order_id") or ""
+                )
+                or None,
             )
-        await append_order_event(
-            session_id=session_id,
-            symbol=position.symbol,
-            side=side,
-            requested_qty=close_qty,
-            position_id=position.position_id,
-            order_type="MARKET",
-            request_price=close_price,
-            fill_qty=close_qty,
-            fill_price=close_price,
-            status="FILLED",
-            idempotency_key=build_order_idempotency_key(
+        if not real_exit_meta:
+            await append_order_event(
                 session_id=session_id,
-                role=f"session_flatten:{notes or 'paper flatten'}",
                 symbol=position.symbol,
                 side=side,
-                position_id=str(position.position_id),
-            ),
-            notes=notes or "paper flatten",
-        )
+                requested_qty=close_qty,
+                position_id=position.position_id,
+                order_type="MARKET",
+                request_price=close_price,
+                fill_qty=close_qty,
+                fill_price=close_price,
+                status="FILLED",
+                idempotency_key=build_order_idempotency_key(
+                    session_id=session_id,
+                    role=f"session_flatten:{notes or 'paper flatten'}",
+                    symbol=position.symbol,
+                    side=side,
+                    position_id=str(position.position_id),
+                ),
+                notes=notes or "paper flatten",
+            )
         await update_position(
             position.position_id,
             status="CLOSED",
@@ -824,6 +840,13 @@ async def flatten_positions_subset(
         side = "SELL" if str(position.direction).upper() == "LONG" else "BUY"
         real_exit_meta: dict[str, Any] = {}
         if real_order_router is not None and real_order_router.enabled:
+            if position.symbol not in price_map:
+                raise RuntimeError(
+                    f"real close requires a live mark for {position.symbol}; no fresh price found"
+                )
+            quote_age_sec = _feed_quote_age_sec(feed_state, now_ist)
+            if not math.isfinite(float(quote_age_sec)):
+                raise RuntimeError(f"real close requires a timestamped quote for {position.symbol}")
             real_qty = real_order_router.exit_quantity_for_position(position)
             real_exit_meta = await real_order_router.place_exit(
                 session_id=session_id,
@@ -832,30 +855,35 @@ async def flatten_positions_subset(
                 position_id=position.position_id,
                 quantity=real_qty,
                 reference_price=close_price,
-                quote_age_sec=_feed_quote_age_sec(feed_state, now_ist),
+                quote_age_sec=quote_age_sec,
                 role=f"close:{notes or 'partial flatten'}",
                 event_time=now_ist,
+                protective_order_id=str(
+                    (position.trail_state or {}).get("real_protective_sl_order_id") or ""
+                )
+                or None,
             )
-        await append_order_event(
-            session_id=session_id,
-            symbol=position.symbol,
-            side=side,
-            requested_qty=close_qty,
-            position_id=position.position_id,
-            order_type="MARKET",
-            request_price=close_price,
-            fill_qty=close_qty,
-            fill_price=close_price,
-            status="FILLED",
-            idempotency_key=build_order_idempotency_key(
+        if not real_exit_meta:
+            await append_order_event(
                 session_id=session_id,
-                role=f"position_flatten:{notes or 'partial flatten'}",
                 symbol=position.symbol,
                 side=side,
-                position_id=str(position.position_id),
-            ),
-            notes=notes or "partial flatten",
-        )
+                requested_qty=close_qty,
+                position_id=position.position_id,
+                order_type="MARKET",
+                request_price=close_price,
+                fill_qty=close_qty,
+                fill_price=close_price,
+                status="FILLED",
+                idempotency_key=build_order_idempotency_key(
+                    session_id=session_id,
+                    role=f"position_flatten:{notes or 'partial flatten'}",
+                    symbol=position.symbol,
+                    side=side,
+                    position_id=str(position.position_id),
+                ),
+                notes=notes or "partial flatten",
+            )
         await update_position(
             position.position_id,
             status="CLOSED",
@@ -952,27 +980,46 @@ async def _open_position_from_candidate(
     real_order_router: RealOrderRouter | None = None,
 ) -> dict[str, Any]:
     real_entry_meta: dict[str, Any] = {}
+    candidate_event_time = candidate.get("event_time") or now
+    candidate["event_time"] = candidate_event_time
     if real_order_router is not None and real_order_router.enabled:
         real_entry_meta = await real_order_router.place_entry(
             session_id=session.session_id,
             symbol=symbol,
             direction=str(candidate["direction"]),
             reference_price=float(candidate["entry_price"]),
-            event_time=candidate.get("event_time") or now,
+            stop_loss=float(candidate["sl_price"]),
+            event_time=candidate_event_time,
         )
+    executed_qty = float(real_entry_meta.get("real_filled_qty") or candidate["position_size"])
+    executed_entry_price = float(
+        real_entry_meta.get("real_entry_fill_price") or candidate["entry_price"]
+    )
+    if "real_filled_qty" in real_entry_meta:
+        executed_qty = float(real_entry_meta["real_filled_qty"])
+    if executed_qty <= 0:
+        raise OrderSafetyError("broker returned zero fill quantity; no position opened")
+    adjusted_levels = _levels_from_executed_entry(
+        candidate=candidate,
+        executed_entry_price=executed_entry_price,
+        real_entry_meta=real_entry_meta,
+    )
     position = await open_position(
         session_id=session.session_id,
         symbol=symbol,
         direction=candidate["direction"],
-        quantity=float(candidate["position_size"]),
-        entry_price=float(candidate["entry_price"]),
-        stop_loss=float(candidate["sl_price"]),
-        target_price=float(candidate.get("runner_target_price") or candidate["target_price"]),
+        quantity=executed_qty,
+        entry_price=executed_entry_price,
+        stop_loss=adjusted_levels["sl_price"],
+        target_price=adjusted_levels["position_target_price"],
         trail_state={
-            "entry_price": float(candidate["entry_price"]),
+            "entry_price": executed_entry_price,
             "direction": candidate["direction"],
-            "initial_sl": float(candidate["sl_price"]),
-            "current_sl": float(candidate["sl_price"]),
+            "model_entry_price": float(candidate["entry_price"]),
+            "model_sl_price": float(candidate["sl_price"]),
+            "model_target_price": float(candidate["target_price"]),
+            "initial_sl": adjusted_levels["sl_price"],
+            "current_sl": adjusted_levels["sl_price"],
             "atr": float(setup_row["atr"]),
             "trail_atr_multiplier": float(
                 params.short_trail_atr_multiplier
@@ -982,20 +1029,14 @@ async def _open_position_from_candidate(
             "rr_ratio": float(candidate["rr_ratio"]),
             "breakeven_r": float(params.breakeven_r),
             "phase": "PROTECT",
-            "highest_since_entry": float(candidate["entry_price"]),
-            "lowest_since_entry": float(candidate["entry_price"]),
+            "highest_since_entry": executed_entry_price,
+            "lowest_since_entry": executed_entry_price,
             "entry_time": candidate["entry_time"],
-            "first_target_price": float(
-                candidate.get("first_target_price") or candidate["target_price"]
-            ),
-            "runner_target_price": (
-                float(candidate["runner_target_price"])
-                if candidate.get("runner_target_price") is not None
-                else None
-            ),
+            "first_target_price": adjusted_levels["first_target_price"],
+            "runner_target_price": adjusted_levels["runner_target_price"],
             "scale_out_pct": float(candidate.get("scale_out_pct") or 0.0),
             "scaled_out": False,
-            "initial_qty": float(candidate["position_size"]),
+            "initial_qty": executed_qty,
             "candle_count": 0,
             **real_entry_meta,
         },
@@ -1010,8 +1051,8 @@ async def _open_position_from_candidate(
         position_id=position.position_id,
         order_type="MARKET",
         request_price=float(candidate["entry_price"]),
-        fill_qty=float(candidate["position_size"]),
-        fill_price=float(candidate["entry_price"]),
+        fill_qty=executed_qty,
+        fill_price=executed_entry_price,
         status="FILLED",
         idempotency_key=build_order_idempotency_key(
             session_id=session.session_id,
@@ -1019,7 +1060,7 @@ async def _open_position_from_candidate(
             symbol=symbol,
             side="BUY" if candidate["direction"] == "LONG" else "SELL",
             position_id=str(position.position_id),
-            event_time=str(candidate.get("event_time") or now),
+            event_time=str(candidate_event_time),
         ),
         notes="paper entry",
     )
@@ -1029,21 +1070,21 @@ async def _open_position_from_candidate(
         symbol,
         candidate["direction"],
         _format_event_time(candidate.get("event_time")),
-        float(candidate["entry_price"]),
-        float(candidate["sl_price"]),
-        float(candidate["target_price"]),
+        executed_entry_price,
+        adjusted_levels["sl_price"],
+        adjusted_levels["first_target_price"],
         float(candidate["rr_ratio"]),
-        float(candidate["position_size"]),
+        executed_qty,
     )
     try:
         subject, body = _format_open_alert(
             symbol=symbol,
             direction=candidate["direction"],
-            entry_price=candidate["entry_price"],
-            sl_price=candidate["sl_price"],
-            target_price=candidate["target_price"],
+            entry_price=executed_entry_price,
+            sl_price=adjusted_levels["sl_price"],
+            target_price=adjusted_levels["first_target_price"],
             sl_distance=candidate["sl_distance"],
-            position_size=candidate["position_size"],
+            position_size=executed_qty,
             rr_ratio=candidate["rr_ratio"],
             strategy=str(getattr(session, "strategy", "")),
             session_id=session.session_id,
@@ -1056,9 +1097,57 @@ async def _open_position_from_candidate(
         "action": "OPEN",
         "position_id": position.position_id,
         "symbol": symbol,
-        "entry_price": candidate["entry_price"],
-        "executed_qty": float(candidate["position_size"]),
+        "entry_price": executed_entry_price,
+        "executed_qty": executed_qty,
         "position": position,
+    }
+
+
+def _levels_from_executed_entry(
+    *,
+    candidate: dict[str, Any],
+    executed_entry_price: float,
+    real_entry_meta: dict[str, Any],
+) -> dict[str, float | None]:
+    """Preserve model risk/reward distances when broker fill differs from model entry."""
+    direction = str(candidate["direction"]).upper()
+    model_entry = float(candidate["entry_price"])
+    sl_distance = abs(float(candidate.get("sl_distance") or 0.0))
+    if sl_distance <= 0:
+        sl_distance = abs(model_entry - float(candidate["sl_price"]))
+    first_target = float(candidate.get("first_target_price") or candidate["target_price"])
+    first_target_distance = abs(first_target - model_entry)
+    runner_target_raw = candidate.get("runner_target_price")
+    runner_target_distance = (
+        abs(float(runner_target_raw) - model_entry) if runner_target_raw is not None else None
+    )
+    if direction == "LONG":
+        computed_sl = float(executed_entry_price) - sl_distance
+        computed_first = float(executed_entry_price) + first_target_distance
+        computed_runner = (
+            float(executed_entry_price) + runner_target_distance
+            if runner_target_distance is not None
+            else None
+        )
+    elif direction == "SHORT":
+        computed_sl = float(executed_entry_price) + sl_distance
+        computed_first = float(executed_entry_price) - first_target_distance
+        computed_runner = (
+            float(executed_entry_price) - runner_target_distance
+            if runner_target_distance is not None
+            else None
+        )
+    else:
+        raise OrderSafetyError(f"unsupported trade direction {direction!r}")
+    sl_price = float(real_entry_meta.get("real_protective_sl_trigger_price") or computed_sl)
+    if sl_price <= 0 or not math.isfinite(sl_price):
+        raise OrderSafetyError("adjusted stop loss is not positive")
+    position_target = computed_runner if computed_runner is not None else computed_first
+    return {
+        "sl_price": round(sl_price, 4),
+        "first_target_price": round(computed_first, 4),
+        "runner_target_price": round(computed_runner, 4) if computed_runner is not None else None,
+        "position_target_price": round(float(position_target), 4),
     }
 
 
@@ -1203,6 +1292,7 @@ async def _advance_open_position(
             reference_price=exit_price_for_order,
             role=f"exit:{decision.exit_reason or 'TIME'}",
             event_time=candle.get("bar_end"),
+            protective_order_id=str(trail_state.get("real_protective_sl_order_id") or "") or None,
         )
 
     fill_total_qty = 0.0

@@ -17,6 +17,7 @@ from engine.broker_adapter import (
     record_real_dry_run_order,
     record_real_order,
 )
+from engine.broker_reconciliation import BrokerOrderSnapshot
 from engine.execution_safety import OrderRateGovernor
 
 
@@ -131,6 +132,27 @@ def test_market_orders_require_positive_market_protection(
 
     with pytest.raises(OrderSafetyError, match="market_protection"):
         intent.validate_for_broker()
+
+
+def test_manual_stop_loss_role_allows_slm_order() -> None:
+    intent = BrokerOrderIntent(
+        session_id="s",
+        symbol="SBIN",
+        side="SELL",
+        quantity=1,
+        role="manual_stop_loss",
+        order_type="SL-M",
+        trigger_price=100.0,
+        reference_price=105.0,
+        reference_price_age_sec=1.0,
+        market_protection=5.0,
+    )
+
+    payload = intent.validate_for_broker().zerodha_payload()
+
+    assert payload["order_type"] == "SL-M"
+    assert payload["trigger_price"] == 100.0
+    assert payload["market_protection"] == 5.0
 
 
 @pytest.mark.asyncio
@@ -709,5 +731,368 @@ async def test_record_real_order_writes_submitted_broker_order(tmp_path) -> None
         broker_payload = json.loads(str(orders[0].broker_payload))
         assert broker_payload["tradingsymbol"] == "TCS"
         assert broker_payload["quantity"] == 1
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_live_slm_order_uses_kite_post_for_market_protection() -> None:
+    class FakeKiteClient:
+        def __init__(self) -> None:
+            self.place_calls = 0
+            self.post_calls: list[dict] = []
+
+        def place_order(self, **kwargs):
+            self.place_calls += 1
+            raise AssertionError("SL-M with market_protection must use Kite _post")
+
+        def _post(self, route, *, url_args, params):
+            self.post_calls.append(
+                {"route": route, "url_args": dict(url_args), "params": dict(params)}
+            )
+            return {"order_id": "kite-slm-1"}
+
+    kite = FakeKiteClient()
+    intent = BrokerOrderIntent(
+        session_id="paper-live-1",
+        symbol="TCS",
+        side="SELL",
+        quantity=1,
+        role="protective_sl",
+        order_type="SL-M",
+        trigger_price=3450.0,
+        reference_price=3500.0,
+        reference_price_age_sec=1.0,
+        market_protection=5.0,
+        event_time="2026-04-28T09:20:00+05:30",
+    )
+    adapter = ZerodhaBrokerAdapter(
+        mode="LIVE",
+        allow_real_orders=True,
+        kite_client=kite,
+        governor=_NoSleepGovernor(),
+        guard_config=RealOrderGuardConfig(
+            enabled=True,
+            acknowledgement="I_UNDERSTAND_REAL_MONEY_ORDERS",
+            max_quantity=1,
+            max_notional=4_000.0,
+            allowed_order_types=frozenset({"SL-M"}),
+        ),
+    )
+
+    result = await adapter.place_order(intent)
+
+    assert result.exchange_order_id == "kite-slm-1"
+    assert kite.place_calls == 0
+    assert len(kite.post_calls) == 1
+    call = kite.post_calls[0]
+    assert call["route"] == "order.place"
+    assert call["url_args"] == {"variety": "regular"}
+    assert call["params"]["order_type"] == "SL-M"
+    assert call["params"]["market_protection"] == 5.0
+
+
+@pytest.mark.asyncio
+async def test_record_real_order_blocks_retry_for_pending_live_intent_without_broker_id(
+    tmp_path,
+) -> None:
+    class FakeKiteClient:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def place_order(self, **kwargs):
+            self.calls += 1
+            raise AssertionError("retry must not submit duplicate live order")
+
+        def orders(self):
+            return []
+
+    db = PaperDB(db_path=tmp_path / "paper.duckdb")
+    kite = FakeKiteClient()
+    try:
+        intent = BrokerOrderIntent(
+            session_id="paper-live-1",
+            symbol="TCS",
+            side="BUY",
+            quantity=1,
+            role="manual",
+            order_type="LIMIT",
+            price=3500.0,
+            reference_price=3500.0,
+            reference_price_age_sec=1.0,
+            event_time="2026-04-28T09:20:00+05:30",
+        )
+        adapter = ZerodhaBrokerAdapter(
+            mode="LIVE",
+            allow_real_orders=True,
+            kite_client=kite,
+            governor=_NoSleepGovernor(),
+            guard_config=RealOrderGuardConfig(
+                enabled=True,
+                acknowledgement="I_UNDERSTAND_REAL_MONEY_ORDERS",
+                max_quantity=1,
+                max_notional=4_000.0,
+                allowed_order_types=frozenset({"LIMIT"}),
+            ),
+        )
+        db.append_order_event(
+            session_id="paper-live-1",
+            symbol="TCS",
+            side="BUY",
+            order_type="LIMIT",
+            requested_qty=1,
+            request_price=3500.0,
+            fill_qty=0,
+            fill_price=None,
+            status="PENDING",
+            exchange_order_id=None,
+            idempotency_key=intent.idempotency_key(),
+            notes="PENDING_DISPATCH",
+            broker_mode="LIVE",
+            broker_payload=json.dumps(intent.zerodha_payload()),
+        )
+
+        with pytest.raises(OrderSafetyError, match="manual broker reconciliation"):
+            await record_real_order(paper_db=db, intent=intent, adapter=adapter)
+
+        assert kite.calls == 0
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_record_real_order_rejected_pre_dispatch_intent_can_retry(tmp_path) -> None:
+    class FakeKiteClient:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def place_order(self, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("Kite rejected SL-M: missing market protection")
+            return "kite-retry-1"
+
+        def orders(self):
+            return []
+
+    db = PaperDB(db_path=tmp_path / "paper.duckdb")
+    kite = FakeKiteClient()
+    try:
+        intent = BrokerOrderIntent(
+            session_id="paper-live-1",
+            symbol="TCS",
+            side="SELL",
+            quantity=1,
+            role="protective_sl",
+            order_type="SL-M",
+            trigger_price=3450.0,
+            reference_price=3500.0,
+            reference_price_age_sec=1.0,
+            market_protection=5.0,
+            event_time="2026-04-28T09:20:00+05:30",
+        )
+        adapter = ZerodhaBrokerAdapter(
+            mode="LIVE",
+            allow_real_orders=True,
+            kite_client=kite,
+            governor=_NoSleepGovernor(),
+            guard_config=RealOrderGuardConfig(
+                enabled=True,
+                acknowledgement="I_UNDERSTAND_REAL_MONEY_ORDERS",
+                max_quantity=1,
+                max_notional=4_000.0,
+                allowed_order_types=frozenset({"SL-M"}),
+            ),
+        )
+
+        with pytest.raises(RuntimeError, match="missing market protection"):
+            await record_real_order(paper_db=db, intent=intent, adapter=adapter)
+
+        order = db.get_session_orders("paper-live-1")[0]
+        assert order.status == "REJECTED"
+        assert order.exchange_order_id is None
+        assert order.notes == "BROKER_REJECTED"
+
+        payload = await record_real_order(paper_db=db, intent=intent, adapter=adapter)
+
+        orders = db.get_session_orders("paper-live-1")
+        assert kite.calls == 2
+        assert len(orders) == 1
+        assert payload["exchange_order_id"] == "kite-retry-1"
+        assert orders[0].status == "PENDING"
+        assert orders[0].exchange_order_id == "kite-retry-1"
+        assert orders[0].notes == "LIVE"
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_record_real_order_recovers_pending_live_intent_from_orderbook(
+    tmp_path,
+) -> None:
+    class FakeAdapter(ZerodhaBrokerAdapter):
+        def __init__(self) -> None:
+            super().__init__(mode="LIVE", allow_real_orders=True, kite_client=None)
+            self.place_calls = 0
+
+        async def place_order(self, intent):
+            self.place_calls += 1
+            raise AssertionError("recovered pending intent must not submit duplicate order")
+
+        async def fetch_order_snapshots(self):
+            return [
+                BrokerOrderSnapshot(
+                    order_id="kite-recovered-1",
+                    symbol="TCS",
+                    side="BUY",
+                    quantity=1,
+                    filled_quantity=1,
+                    average_price=3500.0,
+                    status="COMPLETE",
+                    tag="cpr-manual-paper-liv",
+                    broker_payload={
+                        "order_id": "kite-recovered-1",
+                        "tradingsymbol": "TCS",
+                        "transaction_type": "BUY",
+                        "quantity": 1,
+                        "filled_quantity": 1,
+                        "average_price": 3500.0,
+                        "status": "COMPLETE",
+                        "tag": "cpr-manual-paper-liv",
+                        "product": "MIS",
+                        "exchange": "NSE",
+                        "order_type": "LIMIT",
+                    },
+                )
+            ]
+
+    db = PaperDB(db_path=tmp_path / "paper.duckdb")
+    adapter = FakeAdapter()
+    try:
+        intent = BrokerOrderIntent(
+            session_id="paper-live-1",
+            symbol="TCS",
+            side="BUY",
+            quantity=1,
+            role="manual",
+            order_type="LIMIT",
+            price=3500.0,
+            reference_price=3500.0,
+            reference_price_age_sec=1.0,
+            event_time="2026-04-28T09:20:00+05:30",
+        )
+        db.append_order_event(
+            session_id="paper-live-1",
+            symbol="TCS",
+            side="BUY",
+            order_type="LIMIT",
+            requested_qty=1,
+            request_price=3500.0,
+            fill_qty=0,
+            fill_price=None,
+            status="PENDING",
+            exchange_order_id=None,
+            idempotency_key=intent.idempotency_key(),
+            notes="PENDING_DISPATCH",
+            broker_mode="LIVE",
+            broker_payload=json.dumps(intent.zerodha_payload()),
+        )
+
+        payload = await record_real_order(paper_db=db, intent=intent, adapter=adapter)
+
+        assert payload["recovered_existing"] is True
+        assert payload["exchange_order_id"] == "kite-recovered-1"
+        assert adapter.place_calls == 0
+        order = db.get_session_orders("paper-live-1")[0]
+        assert order.exchange_order_id == "kite-recovered-1"
+        assert order.status == "FILLED"
+        assert order.notes == "RECOVERED_PENDING_DISPATCH"
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("snapshot_count", [0, 2])
+@pytest.mark.asyncio
+async def test_record_real_order_blocks_pending_live_intent_when_recovery_not_unique(
+    tmp_path,
+    snapshot_count: int,
+) -> None:
+    class FakeAdapter(ZerodhaBrokerAdapter):
+        def __init__(self) -> None:
+            super().__init__(mode="LIVE", allow_real_orders=True, kite_client=None)
+            self.place_calls = 0
+
+        async def place_order(self, intent):
+            self.place_calls += 1
+            raise AssertionError("ambiguous pending intent must not submit duplicate order")
+
+        async def fetch_order_snapshots(self):
+            return [
+                BrokerOrderSnapshot(
+                    order_id=f"kite-recovered-{idx}",
+                    symbol="TCS",
+                    side="BUY",
+                    quantity=1,
+                    filled_quantity=1,
+                    average_price=3500.0,
+                    status="COMPLETE",
+                    tag="cpr-manual-paper-liv",
+                    broker_payload={
+                        "order_id": f"kite-recovered-{idx}",
+                        "tradingsymbol": "TCS",
+                        "transaction_type": "BUY",
+                        "quantity": 1,
+                        "filled_quantity": 1,
+                        "average_price": 3500.0,
+                        "status": "COMPLETE",
+                        "tag": "cpr-manual-paper-liv",
+                        "product": "MIS",
+                        "exchange": "NSE",
+                        "order_type": "LIMIT",
+                    },
+                )
+                for idx in range(snapshot_count)
+            ]
+
+    db = PaperDB(db_path=tmp_path / "paper.duckdb")
+    adapter = FakeAdapter()
+    try:
+        intent = BrokerOrderIntent(
+            session_id="paper-live-1",
+            symbol="TCS",
+            side="BUY",
+            quantity=1,
+            role="manual",
+            order_type="LIMIT",
+            price=3500.0,
+            reference_price=3500.0,
+            reference_price_age_sec=1.0,
+            event_time="2026-04-28T09:20:00+05:30",
+        )
+        db.append_order_event(
+            session_id="paper-live-1",
+            symbol="TCS",
+            side="BUY",
+            order_type="LIMIT",
+            requested_qty=1,
+            request_price=3500.0,
+            fill_qty=0,
+            fill_price=None,
+            status="PENDING",
+            exchange_order_id=None,
+            idempotency_key=intent.idempotency_key(),
+            notes="PENDING_DISPATCH",
+            broker_mode="LIVE",
+            broker_payload=json.dumps(intent.zerodha_payload()),
+        )
+
+        with pytest.raises(OrderSafetyError, match="manual broker reconciliation"):
+            await record_real_order(paper_db=db, intent=intent, adapter=adapter)
+
+        assert adapter.place_calls == 0
+        order = db.get_session_orders("paper-live-1")[0]
+        assert order.exchange_order_id is None
+        assert order.status == "PENDING"
+        assert order.notes == "PENDING_DISPATCH"
     finally:
         db.close()

@@ -215,6 +215,8 @@ class TestCLIArgParsing:
         assert "--staged-full-rebuild" in result.stdout
         assert "--duckdb-max-memory" in result.stdout
         assert "--refresh-since" in result.stdout
+        assert "--skip-status" in result.stdout
+        assert "--defer-replica-sync" in result.stdout
         assert "--allow-full-pack-rebuild" in result.stdout
         assert "--allow-full-history-rebuild" in result.stdout
 

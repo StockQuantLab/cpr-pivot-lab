@@ -1871,11 +1871,17 @@ def _colored_direction_table(rows: list[dict], colors: dict) -> None:
 
 def _session_meta_chip(label: str, value: str, color: str) -> None:
     """Render a compact metadata chip (label + value) for session context."""
-    with ui.row().classes("items-center gap-1"):
+    with (
+        ui.row()
+        .classes("items-center gap-2")
+        .style(f"padding-right: 10px; border-right: 1px solid {THEME['surface_border']};")
+    ):
         ui.label(f"{label}:").classes("text-xs uppercase").style(
-            f"color: {THEME['text_muted']}; letter-spacing: 0.05em;"
+            f"color: {THEME['text_muted']}; letter-spacing: var(--ls-label, 0.08em);"
         )
-        ui.label(str(value)).classes("text-sm mono-font").style(f"color: {color};")
+        ui.label(str(value)).classes("text-sm font-semibold").style(
+            f"color: {color}; font-family: var(--font-mono);"
+        )
 
 
 def _format_ratio_value(value: float | None, fallback: str = "—") -> str:

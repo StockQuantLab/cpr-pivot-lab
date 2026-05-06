@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from datetime import date, datetime
 from pathlib import Path
 
+import polars as pl
 import pytest
 
 import scripts.data_hygiene as hygiene
@@ -225,6 +227,85 @@ class TestCheckStale:
         assert "ILLIQUID: 1 active, 1 upserted" in out
         assert ("deactivate", "SHORT_HISTORY", ("SBIN", "TCS")) in calls
         assert ("deactivate", "ILLIQUID", ("RELIANCE",)) in calls
+
+
+class TestRepairInvalid5MinSessionRows:
+    def test_dry_run_reports_invalid_rows_without_writing(self, tmp_path, monkeypatch):
+        inst_dir = tmp_path / "instruments"
+        inst_dir.mkdir()
+        parquet_root = tmp_path / "parquet"
+        path = parquet_root / "5min" / "SBIN" / "2025.parquet"
+        path.parent.mkdir(parents=True)
+        df = pl.DataFrame(
+            {
+                "candle_time": [
+                    datetime(2025, 4, 1, 9, 15),
+                    datetime(2025, 4, 1, 15, 35),
+                ],
+                "open": [100.0, 101.0],
+                "high": [101.0, 102.0],
+                "low": [99.0, 100.0],
+                "close": [100.5, 101.5],
+                "volume": [10, 11],
+                "true_range": [2.0, 2.0],
+                "date": [date(2025, 4, 1), date(2025, 4, 1)],
+                "symbol": ["SBIN", "SBIN"],
+            }
+        )
+        df.write_parquet(path)
+        _patch_kite_paths(monkeypatch, inst_dir, parquet_root)
+
+        results = hygiene.repair_invalid_5min_session_rows(
+            symbols=["SBIN"],
+            start_date=date(2025, 4, 1),
+            end_date=date(2025, 4, 1),
+            apply=False,
+        )
+
+        assert len(results) == 1
+        assert results[0].invalid_rows == 1
+        assert pl.read_parquet(path).height == 2
+
+    def test_apply_removes_invalid_rows_and_writes_backup(self, tmp_path, monkeypatch):
+        inst_dir = tmp_path / "instruments"
+        inst_dir.mkdir()
+        parquet_root = tmp_path / "parquet"
+        path = parquet_root / "5min" / "SBIN" / "2025.parquet"
+        path.parent.mkdir(parents=True)
+        df = pl.DataFrame(
+            {
+                "candle_time": [
+                    datetime(2025, 4, 1, 9, 15),
+                    datetime(2025, 4, 1, 20, 55),
+                ],
+                "open": [100.0, 101.0],
+                "high": [101.0, 102.0],
+                "low": [99.0, 100.0],
+                "close": [100.5, 101.5],
+                "volume": [10, 11],
+                "true_range": [2.0, 2.0],
+                "date": [date(2025, 4, 1), date(2025, 4, 1)],
+                "symbol": ["SBIN", "SBIN"],
+            }
+        )
+        df.write_parquet(path)
+        _patch_kite_paths(monkeypatch, inst_dir, parquet_root)
+        monkeypatch.chdir(tmp_path)
+
+        results = hygiene.repair_invalid_5min_session_rows(
+            symbols=["SBIN"],
+            start_date=date(2025, 4, 1),
+            end_date=date(2025, 4, 1),
+            apply=True,
+        )
+
+        assert len(results) == 1
+        repaired = pl.read_parquet(path)
+        assert repaired.height == 1
+        assert repaired["candle_time"].to_list() == [datetime(2025, 4, 1, 9, 15)]
+        assert results[0].backup_path is not None
+        assert results[0].backup_path.exists()
+        assert pl.read_parquet(results[0].backup_path).height == 2
 
 
 class TestTradeableSymbols:

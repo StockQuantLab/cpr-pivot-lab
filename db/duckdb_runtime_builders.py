@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import time
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, cast
 
@@ -1010,7 +1011,16 @@ class DuckDBRuntimeBuilderMixin:
         # ─────────────────────────────────────────────────────────────────────
 
         since_date_iso, until_date_iso = _prepare_date_window(since_date, until_date)
-        window_filter_sql = _date_window_clause("date::DATE", since_date_iso, until_date_iso)
+        calc_since_date_iso = since_date_iso
+        if since_date_iso:
+            calc_lookback_days = max(45, max(1, int(rvol_lookback_days)) * 4)
+            calc_since_date_iso = (
+                date.fromisoformat(since_date_iso) - timedelta(days=calc_lookback_days)
+            ).isoformat()
+        window_filter_sql = _date_window_clause("date::DATE", calc_since_date_iso, until_date_iso)
+        insert_window_filter_sql = _date_window_clause(
+            "trade_date", since_date_iso, until_date_iso
+        )
         # _date_window_clause embeds dates as SQL literals (no ? placeholders),
         # so window_params is always empty — the filtering is in window_filter_sql.
         window_params: list[object] = []
@@ -1019,7 +1029,7 @@ class DuckDBRuntimeBuilderMixin:
         # Skip DROP TABLE; just delete rows >= since_date and re-insert them.
         if since_date_iso and not force:
             table_exists = self._table_exists("intraday_day_pack")
-            if table_exists:
+            if table_exists and symbols is None:
                 skip_n = _skip_if_table_fully_covered(
                     self.con,
                     table="intraday_day_pack",
@@ -1032,6 +1042,7 @@ class DuckDBRuntimeBuilderMixin:
                 if skip_n is not None:
                     return skip_n
 
+            if table_exists:
                 deleted = _incremental_delete(
                     self.con,
                     table="intraday_day_pack",
@@ -1100,6 +1111,12 @@ class DuckDBRuntimeBuilderMixin:
             f" batch_size={batch_size} batches={total_batches}"
             f" source={'manifest' if manifest is not None else 'parquet_globs'}"
         )
+        if since_date_iso and calc_since_date_iso != since_date_iso:
+            _log(
+                "  [pack] incremental RVOL source window:"
+                f" reading from {calc_since_date_iso}, inserting from {since_date_iso}"
+                + (f" through {until_date_iso}" if until_date_iso else "")
+            )
 
         phase_times = {
             "delete": 0.0,
@@ -1210,6 +1227,8 @@ class DuckDBRuntimeBuilderMixin:
                             LIST(CAST(volume AS DOUBLE) ORDER BY candle_time) AS volume_arr,
                             LIST(CAST(rvol_baseline AS DOUBLE) ORDER BY candle_time) AS rvol_baseline_arr
                         FROM candles
+                        WHERE 1=1
+                        {insert_window_filter_sql}
                         GROUP BY symbol, trade_date
                     """,
                         window_params,
@@ -1249,6 +1268,8 @@ class DuckDBRuntimeBuilderMixin:
                             LIST(volume ORDER BY candle_time) AS volume_arr,
                             LIST(rvol_baseline ORDER BY candle_time) AS rvol_baseline_arr
                         FROM candles
+                        WHERE 1=1
+                        {insert_window_filter_sql}
                         GROUP BY symbol, trade_date
                     """,
                         window_params,

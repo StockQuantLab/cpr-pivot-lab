@@ -316,6 +316,7 @@ Paper trading is implemented end-to-end for live session state, replay/live vali
 - [docs/README.md](docs/README.md) - documentation index and ownership map
 - [STRATEGY.md](STRATEGY.md) - strategy definitions and parameters
 - [docs/PAPER_TRADING_RUNBOOK.md](docs/PAPER_TRADING_RUNBOOK.md) - live-session operator runbook
+- [docs/REAL_ORDER_LIVE_FLOW.md](docs/REAL_ORDER_LIVE_FLOW.md) - actual live broker order flow in plain English
 - [docs/SETUP.md](docs/SETUP.md) - clean setup runbook and command profile
 - [docs/KITE_INGESTION.md](docs/KITE_INGESTION.md) - local Kite refresh and parquet catch-up runbook
 - [docs/RUNTIME_REBUILD.md](docs/RUNTIME_REBUILD.md) - safe full-history and repair rebuild runbook

@@ -313,6 +313,7 @@ async def test_operator_drill_launches_isolated_kite_multi_child(
             strategy="CPR_LEVELS",
             symbols="SBIN,RELIANCE",
             universe_name=None,
+            full_universe=False,
             poll_interval_sec=0.1,
             candle_interval_minutes=5,
             max_cycles=3,
@@ -354,6 +355,52 @@ async def test_operator_drill_launches_isolated_kite_multi_child(
     assert env["PIVOT_MARKET_READ_REPLICA"] == "1"
     assert env["PIVOT_PAPER_SESSION_ID_PREFIX"] == "DRILL-unit-drill-"
     assert "PIVOT_LOCAL_FEED_BAR_DELAY_SEC" not in env
+
+
+@pytest.mark.asyncio
+async def test_operator_drill_full_universe_omits_default_two_symbol_override(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import scripts.paper_trading as pt
+
+    monkeypatch.chdir(tmp_path)
+    captured: dict[str, object] = {}
+
+    class _FakeCompleted:
+        returncode = 0
+        stdout = '{"status":"ok"}\n'
+
+    def fake_run(cmd, *, cwd, env, text, stdout, stderr, check):
+        captured["cmd"] = list(cmd)
+        return _FakeCompleted()
+
+    monkeypatch.setattr(pt.subprocess, "run", fake_run)
+    monkeypatch.setattr(pt, "resolve_trade_date", lambda value: "2026-05-04")
+
+    await pt._cmd_operator_drill(
+        SimpleNamespace(
+            trade_date="2026-05-04",
+            run_id="unit-full-drill",
+            strategy="CPR_LEVELS",
+            symbols=None,
+            universe_name=None,
+            full_universe=True,
+            poll_interval_sec=0.1,
+            candle_interval_minutes=5,
+            max_cycles=3,
+            or_minutes=None,
+            entry_window_end=None,
+            time_exit=None,
+            cpr_entry_start=None,
+            real_orders=False,
+            simulate_real_orders=False,
+        )
+    )
+
+    cmd = captured["cmd"]
+    assert "--symbols" not in cmd
+    assert "--universe-name" not in cmd
 
 
 @pytest.mark.asyncio

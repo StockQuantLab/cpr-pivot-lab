@@ -1320,6 +1320,145 @@ class PaperDB:
         ).fetchall()
         return [self._row_to_order(r) for r in rows]
 
+    def get_order_by_idempotency_key(self, idempotency_key: str) -> PaperOrder | None:
+        key = str(idempotency_key or "").strip()
+        if not key:
+            return None
+        select_cols = self._paper_order_select_sql()
+        row = self.con.execute(
+            f"SELECT {select_cols} FROM paper_orders WHERE idempotency_key = ? LIMIT 1",
+            [key],
+        ).fetchone()
+        return self._row_to_order(row) if row else None
+
+    def update_order_broker_submission(
+        self,
+        order_id: str,
+        *,
+        exchange_order_id: str | None,
+        broker_mode: str | None,
+        broker_payload: str | None,
+        broker_latency_ms: float | None,
+        notes: str | None = None,
+    ) -> int:
+        oid = str(order_id or "").strip()
+        if not oid:
+            return 0
+        matched = self.con.execute(
+            "SELECT COUNT(*) FROM paper_orders WHERE order_id = ?",
+            [oid],
+        ).fetchone()[0]
+        if int(matched or 0) <= 0:
+            return 0
+        self.con.execute(
+            """
+            UPDATE paper_orders
+            SET exchange_order_id = COALESCE(?, exchange_order_id),
+                broker_mode = COALESCE(?, broker_mode),
+                broker_payload = COALESCE(?, broker_payload),
+                broker_latency_ms = COALESCE(?, broker_latency_ms),
+                notes = COALESCE(?, notes),
+                updated_at = CURRENT_TIMESTAMP
+            WHERE order_id = ?
+            """,
+            [
+                exchange_order_id,
+                broker_mode,
+                broker_payload,
+                broker_latency_ms,
+                notes,
+                oid,
+            ],
+        )
+        self._after_write()
+        return int(matched or 0)
+
+    def prepare_order_broker_retry(
+        self,
+        order_id: str,
+        *,
+        broker_mode: str | None,
+        broker_payload: str | None,
+    ) -> int:
+        oid = str(order_id or "").strip()
+        if not oid:
+            return 0
+        matched = int(
+            self.con.execute(
+                "SELECT COUNT(*) FROM paper_orders WHERE order_id = ?",
+                [oid],
+            ).fetchone()[0]
+            or 0
+        )
+        if matched <= 0:
+            return 0
+        self.con.execute(
+            """
+            UPDATE paper_orders
+            SET status = 'PENDING',
+                broker_mode = COALESCE(?, broker_mode),
+                broker_payload = COALESCE(?, broker_payload),
+                broker_status_message = NULL,
+                broker_response = NULL,
+                notes = 'PENDING_DISPATCH_RETRY',
+                updated_at = CURRENT_TIMESTAMP
+            WHERE order_id = ?
+            """,
+            [broker_mode, broker_payload, oid],
+        )
+        self._after_write()
+        return matched
+
+    def update_order_broker_rejection(
+        self,
+        order_id: str,
+        *,
+        broker_mode: str | None,
+        broker_payload: str | None,
+        broker_status_message: str | None,
+        notes: str | None = "BROKER_REJECTED",
+    ) -> int:
+        oid = str(order_id or "").strip()
+        if not oid:
+            return 0
+        matched = int(
+            self.con.execute(
+                "SELECT COUNT(*) FROM paper_orders WHERE order_id = ?",
+                [oid],
+            ).fetchone()[0]
+            or 0
+        )
+        if matched <= 0:
+            return 0
+        broker_response = json.dumps(
+            {"error": str(broker_status_message or "")},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        self.con.execute(
+            """
+            UPDATE paper_orders
+            SET status = 'REJECTED',
+                broker_mode = COALESCE(?, broker_mode),
+                broker_payload = COALESCE(?, broker_payload),
+                broker_status_message = ?,
+                broker_response = ?,
+                notes = COALESCE(?, notes),
+                updated_at = CURRENT_TIMESTAMP
+            WHERE order_id = ?
+            """,
+            [
+                broker_mode,
+                broker_payload,
+                broker_status_message,
+                broker_response,
+                notes,
+                oid,
+            ],
+        )
+        self._after_write()
+        return matched
+
     def update_order_from_broker_snapshot(self, broker_order_id: str, snapshot: dict) -> int:
         broker_id = str(broker_order_id or "").strip()
         if not broker_id:

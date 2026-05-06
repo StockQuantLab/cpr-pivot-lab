@@ -476,3 +476,141 @@ async def test_process_closed_bar_group_writes_signal_decision_audit() -> None:
     assert len(executed_rows) == 1
     assert executed_rows[0]["symbol"] == "BBB"
     assert executed_rows[0]["selected_rank"] == 1
+
+
+@pytest.mark.asyncio
+async def test_process_closed_bar_group_checks_risk_before_entry_execution() -> None:
+    bar_end = datetime(2026, 5, 6, 9, 20, tzinfo=IST)
+    runtime_state = PaperRuntimeState()
+    runtime_state.symbols["AAA"] = SymbolRuntimeState(
+        trade_date="2026-05-06",
+        candles=[],
+        setup_row={"direction": "LONG", "direction_pending": False, "atr": 2.0},
+    )
+    tracker = SessionPositionTracker(
+        max_positions=1, portfolio_value=100_000.0, max_position_pct=1.0
+    )
+    candle = SimpleNamespace(
+        symbol="AAA",
+        bar_end=bar_end,
+        open=100.0,
+        high=101.0,
+        low=99.0,
+        close=100.0,
+        volume=1000.0,
+    )
+    evaluated: list[str] = []
+    executed: list[str] = []
+
+    async def _evaluate_candle(**kwargs: object) -> dict[str, object]:
+        evaluated.append(str(kwargs["candle"].symbol))
+        return {
+            "symbol": "AAA",
+            "action": "ENTRY_CANDIDATE",
+            "candidate": {"symbol": "AAA", "position_size": 1},
+            "setup_row": runtime_state.symbols["AAA"].setup_row,
+        }
+
+    async def _execute_entry(**kwargs: object) -> dict[str, object]:
+        executed.append(str(kwargs["candidate"]["symbol"]))
+        return {"action": "OPEN"}
+
+    async def _enforce_risk_controls(**_: object) -> dict[str, object]:
+        return {"triggered": True}
+
+    result = await process_closed_bar_group(
+        session_id="risk-session",
+        session=SimpleNamespace(strategy="CPR_LEVELS"),
+        bar_candles=[candle],
+        runtime_state=runtime_state,
+        tracker=tracker,
+        params=SimpleNamespace(entry_window_end="10:15"),
+        active_symbols=["AAA"],
+        strategy="CPR_LEVELS",
+        direction_filter="LONG",
+        stage_b_applied=False,
+        symbol_last_prices={"AAA": 100.0},
+        last_price=100.0,
+        evaluate_candle_fn=_evaluate_candle,
+        execute_entry_fn=_execute_entry,
+        enforce_risk_controls=_enforce_risk_controls,
+        build_feed_state=lambda **_: SimpleNamespace(),
+    )
+
+    assert result["triggered"] is True
+    assert evaluated == []
+    assert executed == []
+
+
+@pytest.mark.asyncio
+async def test_process_closed_bar_group_risk_mark_prefers_open_position_symbol() -> None:
+    bar_end = datetime(2026, 5, 6, 9, 25, tzinfo=IST)
+    runtime_state = PaperRuntimeState()
+    tracker = SessionPositionTracker(
+        max_positions=2, portfolio_value=100_000.0, max_position_pct=1.0
+    )
+    position = SimpleNamespace(
+        position_id="pos-1",
+        symbol="SBIN",
+        direction="LONG",
+        entry_price=100.0,
+        stop_loss=95.0,
+        target_price=110.0,
+        quantity=1.0,
+        current_qty=1.0,
+        trail_state={},
+    )
+    tracker.record_open(position, position_value=100.0)
+    candles = [
+        SimpleNamespace(
+            symbol="SBIN",
+            bar_end=bar_end,
+            open=90.0,
+            high=91.0,
+            low=89.0,
+            close=90.0,
+            volume=1000.0,
+        ),
+        SimpleNamespace(
+            symbol="TCS",
+            bar_end=bar_end,
+            open=50.0,
+            high=51.0,
+            low=49.0,
+            close=50.0,
+            volume=1000.0,
+        ),
+    ]
+    seen_last_prices: list[float | None] = []
+
+    async def _evaluate_candle(**_: object) -> dict[str, object]:
+        return {"action": "SKIP", "advance_result": None}
+
+    async def _enforce_risk_controls(**kwargs: object) -> dict[str, object]:
+        seen_last_prices.append(kwargs["feed_state"].last_price)
+        return {"triggered": False}
+
+    result = await process_closed_bar_group(
+        session_id="risk-session",
+        session=SimpleNamespace(strategy="CPR_LEVELS"),
+        bar_candles=candles,
+        runtime_state=runtime_state,
+        tracker=tracker,
+        params=SimpleNamespace(entry_window_end="10:15"),
+        active_symbols=["SBIN", "TCS"],
+        strategy="CPR_LEVELS",
+        direction_filter="LONG",
+        stage_b_applied=False,
+        symbol_last_prices={"SBIN": 90.0, "TCS": 50.0},
+        last_price=None,
+        evaluate_candle_fn=_evaluate_candle,
+        execute_entry_fn=lambda **_: {"action": "SKIP"},
+        enforce_risk_controls=_enforce_risk_controls,
+        build_feed_state=lambda **kwargs: SimpleNamespace(
+            last_price=kwargs["last_price"],
+            raw_state={"symbol_last_prices": kwargs["symbol_last_prices"]},
+        ),
+    )
+
+    assert result["triggered"] is False
+    assert seen_last_prices == [90.0]

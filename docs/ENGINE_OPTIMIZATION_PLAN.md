@@ -501,10 +501,10 @@ Current interpretation:
 
 | Run | Calmar | WR | PF | P/L |
 |---|---:|---:|---:|---:|
-| STD_LONG `7d108d511ef8` | 207 | 33.6% | 3.40 | ₹1.736M |
-| RISK_LONG `f9d8f3c689a9` | 209 | 33.6% | 3.45 | ₹1.730M |
-| STD_SHORT `51c3605228d7` | 88 | 30.0% | 2.57 | ₹1.606M |
-| RISK_SHORT `05cda5c2d526` | 94 | 30.2% | 2.61 | ₹1.624M |
+| STD_LONG `d9bfe51d2d49` | 204 | 33.6% | 3.41 | ₹1.724M |
+| RISK_LONG `dccce0e0ada6` | 207 | 33.6% | 3.46 | ₹1.718M |
+| STD_SHORT `05fd7c6f7184` | 88 | 30.0% | 2.57 | ₹1.615M |
+| RISK_SHORT `f6e520155aa7` | 94 | 30.2% | 2.62 | ₹1.632M |
 
 #### What this means
 
@@ -522,7 +522,7 @@ Current interpretation:
 
 #### Pending validation
 
-- Keep the 2026-05-05 `full_2026_05_05` reference baseline fixed unless a future change is
+- Keep the 2026-05-06 `full_2026_05_06` reference baseline fixed unless a future change is
   explicitly intended to alter the reference behavior.
 - Use the current reference baseline set for any future regression checks.
 

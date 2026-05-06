@@ -55,7 +55,22 @@ def live_mark_feed_state(
 ) -> Any:
     """Build a feed-state view using latest live marks for immediate flatten fills."""
     prices = dict(symbol_last_prices)
-    if ticker_adapter is not None and hasattr(ticker_adapter, "get_last_ltp"):
+    latest_ts = None
+    if ticker_adapter is not None and hasattr(ticker_adapter, "get_last_ltp_with_ts"):
+        for symbol in symbols or prices.keys():
+            normalized = str(symbol).upper()
+            try:
+                ltp, tick_ts = ticker_adapter.get_last_ltp_with_ts(normalized)
+            except Exception:
+                logger.debug(
+                    "Failed to read latest timestamped LTP for %s", normalized, exc_info=True
+                )
+                continue
+            if ltp is not None:
+                prices[normalized] = float(ltp)
+            if isinstance(tick_ts, datetime) and (latest_ts is None or tick_ts > latest_ts):
+                latest_ts = tick_ts
+    elif ticker_adapter is not None and hasattr(ticker_adapter, "get_last_ltp"):
         for symbol in symbols or prices.keys():
             normalized = str(symbol).upper()
             try:
@@ -65,10 +80,11 @@ def live_mark_feed_state(
                 continue
             if ltp is not None:
                 prices[normalized] = float(ltp)
+        latest_ts = getattr(ticker_adapter, "last_tick_ts", None)
     return SimpleNamespace(
         session_id=session_id,
         status="LIVE_MARK",
-        last_event_ts=datetime.now(IST),
+        last_event_ts=latest_ts,
         last_bar_ts=None,
         last_price=None,
         stale_reason=None,

@@ -45,6 +45,8 @@ from __future__ import annotations
 import argparse
 import os
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 
 from db.duckdb import MarketDB, get_db
 from engine.cli_setup import configure_windows_stdio
@@ -219,6 +221,22 @@ def main() -> None:
         default=None,
         help="Override DUCKDB_MAX_MEMORY for this command only (example: 24GB).",
     )
+    parser.add_argument(
+        "--skip-status",
+        action="store_true",
+        help=(
+            "Skip the final table row-count/status summary. Use for orchestrated EOD runs where "
+            "a separate readiness gate verifies the result; avoids expensive COUNT(DISTINCT) scans."
+        ),
+    )
+    parser.add_argument(
+        "--defer-replica-sync",
+        action="store_true",
+        help=(
+            "Defer market replica publication for this build command. Use only when an orchestrator "
+            "runs an explicit sync/verify stage after the build."
+        ),
+    )
     args = parser.parse_args()
 
     if not args.status:
@@ -340,66 +358,70 @@ def main() -> None:
     refresh_since = args.since or args.refresh_date
     refresh_until = args.refresh_date
 
-    if args.table:
-        _build_single(
-            db,
-            args.table,
-            force=args.force,
-            batch_size=args.batch_size,
-            pack_lookback=args.pack_lookback,
-            since_date=refresh_since,
-            until_date=refresh_until,
-            symbols=symbols,
-            resume=args.resume,
-        )
-    elif symbols is not None and not args.staged_full_rebuild and refresh_since is None:
-        # Symbol-level rebuild: no --table given, but symbols were resolved via
-        # --symbols / --symbols-file / --missing → rebuild core tables for those symbols.
-        _run_symbol_rebuild(
-            db,
-            symbols,
-            batch_size=args.batch_size,
-            pack_lookback=args.pack_lookback,
-            since_date=refresh_since,
-        )
-    elif symbols is not None and not args.staged_full_rebuild:
-        db.build_all(
-            force=args.force,
-            symbols=symbols,
-            atr_batch_size=args.batch_size,
-            pack_batch_size=args.batch_size,
-            pack_rvol_lookback_days=args.pack_lookback,
-            since_date=refresh_since,
-            until_date=refresh_until,
-        )
-    elif args.staged_full_rebuild:
-        _run_staged_full_rebuild(
-            db,
-            force=args.force,
-            batch_size=args.batch_size,
-            pack_lookback=args.pack_lookback,
-            since_date=refresh_since,
-            resume_from=args.resume_from,
-            resume_pack=args.resume,
-        )
-    else:
-        print("=" * 60)
-        print(" Building ALL runtime tables from full local parquet history")
-        print("=" * 60)
-        db.build_all(
-            force=args.force,
-            symbols=None,
-            atr_batch_size=args.batch_size,
-            pack_batch_size=args.batch_size,
-            pack_rvol_lookback_days=args.pack_lookback,
-            since_date=refresh_since,
-            until_date=refresh_until,
-        )
+    with _replica_sync_scope(db, defer=args.defer_replica_sync):
+        if args.table:
+            _build_single(
+                db,
+                args.table,
+                force=args.force,
+                batch_size=args.batch_size,
+                pack_lookback=args.pack_lookback,
+                since_date=refresh_since,
+                until_date=refresh_until,
+                symbols=symbols,
+                resume=args.resume,
+            )
+        elif symbols is not None and not args.staged_full_rebuild and refresh_since is None:
+            # Symbol-level rebuild: no --table given, but symbols were resolved via
+            # --symbols / --symbols-file / --missing → rebuild core tables for those symbols.
+            _run_symbol_rebuild(
+                db,
+                symbols,
+                batch_size=args.batch_size,
+                pack_lookback=args.pack_lookback,
+                since_date=refresh_since,
+            )
+        elif symbols is not None and not args.staged_full_rebuild:
+            db.build_all(
+                force=args.force,
+                symbols=symbols,
+                atr_batch_size=args.batch_size,
+                pack_batch_size=args.batch_size,
+                pack_rvol_lookback_days=args.pack_lookback,
+                since_date=refresh_since,
+                until_date=refresh_until,
+            )
+        elif args.staged_full_rebuild:
+            _run_staged_full_rebuild(
+                db,
+                force=args.force,
+                batch_size=args.batch_size,
+                pack_lookback=args.pack_lookback,
+                since_date=refresh_since,
+                resume_from=args.resume_from,
+                resume_pack=args.resume,
+            )
+        else:
+            print("=" * 60)
+            print(" Building ALL runtime tables from full local parquet history")
+            print("=" * 60)
+            db.build_all(
+                force=args.force,
+                symbols=None,
+                atr_batch_size=args.batch_size,
+                pack_batch_size=args.batch_size,
+                pack_rvol_lookback_days=args.pack_lookback,
+                since_date=refresh_since,
+                until_date=refresh_until,
+            )
 
     elapsed = time.time() - start
     print(f"\nCompleted in {elapsed:.1f}s")
-    print()
-    _show_status(db)
+    if args.skip_status:
+        print("Skipped final table status summary (--skip-status).")
+    else:
+        print()
+        _show_status(db)
 
 
 def _build_single(
@@ -467,6 +489,18 @@ def _build_single(
         )
     elif table == "meta":
         db._build_dataset_meta()
+
+
+@contextmanager
+def _replica_sync_scope(db: MarketDB, *, defer: bool) -> Iterator[None]:
+    """Optionally batch market replica publication for an orchestrated build."""
+    if defer:
+        db._begin_replica_batch()
+    try:
+        yield
+    finally:
+        if defer:
+            db._end_replica_batch()
 
 
 def _run_staged_full_rebuild(

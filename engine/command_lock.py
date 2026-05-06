@@ -152,6 +152,10 @@ def acquire_command_lock(name: str, *, detail: str) -> Iterator[None]:
                         fcntl.flock(handle.fileno(), fcntl.LOCK_UN)  # type: ignore[attr-defined]
                 finally:
                     handle.flush()
+                    try:
+                        _lock_info_path(lock_path).unlink()
+                    except FileNotFoundError:
+                        pass
     except SystemExit:
         raise
     except OSError as exc:

@@ -65,8 +65,8 @@ THEME_CLEAN = {
     "surface_border": "#e0ddd8",  # Warm gray border
     "surface_hover": "#eeede9",
     "text_primary": "#1a1a1a",
-    "text_secondary": "#525252",
-    "text_muted": "#7a7a7a",
+    "text_secondary": "#4a5352",  # Subtle teal-gray tint for cohesion
+    "text_muted": "#748a87",  # Teal-tinted muted — softer than pure gray
     "primary": "#0d9488",  # Teal — distinctive, not generic indigo
     "primary_dark": "#0f766e",
     "divider": "#e0ddd8",
@@ -496,13 +496,13 @@ body[class*="terminal"] .kpi-card {
 
 /* Uppercase styling with intentional letter-spacing */
 .text-uppercase {
-    letter-spacing: 0.08em; /* More open for small caps/uppercase */
+    letter-spacing: var(--ls-label, 0.08em);
 }
 .tracking-wide {
     letter-spacing: 0.05em;
 }
 .tracking-tight {
-    letter-spacing: -0.02em; /* Tighter for large display text */
+    letter-spacing: var(--ls-tight, -0.02em);
 }
 
 /* Readable text width for long content */
@@ -510,16 +510,17 @@ body[class*="terminal"] .kpi-card {
     max-width: 65ch;
 }
 
-/* Typography scale - ensure minimum sizes */
-.text-xs { font-size: 0.75rem; }    /* 12px */
-.text-sm { font-size: 0.875rem; }   /* 14px */
-.text-base { font-size: 1rem; }     /* 16px */
-.text-lg { font-size: 1.125rem; }    /* 18px */
-.text-xl { font-size: 1.25rem; }     /* 20px */
-.text-2xl { font-size: 1.5rem; }     /* 24px */
-.text-3xl { font-size: 1.875rem; }   /* 30px */
-.text-4xl { font-size: 2.25rem; }    /* 36px */
-.text-5xl { font-size: 3rem; }       /* 48px */
+/* Typography scale — see heading rules below for h1-h4 overrides.
+   Ratio ~1.2x between steps; sizes below body (16px) used only for labels/captions. */
+.text-xs   { font-size: 0.75rem; }   /* 12px — captions, table headers */
+.text-sm   { font-size: 0.875rem; }  /* 14px — secondary text */
+.text-base { font-size: 1rem; }      /* 16px — body */
+.text-lg   { font-size: 1.1rem; }    /* 17.6px — subheadings */
+.text-xl   { font-size: 1.25rem; }   /* 20px — h4 */
+.text-2xl  { font-size: 1.5rem; }    /* 24px — h3 */
+.text-3xl  { font-size: 1.75rem; }   /* 28px — h2 */
+.text-4xl  { font-size: 2.25rem; }   /* 36px — h1 */
+.text-5xl  { font-size: 3rem; }      /* 48px — display */
 
 /* Leading utilities */
 .leading-tight { line-height: 1.25; }
@@ -551,13 +552,12 @@ body, .q-app {
     display: block;
 }
 
-h1, .text-4xl { font-size: 2.25rem; font-weight: 700; letter-spacing: -0.02em; }
-h2, .text-3xl { font-size: 1.75rem; font-weight: 600; letter-spacing: -0.01em; }
-h3, .text-2xl { font-size: 1.5rem;  font-weight: 600; }
-h4, .text-xl  { font-size: 1.25rem; font-weight: 600; }
-.text-lg { font-size: 1.1rem; font-weight: 500; }
-.text-sm { font-size: 0.875rem; }
-.text-xs { font-size: 0.75rem; }
+/* Heading weight & tracking overrides — sizes come from .text-* utilities above */
+h1, .text-4xl { font-weight: 700; letter-spacing: var(--ls-tight, -0.02em); }
+h2, .text-3xl { font-weight: 600; letter-spacing: -0.01em; }
+h3, .text-2xl { font-weight: 600; }
+h4, .text-xl  { font-weight: 600; }
+.text-lg      { font-weight: 500; }
 
 /* Terminal scanline — only in terminal mode, subtle overlay */
 body.terminal-mode::after {
@@ -690,7 +690,7 @@ body.terminal-mode::after {
     content: ">>";
     position: absolute; right: 16px; top: 50%; transform: translateY(-50%);
     color: var(--theme-primary); opacity: 0; transition: opacity 0.15s;
-    font-family: 'JetBrains Mono', monospace; font-size: 0.8rem;
+    font-family: var(--font-mono); font-size: 0.8rem;
 }
 .nav-tile:hover {
     border-color: var(--theme-primary);
@@ -711,7 +711,7 @@ body.terminal-mode::after {
     content: ">";
     position: absolute; left: 4px;
     opacity: 0; color: var(--theme-primary);
-    font-family: 'JetBrains Mono', monospace;
+    font-family: var(--font-mono);
     transition: opacity 0.1s;
 }
 .nav-item:hover {
@@ -736,7 +736,7 @@ body.terminal-mode::after {
 .q-table thead th {
     color: var(--theme-primary) !important;
     font-weight: 600; text-transform: uppercase;
-    font-size: 0.75rem; letter-spacing: 0.1em;
+    font-size: 0.75rem; letter-spacing: var(--ls-label, 0.08em);
     border-bottom: 2px solid var(--theme-surface-border) !important;
     font-family: var(--font-mono); padding: 12px 16px !important;
 }
@@ -756,8 +756,8 @@ body.terminal-mode::after {
 /* Quasar tabs */
 .q-tab {
     color: var(--theme-text-secondary) !important;
-    font-family: var(--font-mono);
-    text-transform: uppercase; font-size: 0.75rem; letter-spacing: 0.05em;
+    font-family: var(--font-ui);
+    text-transform: uppercase; font-size: 0.75rem; letter-spacing: var(--ls-label, 0.08em);
 }
 .q-tab--active { color: var(--theme-primary) !important; font-weight: 600; }
 .q-tabs__content { border-bottom: 1px solid var(--theme-surface-border); }
@@ -794,7 +794,7 @@ body.terminal-mode::after {
     background: var(--code-bg, #000);
     border: 1px solid var(--theme-surface-border);
     border-radius: 2px;
-    font-family: 'JetBrains Mono', monospace;
+    font-family: var(--font-mono);
     font-size: 0.8rem;
     color: var(--theme-primary);
 }
@@ -849,11 +849,11 @@ body.terminal-mode::after {
     }
     .q-table thead th {
         padding: 8px 12px !important;
-        font-size: 0.65rem !important;
+        font-size: 0.7rem !important;
     }
     .q-table tbody td {
         padding: 10px 12px !important;
-        font-size: 0.75rem !important;
+        font-size: 0.8rem !important;
     }
     /* Hide less important columns on mobile */
     .q-table .hide-mobile {
@@ -888,12 +888,12 @@ body.terminal-mode::after {
     }
     .q-table tbody td {
         padding: 6px 10px !important;
-        font-size: 0.7rem !important;
+        font-size: 0.8rem !important;
         white-space: nowrap;
     }
     .q-table thead th {
         padding: 6px 10px !important;
-        font-size: 0.65rem !important;
+        font-size: 0.7rem !important;
         white-space: nowrap;
     }
 }
@@ -1018,12 +1018,15 @@ def _get_themed_css() -> str:
     --theme-color-warning: {colors["warning"]};
     --theme-color-info: {colors["info"]};
     --theme-color-gray: {colors["gray"]};
+    --ls-label: 0.08em;
+    --ls-tight: -0.02em;
 """
 
     if _theme_state.is_terminal:
         css_vars += """
     --font-body: 'IBM Plex Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
     --font-mono: 'Fira Code', 'SF Mono', 'Consolas', 'Courier New', monospace;
+    --font-ui: 'Fira Code', 'SF Mono', 'Consolas', 'Courier New', monospace;
     --card-radius: 4px;
     --card-shadow: 0 2px 8px rgba(0,0,0,0.4);
     --card-hover-shadow: 0 0 20px rgba(0,255,136,0.2), 0 2px 12px rgba(0,0,0,0.5);
@@ -1043,6 +1046,7 @@ body {
         css_vars += """
     --font-body: 'Manrope', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
     --font-mono: 'JetBrains Mono', 'SF Mono', 'Consolas', 'Courier New', monospace;
+    --font-ui: 'Manrope', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
     --card-radius: 8px;
     --card-shadow: 0 1px 3px rgba(0,0,0,0.1);
     --card-hover-shadow: 0 4px 12px rgba(0,0,0,0.15);
@@ -1283,15 +1287,16 @@ def page_layout(title: str, icon: str = "bar_chart"):
             ui.icon("circle").classes("text-xs").style(
                 f"color: {theme['primary']}; animation: terminal-pulse 2s infinite;"
             )
-            ui.label("CPR_PIVOT_LAB").classes("text-sm font-semibold mono-font").style(
-                f"color: {theme['text_primary']}; letter-spacing: 0.1em;"
+            ui.label("CPR_PIVOT_LAB").classes("text-sm font-semibold").style(
+                f"color: {theme['text_primary']}; letter-spacing: var(--ls-label, 0.08em);"
             )
             ui.label("v1.0").classes("text-xs").style(
-                f"color: {theme['text_muted']}; font-family: 'JetBrains Mono', monospace;"
+                f"color: {theme['text_muted']}; font-family: var(--font-mono);"
             )
 
-        ui.label(f"// {title.upper()}").classes("text-sm ml-4 mono-font").style(
-            f"color: {theme['text_secondary']}; letter-spacing: 0.05em;"
+        ui.label(f"// {title.upper()}").classes("text-sm ml-4").style(
+            f"color: {theme['text_secondary']}; letter-spacing: var(--ls-label, 0.08em);"
+            f"font-family: var(--font-ui);"
         )
 
         ui.space()

@@ -104,6 +104,11 @@ class KiteTickerAdapter:
         with self._lock:
             return self._last_ltp.get(symbol)
 
+    def get_last_ltp_with_ts(self, symbol: str) -> tuple[float | None, datetime | None]:
+        normalized = str(symbol or "").strip().upper()
+        with self._lock:
+            return self._last_ltp.get(normalized), self._symbol_last_tick_ts.get(normalized)
+
     def register_session(
         self,
         session_id: str,

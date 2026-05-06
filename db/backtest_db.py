@@ -682,7 +682,7 @@ class BacktestDB:
         ).pl()
 
     def get_paper_daily_summary(self) -> list[tuple[object, ...]]:
-        """Daily aggregate of all non-TMP paper sessions.
+        """Daily aggregate of actual Kite live paper sessions.
 
         Returns rows with: trade_date, long_trades, long_wins, long_pnl,
         short_trades, short_wins, short_pnl, total_trades, total_wins, total_pnl.
@@ -713,6 +713,7 @@ class BacktestDB:
             FROM backtest_results
             WHERE COALESCE(execution_mode, 'BACKTEST') = 'PAPER'
               AND run_id NOT LIKE 'TMP_%'
+              AND run_id LIKE '%-live-kite'
             GROUP BY trade_date
             ORDER BY trade_date DESC
             """
