@@ -27,10 +27,10 @@ _MIN_MAX_DD_PCT_FOR_BEST = 0.10
 
 async def home_page() -> None:
     """Render the CPR Pivot Lab home page."""
-    await awarm_home_cache(force=True)
+    await awarm_home_cache(force=False)
     status, runs = await asyncio.gather(
         aget_status(lite=True),
-        aget_runs(force=True),
+        aget_runs(force=False),
     )
 
     with page_layout("Home", "home"):

@@ -21,7 +21,7 @@ from web.state import aget_cross_run_trades, aget_runs
 
 async def symbols_page() -> None:
     """Per-symbol performance aggregated across ALL backtest runs."""
-    runs = await aget_runs(force=True)
+    runs = await aget_runs(force=False)
     bt_runs = [r for r in runs if str(r.get("execution_mode") or "BACKTEST").upper() != "PAPER"]
 
     with page_layout("Symbols", "show_chart"):

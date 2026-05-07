@@ -115,7 +115,7 @@ def _effective_run_params(params: dict) -> dict:
 
 async def backtest_page() -> None:
     """Render the Run Results page."""
-    runs = await aget_runs(force=True)
+    runs = await aget_runs(force=False)
 
     with page_layout("Run Results", "bar_chart"):
         theme = THEME

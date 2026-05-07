@@ -1836,6 +1836,7 @@ def paginated_table(
     sort_by: str | None = None,
     descending: bool = False,
     mobile_hidden_cols: set[str] | None = None,
+    max_client_rows: int = 500,
 ) -> None:
     """Render a paginated Quasar QTable with responsive mobile support.
 
@@ -1843,11 +1844,18 @@ def paginated_table(
         sort_by: Column name to sort by initially. Defaults to first column.
         descending: If True, initial sort is descending (newest first for dates).
         mobile_hidden_cols: Set of column field names to hide on mobile (<768px).
+        max_client_rows: Cap rows sent to the browser. 0 = unlimited.
     """
     theme = get_current_theme()
     if not rows:
         ui.label("No data to display.").style(f"color: {theme['text_muted']};")
         return
+
+    # Cap rows sent to the browser to avoid large WebSocket payloads.
+    display_rows = rows
+    total_count = len(rows)
+    if max_client_rows > 0 and total_count > max_client_rows:
+        display_rows = rows[:max_client_rows]
 
     hidden = mobile_hidden_cols or set()
     resolved_columns = []
@@ -1860,10 +1868,15 @@ def paginated_table(
             c["classes"] = (col.get("classes", "") + " hide-mobile").strip()
         resolved_columns.append(c)
 
+    if max_client_rows > 0 and total_count > max_client_rows:
+        ui.label(
+            f"Showing {max_client_rows:,} of {total_count:,} rows — export for full data"
+        ).style(f"color: {theme['text_muted']}; font-size: 0.8rem; margin-bottom: 4px;")
+
     initial_sort = sort_by or (resolved_columns[0]["name"] if resolved_columns else None)
     tbl = ui.table(
         columns=resolved_columns,
-        rows=rows,
+        rows=display_rows,
         row_key=row_key or "id",
         pagination={
             "rowsPerPage": page_size,

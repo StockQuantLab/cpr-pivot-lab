@@ -174,7 +174,7 @@ def _render_param_section(
 
 async def compare_page() -> None:
     """Side-by-side comparison of two backtest runs."""
-    runs = await aget_runs(force=True)
+    runs = await aget_runs(force=False)
 
     with page_layout("Compare", "compare_arrows"):
         theme = THEME

@@ -25,7 +25,7 @@ from web.state import aget_cross_run_trades, aget_runs, build_run_options
 
 async def trade_analytics_page() -> None:
     """Render the Trade Analytics page — aggregates across ALL saved backtest runs."""
-    runs = await aget_runs(force=True)
+    runs = await aget_runs(force=False)
     bt_runs = [r for r in runs if str(r.get("execution_mode") or "BACKTEST").upper() != "PAPER"]
 
     with page_layout("Trade Analytics", "analytics"):

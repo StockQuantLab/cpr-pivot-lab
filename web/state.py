@@ -104,10 +104,28 @@ _data_quality_detail_cache_time: float = 0
 
 _market_breadth_cache: dict[int, tuple[float, pl.DataFrame]] = {}
 
+# Trades caches (60-second TTL, bust on replica version change)
+_TRADES_TTL = 60.0
+_trades_cache: dict[str, tuple[float, pl.DataFrame]] = {}
+_cross_run_trades_cache: dict[frozenset, tuple[float, pl.DataFrame]] = {}
+_trades_cache_replica_version: int = -1
+
 
 # ---------------------------------------------------------------------------
 # Sync helpers (run inside executor)
 # ---------------------------------------------------------------------------
+def _current_backtest_replica_version() -> int | None:
+    """Return the dashboard backtest replica version if the consumer exists."""
+    try:
+        from db.backtest_db import _dashboard_backtest_consumer
+
+        if _dashboard_backtest_consumer is not None:
+            return int(_dashboard_backtest_consumer.get_version())
+    except Exception:
+        return None
+    return None
+
+
 def _fetch_runs_sync(force: bool = False, execution_mode: str = "BACKTEST") -> list[dict]:
     global _runs_cache, _runs_cache_time, _runs_cache_replica_version
     if execution_mode.upper() != "BACKTEST":
@@ -122,15 +140,9 @@ def _fetch_runs_sync(force: bool = False, execution_mode: str = "BACKTEST") -> l
 
     # Bust cache whenever the replica has been updated by any process (delete, new run, etc.).
     # ReplicaConsumer reads the pointer file from disk on every call — cheap stat.
-    try:
-        from db.backtest_db import _dashboard_backtest_consumer
-
-        if _dashboard_backtest_consumer is not None:
-            current_ver = _dashboard_backtest_consumer.get_version()
-            if current_ver != _runs_cache_replica_version:
-                force = True
-    except Exception:
-        pass
+    current_ver = _current_backtest_replica_version()
+    if current_ver is not None and current_ver != _runs_cache_replica_version:
+        force = True
 
     now = time.monotonic()
     if not force and _runs_cache is not None and (now - _runs_cache_time) < _RUNS_TTL:
@@ -149,8 +161,9 @@ def _fetch_runs_sync(force: bool = False, execution_mode: str = "BACKTEST") -> l
                     row["direction_filter"] = (
                         direction if direction in {"LONG", "SHORT", "BOTH"} else "BOTH"
                     )
-            if _dashboard_backtest_consumer is not None:
-                _runs_cache_replica_version = _dashboard_backtest_consumer.get_version()
+            current_ver = _current_backtest_replica_version()
+            if current_ver is not None:
+                _runs_cache_replica_version = current_ver
         except Exception as e:
             logger.debug("Failed to fetch backtest run metrics: %s", e)
             _runs_cache = _runs_cache or []
@@ -206,16 +219,36 @@ def _fetch_status_sync(lite: bool = False) -> dict:
     return dict(_status_cache or {})
 
 
+def _bust_trades_caches_on_replica_change() -> None:
+    """Evict trades caches when the backtest replica version advances."""
+    global _trades_cache_replica_version
+    current_ver = _current_backtest_replica_version()
+    if current_ver is None:
+        return
+    if current_ver != _trades_cache_replica_version:
+        _trades_cache.clear()
+        _cross_run_trades_cache.clear()
+        _trades_cache_replica_version = current_ver
+
+
 def _fetch_trades_sync(run_id: str) -> pl.DataFrame:
+    global _trades_cache
+    now = time.monotonic()
+    cached = _trades_cache.get(run_id)
+    if cached is not None and (now - cached[0]) < _TRADES_TTL:
+        return cached[1]
     try:
         trades = get_dashboard_backtest_db().get_backtest_trades(run_id)
         if not trades.is_empty():
+            _trades_cache[run_id] = (now, trades)
             return trades
         paper_trades = get_dashboard_backtest_db().get_backtest_trades(
             run_id,
             execution_mode="PAPER",
         )
-        return paper_trades if not paper_trades.is_empty() else trades
+        result = paper_trades if not paper_trades.is_empty() else trades
+        _trades_cache[run_id] = (now, result)
+        return result
     except Exception as e:
         logger.debug("Failed to fetch trades for run_id=%s: %s", run_id, e)
         return pl.DataFrame()
@@ -1231,6 +1264,13 @@ def _warm_home_cache_sync(force: bool = False) -> dict[str, int]:
 # Async wrappers
 # ---------------------------------------------------------------------------
 async def aget_runs(force: bool = False, execution_mode: str = "BACKTEST") -> list[dict]:
+    # Fast path: return cached runs without touching the single-threaded executor.
+    if not force and execution_mode.upper() == "BACKTEST":
+        now = time.monotonic()
+        current_ver = _current_backtest_replica_version()
+        replica_unchanged = current_ver is None or current_ver == _runs_cache_replica_version
+        if replica_unchanged and _runs_cache is not None and (now - _runs_cache_time) < _RUNS_TTL:
+            return list(_runs_cache)
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(_executor, lambda: _fetch_runs_sync(force, execution_mode))
 
@@ -1267,24 +1307,34 @@ async def aget_setup_funnel(run_id: str) -> list[dict]:
 
 async def aget_cross_run_trades(runs: list[dict]) -> pl.DataFrame:
     """Aggregate trades across all BACKTEST runs (excludes PAPER). Returns combined Polars DF."""
+    # Fast path: return cached cross-run trades without touching the executor.
+    _bust_trades_caches_on_replica_change()
+    bt_runs = [r for r in runs if str(r.get("execution_mode") or "BACKTEST").upper() != "PAPER"]
+    if not bt_runs:
+        return pl.DataFrame()
+    run_ids = frozenset(r.get("run_id") for r in bt_runs if r.get("run_id"))
+    if not run_ids:
+        return pl.DataFrame()
+    now = time.monotonic()
+    cached = _cross_run_trades_cache.get(run_ids)
+    if cached is not None and (now - cached[0]) < _TRADES_TTL:
+        return cached[1]
+
     loop = asyncio.get_running_loop()
+    ids_list = list(run_ids)
 
     def _go() -> pl.DataFrame:
         db = get_dashboard_backtest_db()
         if not db:
             return pl.DataFrame()
-        bt_runs = [r for r in runs if str(r.get("execution_mode") or "BACKTEST").upper() != "PAPER"]
-        if not bt_runs:
-            return pl.DataFrame()
-        ids = [r["run_id"] for r in bt_runs if r.get("run_id")]
-        if not ids:
-            return pl.DataFrame()
-        placeholders = ",".join(["?"] * len(ids))
+        placeholders = ",".join(["?"] * len(ids_list))
         try:
-            return db.con.execute(
+            df = db.con.execute(
                 f"SELECT * FROM backtest_results WHERE run_id IN ({placeholders})",
-                ids,
+                ids_list,
             ).pl()
+            _cross_run_trades_cache[run_ids] = (now, df)
+            return df
         except Exception:
             return pl.DataFrame()
 
@@ -1292,16 +1342,31 @@ async def aget_cross_run_trades(runs: list[dict]) -> pl.DataFrame:
 
 
 async def aget_symbols(force: bool = False) -> list[str]:
+    # Fast path: return cached symbols without touching the executor.
+    if not force:
+        now = time.monotonic()
+        if _symbols_cache is not None and (now - _symbols_cache_time) < _SYMBOLS_TTL:
+            return list(_symbols_cache)
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(_executor, lambda: _fetch_symbols_sync(force))
 
 
 async def aget_status(lite: bool = False) -> dict:
+    # Fast path: return cached status without touching the executor.
+    now = time.monotonic()
+    if _status_cache is not None and (now - _status_cache_time) < _STATUS_TTL:
+        return dict(_status_cache or {})
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(_executor, lambda: _fetch_status_sync(lite))
 
 
 async def aget_trades(run_id: str) -> pl.DataFrame:
+    # Fast path: return cached trades without touching the executor.
+    _bust_trades_caches_on_replica_change()
+    now = time.monotonic()
+    cached = _trades_cache.get(run_id)
+    if cached is not None and (now - cached[0]) < _TRADES_TTL:
+        return cached[1]
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(_executor, lambda: _fetch_trades_sync(run_id))
 

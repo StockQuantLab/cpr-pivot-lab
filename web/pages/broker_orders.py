@@ -226,4 +226,5 @@ def _render_orders(rows: list[dict]) -> None:
             "local_requested_at",
             "latency_ms",
         },
+        max_client_rows=0,
     )

@@ -35,7 +35,7 @@ _STRAT_NOTES = {
 
 async def strategy_page() -> None:
     """Render the Strategy Analysis page."""
-    runs = await aget_runs(force=True)
+    runs = await aget_runs(force=False)
 
     with page_layout("Strategy", "tune"):
         theme = THEME
