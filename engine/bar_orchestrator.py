@@ -268,6 +268,90 @@ class SessionPositionTracker:
         return max(0, int(investable / float(entry_price)))
 
 
+@dataclass(slots=True)
+class SymbolExposure:
+    """Account-level reservation for one symbol across strategy variants."""
+
+    owner_id: str
+    direction: str
+    status: str = "OPEN"
+
+
+class AccountSymbolExposure:
+    """Account-level symbol guard shared by LONG/SHORT variants.
+
+    SessionPositionTracker is intentionally per-session. This guard models the
+    broker account constraint: a symbol can be owned by only one strategy
+    variant for the day, so LONG and SHORT sessions cannot create offsetting
+    broker exposure for the same instrument.
+    """
+
+    def __init__(self) -> None:
+        self._active: dict[str, SymbolExposure] = {}
+        self._traded_today: set[str] = set()
+
+    @staticmethod
+    def _normalize(symbol: str) -> str:
+        return str(symbol or "").strip().upper()
+
+    def seed_from_tracker(self, *, owner_id: str, tracker: SessionPositionTracker) -> None:
+        for symbol in tracker.open_symbols():
+            position = tracker.get_open_position(symbol)
+            self.reserve(
+                symbol=symbol,
+                owner_id=owner_id,
+                direction=str(getattr(position, "direction", "") or ""),
+            )
+        for symbol in getattr(tracker, "_closed_today", set()):
+            normalized = self._normalize(symbol)
+            if normalized:
+                self._traded_today.add(normalized)
+
+    def block_reason(self, *, symbol: str, owner_id: str) -> str | None:
+        normalized = self._normalize(symbol)
+        if not normalized:
+            return "account_symbol_missing"
+        active = self._active.get(normalized)
+        if active is not None and active.owner_id != owner_id:
+            return "account_symbol_open"
+        if normalized in self._traded_today:
+            return "account_symbol_traded_today"
+        return None
+
+    def reserve(self, *, symbol: str, owner_id: str, direction: str) -> bool:
+        normalized = self._normalize(symbol)
+        if not normalized or self.block_reason(symbol=normalized, owner_id=owner_id) is not None:
+            return False
+        self._active[normalized] = SymbolExposure(
+            owner_id=str(owner_id),
+            direction=str(direction or "").upper(),
+            status="PENDING",
+        )
+        return True
+
+    def confirm_open(self, *, symbol: str, owner_id: str, direction: str) -> None:
+        normalized = self._normalize(symbol)
+        if not normalized:
+            return
+        active = self._active.get(normalized)
+        if active is None or active.owner_id == owner_id:
+            self._active[normalized] = SymbolExposure(
+                owner_id=str(owner_id),
+                direction=str(direction or "").upper(),
+                status="OPEN",
+            )
+
+    def release(self, *, symbol: str, owner_id: str, mark_traded: bool = True) -> None:
+        normalized = self._normalize(symbol)
+        if not normalized:
+            return
+        active = self._active.get(normalized)
+        if active is not None and active.owner_id == owner_id:
+            self._active.pop(normalized, None)
+        if mark_traded:
+            self._traded_today.add(normalized)
+
+
 def should_process_symbol(
     *,
     bar_time: str,

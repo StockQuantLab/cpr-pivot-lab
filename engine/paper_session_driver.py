@@ -10,6 +10,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from engine.bar_orchestrator import (
+    AccountSymbolExposure,
     SessionPositionTracker,
     candidate_quality_score,
     check_bar_risk_controls,
@@ -198,6 +199,7 @@ async def process_closed_bar_group(
     update_symbols_cb: Callable[[list[str]], Any] | None = None,
     real_order_router: RealOrderRouter | None = None,
     signal_audit_writer: Callable[..., Any] | None = None,
+    account_symbol_guard: AccountSymbolExposure | None = None,
 ) -> dict[str, Any]:
     if not bar_candles:
         return {
@@ -282,6 +284,8 @@ async def process_closed_bar_group(
         advance = dict(evaluation.get("advance_result") or {})
         if advance.get("action") == "CLOSE":
             tracker.record_close(candle.symbol, float(advance.get("exit_value") or 0.0))
+            if account_symbol_guard is not None:
+                account_symbol_guard.release(symbol=candle.symbol, owner_id=session_id)
             logger.info(
                 "[%s] CLOSE %s reason=%s",
                 session_id,
@@ -336,6 +340,23 @@ async def process_closed_bar_group(
                 }
             )
             continue
+        if account_symbol_guard is not None:
+            account_block_reason = account_symbol_guard.block_reason(
+                symbol=candle.symbol,
+                owner_id=session_id,
+            )
+            if account_block_reason is not None:
+                signal_audit_rows.append(
+                    {
+                        **audit_base,
+                        "symbol": candle.symbol,
+                        "stage": "ENTRY_SKIP",
+                        "action": "SKIP",
+                        "reason": account_block_reason,
+                        "setup_status": runtime_setup_status(runtime_state, candle.symbol),
+                    }
+                )
+                continue
         setup_status = runtime_setup_status(runtime_state, candle.symbol)
         if not should_process_symbol(
             bar_time=bar_time,
@@ -443,19 +464,70 @@ async def process_closed_bar_group(
             ),
             None,
         )
-        execute_result = await execute_entry_fn(
-            session=session,
-            candidate=candidate,
-            setup_row=dict(selected.get("setup_row") or {}),
-            params=params,
-            now=bar_candles_sorted[0].bar_end,
-            position_tracker=tracker,
-            real_order_router=real_order_router,
-        )
+        symbol = str(candidate.get("symbol") or "")
+        reserved_account_symbol = False
+        if account_symbol_guard is not None:
+            account_block_reason = account_symbol_guard.block_reason(
+                symbol=symbol,
+                owner_id=session_id,
+            )
+            if account_block_reason is not None or not account_symbol_guard.reserve(
+                symbol=symbol,
+                owner_id=session_id,
+                direction=str(candidate.get("direction") or ""),
+            ):
+                signal_audit_rows.append(
+                    {
+                        **audit_base,
+                        "symbol": symbol,
+                        "stage": "ENTRY_EXECUTED",
+                        "action": "SKIP",
+                        "reason": account_block_reason or "account_symbol_reserved",
+                        "setup_status": selected.get("setup_status"),
+                        "selected_rank": selected_rank,
+                        "quality_score": candidate_quality_score(selected),
+                        "candidates_count": len(entry_candidates),
+                        "selected_count": len(selected_entries),
+                        **_candidate_fields(selected),
+                    }
+                )
+                continue
+            reserved_account_symbol = True
+        try:
+            execute_result = await execute_entry_fn(
+                session=session,
+                candidate=candidate,
+                setup_row=dict(selected.get("setup_row") or {}),
+                params=params,
+                now=bar_candles_sorted[0].bar_end,
+                position_tracker=tracker,
+                real_order_router=real_order_router,
+            )
+        except Exception:
+            if reserved_account_symbol and account_symbol_guard is not None:
+                account_symbol_guard.release(
+                    symbol=symbol,
+                    owner_id=session_id,
+                    mark_traded=False,
+                )
+            raise
+        if execute_result.get("action") == "OPEN":
+            if account_symbol_guard is not None:
+                account_symbol_guard.confirm_open(
+                    symbol=symbol,
+                    owner_id=session_id,
+                    direction=str(candidate.get("direction") or ""),
+                )
+        elif reserved_account_symbol and account_symbol_guard is not None:
+            account_symbol_guard.release(
+                symbol=symbol,
+                owner_id=session_id,
+                mark_traded=False,
+            )
         signal_audit_rows.append(
             {
                 **audit_base,
-                "symbol": str(candidate.get("symbol") or ""),
+                "symbol": symbol,
                 "stage": "ENTRY_EXECUTED",
                 "action": str(execute_result.get("action") or ""),
                 "reason": execute_result.get("reason"),

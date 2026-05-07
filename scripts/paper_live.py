@@ -20,7 +20,7 @@ from config.settings import get_settings
 from db.duckdb import get_live_market_db
 from db.paper_db import get_paper_db
 from engine import paper_session_driver as paper_session_driver
-from engine.bar_orchestrator import SessionPositionTracker
+from engine.bar_orchestrator import AccountSymbolExposure, SessionPositionTracker
 from engine.command_lock import acquire_command_lock
 from engine.cpr_atr_shared import regime_snapshot_close_col
 from engine.kite_ticker_adapter import KiteTickerAdapter
@@ -1033,6 +1033,7 @@ async def _process_live_multi_bar(
     ticker_adapter: Any,
     feed_source: str,
     transport: str,
+    account_symbol_guard: AccountSymbolExposure | None = None,
 ) -> None:
     bar_candles = sorted(bar_candles, key=lambda c: c.symbol)
     for candle in bar_candles:
@@ -1079,6 +1080,7 @@ async def _process_live_multi_bar(
             enforce_risk_controls=enforce_session_risk_controls,
             build_feed_state=build_summary_feed_state,
             real_order_router=ctx.real_order_router,
+            account_symbol_guard=account_symbol_guard,
             update_symbols_cb=lambda symbols: ticker_adapter.update_symbols(
                 ctx.session_id, symbols
             ),
@@ -1131,6 +1133,7 @@ async def _apply_live_multi_operator_controls(
     ticker_adapter: Any,
     use_websocket: bool,
     now: datetime,
+    account_symbol_guard: AccountSymbolExposure | None = None,
 ) -> bool:
     """Apply per-session operator controls for the multi-live dispatcher."""
     stop_requested = False
@@ -1264,6 +1267,11 @@ async def _apply_live_multi_operator_controls(
                                 else quantity * (2 * entry_price - close_price)
                             )
                             ctx.tracker.record_close(symbol, exit_value)
+                            if account_symbol_guard is not None:
+                                account_symbol_guard.release(
+                                    symbol=symbol,
+                                    owner_id=ctx.session_id,
+                                )
                     get_paper_db().force_sync()
                     if _reconcile_live_session(
                         session_id=ctx.session_id,
@@ -1614,6 +1622,9 @@ async def run_live_multi_sessions(
                     shared_or_cache=shared_or_cache,
                 )
             )
+        account_symbol_guard = AccountSymbolExposure()
+        for ctx in contexts:
+            account_symbol_guard.seed_from_tracker(owner_id=ctx.session_id, tracker=ctx.tracker)
         last_ticker_tick_count = ticker_adapter.tick_count if ticker_adapter is not None else 0
         last_bucket_start = _floor_bucket_start(datetime.now(IST), candle_interval)
         cycles = 0
@@ -1663,6 +1674,7 @@ async def run_live_multi_sessions(
                     ticker_adapter=ticker_adapter,
                     use_websocket=not local_feed,
                     now=now,
+                    account_symbol_guard=account_symbol_guard,
                 )
             active_contexts = [ctx for ctx in contexts if ctx.final_status == "ACTIVE"]
             if not active_contexts:
@@ -1741,6 +1753,7 @@ async def run_live_multi_sessions(
                             ticker_adapter=ticker_adapter,
                             feed_source=feed_source,
                             transport=transport,
+                            account_symbol_guard=account_symbol_guard,
                         )
                     except Exception:
                         logger.exception(

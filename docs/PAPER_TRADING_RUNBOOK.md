@@ -26,6 +26,9 @@ PYTHONUNBUFFERED=1 doppler run -- uv run pivot-paper-trading daily-live \
 **Rules — read before every session:**
 - `--multi` is the ONLY safe way to run LONG + SHORT concurrently on Windows. DuckDB
   exclusive locking means two separate `daily-live` processes will always fail on the second.
+- `--multi` uses a shared account-level symbol guard. If LONG opens or reserves a symbol, SHORT
+  cannot open that same symbol later in the day, and vice versa. This keeps paper/live behaviour
+  aligned with the broker account reality where one NSE symbol nets into one account position.
 - `--multi` uses `PAPER_STANDARD_MATRIX` → `CPR_CANONICAL_PARAMS` (= `CPR_LEVELS_RISK_LONG`
   overrides). Risk-based sizing is already baked in. Do NOT add `--preset` with `--multi`.
 - `pivot-paper-supervisor` sets `PYTHONUNBUFFERED=1` and `PYTHONFAULTHANDLER=1` for the child.

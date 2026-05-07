@@ -164,6 +164,8 @@ class RealOrderRouter:
             raise OrderSafetyError(
                 f"real-order max open positions reached ({self.config.max_positions})"
             )
+        if not self.config.shadow and symbol.upper() in self._open_notional_by_symbol:
+            raise OrderSafetyError(f"real-order symbol already has open exposure: {symbol.upper()}")
         side = "BUY" if direction.upper() == "LONG" else "SELL"
         intent = self._entry_intent(
             session_id=session_id,

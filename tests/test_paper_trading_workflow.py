@@ -359,6 +359,7 @@ async def test_run_daily_workflow_replay_uses_shared_preparation_and_session(
         notes: str | None,
         preloaded_days=None,
         real_order_config=None,
+        account_symbol_guard=None,
     ):
         calls["replay"] = {
             "session_id": session_id,
@@ -368,6 +369,7 @@ async def test_run_daily_workflow_replay_uses_shared_preparation_and_session(
             "leave_active": leave_active,
             "notes": notes,
             "real_order_config": real_order_config,
+            "account_symbol_guard": account_symbol_guard,
         }
         return {"status": "REPLAYED", "bars": 12}
 
@@ -409,6 +411,7 @@ async def test_run_daily_workflow_replay_uses_shared_preparation_and_session(
         "leave_active": True,
         "notes": "daily replay",
         "real_order_config": None,
+        "account_symbol_guard": None,
     }
     assert payload["session_id"] == "paper-2024-01-02"
     assert payload["preparation"]["coverage_ready"] is True

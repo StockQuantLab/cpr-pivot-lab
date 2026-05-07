@@ -15,6 +15,7 @@ from db.duckdb import get_db
 from db.paper_db import get_paper_db
 from engine import paper_session_driver as paper_session_driver
 from engine.bar_orchestrator import (
+    AccountSymbolExposure,
     SessionPositionTracker,
 )
 from engine.constants import parse_iso_date
@@ -399,6 +400,7 @@ async def _process_replay_bar_major(
     params: Any,
     log_candle_progress: bool = False,
     real_order_router: Any = None,
+    account_symbol_guard: AccountSymbolExposure | None = None,
 ) -> dict[str, Any]:
     """Process one trade date using canonical bar times + shared orchestration."""
     active_days = sorted(
@@ -485,6 +487,7 @@ async def _process_replay_bar_major(
             enforce_risk_controls=enforce_session_risk_controls,
             build_feed_state=build_summary_feed_state,
             real_order_router=real_order_router,
+            account_symbol_guard=account_symbol_guard,
         )
 
         active_symbols_after = set(driver_result["active_symbols"])
@@ -627,6 +630,7 @@ async def replay_session(
     notes: str | None = None,
     preloaded_days: list[ReplayDayPack] | None = None,
     real_order_config: dict[str, Any] | None = None,
+    account_symbol_guard: AccountSymbolExposure | None = None,
 ) -> dict[str, Any]:
     prepared = await _prepare_replay_request(
         session_id=session_id,
@@ -681,6 +685,8 @@ async def replay_session(
         max_position_pct=float(getattr(params, "max_position_pct", 0.0) or 0.0),
     )
     tracker.seed_open_positions(await get_session_positions(session_id, statuses=["OPEN"]))
+    if account_symbol_guard is not None:
+        account_symbol_guard.seed_from_tracker(owner_id=session_id, tracker=tracker)
 
     # Group day packs by trade date so all symbols at the same date
     # are processed in bar-major order (all symbols per bar, then next bar).
@@ -774,6 +780,7 @@ async def replay_session(
             params=params,
             log_candle_progress=True,
             real_order_router=real_order_router,
+            account_symbol_guard=account_symbol_guard,
         )
         last_bar_ts = replay_result["last_bar_ts"] or last_bar_ts
         bars_replayed += int(replay_result["bars_replayed"])

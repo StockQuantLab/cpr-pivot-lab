@@ -627,6 +627,7 @@ class CPRATRBacktest:
                 capital_base=day_start_equity,
             )
             open_positions: list[dict[str, float | str]] = []
+            traded_symbols_today: set[str] = set()
 
             for trade in sorted(trades_by_day[trade_date], key=_sort_key):
                 entry_time = trade.entry_time or "99:99"
@@ -635,11 +636,19 @@ class CPRATRBacktest:
                 for pos in sorted(open_positions, key=lambda row: str(row["exit_time"])):
                     if str(pos["exit_time"]) <= entry_time:
                         released_cash += float(pos["exit_value"])
+                        traded_symbols_today.add(str(pos.get("symbol") or ""))
                     else:
                         remaining.append(pos)
                 open_positions = remaining
                 cash_available += released_cash
 
+                symbol = str(trade.symbol or "")
+                if symbol and (
+                    symbol in traded_symbols_today
+                    or any(str(pos.get("symbol") or "") == symbol for pos in open_positions)
+                ):
+                    skipped_no_slots += 1
+                    continue
                 if len(open_positions) >= max_positions:
                     skipped_no_slots += 1
                     continue
@@ -688,6 +697,7 @@ class CPRATRBacktest:
                 exit_value = round(position_value + gross_pnl_trade, 2)
                 open_positions.append(
                     {
+                        "symbol": symbol,
                         "exit_time": trade.exit_time or self.params.time_exit,
                         "exit_value": exit_value,
                     }
@@ -707,6 +717,7 @@ class CPRATRBacktest:
             released_cash = 0.0
             for pos in open_positions:
                 released_cash += float(pos["exit_value"])
+                traded_symbols_today.add(str(pos.get("symbol") or ""))
             open_positions = []
             cash_available += released_cash
             equity = round(cash_available, 2)

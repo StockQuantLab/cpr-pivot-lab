@@ -37,7 +37,9 @@ actual live orders:
 
 Important current limitation: `--multi --real-orders` is intentionally blocked for the pilot.
 Run one real-routed session first, either LONG or SHORT. Normal `--multi` paper live is still
-supported.
+supported. Paper/live multi sessions share an account-level symbol guard: once one direction
+opens or reserves a symbol, the sibling direction cannot open that same symbol for the rest of
+the trading day.
 
 ## Daily Preconditions
 
@@ -75,10 +77,15 @@ and actual live:
 3. Resolve the opening range and direction.
 4. Scan each symbol on closed 5-minute bars.
 5. Rank candidates by the shared quality selector.
-6. Select entries only if risk, slots, cash, and filters allow.
+6. Select entries only if risk, slots, cash, filters, and the account-level symbol guard allow.
 
 Actual live does not use a different entry rule. It only changes the execution step after a
 candidate has already been selected.
+
+The account-level symbol guard is important for LONG+SHORT operation. Paper ledgers can show
+separate LONG and SHORT sessions, but Zerodha has one account-level position per symbol. If LONG
+and SHORT both traded SBIN at the same time, the broker would net or flip the position. The guard
+therefore treats a symbol as used for the day after either direction opens it.
 
 ## LONG Example
 

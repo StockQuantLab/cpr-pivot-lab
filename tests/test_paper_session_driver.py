@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from engine.bar_orchestrator import SessionPositionTracker
+from engine.bar_orchestrator import AccountSymbolExposure, SessionPositionTracker
 from engine.live_market_data import IST
 from engine.paper_runtime import PaperRuntimeState, SymbolRuntimeState
 from engine.paper_session_driver import process_closed_bar_group
@@ -133,6 +133,174 @@ async def test_process_closed_bar_group_updates_tracker_on_partial_exit() -> Non
     assert tracker.current_open_notional() == pytest.approx(4_000.0)
     assert tracker.cash_available == pytest.approx(6_600.0)
     assert result["triggered"] is False
+
+
+@pytest.mark.asyncio
+async def test_process_closed_bar_group_skips_symbol_open_in_sibling_session() -> None:
+    bar_end = datetime(2026, 4, 9, 9, 25, tzinfo=IST)
+    runtime_state = PaperRuntimeState()
+    runtime_state.symbols["SBIN"] = SymbolRuntimeState(
+        trade_date="2026-04-09",
+        candles=[],
+        setup_row={"direction": "SHORT"},
+    )
+    tracker = SessionPositionTracker(
+        max_positions=10, portfolio_value=1_000_000.0, max_position_pct=0.10
+    )
+    account_guard = AccountSymbolExposure()
+    assert account_guard.reserve(symbol="SBIN", owner_id="long-session", direction="LONG")
+    candle = SimpleNamespace(
+        symbol="SBIN",
+        bar_end=bar_end,
+        open=100.0,
+        high=101.0,
+        low=99.0,
+        close=100.5,
+        volume=1000.0,
+    )
+    audit_rows: list[dict[str, object]] = []
+
+    async def _evaluate_candle(**_: object) -> dict[str, object]:
+        raise AssertionError("entry evaluation should be blocked by account symbol guard")
+
+    async def _enforce_risk_controls(**_: object) -> dict[str, object]:
+        return {"triggered": False}
+
+    result = await process_closed_bar_group(
+        session_id="short-session",
+        session=SimpleNamespace(strategy="CPR_LEVELS"),
+        bar_candles=[candle],
+        runtime_state=runtime_state,
+        tracker=tracker,
+        params=SimpleNamespace(entry_window_end="10:15"),
+        active_symbols=["SBIN"],
+        strategy="CPR_LEVELS",
+        direction_filter="SHORT",
+        stage_b_applied=False,
+        symbol_last_prices={},
+        last_price=None,
+        evaluate_candle_fn=_evaluate_candle,
+        execute_entry_fn=lambda **_: {"action": "SKIP"},
+        enforce_risk_controls=_enforce_risk_controls,
+        build_feed_state=lambda **_: SimpleNamespace(),
+        signal_audit_writer=lambda rows: audit_rows.extend(rows),
+        account_symbol_guard=account_guard,
+    )
+
+    assert result["triggered"] is False
+    assert any(row.get("reason") == "account_symbol_open" for row in audit_rows)
+
+
+@pytest.mark.asyncio
+async def test_process_closed_bar_group_reserves_and_releases_account_symbol() -> None:
+    bar_end = datetime(2026, 4, 9, 9, 25, tzinfo=IST)
+    runtime_state = PaperRuntimeState()
+    runtime_state.symbols["SBIN"] = SymbolRuntimeState(
+        trade_date="2026-04-09",
+        candles=[],
+        setup_row={"direction": "LONG"},
+    )
+    tracker = SessionPositionTracker(
+        max_positions=10, portfolio_value=1_000_000.0, max_position_pct=0.10
+    )
+    account_guard = AccountSymbolExposure()
+    candle = SimpleNamespace(
+        symbol="SBIN",
+        bar_end=bar_end,
+        open=100.0,
+        high=101.0,
+        low=99.0,
+        close=100.5,
+        volume=1000.0,
+    )
+
+    async def _evaluate_entry(**_: object) -> dict[str, object]:
+        return {
+            "action": "ENTRY_CANDIDATE",
+            "setup_status": "candidate",
+            "setup_row": {"direction": "LONG"},
+            "candidate": {
+                "symbol": "SBIN",
+                "direction": "LONG",
+                "entry_price": 100.0,
+                "sl_price": 98.0,
+                "target_price": 104.0,
+                "position_size": 10,
+                "rr_ratio": 2.0,
+                "or_atr_ratio": 0.5,
+            },
+        }
+
+    async def _execute_entry(**kwargs: object) -> dict[str, object]:
+        position = SimpleNamespace(
+            position_id="pos-1",
+            symbol="SBIN",
+            direction="LONG",
+            entry_price=100.0,
+            stop_loss=98.0,
+            target_price=104.0,
+            quantity=10.0,
+            current_qty=10.0,
+            trail_state={},
+        )
+        kwargs["position_tracker"].record_open(position, position_value=1_000.0)
+        return {"action": "OPEN", "position": position}
+
+    async def _risk_ok(**_: object) -> dict[str, object]:
+        return {"triggered": False}
+
+    await process_closed_bar_group(
+        session_id="long-session",
+        session=SimpleNamespace(strategy="CPR_LEVELS"),
+        bar_candles=[candle],
+        runtime_state=runtime_state,
+        tracker=tracker,
+        params=SimpleNamespace(entry_window_end="10:15"),
+        active_symbols=["SBIN"],
+        strategy="CPR_LEVELS",
+        direction_filter="LONG",
+        stage_b_applied=False,
+        symbol_last_prices={},
+        last_price=None,
+        evaluate_candle_fn=_evaluate_entry,
+        execute_entry_fn=_execute_entry,
+        enforce_risk_controls=_risk_ok,
+        build_feed_state=lambda **_: SimpleNamespace(),
+        account_symbol_guard=account_guard,
+    )
+    assert (
+        account_guard.block_reason(symbol="SBIN", owner_id="short-session") == "account_symbol_open"
+    )
+
+    async def _evaluate_exit(**_: object) -> dict[str, object]:
+        return {
+            "action": "ADVANCE",
+            "advance_result": {"action": "CLOSE", "exit_value": 1_020.0, "reason": "TARGET"},
+        }
+
+    await process_closed_bar_group(
+        session_id="long-session",
+        session=SimpleNamespace(strategy="CPR_LEVELS"),
+        bar_candles=[candle],
+        runtime_state=runtime_state,
+        tracker=tracker,
+        params=SimpleNamespace(entry_window_end="10:15"),
+        active_symbols=["SBIN"],
+        strategy="CPR_LEVELS",
+        direction_filter="LONG",
+        stage_b_applied=True,
+        symbol_last_prices={"SBIN": 102.0},
+        last_price=102.0,
+        evaluate_candle_fn=_evaluate_exit,
+        execute_entry_fn=lambda **_: {"action": "SKIP"},
+        enforce_risk_controls=_risk_ok,
+        build_feed_state=lambda **_: SimpleNamespace(),
+        account_symbol_guard=account_guard,
+    )
+    assert (
+        account_guard.block_reason(symbol="SBIN", owner_id="short-session")
+        == "account_symbol_traded_today"
+    )
 
 
 @pytest.mark.asyncio

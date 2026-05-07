@@ -7,6 +7,51 @@ Supersedes: `docs/PARITY_INCIDENT_LOG.md` (contents migrated below).
 
 ---
 
+## 2026-05-07 — FIXED: LIVE: LONG and SHORT multi sessions could reserve the same broker symbol
+
+**Status:** FIXED
+**Severity:** High
+
+### Symptom
+
+Paper `--multi` runs LONG and SHORT as separate session ledgers. That is acceptable for paper
+accounting, but it is not safe to carry into a broker account unchanged: if LONG and SHORT both
+select the same NSE symbol, Zerodha nets the orders at account level instead of preserving two
+independent strategy positions.
+
+### Root Cause
+
+`SessionPositionTracker` was intentionally session-local. `run_live_multi_sessions()` prepared
+one tracker per `_LiveMultiContext`, so each direction only knew its own open/closed symbols.
+There was no account-level symbol reservation shared by sibling LONG/SHORT contexts before entry
+execution.
+
+### Fix
+
+Added `AccountSymbolExposure` in `engine/bar_orchestrator.py` and wired it through
+`engine/paper_session_driver.py`, `scripts/paper_live.py`, `scripts/paper_replay.py`, and
+`scripts/paper_trading.py`. Multi live/replay now reserves a symbol before entry execution,
+confirms it only after `OPEN`, releases it on close, and marks the symbol as traded for the day
+so the sibling direction cannot reuse it later. The same portfolio-level same-symbol guard was
+added to the backtest portfolio constraint path for combined-account runs. `RealOrderRouter`
+also rejects a second real entry for a symbol that already has open real exposure.
+
+### Related
+
+Verified with:
+
+```bash
+uv run pytest tests/test_paper_session_driver.py tests/test_bar_orchestrator.py \
+  tests/test_live_market_data.py tests/test_paper_trading_workflow.py \
+  tests/test_paper_trading_cli.py tests/test_paper_replay.py \
+  tests/test_real_order_runtime.py -q
+uv run ruff check engine/bar_orchestrator.py engine/paper_session_driver.py \
+  scripts/paper_live.py scripts/paper_replay.py scripts/paper_trading.py \
+  engine/cpr_atr_strategy.py engine/real_order_runtime.py tests/test_paper_session_driver.py
+```
+
+---
+
 ## 2026-05-06 — FIXED: DATA: full canonical baseline window had stale pack coverage/RVOL rows
 
 **Status:** FIXED

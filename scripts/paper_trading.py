@@ -23,6 +23,7 @@ from config.settings import get_settings
 from db.backtest_db import get_backtest_db
 from db.duckdb import get_db
 from db.paper_db import PaperSession, get_paper_db
+from engine.bar_orchestrator import AccountSymbolExposure
 from engine.cli_setup import configure_windows_asyncio, configure_windows_stdio, run_asyncio
 from engine.command_lock import acquire_command_lock
 from engine.cpr_atr_strategy import BacktestResult, CPRATRBacktest
@@ -561,6 +562,7 @@ async def _run_daily_workflow(
             notes=notes,
             preloaded_days=(replay_kwargs or {}).get("preloaded_days"),
             real_order_config=(replay_kwargs or {}).get("real_order_config"),
+            account_symbol_guard=(replay_kwargs or {}).get("account_symbol_guard"),
         )
     elif mode == "live":
         payload = await run_live_session(
@@ -1762,6 +1764,7 @@ async def _cmd_daily_replay_multi(args: argparse.Namespace) -> None:
     suppress_alerts = bool(getattr(args, "no_alerts", False))
     if suppress_alerts:
         set_alerts_suppressed(True)
+    account_symbol_guard = AccountSymbolExposure()
     try:
 
         async def _execute_variant(
@@ -1815,6 +1818,7 @@ async def _cmd_daily_replay_multi(args: argparse.Namespace) -> None:
                         strategy_params=normalized_params,
                         feed_source="historical",
                     ),
+                    "account_symbol_guard": account_symbol_guard,
                 },
                 skip_preparation=True,
             )

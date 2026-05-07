@@ -596,6 +596,46 @@ async def test_real_order_router_blocks_cash_budget_overuse(
         db.close()
 
 
+@pytest.mark.asyncio
+async def test_real_order_router_blocks_duplicate_symbol_exposure(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = PaperDB(db_path=tmp_path / "paper.duckdb")
+    adapter = _FakeLiveAdapter()
+    monkeypatch.setattr("engine.real_order_runtime.get_paper_db", lambda: db)
+    try:
+        router = RealOrderRouter(
+            RealOrderRuntimeConfig(
+                enabled=True,
+                fixed_quantity=1,
+                max_positions=2,
+                cash_budget=2_000.0,
+            ),
+            adapter=adapter,
+            account_available_cash=2_000.0,
+        )
+        await router.place_entry(
+            session_id="paper-live-1",
+            symbol="SBIN",
+            direction="LONG",
+            reference_price=750.0,
+            stop_loss=735.0,
+            event_time=None,
+        )
+
+        with pytest.raises(OrderSafetyError, match="symbol already has open exposure"):
+            await router.place_entry(
+                session_id="paper-live-1",
+                symbol="SBIN",
+                direction="SHORT",
+                reference_price=750.0,
+                stop_loss=765.0,
+                event_time=None,
+            )
+    finally:
+        db.close()
+
+
 def test_real_order_router_rejects_budget_above_account_cash() -> None:
     with pytest.raises(OrderSafetyError, match="exceeds available cash"):
         RealOrderRouter(
