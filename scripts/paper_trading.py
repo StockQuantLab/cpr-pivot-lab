@@ -1430,10 +1430,12 @@ async def _cmd_daily_live_multi(args: argparse.Namespace) -> None:
     with asyncio.gather avoids multi-process file-lock conflicts on
     paper.duckdb while allowing all variants to poll simultaneously.
     """
-    if bool(getattr(args, "real_orders", False)):
+    if bool(getattr(args, "real_orders", False)) and not bool(
+        getattr(args, "allow_multi_real_orders", False)
+    ):
         raise SystemExit(
             "--multi --real-orders is intentionally blocked for the pilot. "
-            "Run one LONG or one SHORT real-routed session first."
+            "Pass --allow-multi-real-orders only for an explicitly approved small-capital pilot."
         )
     trade_date = resolve_trade_date(args.trade_date)
     _apply_default_saved_universe(args, trade_date)

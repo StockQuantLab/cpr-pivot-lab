@@ -86,6 +86,7 @@ def test_real_order_config_marks_pilot_session_and_blocks_multi() -> None:
     args = SimpleNamespace(
         real_orders=True,
         multi=False,
+        allow_multi_real_orders=False,
         resume=False,
         real_order_sizing_mode="fixed-qty",
         real_order_fixed_qty=1,
@@ -129,6 +130,16 @@ def test_real_order_config_marks_pilot_session_and_blocks_multi() -> None:
             strategy_params={"direction_filter": "LONG"},
             feed_source="kite",
         )
+    args.allow_multi_real_orders = True
+    assert (
+        paper_trading._build_real_order_config(
+            args,
+            strategy="CPR_LEVELS",
+            strategy_params={"direction_filter": "LONG"},
+            feed_source="kite",
+        )["adapter_mode"]
+        == "LIVE"
+    )
 
 
 def test_simulated_real_order_config_allows_multi_and_local_feed() -> None:
@@ -136,6 +147,7 @@ def test_simulated_real_order_config_allows_multi_and_local_feed() -> None:
         real_orders=False,
         simulate_real_orders=True,
         multi=True,
+        allow_multi_real_orders=False,
         resume=False,
         real_order_sizing_mode="fixed-qty",
         real_order_fixed_qty=1,
@@ -165,6 +177,7 @@ def test_real_order_config_supports_cash_budget_sizing() -> None:
     args = SimpleNamespace(
         real_orders=True,
         multi=False,
+        allow_multi_real_orders=False,
         resume=False,
         real_order_sizing_mode="cash-budget",
         real_order_fixed_qty=1,
@@ -192,6 +205,7 @@ def test_real_order_config_preserves_zero_budget_for_fail_closed_validation() ->
     args = SimpleNamespace(
         real_orders=True,
         multi=False,
+        allow_multi_real_orders=False,
         resume=False,
         real_order_sizing_mode="cash-budget",
         real_order_fixed_qty=1,

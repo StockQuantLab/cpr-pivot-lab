@@ -171,10 +171,14 @@ def build_real_order_config(
         return None
     if real_orders and str(feed_source or "").lower() != "kite":
         raise SystemExit("--real-orders is supported only with --feed-source kite.")
-    if real_orders and bool(getattr(args, "multi", False)):
+    if (
+        real_orders
+        and bool(getattr(args, "multi", False))
+        and not bool(getattr(args, "allow_multi_real_orders", False))
+    ):
         raise SystemExit(
             "--multi --real-orders is intentionally blocked for the pilot. "
-            "Run one LONG or one SHORT session first."
+            "Pass --allow-multi-real-orders only for an explicitly approved small-capital pilot."
         )
     if real_orders and bool(getattr(args, "resume", False)):
         raise SystemExit(

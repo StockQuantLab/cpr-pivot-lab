@@ -744,6 +744,18 @@ def test_paper_trading_parser_supports_daily_commands() -> None:
         ]
     )
     assert daily_live_sim_orders_args.simulate_real_orders is True
+    daily_live_multi_real_args = parser.parse_args(
+        [
+            "daily-live",
+            "--trade-date",
+            "2024-01-03",
+            "--multi",
+            "--real-orders",
+            "--allow-multi-real-orders",
+        ]
+    )
+    assert daily_live_multi_real_args.real_orders is True
+    assert daily_live_multi_real_args.allow_multi_real_orders is True
 
     preset_live_args = parser.parse_args(
         [

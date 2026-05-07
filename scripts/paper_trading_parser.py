@@ -303,6 +303,14 @@ def build_paper_trading_parser(
             ),
         )
         sp.add_argument(
+            "--allow-multi-real-orders",
+            action="store_true",
+            help=(
+                "Explicitly allow --multi --real-orders for a small-capital pilot. "
+                "Dangerous: use only after operator approval."
+            ),
+        )
+        sp.add_argument(
             "--simulate-real-orders",
             action="store_true",
             help=(
